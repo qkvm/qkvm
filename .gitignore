@@ -1,0 +1,14 @@
+# QKVM's saved state: encrypted KVM passwords, TLS key, activity log. Never commit it.
+data/
+
+# A release signing key made with `python -m qkvm.release keygen`. Never commit it.
+*.key
+
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+dist/
+build/
+*.egg-info/

@@ -1,0 +1,132 @@
+# Runs the test suite on every push and pull request. The tests use stand-in KVMs, so no hardware is needed.
+#
+# Actions are named by the commit they are at, with the version it is in a comment: a tag can be
+# moved to other code afterwards, a commit cannot.
+name: Tests
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "17 5 * * 1"  # Mondays: a library can get a known hole without anything changing here
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install
+        run: python -m pip install . pytest
+      - name: Test
+        run: python -m pytest -q
+
+  # The checks a developer runs, in the versions named here: a new release of a checker that finds
+  # fault where the one before did not is taken up on purpose, and not met as a red run.
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+      - name: Install
+        run: python -m pip install . ruff==0.15.20 mypy==2.0.0
+      - name: Lint
+        run: python -m ruff check .
+      - name: Types
+        run: python -m mypy
+
+  # The page itself, run in a real browser against stand-in KVMs: what a person presses, and what they
+  # then see; and, in a second file, against the program as it is started (an update, a restart onto HTTPS). Playwright and its browser are for this job only and nothing a wall is installed with; in
+  # the version named here, like the checkers above. (The same file is skipped in the job "tests", where
+  # there is no Playwright. Here a browser that does not start is a failure: the test file reads CI.)
+  browser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+      - name: Install
+        run: |
+          python -m pip install . pytest playwright==1.63.0
+          python -m playwright install --with-deps chromium
+      - name: The page, in a browser
+        run: python -m pytest -q tests/test_in_a_browser.py tests/test_in_a_browser_with_the_program_itself.py
+
+  # What a fresh install pulls in today, looked up in the list of known vulnerabilities.
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+      - name: Install
+        run: python -m pip install . pip-audit==2.10.0
+      - name: Known vulnerabilities
+        run: python -m pip_audit
+
+  # What a release publishes, made and tried on every push, so that a release does not find out
+  # first: the package, installed by itself where no source lies about, and the image.
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+      - name: Build
+        run: |
+          python -m pip install build twine
+          python -m build
+          python -m twine check --strict dist/*
+      - name: Install the wheel by itself and start it
+        run: |
+          python -m venv /tmp/clean
+          /tmp/clean/bin/pip install dist/*.whl
+          cd /tmp
+          /tmp/clean/bin/qkvm --version
+          /tmp/clean/bin/qkvm --data-dir /tmp/qkvm-data --port 8799 &
+          for attempt in $(seq 1 30); do curl -fsS http://127.0.0.1:8799/healthz && break; sleep 1; done
+          curl -fsS http://127.0.0.1:8799/ | grep -q "<title>"
+
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build
+        run: docker build -t qkvm:test .
+      - name: Start it as the compose file does, and wait until it says it is well
+        run: |
+          docker run -d --name qkvm --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges:true -p 8787:8787 qkvm:test
+          for attempt in $(seq 1 45); do
+            [ "$(docker inspect -f '{{.State.Health.Status}}' qkvm)" = healthy ] && break
+            sleep 2
+          done
+          docker logs qkvm
+          test "$(docker inspect -f '{{.State.Health.Status}}' qkvm)" = healthy
+          curl -fsS http://127.0.0.1:8787/healthz

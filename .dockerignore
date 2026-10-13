@@ -1,0 +1,7 @@
+# Only pyproject.toml and the qkvm package go into the image.
+*
+!pyproject.toml
+!LICENSE
+!README.md
+!qkvm
+qkvm/**/__pycache__

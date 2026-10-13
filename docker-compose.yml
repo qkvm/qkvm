@@ -1,0 +1,58 @@
+# QKVM in a container:   docker compose up -d
+#
+# First run: open http://<this machine>:8787/ and choose a password. Do that right away: until
+# then a new QKVM belongs to whoever opens it first. Where others can reach the port before you
+# do, take the "#" off the "command:" line below: setup then asks for a code that only the log
+# shows (docker compose logs qkvm).
+#
+# To update:   docker compose pull && docker compose up -d
+#
+# This runs the published image. To run what is in this folder instead, build it under the
+# same name first:   docker build -t qkvm/qkvm .
+services:
+  qkvm:
+    image: qkvm/qkvm
+    container_name: qkvm
+    restart: unless-stopped
+    ports:
+      # host:container. Use "127.0.0.1:8787:8787" to reach it from this machine only.
+      - "8787:8787"
+    volumes:
+      - qkvm-data:/data
+    # command: ["--setup-code"]
+    #
+    # After a restart QKVM carries on by itself (watching, alerts, metrics without anybody signing in),
+    # with a key it keeps in the data volume: whoever has a copy of that volume has the saved device
+    # passwords. To keep the key out of the volume and its backups, put 32 or more random characters in
+    # a file next to this one that the container's user (uid 10001) can read and other users of this
+    # computer cannot,
+    #     head -c 32 /dev/urandom | base64 > qkvm-unlock.key
+    #     sudo chown 10001 qkvm-unlock.key && sudo chmod 600 qkvm-unlock.key
+    # and take the "#" off the next four lines and off the "secrets:" block at the end. The volume and
+    # that file are then each useless without the other: keep them apart.
+    # environment:
+    #   QKVM_UNLOCK_FILE: /run/secrets/qkvm_unlock
+    # secrets:
+    #   - qkvm_unlock
+    # Run with as little as it needs.
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    # What QKVM prints (its warnings; the full log is the file in the data volume, which is kept to a size
+    # by QKVM) is kept by Docker, and without an end unless it is given one.
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
+
+volumes:
+  qkvm-data:
+
+# secrets:
+#   qkvm_unlock:
+#     file: ./qkvm-unlock.key

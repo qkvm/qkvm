@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="qkvm-version" content="{{version}}">
+<meta name="qkvm-page" content="{{page}}">
+<title>QKVM</title>
+<link rel="icon" href="static/favicon.svg" type="image/svg+xml">
+<script src="static/theme.js"></script>
+<link rel="stylesheet" href="static/app.css">
+<script src="static/app.js" defer></script>
+</head>
+<body>
+<noscript><p class="noscript">QKVM needs JavaScript.</p></noscript>
+
+<div class="stale" id="stale" role="alert" hidden>
+  <strong>QKVM needs a restart.</strong>
+  Its files were updated, but the program that is running is still the old one, so pictures stay blurry and
+  newer features fail. In the window where it runs press <kbd>Ctrl</kbd>+<kbd>C</kbd>, then start it
+  again with <code>qkvm</code>.
+</div>
+
+<section class="auth" id="auth" hidden>
+  <div class="auth-panel">
+    <aside class="hero" id="auth-hero"></aside>
+    <div class="card" id="auth-card"></div>
+  </div>
+</section>
+
+<div class="shell" id="shell" hidden>
+  <header class="top">
+    <button type="button" class="brand-mini" id="about" title="About QKVM" aria-label="About QKVM">
+      <img src="static/favicon.svg" alt="">
+      <span class="wordmark"><b>Q</b>KVM</span>
+    </button>
+    <nav class="filters" id="filters" aria-label="Show"></nav>
+    <label class="search" id="search-box">
+      <input type="search" id="search" placeholder="Find a KVM" autocomplete="off" spellcheck="false"
+             aria-label="Find a KVM by name or address" title="Find a KVM (/)">
+    </label>
+    <label class="pick" id="group-pick" title="Group" hidden>
+      <select id="group" aria-label="Group"></select>
+    </label>
+    <span class="spacer"></span>
+    <!-- How the wall is shown is set now and then, not all day: it is one button here, and what it holds drops from it. -->
+    <span class="drop">
+      <button type="button" id="view-toggle" aria-haspopup="true" aria-expanded="false" aria-controls="view-panel"
+              title="How the wall is shown: order, columns, how often, display mode">View</button>
+      <div class="popup" id="view-panel" hidden>
+        <div class="pop-row"><span>Order</span>
+          <label class="pick" id="order-pick">
+            <select id="order" aria-label="Order of the tiles">
+              <option value="">As arranged</option>
+              <option value="name">By name</option>
+              <option value="group">By group</option>
+              <option value="state">Problems first</option>
+            </select>
+          </label>
+        </div>
+        <div class="pop-row"><span>Columns</span>
+          <label class="pick" id="cols-pick">
+            <select id="cols" aria-label="Columns">
+              <option value="auto">Fit</option>
+              <option>1</option><option>2</option><option>3</option><option>4</option><option>5</option><option>6</option>
+            </select>
+          </label>
+        </div>
+        <div class="pop-row"><span>A new picture every</span>
+          <label class="pick" id="rate-pick">
+            <select id="rate" aria-label="Refresh every"></select>
+          </label>
+        </div>
+        <button type="button" class="menu-row admin-only" id="arrange" title="Drag the tiles into an order of your own, for everybody who looks at this wall"><span>Arrange the tiles…</span></button>
+        <hr>
+        <button type="button" class="menu-row" id="display" title="Only the screens, for a monitor on the wall"><span>Display mode</span><kbd>D</kbd></button>
+      </div>
+    </span>
+    <button type="button" class="operator-only" id="select-toggle" aria-pressed="false" aria-label="Select KVMs"
+            title="Select mode: tick several KVMs, then run one action on all of them (S)">Select</button>
+    <button type="button" class="primary admin-only" id="add-device" title="Add KVMs">Add KVMs</button>
+    <button type="button" class="admin-only" id="update-badge" aria-label="Update available" hidden>Update</button>
+    <span class="divider"></span>
+    <button type="button" class="icon-btn" id="fullscreen" title="Fullscreen (F)" aria-label="Fullscreen"></button>
+    <button type="button" class="icon-btn" id="theme-toggle"></button>
+    <button type="button" class="icon-btn" id="open-settings" title="Settings" aria-label="Settings"></button>
+    <span class="drop">
+      <button type="button" class="icon-btn" id="me-toggle" aria-haspopup="true" aria-expanded="false" aria-controls="me-panel"
+              title="Your account" aria-label="Your account"></button>
+      <div class="popup" id="me-panel" hidden>
+        <div class="me-who"><strong id="me-name"></strong><span class="muted" id="me-role"></span></div>
+        <hr>
+        <button type="button" class="menu-row" id="my-security"><span>Password and second step</span></button>
+        <button type="button" class="menu-row" id="sign-out"><span>Sign out</span></button>
+      </div>
+    </span>
+    <time id="clock"></time>
+  </header>
+  <div class="display-bar" id="display-bar" hidden>
+    <strong id="display-group"></strong>
+    <label class="check" id="display-rotate-box"><input type="checkbox" id="display-rotate"><span>Rotate groups</span></label>
+    <button type="button" id="display-exit">Exit (Esc)</button>
+  </div>
+  <div class="banner" id="banner" role="status" hidden></div>
+  <main class="wall" id="wall"></main>
+  <div class="bulkbar" id="bulkbar" role="toolbar" aria-label="Bulk actions" hidden>
+    <strong id="bulk-count">0 selected</strong>
+    <button type="button" id="bulk-all">Select all</button>
+    <button type="button" id="bulk-none">Clear</button>
+    <span class="divider"></span>
+    <button type="button" class="primary" id="bulk-run">Run action…</button>
+    <button type="button" class="icon-btn ghost" id="bulk-done" title="Done (Esc)" aria-label="Leave selection"></button>
+  </div>
+</div>
+
+<section class="focus" id="focus" hidden>
+  <div class="focus-bar" id="focus-bar">
+    <span class="dot"></span>
+    <strong id="focus-name"></strong>
+    <span class="muted" id="focus-state"></span>
+    <span class="meta" id="focus-meta"></span>
+    <div class="ports" id="focus-ports" role="group" aria-label="Ports" hidden></div>
+    <span class="spacer"></span>
+    <button type="button" class="icon-btn" id="focus-prev" title="Previous (←)" aria-label="Previous KVM"></button>
+    <button type="button" class="icon-btn" id="focus-next" title="Next (→)" aria-label="Next KVM"></button>
+    <button type="button" id="focus-health" aria-pressed="false" title="How the server is: health, temperatures, fans" hidden>Health</button>
+    <button type="button" class="operator-only" id="focus-actions">Actions</button>
+    <a class="btn" id="focus-open" target="_blank" rel="noopener noreferrer">Open console</a>
+    <button type="button" class="icon-btn" id="focus-close" title="Close (Esc)" aria-label="Close"></button>
+  </div>
+  <div class="focus-screen" id="focus-screen">
+    <canvas id="focus-canvas" role="img" aria-label="Enlarged screen"></canvas>
+    <div class="panel" id="focus-panel" role="group" aria-label="How the server is doing"></div>
+    <div class="veil" id="focus-veil"></div>
+  </div>
+</section>
+
+<div class="toasts" id="toasts" role="status" aria-live="polite"></div>
+</body>
+</html>

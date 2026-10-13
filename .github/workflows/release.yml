@@ -1,0 +1,199 @@
+# Publishes a version: to the GitHub release (what the in-app updater looks for), to PyPI
+# (`pip install qkvm`) and as a container image (`docker pull`).
+#
+# To publish version 1.2.3: set __version__ = "1.2.3" in qkvm/_version.py, commit, then create a
+# GitHub release with the tag v1.2.3. This workflow then
+#
+#   attaches to the release      qkvm-1.2.3-py3-none-any.whl, SHA256SUMS,
+#                                SHA256SUMS.sig (made with the RELEASE_SIGNING_KEY secret: a version that has
+#                                a release key built in is not published without it, anywhere)
+#   uploads to PyPI              the same wheel, and the source archive
+#   pushes the image             ghcr.io/<owner>/<name>, for amd64 and arm64, tagged 1.2.3, 1.2 and latest;
+#                                and to Docker Hub as well when that is set up (see below)
+#
+# What has to be set up once, outside this file:
+#
+#   PyPI         On pypi.org, add a "trusted publisher" for the project qkvm: this repository, the
+#                workflow release.yml, the environment pypi. No password or token is stored anywhere:
+#                PyPI is told by GitHub which repository and workflow is asking.
+#   Docker Hub   The repository variable DOCKERHUB_IMAGE (for example qkvm/qkvm) and the secrets
+#                DOCKERHUB_USERNAME and DOCKERHUB_TOKEN (an access token that may write to it).
+#                Without the variable the image goes to ghcr.io only.
+#   Signing      The secret RELEASE_SIGNING_KEY of the environment "release" (Settings, Environments), and
+#                not of the repository: a repository's secrets can be read by any workflow on any branch
+#                that is pushed. Limit that environment to tags (and, if you like, to your own approval).
+#                See "Publishing releases" in the README.
+#
+# What is built is built in a job that can write nothing and reaches no secret: the tools that do the
+# building come from PyPI, with whatever they bring along, and run there. The key is used in a job of
+# its own that installs nothing from PyPI.
+#
+# Actions are named by the commit they are at, with the version it is in a comment: a tag can be
+# moved to other code afterwards, a commit cannot.
+name: Release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+env:
+  TAG: ${{ github.event.release.tag_name }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      - name: The tag must match the version in the code
+        run: |
+          version=$(python -c "import runpy; print(runpy.run_path('qkvm/_version.py')['__version__'])")
+          test "v$version" = "$TAG" || { echo "tag $TAG does not match version $version"; exit 1; }
+
+      # What is published has passed its own tests, as tagged: not "it passed on another day".
+      - name: Tests
+        run: |
+          python -m pip install . pytest
+          python -m pytest -q
+
+      - name: Build
+        run: |
+          python -m pip install build twine
+          python -m build
+          python -m twine check --strict dist/*
+
+      - name: The package installs, and is the version the tag says
+        run: |
+          python -m venv /tmp/installed
+          /tmp/installed/bin/pip install dist/*.whl
+          cd /tmp && test "$(/tmp/installed/bin/qkvm --version)" = "qkvm ${TAG#v}"
+
+      # In a folder of their own: what goes to PyPI is the packages and nothing else.
+      - name: Checksums
+        run: |
+          mkdir release
+          cp dist/*.whl release/
+          cd release && sha256sum -- *.whl > SHA256SUMS
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: packages
+          path: dist/
+          if-no-files-found: error
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release
+          path: release/
+          if-no-files-found: error
+
+  # Signs what was built, and attaches it to the release. Nothing from PyPI is installed or run here: the
+  # system's own Python, its packaged cryptography library, and qkvm/release.py as it is at the tag.
+  attach:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: release  # where the signing key is kept
+    permissions:
+      contents: write  # to attach files to the release
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release
+          path: release/
+
+      # Refuses to go on where the result would be a release that no copy installs (not signed although
+      # this version takes only signed ones, or signed with another key than the ones built into it).
+      - name: Sign
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+        run: |
+          /usr/bin/python3 -c "import cryptography" 2>/dev/null || { sudo apt-get update --quiet && sudo apt-get install --yes --quiet python3-cryptography; }
+          /usr/bin/python3 -m qkvm.release publish release/SHA256SUMS
+
+      # (Not replacing what is there: run a second time for one tag, this stops, and what copies have
+      # already downloaded stays what the release holds. Remove the files by hand to publish them anew.)
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$TAG" release/*
+
+  # The same files that were built and checked above, not built again.
+  pypi:
+    needs: [build, attach]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/qkvm/
+    permissions:
+      id-token: write  # how GitHub vouches to PyPI for this workflow; there is no token to steal
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: packages
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+
+  image:
+    needs: [build, attach]  # only once the tag is known to match the code, and the release has its files
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write  # to push to ghcr.io
+    env:
+      DOCKERHUB_IMAGE: ${{ vars.DOCKERHUB_IMAGE }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        if: env.DOCKERHUB_IMAGE != ''
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - id: where
+        name: Where the image goes
+        run: |
+          {
+            echo "images<<END"
+            echo "ghcr.io/${GITHUB_REPOSITORY,,}"
+            if [ -n "$DOCKERHUB_IMAGE" ]; then echo "docker.io/$DOCKERHUB_IMAGE"; fi
+            echo "END"
+          } >> "$GITHUB_OUTPUT"
+
+      - id: names
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ steps.where.outputs.images }}
+          tags: |
+            type=semver,pattern={{version}},value=${{ env.TAG }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ env.TAG }}
+
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.names.outputs.tags }}
+          labels: ${{ steps.names.outputs.labels }}
+          # Recorded with the image: what it was built from, and what is in it.
+          provenance: true
+          sbom: true

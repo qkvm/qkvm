@@ -1,0 +1,1349 @@
+/* --- tokens -----------------------------------------------------------------
+   A crisp, flat look: slate neutrals, one solid blue, hairline borders, 4px corners,
+   barely-there shadows. No gradients on controls, no glass. */
+
+:root {
+  --bg: #080b11;
+  --bg-glow: rgba(90, 169, 255, .09);
+  --panel: #1e293b;
+  --inset: #0f172a;      /* wells inside a panel: inputs, table headers */
+  --hover: #334155;
+  --line: rgba(203, 213, 225, .16);
+  --line-strong: rgba(203, 213, 225, .24);
+  --text: #f8fafc;
+  --muted: #94a3b8;
+  --accent: #1d4ed8;
+  --accent-hover: #1e40af;
+  --accent-active: #1e3a8a;
+  --accent-line: #2563eb;
+  --accent-text: #60a5fa;  /* blue that reads on this background */
+  --accent-soft: rgba(59, 130, 246, .14);
+  --on-accent: #ffffff;
+  --ok: #22c55e;
+  --warn: #f59e0b;
+  --bad: #ef4444;
+  --bad-solid: #dc2626;
+  --bad-soft: rgba(239, 68, 68, .12);
+  --shadow-xs: 0 1px 2px rgba(0, 0, 0, .3);
+  --shadow-sm: 0 1px 3px rgba(0, 0, 0, .4), 0 1px 2px -1px rgba(0, 0, 0, .4);
+  --shadow-lg: 0 20px 25px -5px rgba(0, 0, 0, .5), 0 8px 10px -6px rgba(0, 0, 0, .5);
+
+  --radius: 4px;
+  --gap: 12px;
+  --bar-h: 36px;
+  --ease: cubic-bezier(.2, .8, .2, 1);
+  --spring: cubic-bezier(.34, 1.56, .64, 1);
+  --fast: .15s;
+  --med: .22s;
+  color-scheme: dark;
+}
+:root[data-theme="light"] {
+  --bg: #edf0f5;
+  --bg-glow: rgba(31, 102, 209, .1);
+  --panel: #ffffff;
+  --inset: #f8fafc;
+  --hover: #eff6ff;
+  --line: rgba(30, 41, 59, .16);
+  --line-strong: rgba(30, 41, 59, .3);
+  --text: #0f172a;
+  --muted: #64748b;
+  --accent-line: rgba(30, 58, 138, .6);
+  --accent-text: #1d4ed8;
+  --accent-soft: rgba(29, 78, 216, .08);
+  --ok: #16a34a;
+  --warn: #d97706;
+  --bad: #dc2626;
+  --bad-soft: rgba(220, 38, 38, .07);
+  --shadow-xs: 0 1px 2px rgba(0, 0, 0, .05);
+  --shadow-sm: 0 1px 3px rgba(0, 0, 0, .1), 0 1px 2px -1px rgba(0, 0, 0, .1);
+  --shadow-lg: 0 20px 25px -5px rgba(0, 0, 0, .12), 0 8px 10px -6px rgba(0, 0, 0, .1);
+  color-scheme: light;
+}
+
+/* --- base ------------------------------------------------------------------- */
+
+* { box-sizing: border-box; scrollbar-width: thin; scrollbar-color: color-mix(in srgb, var(--muted) 50%, transparent) transparent; }
+[hidden] { display: none !important; }
+html, body { height: 100%; }
+body {
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  background: radial-gradient(1100px 460px at 50% -180px, var(--bg-glow), transparent 70%) var(--bg);
+  color: var(--text);
+  font: 13px/1.5 "Inter", "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+h2 { margin: 0; font-size: 15px; font-weight: 600; letter-spacing: -.01em; }
+h3 { margin: 20px 0 8px; font-size: 11px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+p { margin: 0 0 10px; }
+code, kbd { font-family: "Source Code Pro", "Cascadia Mono", ui-monospace, Consolas, monospace; font-size: 12px; }
+kbd {
+  padding: 0 5px;
+  font-size: 11px;
+  line-height: 18px;
+  color: var(--muted);
+  background: var(--inset);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  white-space: nowrap;
+}
+a { color: var(--accent-text); }
+::selection { background: color-mix(in srgb, var(--accent) 40%, transparent); }
+.spacer { flex: 1; }
+.muted { color: var(--muted); }
+.error { color: var(--bad); }
+.noscript { padding: 24px; text-align: center; }
+.icon { width: 1em; height: 1em; flex: none; }
+.spinner {
+  flex: none;
+  display: inline-block;
+  width: 14px;
+  height: 14px;
+  border: 2px solid currentColor;
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: spin .7s linear infinite;
+}
+.loading { display: flex; align-items: center; gap: 10px; color: var(--muted); }
+@keyframes spin { to { transform: rotate(360deg); } }
+@keyframes rise { from { opacity: 0; transform: translateY(6px); } }
+
+/* --- controls --------------------------------------------------------------- */
+
+button, .btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: 32px;
+  padding: 0 12px;
+  font: inherit;
+  font-weight: 500;
+  white-space: nowrap;
+  text-decoration: none;
+  color: var(--text);
+  background: var(--panel);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-xs);
+  cursor: pointer;
+  user-select: none;
+  transition: background-color var(--fast), border-color var(--fast), color var(--fast), box-shadow var(--fast), transform .1s;
+}
+button:hover, .btn:hover { background: var(--hover); }
+button:active, .btn:active { transform: translateY(1px); box-shadow: none; }
+button:disabled { opacity: .5; cursor: default; pointer-events: none; }
+button .icon, .btn .icon { width: 14px; height: 14px; }
+button.primary, .btn.primary {
+  color: var(--on-accent);
+  background: var(--accent);
+  border-color: var(--accent-line);
+  box-shadow: var(--shadow-sm);
+}
+button.primary:hover, .btn.primary:hover { background: var(--accent-hover); }
+button.primary:active, .btn.primary:active { background: var(--accent-active); }
+/* Destructive: outlined where it is one choice among several, filled where it is the confirmation. */
+button.danger { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 55%, transparent); }
+button.danger:hover { background: var(--bad-soft); }
+button.danger.fill { color: #fff; background: var(--bad-solid); border-color: #b91c1c; box-shadow: var(--shadow-sm); }
+button.danger.fill:hover { background: #b91c1c; }
+button.ghost { background: none; border-color: transparent; box-shadow: none; }
+button.ghost:hover { background: var(--hover); }
+button[aria-pressed="true"]:not(.reveal) { color: var(--accent-text); background: var(--accent-soft); border-color: color-mix(in srgb, var(--accent-text) 50%, transparent); }
+.icon-btn { width: 32px; padding: 0; }
+/* While its work runs, a button shows a spinner in place of its label. */
+button[aria-busy="true"] { position: relative; color: transparent !important; }
+button[aria-busy="true"]::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  margin: auto;
+  width: 14px;
+  height: 14px;
+  border: 2px solid var(--text);
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: spin .7s linear infinite;
+}
+button.primary[aria-busy="true"]::after, button.fill[aria-busy="true"]::after { border-color: #fff; border-top-color: transparent; }
+:focus-visible { outline: 2px solid var(--accent-text); outline-offset: 2px; }
+
+input, textarea, select {
+  font: inherit;
+  color: var(--text);
+  background: var(--inset);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-xs);
+  transition: border-color var(--fast), box-shadow var(--fast);
+}
+input[type="text"], input[type="password"], input[type="number"], textarea { width: 100%; padding: 7px 10px; }
+input[type="text"], input[type="password"], input[type="number"] { height: 34px; }
+input[type="text"]:focus, input[type="password"]:focus, input[type="number"]:focus, input[type="search"]:focus, textarea:focus, select:focus {
+  outline: none;
+  border-color: var(--accent-text);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); width: 15px; height: 15px; margin: 0; }
+textarea { resize: vertical; font-family: "Source Code Pro", "Cascadia Mono", ui-monospace, Consolas, monospace; font-size: 12px; }
+select { height: 32px; padding: 0 8px; cursor: pointer; }
+::placeholder { color: color-mix(in srgb, var(--muted) 75%, transparent); }
+
+.field { display: block; margin-bottom: 16px; }
+.field > span:first-child { display: block; margin-bottom: 6px; font-weight: 500; }
+.field > small, .check > small { display: block; margin-top: 6px; color: var(--muted); line-height: 1.5; }
+.check { display: grid; grid-template-columns: auto 1fr; gap: 3px 10px; align-items: start; margin-bottom: 14px; cursor: pointer; }
+.check > input { margin-top: 2px; }
+.check > small { grid-column: 2; margin-top: 0; }
+.row { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+.actions { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; margin-top: 22px; }
+.actions .left { margin-right: auto; }
+.note {
+  padding: 9px 12px;
+  margin-bottom: 12px;
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--accent-text);
+  border-radius: var(--radius);
+  background: var(--inset);
+}
+.note.warn { border-left-color: var(--warn); }
+.note.bad { border-left-color: var(--bad); }
+.note code { display: block; white-space: pre-wrap; word-break: break-word; }
+.fingerprint { display: block; margin: 6px 0; word-break: break-all; user-select: all; }
+
+/* Password box with its show/hide button */
+.password-box { position: relative; display: block; }
+.password-box input { padding-right: 38px; }
+.reveal {
+  position: absolute;
+  inset: 1px 1px 1px auto;
+  width: 34px;
+  height: auto;
+  padding: 0;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: 0 3px 3px 0;
+  background: none;
+  box-shadow: none;
+  color: var(--muted);
+}
+.reveal:hover { background: none; color: var(--text); }
+.reveal:active { transform: none; }
+.reveal .icon { grid-area: 1 / 1; width: 16px; height: 16px; transition: opacity var(--fast), transform var(--med) var(--spring); }
+.reveal[aria-pressed="false"] .i-hide, .reveal[aria-pressed="true"] .i-show { opacity: 0; transform: scale(.5) rotate(-30deg); }
+
+/* New-password feedback: a strength bar and the rules it is measured against */
+.strength-row { display: flex; align-items: center; gap: 10px; margin: -6px 0 14px; }
+.strength { flex: 1; display: grid; grid-template-columns: repeat(4, 1fr); gap: 4px; }
+.strength i { height: 4px; border-radius: 2px; background: var(--line-strong); transition: background-color var(--med); }
+.strength[data-score="1"] i:nth-child(-n+1) { background: var(--bad); }
+.strength[data-score="2"] i:nth-child(-n+2) { background: var(--warn); }
+.strength[data-score="3"] i:nth-child(-n+3) { background: var(--accent-text); }
+.strength[data-score="4"] i { background: var(--ok); }
+.strength-label { min-width: 5em; text-align: right; font-size: 12px; color: var(--muted); }
+.rules { list-style: none; margin: -4px 0 14px; padding: 0; display: grid; gap: 5px; font-size: 12px; color: var(--muted); }
+.rules li { display: flex; align-items: center; gap: 8px; transition: color var(--med); }
+.rules .icon {
+  width: 16px;
+  height: 16px;
+  padding: 2px;
+  border: 1.5px solid var(--line-strong);
+  border-radius: 50%;
+  stroke: transparent;
+  stroke-width: 3;
+  transition: background-color var(--med), border-color var(--med), stroke var(--med), transform .3s var(--spring);
+}
+.rules li.met { color: var(--text); }
+.rules li.met .icon { background: var(--ok); border-color: var(--ok); stroke: #fff; transform: scale(1.1); }
+
+/* Sun / moon / screen: the one for the current choice turns into view, the others turn away */
+.theme-toggle { position: relative; width: 32px; padding: 0; display: inline-grid; place-items: center; overflow: hidden; }
+.theme-toggle .icon {
+  grid-area: 1 / 1;
+  width: 15px;
+  height: 15px;
+  opacity: 0;
+  transform: rotate(-120deg) scale(.3);
+  transition: opacity var(--med), transform .5s var(--spring);
+}
+:root[data-theme-pref="light"] .theme-toggle .i-light,
+:root[data-theme-pref="dark"] .theme-toggle .i-dark,
+:root[data-theme-pref="auto"] .theme-toggle .i-auto { opacity: 1; transform: none; }
+:root[data-theme-pref="light"] .theme-toggle:hover .i-light { transform: rotate(60deg); }
+:root[data-theme-pref="dark"] .theme-toggle:hover .i-dark { transform: rotate(-24deg) scale(1.1); }
+:root[data-theme-pref="auto"] .theme-toggle:hover .i-auto { transform: scale(1.12); }
+
+/* Animated changes (see glide, zoom and cycleTheme in app.js). The page itself swaps at once;
+   tiles glide to their new places, the enlarged picture grows out of its tile, and a theme
+   change sweeps out from the button. */
+::view-transition-old(root), ::view-transition-new(root) { animation: none; mix-blend-mode: normal; }
+::view-transition-group(*) { animation-duration: .32s; animation-timing-function: cubic-bezier(.2, .8, .2, 1); }
+::view-transition-old(zoom), ::view-transition-new(zoom) { width: 100%; height: 100%; object-fit: contain; }
+
+/* Shown when the page is newer than the program serving it. */
+.stale {
+  position: relative;
+  z-index: 20;
+  padding: 10px 16px;
+  text-align: center;
+  color: #1c1917;
+  background: #fbbf24;
+  border-bottom: 1px solid #b45309;
+}
+.stale kbd, .stale code { color: #1c1917; background: rgba(255, 255, 255, .55); border: 1px solid rgba(0, 0, 0, .25); border-radius: 3px; padding: 0 5px; }
+.notes {
+  max-height: 220px;
+  margin: 0 0 12px;
+  padding: 10px 12px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font: inherit;
+  background: var(--inset);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
+#update-badge { color: var(--accent-text); border-color: color-mix(in srgb, var(--accent-text) 55%, transparent); background: var(--accent-soft); animation: pop .4s var(--spring) both; }
+
+/* --- setup and sign-in ---------------------------------------------------- */
+
+.auth { flex: 1; display: grid; place-items: center; padding: 16px; overflow: auto; }
+.auth-panel {
+  width: min(920px, 100%);
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 430px);
+  background: var(--panel);
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  box-shadow: var(--shadow-lg);
+  overflow: hidden;
+  animation: rise .4s var(--ease) both;
+}
+.hero {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 32px;
+  border-right: 1px solid var(--line);
+  background:
+    radial-gradient(120% 80% at 0% 0%, color-mix(in srgb, var(--accent-text) 24%, transparent), transparent 70%),
+    var(--panel);
+}
+.brand { display: flex; align-items: center; gap: 10px; }
+/* The name: the "Q" in blue, "KVM" in the text colour. */
+.wordmark { font-size: 16px; font-weight: 700; letter-spacing: -.02em; }
+.wordmark b { font-weight: 700; color: var(--accent-text); }
+.brand img { width: 24px; height: 24px; }
+.hero h1 { margin: 14px 0 0; font-size: 26px; font-weight: 600; line-height: 1.15; letter-spacing: -.02em; }
+.hero .lead { margin: 0; font-size: 14px; color: var(--muted); }
+
+/* A small wall of screens switching on. They stay dark in both themes, like the real tiles. */
+.hero-wall { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin: 14px 0; }
+.hero-wall span {
+  position: relative;
+  aspect-ratio: 16 / 10;
+  border: 1px solid rgba(255, 255, 255, .12);
+  border-radius: 3px;
+  background: #0b1220;
+  overflow: hidden;
+  animation: tile-in .6s var(--ease) backwards;
+}
+.hero-wall span::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(135deg, var(--tint), transparent 75%);
+  animation: breathe 6s ease-in-out infinite;
+}
+.hero-wall span::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(105deg, transparent 40%, rgba(255, 255, 255, .14) 50%, transparent 60%);
+  transform: translateX(-100%);
+  animation: sweep 7s ease-in-out infinite;
+}
+.hero-wall i {
+  position: absolute;
+  left: 6px;
+  bottom: 6px;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #22c55e;
+}
+.hero-wall span:nth-child(1) { --tint: #1d4ed8; }
+.hero-wall span:nth-child(2) { --tint: #0f766e; animation-delay: .07s; }
+.hero-wall span:nth-child(3) { --tint: #6d28d9; animation-delay: .14s; }
+.hero-wall span:nth-child(4) { --tint: #0e7490; animation-delay: .21s; }
+.hero-wall span:nth-child(5) { --tint: #b45309; animation-delay: .28s; }
+.hero-wall span:nth-child(6) { --tint: #be185d; animation-delay: .35s; }
+.hero-wall span:nth-child(2)::before, .hero-wall span:nth-child(2)::after { animation-delay: 1.1s; }
+.hero-wall span:nth-child(3)::before, .hero-wall span:nth-child(3)::after { animation-delay: 2.2s; }
+.hero-wall span:nth-child(4)::before, .hero-wall span:nth-child(4)::after { animation-delay: 3.3s; }
+.hero-wall span:nth-child(5)::before, .hero-wall span:nth-child(5)::after { animation-delay: 4.4s; }
+.hero-wall span:nth-child(6)::before, .hero-wall span:nth-child(6)::after { animation-delay: 5.5s; }
+.hero-wall span:nth-child(5) i { background: #f59e0b; animation: blink 2.4s ease-in-out infinite; }
+@keyframes tile-in { from { opacity: 0; transform: translateY(10px) scale(.97); } }
+@keyframes breathe { 0%, 100% { opacity: .45; } 50% { opacity: .8; } }
+@keyframes sweep { 0%, 55% { transform: translateX(-100%); } 85%, 100% { transform: translateX(100%); } }
+@keyframes blink { 50% { opacity: .35; } }
+
+.features { list-style: none; margin: auto 0 0; padding: 0; display: grid; gap: 12px; }
+.features li { display: grid; grid-template-columns: 32px 1fr; column-gap: 12px; align-items: center; }
+.features .icon {
+  grid-row: span 2;
+  width: 32px;
+  height: 32px;
+  padding: 8px;
+  border: 1px solid color-mix(in srgb, var(--accent-text) 30%, transparent);
+  border-radius: var(--radius);
+  color: var(--accent-text);
+  background: var(--accent-soft);
+}
+.features strong { font-weight: 600; }
+.features span { font-size: 12px; color: var(--muted); }
+
+.card { position: relative; padding: 32px 28px; display: flex; flex-direction: column; justify-content: center; }
+.card > .theme-toggle { position: absolute; top: 14px; right: 14px; }
+.card > :not(.theme-toggle) { animation: rise .35s var(--ease) both; }
+.card h2 { margin: 6px 44px 8px 0; font-size: 18px; }
+.steps { display: flex; gap: 6px; margin: 0 44px 16px 0; padding: 0; list-style: none; color: var(--muted); }
+.steps li { flex: 1; padding-top: 7px; border-top: 2px solid var(--line-strong); font-size: 12px; transition: border-color var(--med), color var(--med); }
+.steps li[aria-current="step"] { border-top-color: var(--accent-text); color: var(--text); font-weight: 600; }
+
+/* --- top bar ---------------------------------------------------------------- */
+
+.shell { position: relative; flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.top, .focus-bar {
+  position: relative;
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 8px 14px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line-strong);
+}
+.brand-mini { display: flex; align-items: center; gap: 9px; margin-right: 6px; }
+/* It is a button (it opens About) that looks like the plain logo it is. */
+button.brand-mini, button.brand-mini:hover { height: 32px; padding: 0 4px; color: inherit; background: none; border-color: transparent; box-shadow: none; }
+button.brand-mini:hover .wordmark { color: var(--accent-text); }
+
+/* Display mode: the screens and nothing else. A small bar appears while the mouse moves. */
+.shell.display .top { display: none; }
+.shell.display .wall { padding: 10px; }
+.display-bar {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  z-index: 6;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 6px 6px 6px 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  background: var(--panel);
+  box-shadow: var(--shadow-sm);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity var(--med);
+}
+.display-bar[hidden] { display: none; }
+.display-bar .check { margin: 0; }
+.display-bar .check[hidden] { display: none; }
+.shell.display.awake .display-bar, .shell.display .display-bar:focus-within { opacity: 1; pointer-events: auto; }
+
+/* KVMs found on the network, in the Add KVMs dialog */
+.found { padding: 10px 12px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--inset); }
+.found[hidden] { display: none; }
+.found .picklist { margin-left: 0; }
+.found p { margin: 0 0 8px; }
+.actions.left { justify-content: flex-start; }
+
+/* A button that reads as a link: for a way out that should not compete with the main button */
+button.link, button.link:hover { height: auto; padding: 0; color: var(--accent-text); background: none; border-color: transparent; box-shadow: none; }
+button.link:hover { text-decoration: underline; }
+
+.recovery { display: grid; gap: 10px; margin-bottom: 14px; }
+.recovery p { margin: 0; }
+.recovery .actions { margin-top: 0; }
+.ways h3:first-child { margin-top: 0; }
+.ways code { user-select: all; }
+
+/* Always black on white, whatever the theme: that is what phone cameras read best. */
+.qr { display: block; width: 184px; height: 184px; margin: 4px 0 14px; border: 1px solid var(--line-strong); border-radius: var(--radius); }
+
+.mono { font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace; letter-spacing: .04em; }
+pre.wrap { white-space: pre-wrap; word-break: break-all; margin: 0 0 14px; }
+.codes { columns: 2; margin: 0 0 14px; padding: 12px 16px; border: 1px solid var(--line); border-radius: 8px; line-height: 1.9; user-select: all; }
+
+.about-lead { display: grid; gap: 12px; margin: 0 0 26px; }
+.about-lead p { max-width: 78ch; margin: 0; line-height: 1.6; }
+.block.text p { max-width: 78ch; margin: 0 0 10px; line-height: 1.6; }
+.block.text p:last-child { margin-bottom: 0; }
+.libraries td:last-child { text-align: left; white-space: normal; }
+.brand-mini img { width: 22px; height: 22px; }
+
+/* One row, whatever is in it: what does not fit gives way (see the end of this file), and nothing wraps. */
+.top { flex-wrap: nowrap; }
+.top > * { flex: none; }
+.top > .spacer { flex: 1 1 0; min-width: 0; }
+.top > .search { flex: 0 1 220px; min-width: 96px; }
+.top > .search input, .top > .search input:focus, .top > .search input:not(:placeholder-shown) { width: 100%; }
+
+/* What drops from a button of the bar. */
+.drop { position: relative; display: inline-flex; }
+.drop > button .chevron { width: 12px; height: 12px; margin-left: -2px; color: var(--muted); }
+.drop > button[aria-expanded="true"] { background: var(--hover); }
+.popup {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  z-index: 20;
+  display: grid;
+  gap: 12px;
+  width: 264px;
+  padding: 14px;
+  background: var(--panel);
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  box-shadow: var(--shadow-lg);
+  animation: rise .16s var(--ease) both;
+}
+.popup[hidden] { display: none; }
+.popup hr { width: calc(100% + 28px); margin: 0 -14px; border: 0; border-top: 1px solid var(--line); }
+.pop-row { display: grid; gap: 5px; }
+.pop-row > span { font-size: 11px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+.popup .pick, .popup .pick select { width: 100%; }
+.menu-row { justify-content: flex-start; gap: 10px; width: 100%; margin: -4px 0; padding: 0 8px; background: none; border-color: transparent; box-shadow: none; }
+.menu-row:hover { background: var(--hover); }
+.menu-row:active { transform: none; }
+.menu-row[hidden] { display: none; }
+.menu-row kbd { margin-left: auto; }
+.me-who { display: grid; gap: 1px; }
+.me-who strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.top .divider, .bulkbar .divider { align-self: stretch; width: 1px; margin: 4px 2px; background: var(--line-strong); }
+
+/* All / Online / No signal / Attention: counts that double as filters */
+.filters {
+  display: flex;
+  gap: 2px;
+  height: 32px;
+  padding: 3px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  background: var(--inset);
+  box-shadow: var(--shadow-xs);
+}
+.filters button {
+  height: 24px;
+  padding: 0 10px;
+  gap: 6px;
+  border: 0;
+  border-radius: 3px;
+  background: none;
+  box-shadow: none;
+  color: var(--muted);
+}
+.filters button:hover { background: none; color: var(--text); }
+.filters button:active { transform: none; }
+.filters button[aria-pressed="true"] { color: var(--text); background: var(--panel); border: 0; box-shadow: var(--shadow-sm); }
+.filters b { font-variant-numeric: tabular-nums; font-weight: 600; color: var(--text); }
+.filters b.bump { animation: bump .4s var(--spring); }
+@keyframes bump { 40% { transform: scale(1.4); } }
+
+.search { position: relative; display: inline-flex; align-items: center; color: var(--muted); }
+.search .icon { position: absolute; left: 10px; width: 14px; height: 14px; pointer-events: none; }
+.search input {
+  width: 120px;
+  height: 32px;
+  padding: 0 10px 0 30px;
+  transition: width var(--med) var(--ease), border-color var(--fast), box-shadow var(--fast);
+}
+.search input:focus, .search input:not(:placeholder-shown) { width: 230px; }
+
+/* A select dressed like the buttons: icon, value, chevron */
+.pick {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  height: 32px;
+  color: var(--muted);
+  background: var(--panel);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-xs);
+  transition: background-color var(--fast), border-color var(--fast);
+}
+.pick:hover { background: var(--hover); }
+.pick:focus-within { border-color: var(--accent-text); box-shadow: 0 0 0 3px var(--accent-soft); }
+.pick .icon { position: absolute; width: 14px; height: 14px; pointer-events: none; }
+.pick .icon:first-child { left: 9px; }
+.pick .chevron { right: 7px; width: 12px; height: 12px; }
+.pick select {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 30px;
+  padding: 0 24px 0 30px;
+  font-weight: 500;
+  background: none;
+  border: 0;
+  box-shadow: none;
+  outline: none;
+}
+#clock { min-width: 5.6em; text-align: right; color: var(--muted); font-variant-numeric: tabular-nums; }
+#fullscreen .i-exit, :root.is-fullscreen #fullscreen .i-enter { display: none; }
+:root.is-fullscreen #fullscreen .i-exit { display: block; }
+
+.banner {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 7px 14px;
+  font-size: 12px;
+  background: var(--bad-soft);
+  border-bottom: 1px solid color-mix(in srgb, var(--bad) 40%, transparent);
+  animation: drop .25s var(--ease) both;
+}
+.banner .spinner { width: 12px; height: 12px; }
+@keyframes drop { from { opacity: 0; transform: translateY(-100%); } }
+
+.dot { flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--muted); transition: background-color var(--med); }
+[data-state="online"] > .dot, [data-state="online"] footer .dot { background: var(--ok); }
+[data-state="no_signal"] > .dot, [data-state="no_signal"] footer .dot,
+[data-state="busy"] > .dot, [data-state="busy"] footer .dot,
+[data-state="connecting"] > .dot, [data-state="connecting"] footer .dot { background: var(--warn); }
+[data-state="offline"] > .dot, [data-state="offline"] footer .dot,
+[data-state="auth"] > .dot, [data-state="auth"] footer .dot,
+[data-state="error"] > .dot, [data-state="error"] footer .dot { background: var(--bad); }
+
+/* --- wall ------------------------------------------------------------------ */
+
+.wall {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  display: grid;
+  grid-template-columns: repeat(var(--cols, 3), minmax(0, var(--tile-w, 1fr)));
+  grid-auto-rows: max-content;  /* scroll rather than squash tiles when they don't all fit */
+  gap: var(--gap);
+  padding: var(--gap);
+  justify-content: center;
+  align-content: safe center;
+}
+.shell.selecting .wall, .shell.arranging .wall { padding-bottom: 76px; }  /* room for the bar at the bottom */
+.empty {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 48px 16px;
+  text-align: center;
+  color: var(--muted);
+  animation: rise .4s var(--ease) both;
+}
+.empty h2 { color: var(--text); font-size: 17px; }
+.empty p { margin: 0 0 8px; }
+.empty-icon {
+  display: grid;
+  place-items: center;
+  width: 56px;
+  height: 56px;
+  margin-bottom: 6px;
+  border: 1px solid color-mix(in srgb, var(--accent-text) 30%, transparent);
+  border-radius: 6px;
+  color: var(--accent-text);
+  background: var(--accent-soft);
+}
+.empty-icon .icon { width: 24px; height: 24px; }
+
+.tile {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  background: var(--panel);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-xs);
+  overflow: hidden;
+  isolation: isolate;  /* what lies on a tile is stacked within it, and never over a bar of the page */
+  cursor: zoom-in;
+  transition: box-shadow var(--med), border-color var(--fast);
+  /* backwards: hidden until its turn, then the animation lets go */
+  animation: tile-in .45s var(--ease) backwards;
+  animation-delay: calc(var(--i, 0) * 40ms);
+}
+.tile:hover, .tile:focus-visible { outline: none; border-color: var(--accent-text); box-shadow: 0 0 0 1px var(--accent-text), var(--shadow-sm); }
+.tile.selected { border-color: var(--accent-text); box-shadow: 0 0 0 2px var(--accent-text), var(--shadow-sm); }
+.shell.selecting .tile { cursor: pointer; }
+/* A line along the top edge says at a glance when a tile is not simply live. */
+.tile::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 0;
+  z-index: 2;
+  width: 100%;
+  height: 2px;
+  background: transparent;
+  transition: background-color var(--med);
+}
+.tile[data-state="no_signal"]::before, .tile[data-state="busy"]::before { background: var(--warn); }
+.tile[data-state="offline"]::before, .tile[data-state="auth"]::before, .tile[data-state="error"]::before { background: var(--bad); }
+.tile[data-state="connecting"]::before {
+  width: 40%;
+  background: linear-gradient(90deg, transparent, var(--accent-text), transparent);
+  animation: slide 1.3s ease-in-out infinite;
+}
+@keyframes slide { from { transform: translateX(-100%); } to { transform: translateX(250%); } }
+
+/* Screens stay on black in both themes: they are video, not chrome. */
+.screen { position: relative; aspect-ratio: 16 / 9; background: #020617; overflow: hidden; container-type: inline-size; }
+/* The canvas covers the box exactly; app.js gives it one canvas pixel per screen pixel. */
+.screen canvas, .focus-screen canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  opacity: 0;
+  transition: opacity .35s var(--ease);
+}
+.tile.has-frame .screen canvas, .focus-screen.has-frame canvas { opacity: 1; }
+/* Until the first frame arrives, a soft sweep shows the tile is working on it. */
+.tile[data-state="connecting"]:not(.has-frame) .screen::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(100deg, transparent 30%, rgba(255, 255, 255, .05) 50%, transparent 70%);
+  animation: shimmer 1.6s ease-in-out infinite;
+  pointer-events: none;
+}
+@keyframes shimmer { from { transform: translateX(-100%); } to { transform: translateX(100%); } }
+
+.veil {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 14px;
+  text-align: center;
+  color: #f8fafc;
+  background: rgba(2, 6, 23, .86);
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity var(--med), visibility var(--med);
+}
+.tile:not([data-state="online"]) .veil, .focus:not([data-state="online"]) .veil { opacity: 1; visibility: visible; }
+.veil strong { font-size: 14px; font-weight: 600; }
+.veil > span:not(.veil-icon) { max-width: 38ch; font-size: 12px; color: #94a3b8; }
+.veil-icon {
+  display: grid;
+  place-items: center;
+  width: 38px;
+  height: 38px;
+  margin-bottom: 4px;
+  border: 1px solid rgba(203, 213, 225, .2);
+  border-radius: var(--radius);
+  background: rgba(30, 41, 59, .8);
+  animation: pop .35s var(--spring) both;
+}
+.veil-icon .icon { width: 18px; height: 18px; }
+[data-state="no_signal"] .veil-icon, [data-state="busy"] .veil-icon { color: #f59e0b; }
+[data-state="offline"] .veil-icon, [data-state="auth"] .veil-icon, [data-state="error"] .veil-icon { color: #f87171; }
+.veil button { height: 28px; margin-top: 8px; color: #f8fafc; background: #1e293b; border-color: rgba(203, 213, 225, .3); }
+.veil button:hover { background: #334155; }
+@keyframes pop { from { opacity: 0; transform: scale(.7); } }
+/* Small tiles (a wall of many KVMs) keep just the heading. */
+@container (max-width: 250px) {
+  .veil-icon, .veil > span:not(.veil-icon), .veil button { display: none; }
+}
+
+/* A server seen through its management controller gives no picture. Where a KVM's tile shows the
+   screen, a server's shows how it is doing. Sized by the tile, so it reads on a wall of many. */
+.panel {
+  position: absolute;
+  inset: 0;
+  display: none;
+  flex-direction: column;
+  justify-content: center;
+  gap: clamp(6px, 3.2cqw, 22px);
+  padding: clamp(8px, 5cqw, 40px) clamp(10px, 6cqw, 56px);
+  color: #f8fafc;
+  /* A glow in the colour of its health, over the faint lines of a readout. A server that is off has none. */
+  --glow: rgba(34, 197, 94, .13);
+  background:
+    radial-gradient(90% 120% at 0% 0%, var(--glow), transparent 62%),
+    linear-gradient(rgba(148, 163, 184, .05) 1px, transparent 1px) 0 0 / 100% clamp(10px, 4cqw, 26px),
+    #020617;
+  overflow: hidden;
+}
+.panel[data-tone="warn"] { --glow: rgba(245, 158, 11, .13); }
+.panel[data-tone="bad"] { --glow: rgba(239, 68, 68, .18); }
+.panel[data-power="off"] { --glow: transparent; }
+.has-panel .panel { display: flex; }
+.has-panel canvas { display: none; }
+.tile.has-panel .veil, .focus.has-panel .veil { opacity: 0; visibility: hidden; }
+/* A server whose screen is shown: a fault of its own does not cover the screen (the tile's edge and footer say it). */
+.tile.pictured .veil, .focus.pictured .veil { opacity: 0; visibility: hidden; }
+#focus-health[aria-pressed="true"] { background: var(--hover); }
+.panel-power { display: flex; align-items: baseline; gap: clamp(6px, 2.4cqw, 16px); }
+.panel-power strong { font-size: clamp(18px, 11cqw, 72px); font-weight: 650; line-height: 1; letter-spacing: -.02em; }
+.panel-power > span:last-child { margin-left: auto; font-size: clamp(10px, 2.6cqw, 14px); letter-spacing: .12em; text-transform: uppercase; color: #64748b; }
+.panel .led {
+  align-self: center;
+  width: clamp(8px, 3cqw, 18px);
+  height: clamp(8px, 3cqw, 18px);
+  border-radius: 50%;
+  background: #22c55e;
+  box-shadow: 0 0 0 3px rgba(34, 197, 94, .18), 0 0 14px rgba(34, 197, 94, .7);
+}
+.panel[data-power="off"] .led { background: #475569; box-shadow: 0 0 0 3px rgba(71, 85, 105, .25); }
+/* The locator light is blue on the machine, and so it is here. */
+.panel-power > span.locating { display: inline-flex; align-items: center; gap: .6em; color: #93c5fd; }
+.locating i { width: .75em; height: .75em; border-radius: 50%; background: #3b82f6; box-shadow: 0 0 10px #3b82f6; animation: pulse 1s ease-in-out infinite; }
+@media (prefers-reduced-motion: reduce) { .locating i { animation: none; } }
+.panel-unwell { margin: 0; font-size: 14px; color: #fbbf24; }
+.panel[data-power="off"] .panel-power strong { color: #94a3b8; }
+.readings { display: flex; gap: clamp(8px, 4cqw, 36px); }
+.reading { display: grid; gap: 2px; min-width: 0; }
+.reading span { font-size: clamp(9px, 2.5cqw, 13px); letter-spacing: .08em; text-transform: uppercase; color: #94a3b8; white-space: nowrap; }
+.reading b { font-size: clamp(12px, 4.4cqw, 26px); font-weight: 600; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.reading[data-tone="ok"] b { color: #4ade80; }
+.reading[data-tone="warn"] b, .reading[data-tone="warn"] span { color: #fbbf24; }
+.reading[data-tone="bad"] b { color: #f87171; }
+.panel-hardware { margin: 0; font-size: clamp(10px, 2.9cqw, 15px); color: #94a3b8; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.sensors { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 6px; }
+.sensors div {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 10px;
+  border: 1px solid rgba(203, 213, 225, .16);
+  border-radius: var(--radius);
+  background: rgba(15, 23, 42, .7);
+  font-size: 12px;
+}
+.sensors span { color: #94a3b8; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sensors b { font-weight: 600; font-variant-numeric: tabular-nums; }
+.sensors [data-tone="warn"] { border-color: rgba(245, 158, 11, .5); }
+.sensors [data-tone="warn"] b { color: #fbbf24; }
+/* Small tiles (a wall of many) keep the power state and the two readings that matter most. */
+@container (max-width: 250px) {
+  .panel-hardware, .panel-power > span:last-child:not(.locating), .reading:nth-child(n+3) { display: none; }
+  .panel-power > span.locating { font-size: 0; gap: 0; }  /* the dot alone */
+  .locating i { width: 9px; height: 9px; }
+}
+
+/* What sits on top of a screen: the tick box (left) and the quick buttons (right) */
+.tile-tools, .tile-check { position: absolute; top: 8px; z-index: 3; opacity: 0; transition: opacity var(--fast), transform var(--med) var(--ease); }
+.tile .tile-check { display: none; }  /* only while picking KVMs for a bulk action */
+.shell.selecting .tile .tile-check { display: grid; opacity: 1; animation: pop .25s var(--spring) both; }
+.shell.selecting .tile .tile-tools { display: none; }  /* a click selects; the quick buttons would only get in the way */
+.tile-tools { right: 8px; display: flex; gap: 6px; transform: translateY(-3px); }
+.tile:hover .tile-tools, .tile:focus-within .tile-tools { opacity: 1; transform: none; }
+.tool, .tile-check {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  color: #f8fafc;
+  background: rgba(15, 23, 42, .88);
+  border: 1px solid rgba(203, 213, 225, .3);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-sm);
+  cursor: pointer;
+}
+.tool:hover { color: #fff; background: #1d4ed8; border-color: #2563eb; }
+.tool .icon { width: 14px; height: 14px; }
+.tile-check { left: 8px; width: 24px; height: 24px; }
+.tile-check .icon { width: 14px; height: 14px; stroke-width: 3; opacity: 0; transform: scale(.4); transition: opacity var(--fast), transform var(--med) var(--spring); }
+.tile-check:hover { background: #1e293b; border-color: #60a5fa; }
+.tile.selected .tile-check { background: #1d4ed8; border-color: #2563eb; }
+.tile.selected .tile-check .icon { opacity: 1; transform: none; }
+@media (hover: none) { .tile-tools { opacity: 1; transform: none; } }
+
+/* What an account may not use is not shown. (The server refuses it regardless.) */
+:root:not([data-role="admin"]) .admin-only { display: none !important; }
+:root[data-role="viewer"] .operator-only { display: none !important; }
+
+/* The KVMs an account may see, in the account dialog */
+.picklist { display: grid; gap: 2px; max-height: 190px; margin: 4px 0 0 26px; overflow: auto; }
+.picklist[hidden] { display: none; }
+/* A KVM that answered at two addresses: one line, and a choice of the address to use */
+.pick-twice { display: flex; align-items: center; gap: 8px; }
+.pick-twice select { height: 26px; }
+/* A tile that is the same device as another one says so, where its name is */
+.twin {
+  height: 18px;
+  padding: 0 6px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--warn);
+  background: none;
+  border: 1px solid color-mix(in srgb, var(--warn) 55%, transparent);
+  border-radius: 3px;
+  box-shadow: none;
+  flex: none;
+}
+.twin:hover { background: color-mix(in srgb, var(--warn) 12%, transparent); }
+.results li.ask { border-left-color: var(--warn); flex-wrap: wrap; }
+.results li.ask > span { flex: 1 1 100%; }  /* the question on a line of its own, the answers under it */
+
+/* Multi-port KVMs: one button per input, built like the filter in the top bar. Always shown,
+   because it says which computer the picture belongs to. */
+.ports {
+  display: flex;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  background: var(--inset);
+}
+.ports[hidden] { display: none; }
+.ports button {
+  min-width: 24px;
+  height: 22px;
+  padding: 0 6px;
+  border: 0;
+  border-radius: 3px;
+  background: none;
+  box-shadow: none;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.ports button:hover { background: none; color: var(--text); }
+.ports button:active { transform: none; }
+.ports button.empty { opacity: .45; }
+.ports button:disabled { cursor: default; }
+.ports button[aria-pressed="true"] { color: #fff; background: #1d4ed8; opacity: 1; cursor: default; }
+.ports button[aria-busy="true"] { color: var(--text); animation: pulse 1s ease-in-out infinite; }
+@keyframes pulse { 50% { opacity: .35; } }
+.screen .ports {
+  position: absolute;
+  left: 8px;
+  bottom: 8px;
+  z-index: 3;
+  background: rgba(15, 23, 42, .88);
+  border-color: rgba(203, 213, 225, .3);
+  box-shadow: var(--shadow-sm);
+}
+.screen .ports button { color: #cbd5e1; }
+.screen .ports button:hover { color: #fff; }
+.shell.selecting .tile .ports { pointer-events: none; }  /* a click selects the tile here */
+@container (max-width: 250px) {
+  .screen .ports button { min-width: 20px; height: 18px; padding: 0 4px; font-size: 11px; }
+}
+
+.tile footer {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: var(--bar-h);
+  padding: 0 10px;
+  white-space: nowrap;
+  border-top: 1px solid var(--line);
+}
+.name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; }
+.host { color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; font-variant-numeric: tabular-nums; }
+.meta { margin-left: auto; padding-left: 6px; color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+
+/* The bar that appears while KVMs are being picked for a bulk action */
+.bulkbar {
+  position: absolute;
+  left: 50%;
+  bottom: 18px;
+  z-index: 4;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 8px 8px 14px;
+  background: var(--panel);
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  box-shadow: var(--shadow-lg);
+  transform: translateX(-50%);
+  animation: bar-in .3s var(--spring) both;
+}
+.bulkbar strong { min-width: 6.5em; font-variant-numeric: tabular-nums; }
+
+/* Arranging: every tile says its place, and can be dragged, stepped or numbered to another. */
+.shell.arranging .tile { cursor: grab; }
+.shell.arranging .tile:active { cursor: grabbing; }
+.shell.arranging .bulkbar strong { min-width: 0; }
+.shell.arranging .top { opacity: .45; }
+.arrange { position: absolute; inset: 0; z-index: 5; display: grid; align-content: center; justify-items: center; gap: 10px; color: #f8fafc; background: rgba(2, 6, 23, .8); -webkit-backdrop-filter: blur(3px); backdrop-filter: blur(3px); border-radius: inherit; }
+.arrange .where { display: flex; align-items: center; gap: 8px; }
+.arrange input { width: 72px; height: 46px; padding: 0; font-size: 24px; font-weight: 700; text-align: center; -moz-appearance: textfield; appearance: textfield; }
+.arrange input::-webkit-inner-spin-button, .arrange input::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
+.arrange button { width: 36px; height: 36px; padding: 0; }
+.arrange span { max-width: 90%; overflow: hidden; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.tile.dragging { opacity: .35; }
+.tile.drop-before { box-shadow: -5px 0 0 var(--accent-line); }
+.tile.drop-after { box-shadow: 5px 0 0 var(--accent-line); }
+@keyframes bar-in { from { opacity: 0; transform: translate(-50%, 16px); } }
+
+/* --- enlarged view ---------------------------------------------------------- */
+
+.focus { position: fixed; inset: 0; z-index: 10; display: flex; flex-direction: column; background: var(--bg); }
+.focus-bar strong { font-size: 14px; font-weight: 600; }
+.focus-bar .meta { margin-left: 0; padding-left: 0; }
+.focus-screen { position: relative; flex: 1; min-height: 0; background: #000; container-type: inline-size; }
+.focus .panel { align-items: center; overflow: auto; }
+.focus .panel > * { width: min(100%, 880px); }
+.focus .panel-power strong { font-size: clamp(40px, 7cqw, 84px); }
+.focus .reading b { font-size: clamp(18px, 2.6cqw, 30px); }
+.focus .reading span, .focus .panel-power > span:last-child { font-size: 12px; }
+.focus .panel-hardware { font-size: 15px; white-space: normal; }
+.focus .veil-icon { width: 52px; height: 52px; }
+.focus .veil-icon .icon { width: 24px; height: 24px; }
+.focus .veil strong { font-size: 17px; }
+
+/* --- dialogs ---------------------------------------------------------------- */
+
+dialog.dialog {
+  width: min(480px, calc(100vw - 24px));
+  max-height: calc(100vh - 24px);
+  padding: 0;
+  color: var(--text);
+  background: var(--panel);
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  box-shadow: var(--shadow-lg);
+  /* Fades and settles in when opened, and back out when closed. */
+  opacity: 0;
+  transform: translateY(10px) scale(.98);
+  transition: opacity .18s ease, transform .25s var(--ease), overlay .25s allow-discrete, display .25s allow-discrete;
+}
+dialog.dialog.wide { width: min(860px, calc(100vw - 24px)); }
+dialog.dialog[open] { display: flex; flex-direction: column; opacity: 1; transform: none; }
+@starting-style { dialog.dialog[open] { opacity: 0; transform: translateY(10px) scale(.98); } }
+dialog.dialog::backdrop {
+  background: rgba(2, 6, 23, 0);
+  transition: background-color .25s, overlay .25s allow-discrete, display .25s allow-discrete;
+}
+dialog.dialog[open]::backdrop { background: rgba(2, 6, 23, .6); }
+@starting-style { dialog.dialog[open]::backdrop { background: rgba(2, 6, 23, 0); } }
+.dialog-head { display: flex; align-items: center; gap: 10px; padding: 13px 13px 13px 22px; border-bottom: 1px solid var(--line); }
+.dialog-head h2 { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dialog-body { padding: 20px 22px 22px; overflow: auto; }
+.dialog-body > :last-child { margin-bottom: 0; }
+.dialog-body p { margin-bottom: 12px; line-height: 1.55; }
+.dialog-body h3 { margin: 22px 0 10px; }
+
+/* Settings: its sections down the side, in groups, and the one that is chosen beside them. The dialog keeps
+   one size whichever is shown, so that nothing jumps when going from one to the next. */
+dialog.dialog.settings { width: min(1080px, calc(100vw - 24px)); height: min(780px, calc(100vh - 24px)); }
+dialog.settings .dialog-body { display: grid; grid-template-columns: 212px minmax(0, 1fr); flex: 1; min-height: 0; padding: 0; overflow: hidden; }
+.sections { display: flex; flex-direction: column; gap: 2px; padding: 14px 10px; overflow-y: auto; background: var(--inset); border-right: 1px solid var(--line); }
+.sections .group { margin: 14px 10px 6px; font-size: 11px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+.sections .group:first-child { margin-top: 2px; }
+.sections button {
+  flex: none;
+  justify-content: flex-start;
+  gap: 10px;
+  width: 100%;
+  height: 34px;
+  padding: 0 10px;
+  color: var(--muted);
+  font-weight: 500;
+  background: none;
+  border: 1px solid transparent;
+  box-shadow: none;
+}
+.sections button:hover { color: var(--text); background: var(--hover); }
+.sections button:active { transform: none; }
+.sections button[aria-selected="true"] { color: var(--text); background: var(--accent-soft); border-color: color-mix(in srgb, var(--accent-line) 45%, transparent); }
+.sections button[aria-selected="true"] .icon { color: var(--accent-text); }
+/* One shape for every section (see `block` and `setting` in app.js).
+   Its first line says what it is and has, at its right, what one does in the section as a whole: add, save,
+   export. That line stays in sight while the rest scrolls under it. Below it come blocks: a small heading and
+   a set of lines in one frame. In it every line reads the same way: what it is at the left, with a sentence under it where one
+   is needed, and at the right what one does about it (a tick, a choice, a box to type in, a button). A list
+   is such a frame too, with what one does to a line at that line's right end. What explains stands before the
+   first block (.intro) or after the last (.footnote): never under a button. */
+.section { --pad: 28px; min-width: 0; padding: 0 var(--pad) var(--pad); overflow: auto; }
+.section > :last-child { margin-bottom: 0; }
+.section > * { animation: rise .25s var(--ease) both; }
+.section-head {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px 24px;
+  min-height: 69px;
+  margin: 0 calc(-1 * var(--pad)) 24px;
+  padding: 18px var(--pad);
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+  animation: none;
+}
+.section-what { display: flex; flex-wrap: wrap; align-items: baseline; gap: 3px 14px; min-width: 0; }
+.section-what strong { font-size: 16px; font-weight: 600; letter-spacing: -.01em; }
+.section-does { display: flex; flex: none; gap: 8px; }
+.section-does:empty { display: none; }
+.section .intro { max-width: 78ch; margin: 0 0 22px; color: var(--muted); line-height: 1.6; }
+.section .footnote { max-width: 78ch; margin: 28px 0 0; padding-top: 18px; color: var(--muted); line-height: 1.6; border-top: 1px solid var(--line); }
+.section .note { margin-bottom: 20px; padding: 11px 14px; line-height: 1.55; }
+
+.block + .block, .intro + .block { margin-top: 0; }
+.block { margin: 0 0 28px; }
+.section .block > h3 { margin: 0 0 10px; }
+.lines { border: 1px solid var(--line); border-radius: 6px; background: color-mix(in srgb, var(--inset) 38%, var(--panel)); }
+.lines > :first-child { border-top-left-radius: 5px; border-top-right-radius: 5px; }
+.lines > :last-child { border-bottom-left-radius: 5px; border-bottom-right-radius: 5px; }
+/* A line of a card. A field (label, box, hint) and a tick (box, label, hint) are laid out as one as well. */
+.lines > .setting, .lines > .field, .lines > .check {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 3px 28px;
+  min-height: 58px;
+  margin: 0;
+  padding: 13px 18px;
+}
+.lines > :is(.setting, .field, .check, .lines-foot, .nothing):not(:first-child) { border-top: 1px solid var(--line); }
+.lines > .check { cursor: pointer; }
+.lines > a.setting { color: inherit; text-decoration: none; transition: background-color var(--fast); }
+.lines > a.setting:hover { background: var(--hover); }
+.lines > a.setting .icon { width: 15px; height: 15px; color: var(--muted); }
+.setting > .what { grid-column: 1; grid-row: 1 / span 2; min-width: 0; }
+.setting > .what > strong, .lines > .field > span:first-child, .lines > .check > span { display: block; margin: 0; font-weight: 500; }
+.setting > .what > small, .lines > .field > small, .lines > .check > small { display: block; max-width: 64ch; margin: 3px 0 0; color: var(--muted); line-height: 1.5; }
+.setting > .does { grid-column: 2; grid-row: 1 / span 2; display: flex; flex-wrap: wrap; justify-content: flex-end; align-items: center; gap: 8px; max-width: 420px; }
+.setting > .does > code, .setting > .does > .value { text-align: right; word-break: break-all; user-select: all; }
+.setting > .does > .value { color: var(--muted); user-select: text; word-break: normal; }
+.lines > .field > span:first-child, .lines > .check > span { grid-column: 1; grid-row: 1; align-self: end; }
+.lines > .field > small, .lines > .check > small { grid-column: 1; grid-row: 2; align-self: start; margin-top: 0; }
+/* (With no sentence under it, what a line is stands in the middle of it.) */
+.lines > .field:not(:has(> small)) > span:first-child, .lines > .check > span:last-child { grid-row: 1 / span 2; align-self: center; }
+.lines > .field > :is(input, select, textarea, .password-box), .lines > .check > input { grid-column: 2; grid-row: 1 / span 2; }
+.lines > .field > :is(input[type="text"], input[type="password"], .password-box) { width: 320px; }
+.lines > .field > input[type="number"] { width: 112px; }
+.lines > .field > select { min-width: 220px; max-width: 320px; }
+.lines > .check > input { width: 16px; height: 16px; margin: 0 2px 0 0; }
+/* A list's last line, while there is more of it to show. */
+.lines > .lines-foot { display: flex; align-items: center; justify-content: center; padding: 9px 18px; }
+.lines > .nothing { margin: 0; padding: 22px 18px; color: var(--muted); text-align: center; }
+.made:not(:empty) { margin: 0 0 22px; }
+.made > :last-child { margin-bottom: 0; }
+/* Something that is shown once, with the button that copies it: the box takes the room there is. */
+.once { display: flex; gap: 8px; margin: 0 0 16px; }
+.once input { flex: 1; min-width: 0; }
+/* What a list is narrowed by, above it. */
+.toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin: 0 0 14px; }
+.toolbar input[type="search"] { flex: 0 1 320px; height: 32px; padding: 0 10px; }
+.toolbar select { min-width: 190px; }
+@media (max-width: 760px) {
+  /* No room for a column: the sections become one row that scrolls sideways, and never a second row. */
+  dialog.settings .dialog-body { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); }
+  .sections { flex-direction: row; gap: 4px; padding: 8px 10px; overflow: auto hidden; border-right: 0; border-bottom: 1px solid var(--line); scrollbar-width: thin; }
+  .sections .group { display: none; }
+  .sections button { width: auto; }
+  .section { --pad: 16px; }
+  .section-head { flex-wrap: wrap; min-height: 0; padding: 14px var(--pad); margin-bottom: 18px; }
+  /* No room for what it is and what one does about it side by side: one under the other. */
+  .lines > .setting, .lines > .field, .lines > .check { grid-template-columns: minmax(0, 1fr); gap: 8px; }
+  .lines > .check { grid-template-columns: auto minmax(0, 1fr); gap: 3px 12px; }
+  .lines > .check > input { grid-column: 1; grid-row: 1; margin-top: 2px; align-self: start; }
+  .lines > .check > span, .lines > .check > small { grid-column: 2; }
+  .lines > .field > :is(input, select, textarea, .password-box), .setting > .does { grid-column: 1; grid-row: auto; justify-content: flex-start; }
+  .lines > .field > :is(input[type="text"], input[type="password"], .password-box) { width: 100%; }
+  .lines > .field > span:first-child, .lines > .field > small, .setting > .what { grid-row: auto; }
+}
+
+/* Compact action buttons: icon, name, and the keys it sends */
+.action-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 8px; }
+.action-grid button, .action-grid .btn { height: 42px; padding: 0 10px 0 6px; justify-content: flex-start; gap: 10px; }
+.action-grid button > span, .action-grid .btn > span { flex: 1; overflow: hidden; text-overflow: ellipsis; text-align: left; }
+.action-grid .icon {
+  width: 28px;
+  height: 28px;
+  padding: 6px;
+  border: 1px solid color-mix(in srgb, var(--accent-text) 30%, transparent);
+  border-radius: var(--radius);
+  color: var(--accent-text);
+  background: var(--accent-soft);
+}
+.action-grid button.danger { color: var(--text); }
+.action-grid button.danger .icon { color: var(--bad); background: var(--bad-soft); border-color: color-mix(in srgb, var(--bad) 35%, transparent); }
+
+/* Modifier keys as toggles, plus one more key */
+.keypicker { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 14px; }
+.chip-toggle { position: relative; cursor: pointer; }
+.chip-toggle input { position: absolute; opacity: 0; pointer-events: none; }
+.chip-toggle span {
+  display: inline-flex;
+  align-items: center;
+  height: 32px;
+  padding: 0 12px;
+  font-weight: 500;
+  background: var(--panel);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-xs);
+  transition: background-color var(--fast), border-color var(--fast), color var(--fast);
+}
+.chip-toggle:hover span { background: var(--hover); }
+.chip-toggle input:checked + span { color: var(--on-accent); background: var(--accent); border-color: var(--accent-line); }
+.chip-toggle input:focus-visible + span { outline: 2px solid var(--accent-text); outline-offset: 2px; }
+.keypicker kbd { margin-left: auto; font-size: 12px; line-height: 24px; padding: 0 8px; color: var(--text); }
+
+/* Who a bulk action is about to hit, and how each one went */
+.targets, .progress { list-style: none; margin: 0 0 12px; padding: 0; max-height: 240px; overflow: auto; border: 1px solid var(--line); border-radius: var(--radius); background: var(--inset); }
+.targets li, .progress li { display: flex; align-items: center; gap: 9px; padding: 7px 10px; border-top: 1px solid var(--line); }
+.targets li:first-child, .progress li:first-child { border-top: 0; }
+.targets .muted, .progress .muted { margin-left: auto; font-size: 12px; text-align: right; }
+.progress li { animation: rise .25s var(--ease) both; }
+.progress .icon { width: 14px; height: 14px; stroke-width: 3; }
+.progress li.ok .icon { color: var(--ok); }
+.progress li.bad .icon { color: var(--bad); }
+.progress li.bad .muted { color: var(--bad); }
+.progress li.unknown .icon, .progress li.unknown .muted { color: var(--warn); }
+.progress li.skipped { color: var(--muted); }
+
+.rows { width: 100%; border-collapse: collapse; }
+.rows th { padding: 7px 10px; text-align: left; font-size: 11px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); background: var(--inset); border-bottom: 1px solid var(--line-strong); }
+.rows td { padding: 8px 10px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+.rows tbody tr { transition: background-color var(--fast); }
+.rows tbody tr:hover { background: var(--inset); }
+.rows td:last-child { text-align: right; white-space: nowrap; }
+.rows td:last-child button { margin-left: 6px; height: 28px; }
+.rows .wrap { word-break: break-word; }
+.rows .when { white-space: nowrap; color: var(--muted); }
+/* A list in a card: the card's edge is its frame, and its lines have the room the card's other lines have. */
+.lines > .rows { border-collapse: separate; border-spacing: 0; }
+.lines > .rows th { padding: 9px 18px; border-bottom-color: var(--line); }
+.lines > .rows th:first-child { border-top-left-radius: 5px; }
+.lines > .rows th:last-child { border-top-right-radius: 5px; }
+.lines > .rows td { padding: 12px 18px; line-height: 1.45; }
+.lines > .rows tbody tr:last-child td { border-bottom: 0; }
+.lines > .rows tbody tr:last-child td:first-child { border-bottom-left-radius: 5px; }
+.lines > .rows tbody tr:last-child td:last-child { border-bottom-right-radius: 5px; }
+.lines > .rows td .muted, .lines > .rows td .error { margin-top: 2px; font-size: 12px; }
+
+.results { list-style: none; margin: 14px 0 0; padding: 0; display: grid; gap: 6px; }
+.results li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--line-strong);
+  border-radius: var(--radius);
+  background: var(--inset);
+  animation: rise .25s var(--ease) both;
+  transition: border-color var(--med);
+}
+.results li > span { flex: 1; min-width: 0; word-break: break-word; }
+.results li.ok { border-left-color: var(--ok); }
+.results li.bad { border-left-color: var(--bad); }
+
+/* --- toasts ------------------------------------------------------------------ */
+
+.toasts { position: fixed; right: 16px; bottom: 16px; z-index: 2147483647; display: grid; gap: 8px; max-width: min(400px, calc(100vw - 32px)); }
+.toast {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 14px;
+  color: var(--text);
+  background: var(--panel);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-lg);
+  animation: toast-in .3s var(--spring) both;
+}
+.toast .icon { width: 16px; height: 16px; margin-top: 2px; color: var(--accent-text); }
+.toast.ok .icon { color: var(--ok); }
+.toast.error .icon { color: var(--bad); }
+.toast.working .spinner { margin-top: 3px; color: var(--accent-text); }
+.toast.leaving { animation: toast-out .25s var(--ease) forwards; }
+@keyframes toast-in { from { opacity: 0; transform: translateX(24px); } }
+@keyframes toast-out { to { opacity: 0; transform: translateX(24px); } }
+
+/* --- smaller screens, calmer motion ------------------------------------------- */
+
+@media (max-width: 1560px) {
+  #clock { display: none; }  /* the first thing to go when the bar gets full */
+}
+@media (max-width: 1440px) {
+  /* Where room gets short, the buttons used least keep only their icon (the tooltip names them). */
+  .top #select-toggle, .top #update-badge { width: 32px; padding: 0; gap: 0; font-size: 0; }
+  .filters button { padding: 0 8px; }
+}
+@media (max-width: 1280px) {
+  .brand-mini span { display: none; }
+}
+@media (max-width: 1200px) {
+  .top #add-device, .top #view-toggle { width: 32px; padding: 0; gap: 0; font-size: 0; }
+  .top #view-toggle .chevron { display: none; }
+}
+@media (max-width: 1000px) {
+  /* The counts stay; the words that go with the coloured dots do not. */
+  .top .filters button[data-filter]:not([data-filter="all"]) { font-size: 0; gap: 0; }
+  .top .filters button b { font-size: 13px; margin-left: 5px; }
+  .top .pick select { max-width: 120px; }
+}
+@media (max-width: 900px) {
+  .top > .divider { display: none; }  /* the last of the room, for when an update's button stands in the bar too */
+}
+@media (max-width: 820px) {
+  /* A tablet held upright, a phone: the search and the buttons in the first row, the counts and the group in a
+     second. Never a third. */
+  .top { flex-wrap: wrap; }
+  .top > .spacer, .top > .divider { display: none; }
+  .top > .search { flex: 1 1 60px; min-width: 60px; }
+  .top > .filters { order: 10; flex: 1 1 0; min-width: 150px; }
+  .top > .filters button { flex: 1; justify-content: center; padding: 0 4px; }
+  .top > #group-pick { order: 11; flex: 0 1 150px; min-width: 0; }
+  .top > #group-pick select { width: 100%; max-width: none; }
+  .popup { position: fixed; top: 52px; right: 8px; left: auto; width: min(264px, calc(100vw - 16px)); }
+}
+@media (max-width: 480px) {
+  .top > .brand-mini { display: none; }  /* it opens About, which is in the settings as well */
+  .top > #fullscreen { display: none; }  /* a phone's browser is as full as it gets; the search needs the room */
+}
+@media (max-width: 370px) {
+  .top > #update-badge { display: none; }  /* Settings has the update as well */
+}
+@media (max-width: 340px) {
+  .top > #theme-toggle { display: none; }  /* the smallest of phones: the colours follow the phone's own */
+  .top > #group-pick { flex-basis: 110px; }  /* so that it stays next to the counts */
+}
+@media (max-width: 820px) {
+  .auth-panel { grid-template-columns: minmax(0, 1fr); width: min(480px, 100%); }
+  .hero { padding: 22px 22px 18px; border-right: 0; border-bottom: 1px solid var(--line); gap: 8px; }
+  .hero h1 { margin-top: 8px; font-size: 22px; }
+  .hero-wall, .features { display: none; }
+  .card { padding: 22px; }
+  .bulkbar { left: 12px; right: 12px; bottom: 12px; flex-wrap: wrap; transform: none; animation: rise .3s var(--ease) both; }
+}
+@media (max-width: 560px) {
+  .row { grid-template-columns: 1fr; }
+  .dialog-body { padding: 16px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: .01ms !important;
+    animation-delay: 0s !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: .01ms !important;
+  }
+}

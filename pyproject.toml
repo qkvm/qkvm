@@ -1,0 +1,95 @@
+[project]
+name = "qkvm"
+dynamic = ["version"]
+description = "Self-hosted screen wall and command center for IP KVMs and servers (GL.iNet Comet, PiKVM-style, JetKVM, Redfish)"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "AGPL-3.0-only"
+license-files = ["LICENSE"]
+authors = [{ name = "QKVM" }]
+keywords = ["kvm", "ip-kvm", "kvm-over-ip", "pikvm", "jetkvm", "glinet", "redfish", "bmc", "homelab", "self-hosted"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Web Environment",
+    "Framework :: FastAPI",
+    "Intended Audience :: System Administrators",
+    "Intended Audience :: Information Technology",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: System :: Hardware",
+    "Topic :: System :: Monitoring",
+    "Topic :: System :: Systems Administration",
+]
+dependencies = [
+    "fastapi>=0.142",
+    "starlette>=1.3.1",  # older ones rebuild a request's address from its Host header without checking it
+    "uvicorn>=0.46",
+    "httpx>=0.28",
+    "sniffio>=1.3",  # the HTTP library looks for it on every request, and looking in vain is slow
+    "websockets>=15",  # the first that can be told to go straight to a device and not through a proxy
+    "cryptography>=50",
+    # A JetKVM sends its picture as WebRTC video only: a WebRTC client and, with it, a video decoder.
+    # The largest thing here by far, and loaded only once there is a JetKVM on the wall.
+    "aiortc>=1.9",
+    # Used through the libraries above; listed to keep out versions with known vulnerabilities.
+    "anyio>=4.14.2",
+    "idna>=3.15",
+    "h11>=0.16",  # reads every request that comes in; older ones could be made to see two requests where a proxy in front saw one
+]
+
+[project.urls]
+Homepage = "https://qkvm.com"
+Documentation = "https://docs.qkvm.com"
+Source = "https://github.com/qkvm/qkvm"
+Issues = "https://github.com/qkvm/qkvm/issues"
+Changelog = "https://github.com/qkvm/qkvm/blob/main/CHANGELOG.md"
+
+[project.scripts]
+qkvm = "qkvm.__main__:main"
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[build-system]
+requires = ["hatchling>=1.27"]  # the first that writes the licence the way it is given above
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "qkvm/_version.py"
+
+# core-metadata-version: the newest that the tools which upload and check a package are sure to read.
+[tool.hatch.build.targets.wheel]
+packages = ["qkvm"]
+core-metadata-version = "2.4"
+
+# Named one by one: whatever else lies in the folder it is built in (a data folder, a key) stays out.
+[tool.hatch.build.targets.sdist]
+only-include = ["qkvm", "tests", "README.md", "CHANGELOG.md", "SECURITY.md", "CONTRIBUTING.md", "LICENSE", "pyproject.toml"]
+core-metadata-version = "2.4"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+# What is checked on every push, besides the tests:  ruff check .   and   mypy
+[tool.ruff]
+target-version = "py311"
+
+[tool.ruff.lint]
+# Mistakes (E, F, W), the patterns that tend to turn into bugs (B), waits and calls that would hold up the one
+# thread everything is served from (ASYNC), and a check switched off where it finds nothing (RUF).
+select = ["E", "F", "W", "B", "ASYNC", "PLE", "RUF"]
+ignore = [
+    "E501",  # how long a line may be is a matter of taste, and here they are long
+    "RUF005",  # a + [b] says what it does as well as [*a, b]
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["ASYNC110"]  # a stand-in device may wait in small steps for its state to change
+
+[tool.mypy]
+strict = true
+files = ["qkvm"]
