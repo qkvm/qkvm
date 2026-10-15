@@ -213,7 +213,8 @@ def test_a_certificate_that_was_made_anew_is_served_and_not_only_shown(tmp_path:
         shown = admin.get("/api/v1/settings").json()["cert_fingerprint"]
 
         def another(addresses: list[str]) -> Any:
-            core.cert_fingerprint = "AA:" + shown[3:]
+            # Another first byte than the real one's: a fingerprint that begins with AA by chance (one in 256) is no other.
+            core.cert_fingerprint = ("AB:" if shown.startswith("AA:") else "AA:") + shown[3:]
             return tmp_path / "tls" / "cert.pem", tmp_path / "tls" / "key.pem"
 
         same = admin.put("/api/v1/settings", json={**settings, "interval": 3}).json()

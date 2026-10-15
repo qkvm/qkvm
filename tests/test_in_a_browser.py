@@ -554,7 +554,7 @@ def test_ones_own_password_is_changed_in_its_dialog(tmp_path: Path, browser: Bro
     with a_wall(tmp_path, ("Build server", fakes[0])) as (live, _), looking(browser, live) as page:
         sign_in(page, live)
         pane = settings(page, "security")
-        pane.get_by_role("button", name="Change password…").click()
+        pane.get_by_role("button", name="Change password...").click()
         form = top(page)
         expect(form.locator("h2")).to_have_text("Change password")
         boxes = form.locator("input[type=password]")
@@ -572,7 +572,7 @@ def test_ones_own_password_is_changed_in_its_dialog(tmp_path: Path, browser: Bro
         told(page, "Password changed")
         expect(page.locator("dialog[open]")).to_have_count(1)  # the dialog is gone, Settings is still there
         # Cancel leaves everything as it was.
-        pane.get_by_role("button", name="Change password…").click()
+        pane.get_by_role("button", name="Change password...").click()
         top(page).get_by_role("button", name="Cancel").click()
         expect(page.locator("dialog[open]")).to_have_count(1)
 
@@ -628,7 +628,7 @@ def test_the_wall_goes_into_a_file_and_comes_back_out_of_it(tmp_path: Path, brow
         sign_in(page, live)
         expect(page.locator("#wall article.has-frame")).to_have_count(1)
         pane = settings(page, "files")
-        pane.get_by_role("button", name="Export…", exact=True).click()
+        pane.get_by_role("button", name="Export...", exact=True).click()
         form = top(page)
         secrets = form.locator("input[type=password]")
         secrets.nth(0).fill("short")
@@ -655,7 +655,7 @@ def test_the_wall_goes_into_a_file_and_comes_back_out_of_it(tmp_path: Path, brow
 
         # And comes back from the file: with the wrong passphrase nothing of it, with the right one all of it.
         top(page).locator('[role=tab][data-tab="files"]').click()
-        pane.get_by_role("button", name="Import…", exact=True).click()
+        pane.get_by_role("button", name="Import...", exact=True).click()
         form = top(page)
         form.locator("input[type=file]").set_input_files(file)
         expect(form.locator("input[type=password]")).to_be_visible()  # a sealed file: its passphrase is asked for
@@ -953,7 +953,7 @@ def test_a_kvm_is_renamed_and_keeps_the_password_that_was_saved_for_it(tmp_path:
         sign_in(page, live)
         expect(tile(page, "Build server")).to_have_attribute("data-state", "online")
         page.get_by_role("button", name="Actions for Build server").click()
-        top(page).get_by_role("button", name="Edit…").click()
+        top(page).get_by_role("button", name="Edit...").click()
         form = top(page)
         expect(form.locator("h2")).to_have_text("Edit Build server")
         # The password that is saved is not in the page: its box is empty, and left empty it is kept.
@@ -970,7 +970,7 @@ def test_a_kvm_is_renamed_and_keeps_the_password_that_was_saved_for_it(tmp_path:
 
         # A name that is no name is refused where it is typed, and the tile keeps the one it has.
         page.get_by_role("button", name="Actions for Web server").click()
-        top(page).get_by_role("button", name="Edit…").click()
+        top(page).get_by_role("button", name="Edit...").click()
         form = top(page)
         form.locator("input[type=text]").first.fill("two" + chr(0x2028) + "lines")
         form.get_by_role("button", name="Save", exact=True).click()
@@ -1006,7 +1006,7 @@ def test_what_is_no_kvm_is_not_added_anyway_and_a_tile_that_signs_nobody_in_is_s
             fake.state.login_status = 503
             expect(tile(page, "Build server")).to_have_attribute("data-state", "error", timeout=20_000)
             page.get_by_role("button", name="Actions for Build server").click()
-            top(page).get_by_role("button", name="Edit…").click()
+            top(page).get_by_role("button", name="Edit...").click()
             form = top(page)
             address = form.locator("input[type=text]").nth(1)
             as_it_is = address.input_value()
@@ -1410,7 +1410,7 @@ def test_what_is_taken_in_from_a_file_is_what_its_summary_showed(tmp_path: Path,
     second = json.dumps({"format": exchange.FORMAT, "version": 1, "actions": [{"name": "Another key altogether", "kind": "keys", "keys": "ControlLeft,AltLeft,Delete"}]})
     with a_wall(tmp_path) as (live, admin), looking(browser, live) as page:
         sign_in(page, live)
-        settings(page, "files").get_by_role("button", name="Import…", exact=True).click()
+        settings(page, "files").get_by_role("button", name="Import...", exact=True).click()
         form = top(page)
         held: list[Any] = []
         page.route("**/api/v1/import/read", lambda route: held.append((route, route.fetch())))
@@ -1575,7 +1575,7 @@ def test_a_server_on_the_wall_has_a_power_button_and_no_keyboard(tmp_path: Path,
             expect(tile(page, "A server")).to_have_attribute("data-state", "online", timeout=40_000)
             page.get_by_role("button", name="Actions for A server").click()
             menu = top(page)
-            expect(menu.get_by_role("button", name="Send keys…")).to_have_count(0)  # a controller has no keyboard to type on
+            expect(menu.get_by_role("button", name="Send keys...")).to_have_count(0)  # a controller has no keyboard to type on
             expect(menu.get_by_role("button", name="Shut down", exact=True)).to_be_visible()
             assert page.locator("img[src='x']").count() == 0 and page.evaluate("window.reached") is None
             menu.get_by_role("button", name="Locator light on", exact=True).click()

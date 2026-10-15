@@ -2,7 +2,7 @@
 
 ## 0.1.1
 
-0.1.0 under its name written qKVM, with three things in the program put right, three tests
+0.1.0 under its name written qKVM, with three things in the program put right, four tests
 and the test bed made right, the security policy's paragraph on updates corrected and the
 README's release steps rewritten. A release's own test run is green on all thirteen jobs
 GitHub runs (the run of 0.1.0's tag was red in one); on Python 3.11 what is told to stop
@@ -76,6 +76,12 @@ goodbye is hung up on.
 - The test for a flood of pings counts the frames the wall worked through before it hung up
   by itself, not by the wall's count of the second it is in; and its stand-in's reader no
   longer ends with a warning when the wall hangs up on it.
+- Two tests stood in another certificate's fingerprint by writing AA over its first byte. One
+  real fingerprint in 256 begins with AA, and then the stand-in was the real one: one of them
+  failed so on GitHub's Windows with Python 3.13, the other would have proved nothing. They
+  take another first byte than the real one's now.
+- The page and the README write their punctuation plainly: menu paths as Settings > Security,
+  three dots where a word trails off, straight quotes.
 
 ## 0.1.0
 

@@ -9,7 +9,7 @@ Please do not open a public issue for something that could be used against other
 installations. Report it privately instead: on https://github.com/qkvm/qkvm open the
 *Security* tab and choose *Report a vulnerability*.
 
-Say which version you run (`qkvm --version`, or *Settings → About*), what you did,
+Say which version you run (`qkvm --version`, or *Settings > About*), what you did,
 and what happened. A way to reproduce it helps most.
 
 ## What counts
@@ -62,7 +62,7 @@ and its files readable by their owner only.
 | `qkvm.damaged-*.json` | a settings file that could not be read at some start, set aside for you to look at when qKVM went on from its second copy | as `qkvm.json`, of its day. `--reset-password`, and a start that takes the key out of the folder, remove these |
 | `sessions.json` | the browsers that asked to be kept signed in over a restart: a SHA-256 of each one's cookie, its account and date | yes; it cannot be replayed as a sign-in |
 | `watch.json` | what each machine was last seen as (on, off, not answering), for alerts after a restart | yes |
-| `audit.log`, `audit.log.1` … | the activity log: who did what, when, from which address. At a failed sign-in, the name that was typed only where it is an account's | yes |
+| `audit.log`, `audit.log.1` ... | the activity log: who did what, when, from which address. At a failed sign-in, the name that was typed only where it is an account's | yes |
 | `qkvm.log` | starts, device outages, errors; until setup is done, the setup code (sign-ins, refused ones too, are in `audit.log`) | yes |
 | `tls/key.pem`, `tls/cert.pem` | the key and certificate of qKVM's own HTTPS, when it made them | yes: whoever has the key can pass for this qKVM to a browser that has accepted its certificate |
 | `updates/` | versions installed from inside the app | yes (program files) |
@@ -74,7 +74,7 @@ device passwords in that copy**, a viewer's included, and that removing an accou
 make an old copy of the folder safe. When somebody who had an account leaves, change the
 passwords of the devices.
 
-**Tokens and display links** (*Settings → Tokens*) are credentials of their own: whoever has
+**Tokens and display links** (*Settings > Tokens*) are credentials of their own: whoever has
 one can do what it was made for (look, or look and act, on the machines it is for) until it
 runs out or an admin takes it back. `qkvm.json` holds a SHA-256 of each, never the token.
 They work only while qKVM is unlocked, and they cannot change settings, accounts, devices or
@@ -88,7 +88,7 @@ that proxy, and only it, about the name; whoever can reach qKVM's port from that
 address, or can make that proxy send the header, is whoever they say. Whoever signs in
 elsewhere brings no password here, so it cannot be had together with `--locked-start`.
 
-**A file exported with a passphrase** (*Settings → Export and import*) holds every device
+**A file exported with a passphrase** (*Settings > Export and import*) holds every device
 password of the wall, the saved texts and the alert address, encrypted with a key of its own
 that the passphrase locks (scrypt, AES-256-GCM). It is as safe as its passphrase, and once
 made it is out of qKVM's reach: who has the file can try passphrases for as long as they
@@ -123,7 +123,7 @@ but not out of copies of the whole folder made before.
 - While somebody searches for devices: every address of the computer's own network (a /24),
   and the Tailscale peers, on the ports KVMs answer on.
 - `api.github.com`, once a day, to ask whether a newer release exists (it sends nothing about
-  the installation; *Settings → Updates* switches it off). When an admin installs one:
+  the installation; *Settings > Updates* switches it off). When an admin installs one:
   `github.com`, and the file servers GitHub sends the download on to, over HTTPS only.
 - The address alerts are sent to, if one was given.
 - The syslog collector given with `--audit-syslog`, if one was: each entry of the activity

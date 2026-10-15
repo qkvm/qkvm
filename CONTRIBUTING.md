@@ -9,7 +9,7 @@ decision about trust, and no judgement of what you would have sent.
 
 - **A bug, or a device that does not work as it should:** open an issue at
   https://github.com/qkvm/qkvm/issues. Say which version you run (`qkvm --version`, or
-  *Settings → About*), how it is installed (pip, a container), what kind of device it is
+  *Settings > About*), how it is installed (pip, a container), what kind of device it is
   about, what you did and what happened. The lines of `qkvm.log` from that moment help; it
   holds no passwords, but take out any address or name you would rather not show.
 - **A security problem:** not in a public issue. [SECURITY.md](SECURITY.md) says how to

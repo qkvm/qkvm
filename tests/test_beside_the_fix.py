@@ -365,7 +365,8 @@ def test_settings_that_could_not_be_saved_show_the_certificate_that_is_served(tm
         shown = admin.get("/api/v1/settings").json()["cert_fingerprint"]
 
         def another(addresses: list[str]) -> Any:
-            core.cert_fingerprint = "AA:" + shown[3:]
+            # Another first byte than the real one's: a fingerprint that begins with AA by chance (one in 256) is no other.
+            core.cert_fingerprint = ("AB:" if shown.startswith("AA:") else "AA:") + shown[3:]
             return tmp_path / "tls" / "cert.pem", tmp_path / "tls" / "key.pem"
 
         def full(self: Store, data: dict[str, Any]) -> None:

@@ -1844,7 +1844,7 @@ def create_app(core: Core) -> FastAPI:
         user: UserRecord = request.state.user
         if body.require_totp and user.totp is None:
             # Whoever makes the rule has done it themselves: nobody is locked into setting it up by somebody who has not.
-            return fail(409, "own_first", "Switch two-factor sign-in on for your own account first (Settings → Security), then require it of others")
+            return fail(409, "own_first", "Switch two-factor sign-in on for your own account first (Settings > Security), then require it of others")
         previous = store.server.require_totp
         store.server.require_totp = body.require_totp
         if refused := await saved("This rule", lambda: setattr(store.server, "require_totp", previous)):
@@ -1928,7 +1928,7 @@ def create_app(core: Core) -> FastAPI:
             return fail(409, "yourself", "You cannot suspend the account you are signed in with")
         if yourself and (body.password or body.totp_off):
             # Here nothing is asked for. A browser left open for a minute would be an account taken over for good.
-            return fail(409, "own_account", "Change your own password and second step under Settings → Security, where your current password is asked for")
+            return fail(409, "own_account", "Change your own password and second step under Settings > Security, where your current password is asked for")
         before = (user.name, user.role, user.devices, user.groups, user.suspended, user.auth, user.totp, user.totp_codes, user.totp_step, user.totp_changes)
 
         def as_it_was() -> None:

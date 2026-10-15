@@ -128,16 +128,16 @@ pip install .          # or, for the image:  docker build -t qkvm/qkvm .
 
 The first visit walks you through four steps:
 
-1. **Password** – choose the password of the first account, `admin`.
-2. **Recovery key** – shown once. Keep it: it is the way back in if a password is forgotten.
-3. **Network** – where it is reachable: this computer only, Tailscale, the local network.
+1. **Password**: choose the password of the first account, `admin`.
+2. **Recovery key**: shown once. Keep it: it is the way back in if a password is forgotten.
+3. **Network**: where it is reachable: this computer only, Tailscale, the local network.
    (In a container this is decided by the port mapping, `-p`, instead.)
-4. **KVMs** – let qKVM find the KVMs on your network, or paste their addresses, and give
+4. **KVMs**: let qKVM find the KVMs on your network, or paste their addresses, and give
    their login; each one is checked and added.
 
 ## Using it
 
-- **Tiles** refresh about once a second. Click one to enlarge it (`←` / `→` switch, `Esc` closes).
+- **Tiles** refresh about once a second. Click one to enlarge it (the left and right arrow keys switch, `Esc` closes).
   Pictures are drawn pixel for pixel: each frame is fetched with detail to spare (for a
   normal tile, the KVM's full frame) and scaled once to exactly the screen pixels it covers,
   which keeps text sharp at any display scaling.
@@ -145,8 +145,8 @@ The first visit walks you through four steps:
   buttons, and the search box (`/`) narrows the wall by name, address or group.
 - **Groups:** give a KVM a group when adding or editing it (a rack, a room, a customer). Once
   there are groups, the top bar gets a list to show one of them at a time.
-- **Your own order:** an admin puts the tiles where they belong with *View → Arrange the
-  tiles…*: every tile shows its place, 1, 2, 3 and so on, and is dragged to another, stepped
+- **Your own order:** an admin puts the tiles where they belong with *View > Arrange the
+  tiles...*: every tile shows its place, 1, 2, 3 and so on, and is dragged to another, stepped
   one place with the arrows, or given a place by typing its number. *Save this order* keeps
   it on the server, so it is the same for every browser and every screen that shows this
   wall; `Esc` or *Cancel* leaves it as it was. A machine added later stands at the end until
@@ -155,11 +155,11 @@ The first visit walks you through four steps:
   group, or with what needs attention first), the number of columns, how often a new picture
   is fetched, and display mode. These are each browser's own choice: a wall screen can show
   problems first while a desk keeps the arranged order.
-- **Display mode** (*View → Display mode*, or `D`): the screens and nothing else, as large as
+- **Display mode** (*View > Display mode*, or `D`): the screens and nothing else, as large as
   fits, for a monitor on the wall. Move the mouse for a small bar that can rotate through
   the groups every 20 seconds; `Esc` leaves. The address gets `#display`, so a browser on a
   wall screen can be pointed straight at it. For a screen that is to stay on, make it a
-  link of its own under *Settings → Tokens* (see [Scripts and wall screens](#scripts-and-wall-screens)):
+  link of its own under *Settings > Tokens* (see [Scripts and wall screens](#scripts-and-wall-screens)):
   a viewer account signed in there with *Keep this browser signed in* is asked for its
   password again after 30 days, and a link is asked for nothing.
 - **Find KVMs on my network** (in *Add KVM*): asks the 254 addresses around this computer's
@@ -192,15 +192,15 @@ The first visit walks you through four steps:
   captures one computer at a time, so there is one live picture per KVM, not one per port.
   Switching takes the KVM a few seconds and also changes a monitor plugged into it.
 - **Actions** (the lightning button on a tile):
-  - *Keyboard* – Wake screen, Ctrl+Alt+Del, Lock screen, Task Manager, Show desktop, Enter,
-    Esc, Close window; *Send keys…* for any other combination; *Type text…* to type a command.
-  - *Your actions* – key combinations and text you saved under Settings → Actions.
-  - *Power* – Keep awake / Allow sleep (the KVM nudges the mouse); press power, hold power and
+  - *Keyboard*: Wake screen, Ctrl+Alt+Del, Lock screen, Task Manager, Show desktop, Enter,
+    Esc, Close window; *Send keys...* for any other combination; *Type text...* to type a command.
+  - *Your actions*: key combinations and text you saved under Settings > Actions.
+  - *Power*: Keep awake / Allow sleep (the KVM nudges the mouse); press power, hold power and
     press reset when the KVM has an ATX power board; Wake-on-LAN for the targets saved on it.
-  - *Reboot KVM* – restarts the KVM itself.
+  - *Reboot KVM*: restarts the KVM itself.
 - **Bulk actions:** press **Select** (or `S`) to enter select mode, tick the KVMs you want
   (*Select all* takes the ones currently shown, so filter or search first), then
-  **Run action…**. You confirm against the list of machines; what can lose somebody's work
+  **Run action...**. You confirm against the list of machines; what can lose somebody's work
   (the power and reset buttons, a reboot, typed text, a saved action marked so) needs an
   extra tick; and each KVM reports back as it finishes, with a retry for the ones that
   failed. A run goes to a few machines at a time, or, if you say so when confirming, to one
@@ -211,20 +211,20 @@ The first visit walks you through four steps:
   one for the same machine is refused, whoever sends it and from wherever: a power button
   pressed twice does not press harder, it undoes the first press.
 - **Settings**
-  - *KVMs* – add, edit, remove; review a KVM's certificate.
-  - *Actions* – your own actions. Saved text is stored encrypted and never shown again. It
+  - *KVMs*: add, edit, remove; review a KVM's certificate.
+  - *Actions*: your own actions. Saved text is stored encrypted and never shown again. It
     can be typed by every operator, on any machine that operator may use, and what is typed
     can be read there: a saved text is known to all of them. A password that not every
     operator should have is not something to save here.
-  - *Network* – where qKVM listens, the port, HTTPS. Changes apply without restarting the program.
-  - *Accounts* – who may sign in, as what, and which KVMs they see (see [Accounts](#accounts)).
-  - *Alerts* – be told when a KVM goes offline or loses its picture (see [Alerts](#alerts)).
-  - *Security* – change your password, two-factor sign-in, the recovery key, sign out your
+  - *Network*: where qKVM listens, the port, HTTPS. Changes apply without restarting the program.
+  - *Accounts*: who may sign in, as what, and which KVMs they see (see [Accounts](#accounts)).
+  - *Alerts*: be told when a KVM goes offline or loses its picture (see [Alerts](#alerts)).
+  - *Security*: change your password, two-factor sign-in, the recovery key, sign out your
     other browsers.
-  - *Updates* – the running version, checking for a newer one and installing it.
-  - *Activity* – who signed in, who changed what, who sent which action (never what was typed);
+  - *Updates*: the running version, checking for a newer one and installing it.
+  - *Activity*: who signed in, who changed what, who sent which action (never what was typed);
     to search, to narrow down to one kind, and to download.
-  - *About* – version, website, source and licence.
+  - *About*: version, website, source and licence.
 - **Fullscreen** (`F`) and the **colours** (light, dark, or as the system has them) are each
   a button of their own in the top bar, next to Settings.
 - **Your account** (the person at the right end of the top bar) says who is signed in and
@@ -235,7 +235,7 @@ digits arrive as written but some symbols do not.
 
 ## Accounts
 
-The first account is an admin called `admin`. Admins add more under *Settings → Accounts*,
+The first account is an admin called `admin`. Admins add more under *Settings > Accounts*,
 each with its own name, password and role:
 
 | Role | Sees the wall | Runs actions (keys, text, power, ports, reboot) | Settings, KVMs, accounts, updates, activity log |
@@ -255,7 +255,7 @@ each with its own name, password and role:
   all of that, and changing its password would say something that did not happen.
 - With one account, signing in asks for the password only. With several, it asks for the
   user name too.
-- Everyone can change their own password (*Settings → Security*), which asks for the
+- Everyone can change their own password (*Settings > Security*), which asks for the
   current one. An admin can set a new one for somebody else, which signs that account out
   everywhere; their own they change like everybody, where the current one is asked for.
 - The only admin cannot be removed or demoted, and nobody can change their own role or
@@ -269,19 +269,19 @@ each with its own name, password and role:
 
 ### Two-factor sign-in
 
-Anyone can add a second step to their own account under *Settings → Security*: signing in
+Anyone can add a second step to their own account under *Settings > Security*: signing in
 then asks for the password and for a 6-digit code from an authenticator app (Google
 Authenticator, Microsoft Authenticator, 1Password, Aegis and so on). Setting it up shows a
 QR code to scan (and the same key as text); a code works once.
 
-- **It can be required.** *Settings → Accounts → Two-factor sign-in: required of* admins, of
+- **It can be required.** *Settings > Accounts > Two-factor sign-in: required of* admins, of
   admins and operators, or of everybody. An account under the rule that has not set it up
   signs in with its password and lands on one page, which sets it up; until that is done it
   sees no screen and can do nothing else. Whoever makes the rule has to have it switched on
   for their own account first.
 - **One-time codes for when the phone is not at hand.** Switching the second step on hands
   out ten codes, shown once: each signs you in a single time in place of a code from the
-  app (*No phone at hand?* on the sign-in page). *Settings → Security* says how many are left
+  app (*No phone at hand?* on the sign-in page). *Settings > Security* says how many are left
   and makes ten new ones, which ends the old. qKVM keeps only what it needs to recognise
   them, under the same key as the saved passwords, and a sign-in with one is marked as such
   in the activity log.
@@ -319,7 +319,7 @@ server {
 ```
 
 - Whoever the proxy names is signed in as **the qKVM account of that name**, with the role
-  and the machines that account has. There has to be one: *Settings → Accounts → Add
+  and the machines that account has. There has to be one: *Settings > Accounts > Add
   account*, with the name the proxy sends (`olga`, `olga@example.org`) and no password.
   Somebody the proxy knows and qKVM does not is told so, and sees nothing.
 - **The header is believed of the proxy named with `--trusted-proxy`, and of nobody else:**
@@ -341,7 +341,7 @@ server {
 
 ## Alerts
 
-*Settings → Alerts* makes qKVM watch the KVMs and tell you when one goes offline, when a
+*Settings > Alerts* makes qKVM watch the KVMs and tell you when one goes offline, when a
 computer loses its picture, when a login is rejected or a certificate changes, and when that
 is over. A change counts once it has lasted about half a minute.
 
@@ -352,7 +352,7 @@ is over. A change counts once it has lasted about half a minute.
 - **An alert says where to look.** *Link in alerts* is the address of the wall as you reach
   it; an alert then carries a link that opens the wall at the tile it is about (in ntfy, a
   tap on the notification does). Leave it empty for alerts without one.
-- **One machine can be left out:** *Settings → KVMs → Edit → Send alerts about this one*. For
+- **One machine can be left out:** *Settings > KVMs > Edit > Send alerts about this one*. For
   a test bench that is switched on and off all day, or a machine that sleeps.
 - **Pause for maintenance:** *Pause alerts*, for an hour or for four, sends nothing while machines
   are worked on, restarts included. When the pause is over, what is not as it was before it is
@@ -375,7 +375,7 @@ is over. A change counts once it has lasted about half a minute.
 
 ## Export and import
 
-*Settings → Export and import* writes the wall to a file, and takes a file in: to keep what
+*Settings > Export and import* writes the wall to a file, and takes a file in: to keep what
 was set up, to fill a second qKVM without typing every device again, or to move to another
 computer.
 
@@ -435,7 +435,7 @@ signs in: it has no password here to be asked for. Export as an admin that has o
 
 ## Scripts and wall screens
 
-*Settings → Tokens* makes two things that use qKVM without a person signing in. Both are
+*Settings > Tokens* makes two things that use qKVM without a person signing in. Both are
 shown once, qKVM keeps only what it needs to know them again, and an admin can take either
 back at any moment. Neither can change settings, accounts, devices or other tokens: that
 takes a person.
@@ -504,7 +504,7 @@ What to do is said as JSON, `{"action": "..."}`:
 
 ## Metrics
 
-A monitoring system can collect the state of the wall: *Settings → Metrics* makes a token, and
+A monitoring system can collect the state of the wall: *Settings > Metrics* makes a token, and
 from then on `GET /metrics` answers whoever sends it, in the text format that Prometheus and
 everything that reads its format understand:
 
@@ -526,10 +526,10 @@ reach it by has to be listed under `allowed_hosts` in `qkvm.json`, as for a brow
 |---|---|
 | `qkvm_devices{state}` | how many tiles are in each state: `online`, `no_signal`, `offline`, `auth`, `error`, `busy`, `connecting` |
 | `qkvm_device_up{id,device,kind,group}` | 1 while that device answers, 0 while it does not |
-| `qkvm_device_picture{…}` | 1 while it shows a picture; for a server, while it is switched on |
-| `qkvm_device_last_seen_seconds{…}` | seconds since it last answered |
-| `qkvm_device_temperature_celsius{…,sensor}` | how warm it is: the KVM itself (`sensor="device"`), or each sensor of a server |
-| `qkvm_server_healthy{…}` | 1 while a server's management controller calls it healthy |
+| `qkvm_device_picture{...}` | 1 while it shows a picture; for a server, while it is switched on |
+| `qkvm_device_last_seen_seconds{...}` | seconds since it last answered |
+| `qkvm_device_temperature_celsius{...,sensor}` | how warm it is: the KVM itself (`sensor="device"`), or each sensor of a server |
+| `qkvm_server_healthy{...}` | 1 while a server's management controller calls it healthy |
 | `qkvm_unlocked` | 1 while qKVM can talk to its devices (somebody has signed in since it started) |
 | `qkvm_sessions`, `qkvm_devices_configured`, `qkvm_update_available`, `qkvm_info{version}`, `qkvm_start_time_seconds` | about qKVM itself |
 
@@ -721,11 +721,11 @@ A few things are worth knowing:
 - **Forgotten password:** *Forgot your password?* on the sign-in page lists the ways back in.
   - *The recovery key* sets a new password for any account and keeps everything else as it
     was. It is shown once when qKVM is set up; an admin can make a new one under
-    *Settings → Security*, which cancels the old one. Only a locked copy is stored. Whoever
+    *Settings > Security*, which cancels the old one. Only a locked copy is stored. Whoever
     holds it can take over any account, so keep it like a password, and not on the computer
     qKVM runs on. It replaces the password only: an account with two-factor sign-in still
     needs its code.
-  - *Another admin* can set a new password for you under *Settings → Accounts*.
+  - *Another admin* can set a new password for you under *Settings > Accounts*.
   - *Starting over:* with neither, `qkvm --reset-password` forgets every account
     and the recovery key, so the first account can be created again. The saved KVM passwords
     were encrypted for those accounts, so they are erased and must be entered again; the
@@ -762,7 +762,7 @@ A few things are worth knowing:
   claim a copy you just started. Use it where others can reach the port before you do.
 - **Each KVM's certificate is remembered** the first time qKVM talks to it (like an SSH host
   key). If something else answers at that address later, qKVM refuses to send it the password
-  and the tile says so; *Settings → KVMs → Edit → Review certificate* shows both fingerprints.
+  and the tile says so; *Settings > KVMs > Edit > Review certificate* shows both fingerprints.
   A tile moved to another address takes its saved password along only where the device
   there shows that same certificate; anywhere else, and always for a server's controller
   (whose maker may have put one certificate on every board), the password is typed again.
@@ -791,7 +791,7 @@ A few things are worth knowing:
   put a page of its own in your browser. One part of that is not qKVM's own to promise: a
   JetKVM's video and its control channel come through a WebRTC library (aiortc), and what a
   taken-over JetKVM could make that library hold or compute has not been measured.
-- **The activity log** (*Settings → Activity*) keeps about 20 MB, which is years of an
+- **The activity log** (*Settings > Activity*) keeps about 20 MB, which is years of an
   ordinary wall. It is a file of JSON lines, `audit.log` in the data folder: one entry a
   line, with the time, what happened, the address it came from, the account, and what it
   concerned. Where it cannot be written (a full disk), what is asked for is done all the
@@ -821,7 +821,7 @@ A few things are worth knowing:
   libraries have to say goes there too, one line of each kind a minute at the most: a line for every
   request that is none would be the log's history gone in minutes. Sign-ins, refused ones too, are in
   the activity log. `--log-level debug` writes more.
-- **Health check:** `GET /healthz` answers `{"status": "ok", "version": "…", "api": ["v1"], "page": "…", "locked": false}`
+- **Health check:** `GET /healthz` answers `{"status": "ok", "version": "...", "api": ["v1"], "page": "...", "locked": false}`
   without a login, for a monitor or a watchdog. (`"page"` is a mark of the page's own files: a
   browser tab left open across a restart compares it with its own, and fetches the page again
   when they differ.) `"locked": true` means qKVM cannot open the saved device passwords just
@@ -928,7 +928,7 @@ A few things are worth knowing:
 
 ## Updates
 
-*Settings → Updates* shows the running version, checks GitHub for a newer release, shows its
+*Settings > Updates* shows the running version, checks GitHub for a newer release, shows its
 notes and installs it. By default qKVM asks GitHub once a day and shows an **Update**
 button in the top bar when there is something new; installing is always your click, and asks
 for your password again.

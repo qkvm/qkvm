@@ -642,7 +642,7 @@ function showSetup(session) {
     steps(0),
     h('h2', {}, 'Create your password'),
     h('p', { class: 'muted' },
-      'This is the password of the first account, “admin”. It protects qKVM and encrypts the KVM passwords ',
+      'This is the password of the first account, "admin". It protects qKVM and encrypts the KVM passwords ',
       'saved on this computer. qKVM does not store it: the recovery key you get next is the only way around a ',
       'forgotten password. More accounts can be added later.'),
     h('input', { type: 'text', autocomplete: 'username', value: 'admin', hidden: true }),
@@ -699,7 +699,7 @@ function setupDevices(settings, wanted) {
   finish.addEventListener('click', () => busy(finish, async () => {
     if ($('#auth-card textarea')?.value.trim() && !(await confirmBox({
       title: 'Finish without adding them?',
-      message: 'The addresses in the list have not been added yet. “Check and add” adds them; or finish now and add them later from the wall.',
+      message: 'The addresses in the list have not been added yet. "Check and add" adds them; or finish now and add them later from the wall.',
       action: 'Finish anyway',
       danger: false,
     }))) return;
@@ -739,11 +739,11 @@ function networkForm(settings, advanced) {
 
   // Its lines, for whoever lays them out: the first run stacks them (`el`), Settings puts them into cards.
   const listen = [
-    check(local, 'This computer', 'http://127.0.0.1 — always on, so you can never lock yourself out.'),
-    check(ts, tailscale ? `Tailscale — ${tailscale}` : 'Tailscale — not connected on this computer',
+    check(local, 'This computer', 'http://127.0.0.1, always on, so you can never lock yourself out.'),
+    check(ts, tailscale ? `Tailscale: ${tailscale}` : 'Tailscale: not connected on this computer',
       tailscale ? 'Reachable from your other Tailscale devices; Tailscale encrypts the traffic.'
         : 'qKVM starts listening there as soon as Tailscale connects.'),
-    check(lanBox, lan ? `Local network — ${lan}` : 'Local network',
+    check(lanBox, lan ? `Local network: ${lan}` : 'Local network',
       'Anyone on your network can reach the sign-in page.'),
   ];
   const secure = check(https, 'Encrypt connections (HTTPS)', settings.https_forced
@@ -751,7 +751,7 @@ function networkForm(settings, advanced) {
     : 'Uses a certificate made on this computer; your browser asks you to accept it once. '
       + 'Recommended whenever the local network is enabled.');
   const more = advanced ? [
-    field('Port', port, 'The number after the colon in the wall’s address.'),
+    field('Port', port, "The number after the colon in the wall's address."),
     field('Tile refresh (seconds)', interval,
       'What a browser starts with. One where a rate was picked in the top bar keeps its own.'),
   ] : [];
@@ -884,7 +884,7 @@ function addDevicesForm(onAdded) {
   async function relocate(entry, row) {
     const text = $('span', row);
     for (const button of row.querySelectorAll('button')) button.remove();
-    text.textContent = `${entry.known_as}: checking ${entry.address}…`;
+    text.textContent = `${entry.known_as}: checking ${entry.address}...`;
     try {
       const there = tiles.get(entry.known_id)?.device || (await api('GET', 'api/v1/wall')).devices.find(device => device.id === entry.known_id);
       if (!there) throw new ApiError(`${entry.known_as} is no longer on the wall`, 'not_found', 404);
@@ -906,7 +906,7 @@ function addDevicesForm(onAdded) {
   async function moveTo(twin, url, row) {
     const text = $('span', row);
     for (const button of row.querySelectorAll('button')) button.remove();
-    text.textContent = `${url} — checking…`;
+    text.textContent = `${url}: checking...`;
     try {
       // What is saved for that tile now, so that only its address changes. Asked for where no wall is drawn
       // (the first-run steps): guessing "none" there would take its group and its console link away.
@@ -921,14 +921,14 @@ function addDevicesForm(onAdded) {
       onAdded();
     } catch (ex) {
       row.className = 'bad';
-      text.textContent = `${url} — ${ex.message}`;
+      text.textContent = `${url}: ${ex.message}`;
     }
   }
 
   async function add(url, row, force, keepBoth = false) {
     const text = $('span', row);
     row.className = '';
-    text.textContent = `${url} — checking…`;
+    text.textContent = `${url}: checking...`;
     for (const button of row.querySelectorAll('button')) button.remove();
     try {
       const { device, about } = await api('POST', 'api/v1/devices', {
@@ -938,7 +938,7 @@ function addDevicesForm(onAdded) {
       row.className = 'ok';
       // Said where it is so: what is typed and seen there, and the device's password, are not encrypted on the way.
       const how = String(device.url || '').startsWith('http://') ? ' · over plain HTTP' : '';
-      text.textContent = `${device.name} added${model ? ` — ${model}` : ''}${how}`;
+      text.textContent = `${device.name} added${model ? ` (${model})` : ''}${how}`;
       onAdded();
       return true;
     } catch (ex) {
@@ -947,14 +947,14 @@ function addDevicesForm(onAdded) {
         // Not a failure: the device is on the wall, under another of its addresses. What is to become of
         // this one is for the person to say, and nothing is done until they have.
         row.className = 'ask';
-        text.textContent = `${url} — ${ex.message}.`;
+        text.textContent = `${url}: ${ex.message}.`;
         row.append(
           h('button', { type: 'button', onclick: () => moveTo(twin, url, row) }, 'Use this address instead'),
           h('button', { type: 'button', onclick: () => add(url, row, force, true) }, 'Keep both'));
         return true;
       }
       row.className = 'bad';
-      text.textContent = `${url} — ${ex.message}`;
+      text.textContent = `${url}: ${ex.message}`;
       // Worth saving anyway only when the device simply couldn't be reached right now. (Not where it answers
       // and signs nobody in: an address that is no KVM at all does that, and would be sent the password from then on.)
       if (CANNOT_BE_REACHED.includes(ex.code)) {
@@ -1200,7 +1200,7 @@ const QUICK_KEYS = [
   { icon: 'x', label: 'Close window', keys: 'AltLeft,F4', confirm: true, danger: true },
 ];
 
-let savedActions = [];  // the user's own actions, from Settings → Actions
+let savedActions = [];  // the user's own actions, from Settings > Actions
 
 // "ControlLeft,AltLeft,Delete" -> "Ctrl+Alt+Del"
 function keysLabel(keys) {
@@ -1323,8 +1323,8 @@ function runBulk(targets, spec, gap) {
   let shown = null;  // the dialog, once there is one to ask whether it is still open
   const dialog = openDialog(`${spec.title} · ${targets.length} KVMs`, (body, close) => {
     const rows = new Map(targets.map(tile => [tile,
-      h('li', {}, h('span', { class: 'spinner' }), h('strong', {}, tile.device.name), h('span', { class: 'muted' }, 'Waiting…'))]));
-    const summary = h('p', { role: 'status' }, 'Starting…');
+      h('li', {}, h('span', { class: 'spinner' }), h('strong', {}, tile.device.name), h('span', { class: 'muted' }, 'Waiting...'))]));
+    const summary = h('p', { role: 'status' }, 'Starting...');
     const retry = h('button', { type: 'button', hidden: true }, 'Retry failed');
     const halt = h('button', { type: 'button', class: 'danger' }, 'Stop');
     const done = h('button', { type: 'button', class: 'primary', hidden: true, onclick: close }, 'Close');
@@ -1339,7 +1339,7 @@ function runBulk(targets, spec, gap) {
     const run = async list => {
       for (const button of [retry, done]) button.hidden = true;
       Object.assign(halt, { hidden: false, disabled: false });
-      for (const tile of list) mark(tile, '', 'Waiting…');
+      for (const tile of list) mark(tile, '', 'Waiting...');
       const queue = [...list];
       const failed = [];
       const skipped = [];
@@ -1370,10 +1370,10 @@ function runBulk(targets, spec, gap) {
             // sent on top of it, and its mark is its own to take away. Offered again with what failed.
             mark(tile, 'bad', `"${acting.get(tile.device.id)}" is still under way here`);
             failed.push(tile);
-            summary.textContent = `${ok + failed.length + unknown} of ${list.length} done…`;
+            summary.textContent = `${ok + failed.length + unknown} of ${list.length} done...`;
             continue;
           }
-          mark(tile, '', 'Sending…');
+          mark(tile, '', 'Sending...');
           acting.set(tile.device.id, spec.title);
           try {
             const result = await api('POST', `api/v1/devices/${tile.device.id}/actions`, { ...spec.body, batch }, ACTION_PATIENCE);
@@ -1391,7 +1391,7 @@ function runBulk(targets, spec, gap) {
           } finally {
             acting.delete(tile.device.id);
           }
-          summary.textContent = `${ok + failed.length + unknown} of ${list.length} done…`;
+          summary.textContent = `${ok + failed.length + unknown} of ${list.length} done...`;
           if (gap > 0 && queue.length) {
             summary.textContent += ` Next in ${gap} s.`;
             await new Promise(resolve => { wake = resolve; setTimeout(resolve, gap * 1000); });
@@ -1445,7 +1445,7 @@ async function perform(ids, spec, onStarted) {
     return;
   }
   acting.set(tile.device.id, spec.title);
-  const finished = working(`${tile.device.name}: ${spec.title}…`);
+  const finished = working(`${tile.device.name}: ${spec.title}...`);
   let result;
   try {
     result = await api('POST', `api/v1/devices/${tile.device.id}/actions`, spec.body, ACTION_PATIENCE);
@@ -1601,8 +1601,8 @@ function actionsDialog(target) {
       ...savedActions.map(action => quick(action.kind === 'text' ? 'type' : 'star', action.name, savedSpec(action),
         action.kind === 'keys' ? keysLabel(action.keys) : null)),
       h('button', { type: 'button', class: 'admin-only', onclick: () => { close(); settingsDialog('actions'); } },
-        icon('plus'), h('span', {}, savedActions.length ? 'Manage…' : 'Add your own…')),
-      !savedActions.length && !can('admin') && h('p', { class: 'muted' }, 'None yet. An admin can add some under Settings → Actions.'),
+        icon('plus'), h('span', {}, savedActions.length ? 'Manage...' : 'Add your own...')),
+      !savedActions.length && !can('admin') && h('p', { class: 'muted' }, 'None yet. An admin can add some under Settings > Actions.'),
     ].filter(Boolean));
     fillSaved();
     loadSavedActions().then(fillSaved);
@@ -1636,7 +1636,7 @@ function actionsDialog(target) {
             onclick: event => openSignedIn(event, single),
           }, icon('external'), h('span', {}, 'Open console'), status?.console && can('operator') && h('kbd', {}, 'signed in')),
           h('button', { type: 'button', onclick: () => { close(); openFocus(device.id); } }, icon('maximize'), h('span', {}, 'Enlarge')),
-          h('button', { type: 'button', class: 'admin-only', onclick: () => { close(); editDeviceDialog(device, reloadWall); } }, icon('edit'), h('span', {}, 'Edit…')),
+          h('button', { type: 'button', class: 'admin-only', onclick: () => { close(); editDeviceDialog(device, reloadWall); } }, icon('edit'), h('span', {}, 'Edit...')),
           certProblem && h('button', {
             type: 'button', class: 'danger admin-only', onclick: () => certificateDialog(device, () => { close(); reloadWall(); }),
           }, icon('shield'), h('span', {}, 'Review certificate'))));
@@ -1667,8 +1667,8 @@ function actionsDialog(target) {
           // The keys are shown next to the name, unless the name already is the keys.
           QUICK_KEYS.map(key => quick(key.icon, key.label, keySpec(key.label, key.keys, { confirm: key.confirm, danger: key.danger }),
             keysLabel(key.keys) === key.label ? null : keysLabel(key.keys))),
-          h('button', { type: 'button', onclick: () => { close(); sendKeysDialog(ids); } }, icon('command'), h('span', {}, 'Send keys…')),
-          h('button', { type: 'button', onclick: () => { close(); typeTextDialog(ids); } }, icon('type'), h('span', {}, 'Type text…'))),
+          h('button', { type: 'button', onclick: () => { close(); sendKeysDialog(ids); } }, icon('command'), h('span', {}, 'Send keys...')),
+          h('button', { type: 'button', onclick: () => { close(); typeTextDialog(ids); } }, icon('type'), h('span', {}, 'Type text...'))),
         h('h3', {}, 'Your actions'),
         saved,
       ],
@@ -1819,7 +1819,7 @@ function forgotDialog() {
       },
     },
       nameBox,
-      field('Recovery key', key, 'The key shown when qKVM was set up, or made later under Settings → Security.'),
+      field('Recovery key', key, 'The key shown when qKVM was set up, or made later under Settings > Security.'),
       first.el,
       coach.meter,
       second.el,
@@ -1831,14 +1831,14 @@ function forgotDialog() {
       h('h3', {}, 'With the recovery key'),
       hasRecovery ? withKey : h('p', { class: 'muted' }, 'No recovery key has been made for this copy of qKVM.'),
       askName && h('h3', {}, 'With the help of an admin'),
-      askName && h('p', {}, 'Any admin can set a new password for you under Settings → Accounts.'),
+      askName && h('p', {}, 'Any admin can set a new password for you under Settings > Accounts.'),
       h('h3', {}, 'Starting over'),
       h('p', {}, 'If neither is possible, run this on the computer qKVM runs on, with qKVM stopped:'),
       h('p', {}, h('code', {}, 'qkvm --reset-password')),
       h('p', { class: 'muted' }, 'It removes every account and the saved KVM passwords. The list of KVMs and the other settings stay. ',
         'Opening qKVM then starts with choosing a password, and the KVM passwords have to be entered again.'),
       h('h3', {}, 'Lost the phone with your authenticator app?'),
-      h('p', { class: 'muted' }, 'An admin can switch two-factor sign-in off for your account under Settings → Accounts, or run ',
+      h('p', { class: 'muted' }, 'An admin can switch two-factor sign-in off for your account under Settings > Accounts, or run ',
         h('code', {}, 'qkvm --disable-2fa NAME'), ' on that computer.')));
     (hasRecovery ? (askName ? name : key) : body).focus?.();
   });
@@ -1935,7 +1935,7 @@ function twoFactorSetup(onDone) {
           });
         },
       },
-        h('p', {}, h('strong', {}, '1. '), 'In an authenticator app (Google Authenticator, Microsoft Authenticator, 1Password, Aegis…) ',
+        h('p', {}, h('strong', {}, '1. '), 'In an authenticator app (Google Authenticator, Microsoft Authenticator, 1Password, Aegis...) ',
           'add an account and scan this code.'),
         qrPicture(setup.qr, 'QR code to scan with an authenticator app'),
         field('Or type the setup key', h('input', {
@@ -2306,7 +2306,7 @@ function importDialog(onDone) {
         const here = there.devices.length - fresh.length - twins.length;
         rows.push(row('devices', `KVMs and servers: ${fresh.length} to add`,
           [here ? `${here} are on this wall already and stay as they are.` : '',
-            twins.length ? `${twins.length} are left out as the same device as one that is here or earlier in the file (${twins.slice(0, 3).map(device => `${device.name}: ${device.same_as}`).join('; ')}${twins.length > 3 ? '; …' : ''}).` : '',
+            twins.length ? `${twins.length} are left out as the same device as one that is here or earlier in the file (${twins.slice(0, 3).map(device => `${device.name}: ${device.same_as}`).join('; ')}${twins.length > 3 ? '; ...' : ''}).` : '',
           ].filter(Boolean).join(' '), fresh.length > 0));
         if (fresh.length) rows.push(listed(fresh.map(ofDevice)));
       }
@@ -2340,7 +2340,7 @@ function importDialog(onDone) {
         !there.encrypted && there.secrets && h('div', { class: 'note warn' }, 'This file holds passwords in plain text. Whoever wrote it chose to; delete it once it is taken in.'),
         h('div', {}, rows),
         there.left_out.length > 0 && h('div', { class: 'note warn' },
-          `${there.left_out.length} ${there.left_out.length === 1 ? 'entry was' : 'entries were'} left out: `, there.left_out.slice(0, 5).join('; '), there.left_out.length > 5 ? '…' : ''),
+          `${there.left_out.length} ${there.left_out.length === 1 ? 'entry was' : 'entries were'} left out: `, there.left_out.slice(0, 5).join('; '), there.left_out.length > 5 ? '...' : ''),
         !rows.length && h('p', {}, 'There is nothing in this file to take in.'),
       ].filter(Boolean));
       read.hidden = true;
@@ -2376,9 +2376,9 @@ function importDialog(onDone) {
 }
 
 async function filesTab(refresh, does) {
-  const toFile = h('button', { type: 'button' }, icon('download'), 'Export…');
+  const toFile = h('button', { type: 'button' }, icon('download'), 'Export...');
   toFile.addEventListener('click', exportDialog);
-  const fromFile = h('button', { type: 'button', class: 'primary' }, icon('upload'), 'Import…');
+  const fromFile = h('button', { type: 'button', class: 'primary' }, icon('upload'), 'Import...');
   fromFile.addEventListener('click', () => importDialog(() => { refresh(); reloadWall(); }));
   does.append(toFile, fromFile);
   return [
@@ -2535,7 +2535,7 @@ async function alertsTab(refresh, does) {
         h('button', { type: 'button', onclick: pause(60) }, 'For an hour'),
         h('button', { type: 'button', onclick: pause(240) }, 'For four hours'))),
     h('p', { class: 'footnote' },
-      'A single machine that is not to be heard about at all: Settings → KVMs → Edit. ',
+      'A single machine that is not to be heard about at all: Settings > KVMs > Edit. ',
       'Without an address, changes are still written to the activity log. While alerts are on, qKVM keeps watching after ',
       'everyone has signed out, which means the saved KVM passwords stay unlocked in its memory until it is restarted. ',
       'After a restart, watching begins when someone signs in. A JetKVM that is not on screen is only checked for answering, ',
@@ -2567,7 +2567,7 @@ async function aboutTab() {
       h('div', { class: 'brand' }, h('img', { src: 'static/favicon.svg', alt: '' }),
         h('span', { class: 'wordmark' }, h('b', {}, 'q'), 'KVM'),
         h('span', { class: 'muted' }, `Version ${running.version || version}`)),
-      h('p', {}, 'A self-hosted screen wall and command center for IP KVMs and servers. Nothing goes through anyone’s cloud: ',
+      h('p', {}, "A self-hosted screen wall and command center for IP KVMs and servers. Nothing goes through anyone's cloud: ",
         'qKVM talks to each KVM directly, over your network or VPN.')),
     block('Where to find it',
       place(SITE, 'Website'),
@@ -2681,7 +2681,7 @@ function settingsDialog(first) {
       const does = h('div', { class: 'section-does' });
       const head = h('header', { class: 'section-head' },
         h('div', { class: 'section-what' }, h('strong', {}, label), h('span', { class: 'muted' }, about)), does);
-      pane.replaceChildren(head, h('p', { class: 'loading' }, h('span', { class: 'spinner' }), 'Loading…'));
+      pane.replaceChildren(head, h('p', { class: 'loading' }, h('span', { class: 'spinner' }), 'Loading...'));
       pane.scrollTop = 0;
       let content;
       try {
@@ -2925,7 +2925,7 @@ async function actionsTab(refresh, does) {
   does.append(h('button', { type: 'button', class: 'primary', onclick: () => editActionDialog(null, refresh) }, icon('plus'), 'New action'));
   const remove = async action => {
     const sure = await confirmBox({
-      title: `Remove “${action.name}”?`,
+      title: `Remove "${action.name}"?`,
       message: 'It disappears from the action menu of every KVM.',
       action: 'Remove',
     });
@@ -2958,7 +2958,7 @@ async function actionsTab(refresh, does) {
 
 // Create (action = null) or change one of the user's own actions.
 function editActionDialog(action, onDone) {
-  openDialog(action ? `Edit “${action.name}”` : 'New action', (body, close) => {
+  openDialog(action ? `Edit "${action.name}"` : 'New action', (body, close) => {
     const name = h('input', { type: 'text', value: action?.name || '', maxLength: 60, required: true, placeholder: 'Restart print spooler' });
     const kinds = ['keys', 'text'].map(kind => h('input', { type: 'radio', name: 'kind', value: kind, checked: (action?.kind || 'keys') === kind }));
     const picker = keyPicker(action?.kind === 'keys' ? action.keys : '');
@@ -2972,7 +2972,7 @@ function editActionDialog(action, onDone) {
     const keysPane = h('div', {}, h('p', { class: 'muted' }, 'Pressed together on the connected computer, then released.'), picker.el);
     const textPane = h('div', {},
       field('Text to type', text,
-        'Typed as if on the computer’s keyboard (US layout). Stored encrypted; it is never shown again or written to the activity log.'),
+        "Typed as if on the computer's keyboard (US layout). Stored encrypted; it is never shown again or written to the activity log."),
       check(enter, 'Press Enter afterwards'));
     const error = h('p', { class: 'error', hidden: true });
     const save = h('button', { type: 'submit', class: 'primary' }, 'Save');
@@ -3166,7 +3166,7 @@ async function updatesTab(refresh, does) {
   if (!status.repo) {
     notice = h('div', { class: 'note warn' },
       'Updates are not set up. This copy does not know which GitHub repository its releases are published in; ',
-      'see “Publishing releases” in the README.');
+      'see "Publishing releases" in the README.');
   } else if (status.installed && !status.supervised) {
     notice = h('div', { class: 'note' }, `Version ${status.installed} is installed. Restart qKVM to start using it.`);
   } else if (status.available) {
@@ -3296,17 +3296,17 @@ async function securityTab(refresh) {
         does(session.recovery ? 'Create a new recovery key' : 'Create a recovery key', () => newRecoveryKey(refresh)))),
     block('Two-factor sign-in', me?.totp
       ? [
-        setting('Second step', 'On: signing in asks for a code from your authenticator app.', does('Switch off…', () => twoFactorOff(refresh), true)),
+        setting('Second step', 'On: signing in asks for a code from your authenticator app.', does('Switch off...', () => twoFactorOff(refresh), true)),
         setting('One-time codes', `${me.recovery_codes} left. For signing in when the phone is not at hand; each works once.`,
-          does('Make ten new ones…', () => newOneTimeCodes(refresh))),
+          does('Make ten new ones...', () => newOneTimeCodes(refresh))),
       ]
       : setting('Second step', 'Off. With it, signing in also asks for a 6-digit code from an authenticator app on your phone.',
         does('Add a second step', () => twoFactorSetup(refresh)))),
     block('Password',
       setting('Password', 'Asked for with the one it replaces. Changing it signs your other browsers out.',
-        does('Change password…', changePasswordDialog))),
+        does('Change password...', changePasswordDialog))),
     h('p', { class: 'footnote' },
-      'KVM passwords are stored encrypted, and each account’s password can unlock them for the running program. ',
+      "KVM passwords are stored encrypted, and each account's password can unlock them for the running program. ",
       unattended
         ? 'This qKVM opens them itself after a restart and carries on watching: the key for that is kept in its data folder, or where --unlock-file says. Whoever has that key and the data folder has the KVM passwords. Started with --locked-start, it keeps no such key.'
         : 'After a restart this qKVM cannot reach the KVMs until someone signs in: it was started with --locked-start, or nobody has signed in yet since it was told otherwise.'),
@@ -3325,7 +3325,7 @@ function eventLabel(entry) {
 async function activityTab(refresh, does) {
   const detail = entry => [
     entry.device, entry.account, ROLE_NAMES[entry.role], entry.name || ACTION_NAMES[entry.action] || entry.action,
-    entry.event === 'alert' && `${LABELS[entry.was] || entry.was} → ${LABELS[entry.state] || entry.state}`,
+    entry.event === 'alert' && `${LABELS[entry.was] || entry.was} to ${LABELS[entry.state] || entry.state}`,
     entry.held && 'not sent: alerts were paused', entry.minutes && `${entry.minutes} minutes`,
     entry.recovery_code && `with a one-time code (${entry.codes_left} left)`,
     entry.event === 'login_failed' && entry.suspended && 'the account is suspended',
@@ -3351,7 +3351,7 @@ async function activityTab(refresh, does) {
     h('td', { class: 'wrap' }, detail(entry)),
     h('td', {}, entry.ip));
   const find = h('input', {
-    type: 'search', placeholder: 'A name, a machine, an address…', 'aria-label': 'Find in the activity log', spellcheck: false, autocomplete: 'off',
+    type: 'search', placeholder: 'A name, a machine, an address...', 'aria-label': 'Find in the activity log', spellcheck: false, autocomplete: 'off',
   });
   const kind = h('select', { 'aria-label': 'What kind' }, [
     ['', 'Everything'], ['signin', 'Signing in'], ['action', 'Actions on machines'], ['change', 'Changes'], ['alert', 'Alerts'],
@@ -3438,7 +3438,7 @@ async function activityTab(refresh, does) {
 // --- the wall --------------------------------------------------------------------------------------
 
 const LABELS = {
-  connecting: 'Connecting…', online: 'Online', no_signal: 'No signal',
+  connecting: 'Connecting...', online: 'Online', no_signal: 'No signal',
   offline: 'Offline', auth: 'Login failed', error: 'Problem', busy: 'In use elsewhere',
 };
 // A server that is switched off is not a computer without a picture: it is called what it is.
@@ -3660,7 +3660,7 @@ function newView() {
 }
 
 // How long a picture stays up while its KVM says "ask again": a KVM that is slow with its pictures
-// keeps showing the last one, rather than "Connecting…" between every two of them.
+// keeps showing the last one, rather than "Connecting..." between every two of them.
 const PICTURE_KEPT = 8000;  // ms
 
 function applyResult(view, result) {
@@ -3768,7 +3768,7 @@ function fillPanel(panel, status, full = false) {
       server.temperatures.map(sensor => h('div', { dataset: sensor.ok ? {} : { tone: 'warn' } },
         h('span', {}, sensor.name), h('b', {}, `${Math.round(sensor.celsius)} °C`))),
       server.fans.map(fan => h('div', { dataset: fan.ok ? {} : { tone: 'warn' } },
-        h('span', {}, fan.name), h('b', {}, fan.reading == null ? '–' : `${Math.round(fan.reading)} ${fan.unit}`)))),
+        h('span', {}, fan.name), h('b', {}, fan.reading == null ? '-' : `${Math.round(fan.reading)} ${fan.unit}`)))),
   ].filter(Boolean));
   return true;
 }
@@ -3916,8 +3916,8 @@ function veilContent(device, status, view, state, message) {
   // The button stays while what it says stays, which can be longer than the details it was made with: the
   // device is looked up when the button is pressed, so that an edit starts from what is saved now.
   const now = () => tiles.get(device.id)?.device || device;
-  if (message === 'Rebooting…') {
-    Object.assign(content, { title: 'Rebooting…', text: device.picture === false ? 'Back in a minute or two.' : 'Back in about a minute.' });
+  if (message === 'Rebooting...') {
+    Object.assign(content, { title: 'Rebooting...', text: device.picture === false ? 'Back in a minute or two.' : 'Back in about a minute.' });
   } else if (state === 'no_signal') {
     content.text = 'The computer is off, asleep or not plugged into the KVM.';
   } else if (state === 'offline' && status?.last_seen_ago != null) {
@@ -4041,7 +4041,7 @@ function render(tile) {
     } else if (state !== 'online') {
       tile.wentDown = true;
       state = 'connecting';
-      message = 'Rebooting…';
+      message = 'Rebooting...';
     } else if (tile.wentDown) {
       tile.rebootUntil = 0;
     }
@@ -4634,7 +4634,7 @@ async function pollStatus(run) {
         if (run !== wallRun) return;
         wallDown = true;
       }
-      setBanner(wallDown ? 'Lost contact with qKVM. Trying again…' : null);
+      setBanner(wallDown ? 'Lost contact with qKVM. Trying again...' : null);
       renderFocus();
     }
     await sleep(4000);
@@ -4694,7 +4694,7 @@ async function startWall() {
   if (can('admin') && !hasRecovery && prefs.get('recovery-hint', '') !== 'shown') {
     // Said once per browser: a copy set up before recovery keys existed has none.
     prefs.set('recovery-hint', 'shown');
-    toast('There is no recovery key yet. Create one under Settings → Security, so a forgotten password can be replaced.', 'info');
+    toast('There is no recovery key yet. Create one under Settings > Security, so a forgotten password can be replaced.', 'info');
   }
   pollStatus(run);
 }
@@ -4742,7 +4742,7 @@ function sessionExpired() {
   reloadIfOutdated();  // sessions end when the program restarts, which is also when it may have become a newer one
 }
 
-// A display link (…#display&key=…) opened in this browser: the key is kept here and taken out of the address,
+// A display link (...#display&key=...) opened in this browser: the key is kept here and taken out of the address,
 // where it would be on show for whoever walks past the screen.
 function takeDisplayKey() {
   const given = /[#&]key=(qkvm_[A-Za-z0-9_-]{20,80})/.exec(location.hash);
