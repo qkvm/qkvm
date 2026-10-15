@@ -19,7 +19,7 @@ import time
 from collections.abc import Callable
 from typing import Any
 
-from tests import local_socket
+from tests import ServerThread, local_socket
 
 Answer = Any
 
@@ -38,11 +38,11 @@ class Scripted:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._stop: asyncio.Event | None = None
         self._ready = threading.Event()
-        self._thread = threading.Thread(target=lambda: asyncio.run(self._serve()), daemon=True)
+        self._serving = ServerThread("scripted device", lambda: asyncio.run(self._serve()), self._ready.is_set)
+        self._thread = self._serving.thread
 
     def start(self) -> Scripted:
-        self._thread.start()
-        assert self._ready.wait(10)
+        self._serving.start()
         return self
 
     def stop(self) -> None:

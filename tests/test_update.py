@@ -412,7 +412,7 @@ def test_having_nowhere_to_print_to_does_not_stop_it(monkeypatch: pytest.MonkeyP
 
     monkeypatch.setattr(cli.sys, "stdout", Broken())
     monkeypatch.setattr(cli.sys, "stderr", Broken())
-    cli.say("QKVM 0.1.0 - 3 devices")
+    cli.say("qKVM 0.1.0 - 3 devices")
     cli.say("qkvm: something to complain about", error=True)
 
     # And the starter, itself without a window, gives the wall a real "nowhere" to write to: what it would
@@ -441,7 +441,7 @@ def broken_inside(wheel: bytes) -> bytes:
 
 def test_a_package_that_is_broken_inside_is_a_failed_update_like_any_other(github: FakeGitHub, tmp_path: Path) -> None:
     # It passed its checksum (whoever made the list made it of this file) and cannot be unpacked: that came out
-    # as an error nobody had named, the page was answered "something went wrong inside QKVM", and the
+    # as an error nobody had named, the page was answered "something went wrong inside qKVM", and the
     # update stayed "installing".
     github.publish("9.9.9", broken_inside(make_wheel("9.9.9")))
     update = updater(github, tmp_path)

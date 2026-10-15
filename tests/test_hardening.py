@@ -340,7 +340,7 @@ def test_the_tailscale_tool_is_never_taken_from_the_current_folder(tmp_path: Pat
 
 def test_a_proxy_that_was_named_is_believed_about_who_is_calling_and_no_other(tmp_path: Path) -> None:
     # Behind a reverse proxy on another address every visitor arrives from the proxy's address. Unless
-    # QKVM is told that it is one, five wrong passwords by anybody lock everybody out, and the cookie
+    # qKVM is told that it is one, five wrong passwords by anybody lock everybody out, and the cookie
     # goes out as if the visitor had come without HTTPS.
     from tests.test_wall import PASSWORD, wall
 
@@ -351,7 +351,7 @@ def test_a_proxy_that_was_named_is_believed_about_who_is_calling_and_no_other(tm
         pass  # set up, from this computer
     with wall(tmp_path, sign_in=False, address="172.18.0.2") as client:  # not named: what it says about its visitors is not believed
         assert [sign_in(client, "wrong", "198.51.100.7").status_code for _ in range(5)] == [401] * 5
-        assert sign_in(client, PASSWORD, "203.0.113.9").status_code == 429  # one address, as far as QKVM can tell
+        assert sign_in(client, PASSWORD, "203.0.113.9").status_code == 429  # one address, as far as qKVM can tell
 
     core_options = {"trusted_proxies": ("172.18.0.0/16",)}
     with wall(tmp_path, sign_in=False, address="172.18.0.2", **core_options) as client:
@@ -408,7 +408,7 @@ def test_the_addresses_of_one_ipv6_network_count_as_one(tmp_path: Path) -> None:
 
 def test_the_web_server_does_not_read_the_forwarding_headers_by_itself(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     # It would, for a proxy on this computer and for whatever FORWARDED_ALLOW_IPS says in its environment:
-    # a second opinion on who is calling, that nothing in QKVM's settings or documentation knows of.
+    # a second opinion on who is calling, that nothing in qKVM's settings or documentation knows of.
     from qkvm import cli
 
     assert cli.SERVER_OPTIONS["proxy_headers"] is False
@@ -419,7 +419,7 @@ def test_the_web_server_does_not_read_the_forwarding_headers_by_itself(tmp_path:
     assert "no account called nobody" in capsys.readouterr().err
 
 
-# --- what a device cannot make QKVM do -----------------------------------------------------------------
+# --- what a device cannot make qKVM do -----------------------------------------------------------------
 
 
 class Elsewhere:
@@ -458,8 +458,8 @@ class Elsewhere:
 
 def test_a_device_cannot_send_qkvm_on_to_another_address(fake: FakeKvm) -> None:
     # The connection that keeps a KVM's video awake is a websocket, and the library that makes it follows a
-    # redirect, to any host, taking the KVM's session cookie along. A device does not get to point QKVM,
-    # from where QKVM sits in the network, at something else.
+    # redirect, to any host, taking the KVM's session cookie along. A device does not get to point qKVM,
+    # from where qKVM sits in the network, at something else.
     elsewhere = Elsewhere()
     fake.state.ws_moved = f"ws://127.0.0.1:{elsewhere.port}/any/path"
 
@@ -479,7 +479,7 @@ def test_a_device_cannot_send_qkvm_on_to_another_address(fake: FakeKvm) -> None:
 def test_devices_are_talked_to_directly_whatever_proxy_this_computer_is_set_to_use(
     tmp_path: Path, fake: FakeKvm, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # A KVM is on the local network. Where the computer QKVM runs on is told to use a proxy for the web (in
+    # A KVM is on the local network. Where the computer qKVM runs on is told to use a proxy for the web (in
     # a company, as a rule; Docker hands such settings on to its containers), the KVM's password must not
     # be sent there, and the KVM must not be "unreachable" because the proxy cannot see it.
     from tests.test_wall import add, snap, wall
@@ -521,7 +521,7 @@ class Talkative:
 def test_a_jetkvm_that_never_stops_talking_does_not_fill_the_memory(monkeypatch: pytest.MonkeyPatch) -> None:
     # After the request for video a JetKVM sends its answer and then the addresses it can be reached at, one
     # message each. Every one was kept, for as long as they kept coming: whoever answers for a JetKVM (it
-    # serves plain HTTP by default) could send them until the computer QKVM runs on had no memory left.
+    # serves plain HTTP by default) could send them until the computer qKVM runs on had no memory left.
     import base64
     import json
 
@@ -608,7 +608,7 @@ def test_a_picture_that_says_it_is_enormous_is_not_handed_to_a_browser(tmp_path:
 def test_a_connection_that_asks_for_nothing_is_not_kept_for_ever(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     # Nobody has to sign in to open a connection. One that then sends nothing, or the first half of a request
     # and no more, was kept for as long as its maker liked: enough of them, and there is no connection left
-    # for a browser, or for QKVM to reach a device with. The web server only kept time between two requests.
+    # for a browser, or for qKVM to reach a device with. The web server only kept time between two requests.
     from qkvm import cli
 
     monkeypatch.setattr(cli, "HEADERS_WITHIN", 0.6)
@@ -619,14 +619,14 @@ def test_a_connection_that_asks_for_nothing_is_not_kept_for_ever(tmp_path: Path,
         assert browser.get("/healthz").status_code == 200
         for stalled in (silent, halfway):
             stalled.settimeout(5)
-            assert stalled.recv(100) == b""  # closed, by QKVM
+            assert stalled.recv(100) == b""  # closed, by qKVM
             stalled.close()
         # Whoever asks properly is served as before, a second time on the connection they have, and after a
         # pause longer than the clock for asking.
         assert browser.get("/healthz").status_code == 200
         time.sleep(1.0)
         assert browser.get("/healthz").json()["status"] == "ok"
-        # There is nothing in QKVM that is talked to over a websocket, and so no way in for one.
+        # There is nothing in qKVM that is talked to over a websocket, and so no way in for one.
         upgrade = {"Connection": "Upgrade", "Upgrade": "websocket", "Sec-WebSocket-Version": "13", "Sec-WebSocket-Key": "dGhlIHNhbXBsZSBub25jZQ=="}
         assert browser.get("/api/ws", headers=upgrade).status_code in (401, 404)
 
@@ -720,10 +720,10 @@ def test_https_from_the_first_request_with_a_certificate_of_ones_own(tmp_path: P
 
 
 def test_the_health_check_says_when_nothing_is_being_watched(tmp_path: Path) -> None:
-    # After a restart QKVM cannot reach a single device until somebody signs in: that is what keeps the saved
+    # After a restart qKVM cannot reach a single device until somebody signs in: that is what keeps the saved
     # passwords from whoever takes the disk. It is also the moment (the power was out) when being told matters
     # most, and until now nothing said so: a monitor asking /healthz heard "ok".
-    # (Started to keep no key of its own, which is where a restart leaves it locked. As it comes QKVM
+    # (Started to keep no key of its own, which is where a restart leaves it locked. As it comes qKVM
     # keeps one and carries on by itself; this test ran that way, and passed only where the first wall was
     # closed before its key had been made to fit, which is a matter of a moment. A reviewer saw it fail.)
     from tests.test_wall import PASSWORD, wait_until, wall
@@ -738,7 +738,7 @@ def test_the_health_check_says_when_nothing_is_being_watched(tmp_path: Path) -> 
         assert client.get("/healthz").json()["locked"] is False
     # As it comes: once its own key fits, a restart leaves nothing locked, and the health check says that too.
     with wall(tmp_path / "as it comes") as client:
-        wait_until(lambda: client.core.store.unlock is not None, "QKVM's own key was never made to fit")  # type: ignore[attr-defined]
+        wait_until(lambda: client.core.store.unlock is not None, "qKVM's own key was never made to fit")  # type: ignore[attr-defined]
     with wall(tmp_path / "as it comes", sign_in=False) as client:
         assert client.get("/healthz").json()["locked"] is False
 
@@ -774,7 +774,7 @@ def test_a_key_that_cannot_be_read_is_said_at_start_in_a_sentence(tmp_path: Path
 
 
 def test_settings_that_could_not_be_listened_on_take_back_only_where_it_listens() -> None:
-    # A port that turns out to be taken: QKVM goes back to where it listened before. It used to go back to
+    # A port that turns out to be taken: qKVM goes back to where it listened before. It used to go back to
     # everything that was set at that time, a metrics token that had since been withdrawn included.
     from qkvm import cli
     from qkvm.store import ServerSettings
@@ -795,6 +795,35 @@ def test_ten_thousand_wrong_guesses_do_not_break_the_count() -> None:
     for _ in range(1100):  # the lock doubles each time; left to itself, the sum stopped being a number at the 1029th
         limiter.fail("192.0.2.1", "admin")
     assert 0 < limiter.retry_after("192.0.2.1") <= Limiter.LONGEST
+
+
+def test_the_wait_said_is_never_longer_than_the_lock_whatever_the_clock_reads(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The lock's end is "now plus the lock", and the wait said is "that minus now". Where the clock stands
+    # still between the two, as it does for sixteen thousandths of a second at a time on Windows before Python
+    # 3.13, that is the same now, and for one value of it in five floating point makes (now + 900.0) - now a
+    # hair more than 900.0: the wait said was 900.0000000000005 s, "try again in 901 s", and the test above
+    # failed by what the clock happened to read. The same for the first lock of thirty seconds
+    # (30.000000000000455: "try again in 31 s") and every length between. The clock here reads a value that
+    # does both, and stands still.
+    from qkvm import security
+    from qkvm.security import Limiter
+
+    standing_still = 4066.002
+    for lock in (Limiter.BASE, Limiter.LONGEST):
+        assert (standing_still + lock) - standing_still > lock  # a value that does what it is here for
+
+    class Clock:
+        monotonic = staticmethod(lambda: standing_still)
+        time = staticmethod(time.time)
+
+    monkeypatch.setattr(security, "time", Clock)
+    limiter = Limiter()
+    for _ in range(Limiter.FREE):
+        limiter.fail("192.0.2.1", "admin")
+    assert limiter.retry_after("192.0.2.1") == Limiter.BASE
+    for _ in range(1100):
+        limiter.fail("192.0.2.1", "admin")
+    assert limiter.retry_after("192.0.2.1") == Limiter.LONGEST
 
 
 def test_a_picture_is_judged_by_its_beginning_and_quickly(fake: FakeKvm) -> None:

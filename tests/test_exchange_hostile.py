@@ -115,7 +115,7 @@ def test_half_a_character_in_a_saved_action_or_a_password(tmp_path: Path) -> Non
         named = taken(admin, plain(actions=[{"name": "lock\ud800", "kind": "keys", "keys": "KeyA"}]), ("actions",))
         listed = operator.get("/api/v1/actions")
         print(f"\npassword: {with_password.status_code} {with_password.text[:70]} | text: {with_text.status_code} | action name: {named.status_code}, GET /api/v1/actions (operator): {listed.status_code}")
-        assert with_password.status_code != 500 and with_text.status_code != 500, "a file is answered with 'something went wrong inside QKVM'"
+        assert with_password.status_code != 500 and with_text.status_code != 500, "a file is answered with 'something went wrong inside qKVM'"
         assert listed.status_code == 200, "nobody can open the list of saved actions any more"
 
 

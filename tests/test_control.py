@@ -92,7 +92,7 @@ def test_status_says_whether_it_runs_and_where(tmp_path: Path, capsys: pytest.Ca
     try:
         assert cli.main(["status", "--data-dir", str(tmp_path)]) == 0
         said = capsys.readouterr().out
-        assert "QKVM 0.1.0 is running" in said and f"process {os.getpid()}" in said and "http://127.0.0.1:8787/" in said
+        assert "qKVM 0.1.0 is running" in said and f"process {os.getpid()}" in said and "http://127.0.0.1:8787/" in said
     finally:
         wall.end()
     assert cli.main(["status", "--data-dir", str(tmp_path)]) == 3  # and it leaves nothing behind that says it still runs
@@ -322,7 +322,7 @@ def test_it_stops_before_it_says_so(tmp_path: Path, monkeypatch: pytest.MonkeyPa
 
 def test_stop_is_not_taken_for_done_in_the_moment_between_two_runs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
     # A wall that is being started again (an update, a restart asked for a moment ago) holds no lock for a
-    # moment, and the copy that comes up throws away what was asked of the one before. "QKVM stopped", said in
+    # moment, and the copy that comes up throws away what was asked of the one before. "qKVM stopped", said in
     # that moment, was said of a wall that then went on running.
     monkeypatch.setattr(cli, "GONE_FOR", 1.0)
     lock = InstanceLock(tmp_path)
@@ -392,7 +392,7 @@ def served_and_left(self: uvicorn.Server, sockets: Any = None) -> None:
 
 
 def test_a_wall_started_with_a_folder_elsewhere_is_found_without_saying_where(tmp_path: Path, home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
-    # `qkvm stop`, typed twice by somebody whose wall keeps its settings in a folder of their choosing: "QKVM is
+    # `qkvm stop`, typed twice by somebody whose wall keeps its settings in a folder of their choosing: "qKVM is
     # not running" in the folder at home, which was true and of no use. The place was known the day it started.
     elsewhere = tmp_path / "walls" / "data"
     elsewhere.mkdir(parents=True)

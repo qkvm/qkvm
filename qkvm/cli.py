@@ -94,7 +94,7 @@ class Http(H11Protocol):
     one (the web server keeps time only between two requests). And one that asks for something large and
     then takes nothing of the answer is kept for as long as it likes: an answer is not given up on, and a
     connection is not closed, while there is something left to send. Anybody who can reach the port could
-    hold as many as the system gives out, and leave none for a browser, or for QKVM to reach a device with.
+    hold as many as the system gives out, and leave none for a browser, or for qKVM to reach a device with.
     """
 
     _asking: asyncio.TimerHandle | None = None  # runs while a request is awaited or arriving
@@ -175,7 +175,7 @@ class Http(H11Protocol):
 # How the web server is run, whatever it listens on.
 SERVER_OPTIONS: dict[str, Any] = {
     "http": Http,
-    "ws": "none",  # nothing in QKVM is talked to over a websocket: there is no way in for one
+    "ws": "none",  # nothing in qKVM is talked to over a websocket: there is no way in for one
     "log_config": None,  # keep the handlers set up in setup_logging
     "log_level": "warning",
     "access_log": False,  # tiles poll for a frame every second; an access log would be nothing but noise
@@ -204,19 +204,19 @@ def tls_pair(cert: str | None, key: str | None) -> tuple[Path, Path] | None:
     try:
         if "ENCRYPTED" in Path(key).read_text(encoding="ascii", errors="replace"):
             # The library would stop and ask for it on the terminal, at every start, where a service has nobody.
-            raise ValueError(f"{key} is protected by a passphrase, and there is nobody to type it when QKVM starts: use a key without one")
+            raise ValueError(f"{key} is protected by a passphrase, and there is nobody to type it when qKVM starts: use a key without one")
         ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER).load_cert_chain(cert, key, password=lambda: "")
     except ssl.SSLError as ex:
         raise ValueError(f"{cert} and {key} do not belong together, or are not a certificate and its key ({ex.reason or ex})") from None
     except OSError as ex:  # the key is another user's, more often than not
-        raise ValueError(f"{ex.filename or key} cannot be read by the user QKVM runs as ({ex.strerror or ex})") from None
+        raise ValueError(f"{ex.filename or key} cannot be read by the user qKVM runs as ({ex.strerror or ex})") from None
     return Path(cert), Path(key)
 
 
 def networks_said(option: str, value: str | None) -> list[str]:
     """The addresses given with --allow-from or --trusted-proxy. ValueError when the option is there and they are not.
 
-    `--allow-from "$OFFICE"` with nothing in OFFICE would otherwise start a QKVM that answers everybody,
+    `--allow-from "$OFFICE"` with nothing in OFFICE would otherwise start a qKVM that answers everybody,
     by the very option that was to prevent it.
     """
     if value is None:
@@ -228,7 +228,7 @@ def networks_said(option: str, value: str | None) -> list[str]:
 
 
 def listening_as(settings: ServerSettings) -> tuple[list[str], int, bool]:
-    """Where and how QKVM listens, of everything that is set: what has to be taken back if the next try fails."""
+    """Where and how qKVM listens, of everything that is set: what has to be taken back if the next try fails."""
     return list(settings.bind), settings.port, settings.https
 
 
@@ -246,7 +246,7 @@ def _in_full(folder: Path) -> Path:
 
 
 def say(text: str = "", error: bool = False) -> None:
-    """A line for whoever started QKVM, if there is anybody to read it."""
+    """A line for whoever started qKVM, if there is anybody to read it."""
     try:
         # flush: when output goes to a log file, the addresses should show up right away
         print(text, file=sys.stderr if error else sys.stdout, flush=True)
@@ -260,7 +260,7 @@ _listener: logging.handlers.QueueListener | None = None  # the thread that write
 _others: logging.Handler | None = None  # what takes the lines that are not this program's own (see setup_logging)
 OURS = ("qkvm", "uvicorn")  # whose lines are this program's own to say
 
-# For a line in the log that whoever started QKVM is told in words of their own (see `say`): it is kept
+# For a line in the log that whoever started qKVM is told in words of their own (see `say`): it is kept
 # out of the terminal, where the same thing twice, the second time in the middle of the first, helps nobody.
 SAID = {"said": True}
 
@@ -434,7 +434,7 @@ def serve(core: Core, running: InstanceLock | None = None) -> int:
             try:
                 core.store.save()
             except OSError as failed:  # it listens where it did; that this is not written down is said, and nothing more
-                log.error("going back to where QKVM listened before could not be saved: %s", failed)
+                log.error("going back to where qKVM listened before could not be saved: %s", failed)
             working = None
             continue
         working = listening_as(core.store.server)
@@ -453,7 +453,7 @@ def serve(core: Core, running: InstanceLock | None = None) -> int:
                     # work, for which the starter would take an installed update back.
                     where = f": {ex.filename}" if isinstance(ex, OSError) and ex.filename else ""
                     why = ex.strerror if isinstance(ex, OSError) and ex.strerror else ex
-                    say(f"qkvm: the certificate for HTTPS could not be made or read ({why}{where}); QKVM was not started", error=True)
+                    say(f"qkvm: the certificate for HTTPS could not be made or read ({why}{where}); qKVM was not started", error=True)
                     return 2
                 # The listeners are being opened again while it runs (an address of the computer changed):
                 # with the certificate it had, which may not name the new address, rather than not at all.
@@ -465,7 +465,7 @@ def serve(core: Core, running: InstanceLock | None = None) -> int:
             running.say(listening=core.listening)  # for `qkvm status`
 
         count = len(core.store.devices)
-        say(f"QKVM {__version__} - {count} device{'' if count == 1 else 's'}")
+        say(f"qKVM {__version__} - {count} device{'' if count == 1 else 's'}")
         for url in core.listening:
             say(f"  {url}")
         say(f"  settings in {_in_full(core.data_dir)}")  # the first thing asked when something is not where it was expected
@@ -487,7 +487,7 @@ def serve(core: Core, running: InstanceLock | None = None) -> int:
                 log.info("first run - setup code for setting up from another machine: %s", core.setup_code)
             elif any(urlsplit(url).hostname not in ("127.0.0.1", "localhost", "::1") for url in core.listening):
                 # Easy by default, and said as it is: until then the wall is whoever's comes first.
-                say("  Whoever opens it first chooses that password, so do it now. (Started with --setup-code, QKVM asks for a code printed here first.)")
+                say("  Whoever opens it first chooses that password, so do it now. (Started with --setup-code, qKVM asks for a code printed here first.)")
 
         config = uvicorn.Config(create_app(core), ssl_certfile=certfile, ssl_keyfile=keyfile, **SERVER_OPTIONS)
         server = uvicorn.Server(config)
@@ -520,7 +520,7 @@ def serve(core: Core, running: InstanceLock | None = None) -> int:
         if not core.restart_requested:
             log.info("stopped")
             return 0
-        say("QKVM - restarting listeners")
+        say("qKVM - restarting listeners")
 
 
 # `start` is what it does without a word: run here, in this window, until it is stopped. The others are
@@ -575,11 +575,11 @@ class Asks:
         threading.Thread(target=watch, name="asks", daemon=True).start()
 
 
-KNOWN = "elsewhere.json"  # in the folder QKVM keeps at home: the other folders walls were started with
+KNOWN = "elsewhere.json"  # in the folder qKVM keeps at home: the other folders walls were started with
 
 
 def home_folder() -> Path | None:
-    """The folder QKVM keeps at home, without a word where there is no home (a service, a container)."""
+    """The folder qKVM keeps at home, without a word where there is no home (a service, a container)."""
     try:
         Path.home()
     except RuntimeError:
@@ -690,7 +690,7 @@ def by_hand(holder: dict[str, Any] | None) -> str:
 def describe(where: Path, holder: dict[str, Any] | None) -> None:
     """What `qkvm status` says of one running copy."""
     version = holder.get("version") if holder else None
-    say(f"QKVM{f' {version}' if isinstance(version, str) else ''} is running with {where}{who(holder)}")
+    say(f"qKVM{f' {version}' if isinstance(version, str) else ''} is running with {where}{who(holder)}")
     for url in (holder.get("listening") if holder else None) or []:
         say(f"  {url}")
 
@@ -713,7 +713,7 @@ def ask(command: str, data_dir: Path, folder_said: bool) -> int:
                 describe(folder, held.holder())
             return 0
         if len(elsewhere) > 1:
-            say(f"qkvm: more than one QKVM is running. Say which one to {command} with --data-dir:", error=True)
+            say(f"qkvm: more than one qKVM is running. Say which one to {command} with --data-dir:", error=True)
             for folder, held in elsewhere:
                 say(f"      {folder}{who(held.holder())}", error=True)
             return 2
@@ -726,9 +726,9 @@ def ask(command: str, data_dir: Path, folder_said: bool) -> int:
             others = [str(folder) for folder in known_folders()]
             hint = f", nor with {', '.join(others)}" if others else " (settings kept elsewhere? Say where: --data-dir FOLDER)"
         if command == "restart":
-            say(f"qkvm: QKVM is not running with {where}{hint}: there is nothing to restart", error=True)
+            say(f"qkvm: qKVM is not running with {where}{hint}: there is nothing to restart", error=True)
             return 1
-        say(f"QKVM is not running with {where}{hint}")
+        say(f"qKVM is not running with {where}{hint}")
         return 3 if command == "status" else 0  # 3: what a service manager expects of "not running"
     holder = lock.holder()
     if command == "status":
@@ -754,7 +754,7 @@ def ask(command: str, data_dir: Path, folder_said: bool) -> int:
             if not taken:
                 free_since = time.monotonic() if free_since is None else free_since
                 if time.monotonic() - free_since >= GONE_FOR:
-                    say(f"QKVM stopped{who(holder)}{f', which ran with {found}' if found else ''}")
+                    say(f"qKVM stopped{who(holder)}{f', which ran with {found}' if found else ''}")
                     return 0
             elif free_since is not None:
                 # It let go and holds the lock again: it was being started again when it was asked, and the
@@ -768,7 +768,7 @@ def ask(command: str, data_dir: Path, folder_said: bool) -> int:
             # The lock is not tried for here: in the moment between the old one and the new, it would be had.
             now = lock.holder()
             if now and now.get("since") != before and now.get("listening"):
-                say(f"QKVM restarted{who(now)}{f', which runs with {found}' if found else ''}")
+                say(f"qKVM restarted{who(now)}{f', which runs with {found}' if found else ''}")
                 return 0
         if not waiting_said and time.monotonic() - asked > 4:
             # It answers within a second or two. Past that, whoever typed this is told that it is waited for.
@@ -790,7 +790,7 @@ def main(argv: list[str] | None = None) -> int:
         prog="qkvm",
         allow_abbrev=False,  # an option is its whole name: the starter reads --data-dir before this does, and has to read the same
         usage="qkvm [start|stop|restart|status] [options]",
-        description="QKVM: a self-hosted screen wall and command center for IP KVMs and servers. "
+        description="qKVM: a self-hosted screen wall and command center for IP KVMs and servers. "
         "Without a command, or with `start`, it runs here until it is stopped (Ctrl+C). The other commands are "
         "about the copy that runs already with the same data folder, whatever window it was started in: "
         "`status` says whether there is one and where it listens, `stop` ends it, `restart` has it started again.",
@@ -813,7 +813,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--trusted-proxy",
         metavar="ADDRESS",
-        help="a reverse proxy in front of QKVM, as an address or a network (10.0.0.5, 172.18.0.0/16), comma separated: "
+        help="a reverse proxy in front of qKVM, as an address or a network (10.0.0.5, 172.18.0.0/16), comma separated: "
         "it is believed about who is calling (X-Forwarded-For) and whether over HTTPS (X-Forwarded-Proto). "
         "Where none is named, a proxy on this computer is believed; once one is named, only what was named",
     )
@@ -832,7 +832,7 @@ def main(argv: list[str] | None = None) -> int:
         "--sso-header",
         metavar="HEADER",
         help="sign in whoever the reverse proxy named with --trusted-proxy says it has signed in, in this header "
-        "(Remote-User, X-Forwarded-User, X-authentik-username ...), as the QKVM account of that name. Not together with --locked-start",
+        "(Remote-User, X-Forwarded-User, X-authentik-username ...), as the qKVM account of that name. Not together with --locked-start",
     )
     parser.add_argument("--https", action="store_true", help="serve HTTPS from the first request, whatever the settings say (with a certificate made here)")
     parser.add_argument("--tls-cert", metavar="FILE", help="serve HTTPS with this certificate (PEM, with the chain that leads to it) instead of one made here")
@@ -840,7 +840,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--unlock-file",
         metavar="FILE",
-        help="open the saved device passwords at start with the key in this file, so that QKVM watches, alerts and answers "
+        help="open the saved device passwords at start with the key in this file, so that qKVM watches, alerts and answers "
         "a collector after a restart without anybody signing in. The file is kept outside the data folder (it is made if it "
         "is not there): whoever has both has the passwords. Also read from the environment variable QKVM_UNLOCK_FILE",
     )
@@ -874,13 +874,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--setup-code",
         action="store_true",
-        help="ask whoever sets QKVM up from another computer for a code that is printed here at start (where others could reach a new wall before you do)",
+        help="ask whoever sets qKVM up from another computer for a code that is printed here at start (where others could reach a new wall before you do)",
     )
     parser.add_argument("--version", action="version", version=f"qkvm {__version__}")
     args = parser.parse_args(argv)
 
     if os.name == "posix":
-        # What QKVM writes is its owner's alone, also where the folder it writes to was made by somebody
+        # What qKVM writes is its owner's alone, also where the folder it writes to was made by somebody
         # else and is open to more: the settings with the accounts in them, the logs, the activity log.
         os.umask(0o077)
     data_dir = Path(args.data_dir) if args.data_dir else default_data_dir()
@@ -892,9 +892,9 @@ def main(argv: list[str] | None = None) -> int:
         data_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         free = lock.acquire(patience=0.5)
     except OSError as ex:
-        # Usually a folder mounted into a container that belongs to another user than the one QKVM runs as.
+        # Usually a folder mounted into a container that belongs to another user than the one qKVM runs as.
         say(f"qkvm: cannot keep settings in {_in_full(data_dir)}: {ex.strerror or ex}", error=True)
-        say("      The folder has to be writable by the user QKVM runs as (in the container: uid 10001).", error=True)
+        say("      The folder has to be writable by the user qKVM runs as (in the container: uid 10001).", error=True)
         return 2
     if not free:
         say(f"qkvm: another copy is already running with {_in_full(data_dir)}{who(lock.holder())}", error=True)
@@ -908,9 +908,9 @@ def main(argv: list[str] | None = None) -> int:
             if os.name == "posix" and stat.S_IMODE(data_dir.stat().st_mode) & 0o022:
                 # Not refused: it may be meant (a folder shared with a group that looks after the wall). But said.
                 say(f"qkvm: {_in_full(data_dir)} can be written to by other users of this computer.", error=True)
-                say("      Whoever can write there can stop QKVM, and can put there what it runs after an update (chmod go-w makes it yours alone).", error=True)
+                say("      Whoever can write there can stop qKVM, and can put there what it runs after an update (chmod go-w makes it yours alone).", error=True)
             if os.name == "posix" and not os.environ.get("QKVM_CONTAINER"):
-                # What QKVM writes there is its owner's alone from the first byte. A folder that came back from
+                # What qKVM writes there is its owner's alone from the first byte. A folder that came back from
                 # a copy (through a share, out of an archive that kept no modes) is used as it is found.
                 readable = [name for name in (unlock.OWN, "qkvm.json", "qkvm.bak") if _others_read(data_dir / name)]
                 if readable and stat.S_IMODE(data_dir.stat().st_mode) & 0o055:
@@ -935,7 +935,7 @@ def main(argv: list[str] | None = None) -> int:
                 if args.locked_start:
                     raise ValueError(
                         "--sso-header cannot be had with --locked-start: whoever signs in elsewhere brings no password here, "
-                        "and without a key of its own QKVM cannot open the saved device passwords"
+                        "and without a key of its own qKVM cannot open the saved device passwords"
                     )
             if args.locked_start and unlock_file:
                 raise ValueError("--locked-start and --unlock-file say opposite things: one keeps no key that opens the saved passwords, the other says where it is")
@@ -963,7 +963,7 @@ def main(argv: list[str] | None = None) -> int:
             # A disk that is full, a file something else holds: said as what it is, and as "could not start".
             # Left to end in a traceback, it would be taken for a version that does not work, and a version
             # that had just been installed would be taken back for it.
-            say(f"qkvm: the data folder {data_dir} could not be read or written ({ex.strerror or ex}{f': {ex.filename}' if ex.filename else ''}); QKVM was not started", error=True)
+            say(f"qkvm: the data folder {data_dir} could not be read or written ({ex.strerror or ex}{f': {ex.filename}' if ex.filename else ''}); qKVM was not started", error=True)
             return 2
         # Started by `python -m qkvm`, which can start us again; a bare `python -m qkvm.cli` cannot.
         core.supervised = os.environ.get("QKVM_CHILD") == "1"
@@ -998,7 +998,7 @@ def main(argv: list[str] | None = None) -> int:
                 say(f"qkvm: the data folder {data_dir} could not be written ({ex.strerror or ex}); nothing was changed", error=True)
                 return 2
             log.warning("accounts reset from the command line")
-            say("Accounts cleared. Start QKVM and open it to create the first one again, then re-enter the KVM passwords.")
+            say("Accounts cleared. Start qKVM and open it to create the first one again, then re-enter the KVM passwords.")
             if left:
                 names = ", ".join(left)
                 say(f"qkvm: in {data_dir}, {names} could not be removed, and still holds the accounts and the saved passwords: remove it by hand", error=True)
@@ -1008,7 +1008,7 @@ def main(argv: list[str] | None = None) -> int:
         outdated = outdated_libraries()
         if outdated:
             log.warning("libraries with known vulnerabilities: %s", "; ".join(outdated.values()), extra=SAID)
-            # By name: upgrading QKVM itself leaves a library alone that still meets what an older QKVM asked for.
+            # By name: upgrading qKVM itself leaves a library alone that still meets what an older qKVM asked for.
             say(f"qkvm: these libraries have known vulnerabilities - update them with: pip install --upgrade {' '.join(outdated)}", error=True)
             for line in outdated.values():
                 say(f"  {line}", error=True)
@@ -1024,7 +1024,7 @@ def main(argv: list[str] | None = None) -> int:
             told = core.unlock_at_start()
         except OSError as ex:
             # (As above: a disk that takes no writes is "could not start", not a version that does not work.)
-            say(f"qkvm: the data folder {data_dir} could not be written ({ex.strerror or ex}{f': {ex.filename}' if ex.filename else ''}); QKVM was not started", error=True)
+            say(f"qkvm: the data folder {data_dir} could not be written ({ex.strerror or ex}{f': {ex.filename}' if ex.filename else ''}); qKVM was not started", error=True)
             return 2
         if told:
             say(f"qkvm: {told}", error=True)

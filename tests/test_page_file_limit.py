@@ -3,7 +3,7 @@
 A person reads a file back through the page, and the page looks at the file's size before it sends
 anything (static/app.js, `chosen.size`). That number was two million bytes while the server wrote plain
 files of up to exchange.MAX_FILE (4,000,000) characters and sealed ones of up to exchange.MAX_SEALED:
-a wall's own export was "larger than anything QKVM writes" to its own import dialog.
+a wall's own export was "larger than anything qKVM writes" to its own import dialog.
 test_largest_file.py goes through the API, where the page's check is not in the way.
 """
 
@@ -33,7 +33,7 @@ def fast(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def the_most_the_page_takes() -> int:
     """The size above which the import dialog refuses a chosen file without sending it."""
-    found = re.search(r"chosen\.size\s*>\s*([0-9_]+)\)\s*return fail\('The file is larger than anything QKVM writes", PAGE.read_text(encoding="utf-8"))
+    found = re.search(r"chosen\.size\s*>\s*([0-9_]+)\)\s*return fail\('The file is larger than anything qKVM writes", PAGE.read_text(encoding="utf-8"))
     assert found, "the import dialog no longer checks a file's size the way this test reads it: look at it again"
     return int(found.group(1).replace("_", ""))
 
@@ -59,5 +59,5 @@ def test_a_wall_of_a_size_the_program_provides_for_exports_a_file_its_own_page_r
         assert admin.post("/api/v1/import/read", json={"file": sealed.text, "passphrase": PASSPHRASE}).status_code == 200
         assert admin.post("/api/v1/import/read", json={"file": plain.text}).status_code == 200
     print(f">>> 1200 devices with RSA-2048 certificates ({len(pem)} characters each): sealed export {len(sealed.content)} bytes, plain export {len(plain.content)} bytes; the page takes {most}")
-    assert len(sealed.content) <= most, f"the wall's own sealed export ({len(sealed.content)} bytes) is 'larger than anything QKVM writes' to its import dialog ({most})"
-    assert len(plain.content) <= most, f"the wall's own plain export ({len(plain.content)} bytes) is 'larger than anything QKVM writes' to its import dialog ({most})"
+    assert len(sealed.content) <= most, f"the wall's own sealed export ({len(sealed.content)} bytes) is 'larger than anything qKVM writes' to its import dialog ({most})"
+    assert len(plain.content) <= most, f"the wall's own plain export ({len(plain.content)} bytes) is 'larger than anything qKVM writes' to its import dialog ({most})"

@@ -152,16 +152,23 @@ def test_a_device_that_pings_and_takes_no_answer_is_hung_up_on() -> None:
 
 
 @pytest.mark.parametrize("sends", ["pings and reads the answers", "pings and reads nothing", "pongs nobody asked for"])
-def test_a_flood_of_pings_or_pongs_of_no_bytes_ends_the_connection(sends: str) -> None:
+def test_a_flood_of_pings_or_pongs_of_no_bytes_ends_the_connection(sends: str, monkeypatch: pytest.MonkeyPatch) -> None:
     # Two bytes each, a hundred thousand to one read from the network, each worked through and answered by the
     # library on the one thread there is: the wall stood still for as long as a device kept that up, and what
     # was owed to the device never came to the megabyte at which it would have been hung up on.
     sent = 0
 
+    def reads(conn: socket.socket) -> None:
+        try:
+            while conn.recv(65536):
+                pass
+        except OSError:
+            pass  # hung up on, as it is meant to be
+
     def flood(conn: socket.socket) -> None:
         nonlocal sent
         if sends == "pings and reads the answers":
-            threading.Thread(target=lambda: [None for _ in iter(lambda: conn.recv(65536), b"")], daemon=True).start()
+            threading.Thread(target=reads, args=(conn,), daemon=True).start()
         burst = frame(0xA if sends == "pongs nobody asked for" else 0x9) * 8192
         while sent < 64 * 2**20:
             conn.sendall(burst)
@@ -169,23 +176,36 @@ def test_a_flood_of_pings_or_pongs_of_no_bytes_ends_the_connection(sends: str) -
         time.sleep(30)
 
     device = OddDevice(flood)
+    worked_through = 0  # frames the wall took in, counted here (the wall's own count is of the second it is in)
+    real = kvm._ToADevice.process_event
 
-    async def run() -> tuple[float, int]:
+    def counted(self: kvm._ToADevice, event: Any) -> None:
+        nonlocal worked_through
+        if getattr(event, "opcode", None) is not None:
+            worked_through += 1
+        real(self, event)
+
+    monkeypatch.setattr(kvm._ToADevice, "process_event", counted)
+
+    async def run() -> float:
         began = time.monotonic()
         async with kvm.ws_connect(f"ws://127.0.0.1:{device.port}/", close_timeout=1) as ws:
             with pytest.raises(WebSocketException):
                 await kvm.Listening(ws, 2**20).message(8)
-        return time.monotonic() - began, ws._frames  # type: ignore[attr-defined]
+        return time.monotonic() - began
 
     try:
-        took, worked_through = asyncio.run(run())
+        took = asyncio.run(run())
     finally:
         device.stop()
-    # Hung up on at once, and within the first piece or two of what arrived: counted where the wall works
-    # through it. (How much the stand-in had sent by then says nothing of that. It sends into the system's
-    # buffers, and for a moment after the wall has gone: on a machine of somebody else's that was 58 MiB in
-    # seven hundredths of a second, of which the wall had worked through two thousand frames.)
-    assert took < 4 and worked_through <= 2 * kvm.AT_A_TIME, f"{worked_through} frames were worked through in {took:.1f} s, and {sent / 2**20:.0f} MiB sent"
+    # Hung up on at once, and within the first piece or two of what arrived (a piece of AT_A_TIME bytes holds
+    # half as many frames of two; two pieces, because the wall counts pings by the second and the second can
+    # turn within a piece, leaving that piece's count under MOST_PINGS_A_SECOND, and the next piece trips it
+    # whatever its count): counted where the wall works through it. (How much the stand-in had sent
+    # by then says nothing of that. It sends into the system's buffers, and for a moment after the wall has
+    # gone: on a machine of somebody else's that was 58 MiB in seven hundredths of a second, of which the wall
+    # had worked through two thousand frames.)
+    assert took < 4 and worked_through <= 2 * (kvm.AT_A_TIME // 2), f"{worked_through} frames were worked through in {took:.1f} s, and {sent / 2**20:.0f} MiB sent"
 
 
 def test_a_device_that_pings_as_devices_do_is_listened_to() -> None:

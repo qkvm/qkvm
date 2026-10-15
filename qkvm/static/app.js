@@ -159,8 +159,8 @@ async function api(method, path, body, patience = 30000) {
       body: body === undefined ? undefined : JSON.stringify(body),
     });
   } catch (ex) {
-    if (ex.name === 'TimeoutError') throw new ApiError('QKVM took too long to answer', 'timeout', 0);
-    throw new ApiError('QKVM is not responding', 'network', 0);
+    if (ex.name === 'TimeoutError') throw new ApiError('qKVM took too long to answer', 'timeout', 0);
+    throw new ApiError('qKVM is not responding', 'network', 0);
   }
   let data = null;
   try { data = await res.json(); } catch { /* empty or not JSON */ }
@@ -465,7 +465,7 @@ const ROLE_HINTS = {
   viewer: 'Sees the wall. Cannot do anything to a machine.',
 };
 let me = null;        // { id, name, role } of the account signed in here
-let ssoOn = false;    // an identity proxy in front of QKVM signs people in: accounts need no password here
+let ssoOn = false;    // an identity proxy in front of qKVM signs people in: accounts need no password here
 let askName = false;  // there are several accounts, so signing in asks which one
 let hasRecovery = false;  // a recovery key exists, so a forgotten password can be replaced from the sign-in page
 
@@ -486,9 +486,9 @@ function setMe(user) {
 }
 
 const HERO = {
-  welcome: ['Welcome to QKVM.', 'Every KVM on one screen, on your own network. Setting up takes about a minute.'],
+  welcome: ['Welcome to qKVM.', 'Every KVM on one screen, on your own network. Setting up takes about a minute.'],
   back: ['Welcome back.', 'Sign in to see your KVMs.'],
-  plain: ['QKVM', 'Every KVM on one screen, on your own network.'],
+  plain: ['qKVM', 'Every KVM on one screen, on your own network.'],
 };
 
 function hero(kind) {
@@ -496,7 +496,7 @@ function hero(kind) {
   const feature = (name, heading, text) => h('li', {}, icon(name), h('strong', {}, heading), h('span', {}, text));
   return [
     h('div', { class: 'brand' }, h('img', { src: 'static/favicon.svg', alt: '' }),
-      h('span', { class: 'wordmark' }, h('b', {}, 'Q'), 'KVM')),
+      h('span', { class: 'wordmark' }, h('b', {}, 'q'), 'KVM')),
     h('h1', {}, title),
     h('p', { class: 'lead' }, lead),
     // A little wall of screens coming to life; decoration only.
@@ -642,8 +642,8 @@ function showSetup(session) {
     steps(0),
     h('h2', {}, 'Create your password'),
     h('p', { class: 'muted' },
-      'This is the password of the first account, “admin”. It protects QKVM and encrypts the KVM passwords ',
-      'saved on this computer. QKVM does not store it: the recovery key you get next is the only way around a ',
+      'This is the password of the first account, “admin”. It protects qKVM and encrypts the KVM passwords ',
+      'saved on this computer. qKVM does not store it: the recovery key you get next is the only way around a ',
       'forgotten password. More accounts can be added later.'),
     h('input', { type: 'text', autocomplete: 'username', value: 'admin', hidden: true }),
     first.el,
@@ -651,7 +651,7 @@ function showSetup(session) {
     second.el,
     coach.rules,
     session.setup_code_required && field('Setup code', code,
-      'This QKVM was started with --setup-code. The code is where it runs: in its terminal, or in its log (journalctl -u qkvm for a service, docker logs qkvm for a container). It proves this copy is yours.'),
+      'This qKVM was started with --setup-code. The code is where it runs: in its terminal, or in its log (journalctl -u qkvm for a service, docker logs qkvm for a container). It proves this copy is yours.'),
     error,
     h('div', { class: 'actions' }, submit),
   );
@@ -684,9 +684,9 @@ async function setupNetwork() {
   showAuth(
     'welcome',
     steps(2),
-    h('h2', {}, 'Where should QKVM be reachable?'),
+    h('h2', {}, 'Where should qKVM be reachable?'),
     settings.overridden && h('div', { class: 'note warn' },
-      'QKVM was started with --bind or --port (in a container it always is). Those decide where it listens, ',
+      'qKVM was started with --bind or --port (in a container it always is). Those decide where it listens, ',
       'whatever is chosen here.'),
     network.el,
     h('div', { class: 'actions' },
@@ -729,7 +729,7 @@ function networkForm(settings, advanced) {
   const local = h('input', { type: 'checkbox', checked: true, disabled: true });
   const ts = h('input', { type: 'checkbox', checked: has('tailscale') });
   const lanBox = h('input', { type: 'checkbox', checked: has('lan') });
-  // Said when QKVM was started (--https, or a certificate of its owner's): not something to switch off from here.
+  // Said when qKVM was started (--https, or a certificate of its owner's): not something to switch off from here.
   const https = h('input', { type: 'checkbox', checked: settings.https, disabled: settings.https_forced });
   const port = h('input', { type: 'number', min: 1, max: 65535, value: settings.port, required: true });
   const interval = h('input', { type: 'number', min: 0.2, max: 60, step: 0.1, value: settings.interval, required: true });
@@ -742,12 +742,12 @@ function networkForm(settings, advanced) {
     check(local, 'This computer', 'http://127.0.0.1 — always on, so you can never lock yourself out.'),
     check(ts, tailscale ? `Tailscale — ${tailscale}` : 'Tailscale — not connected on this computer',
       tailscale ? 'Reachable from your other Tailscale devices; Tailscale encrypts the traffic.'
-        : 'QKVM starts listening there as soon as Tailscale connects.'),
+        : 'qKVM starts listening there as soon as Tailscale connects.'),
     check(lanBox, lan ? `Local network — ${lan}` : 'Local network',
       'Anyone on your network can reach the sign-in page.'),
   ];
   const secure = check(https, 'Encrypt connections (HTTPS)', settings.https_forced
-    ? 'On because QKVM was started that way. It cannot be switched off from here.'
+    ? 'On because qKVM was started that way. It cannot be switched off from here.'
     : 'Uses a certificate made on this computer; your browser asks you to accept it once. '
       + 'Recommended whenever the local network is enabled.');
   const more = advanced ? [
@@ -786,7 +786,7 @@ async function applyNetwork(values) {
   showAuth(
     'plain',
     h('h2', {}, 'Network settings saved'),
-    h('p', {}, 'QKVM is restarting its listeners. It is now reachable at:'),
+    h('p', {}, 'qKVM is restarting its listeners. It is now reachable at:'),
     h('ul', {}, result.urls.map(url => h('li', {}, h('a', { href: url }, url)))),
     scheme === 'https:' && location.protocol !== 'https:' && h('div', { class: 'note warn' },
       'Your browser will warn that the certificate is self-signed. Before accepting, check that it shows this SHA-256 fingerprint:',
@@ -873,7 +873,7 @@ function addDevicesForm(onAdded) {
       moved.length > 0 && h('ul', { class: 'results' }, moved),
       twice && h('p', { class: 'muted' }, 'A KVM that answered at two addresses, on your network and on Tailscale, is listed once. Choose which address the wall uses for it.'),
       result.container && h('p', { class: 'muted' },
-        'QKVM runs in a container, and what it can look through is the network the container is on, which is usually not yours. ',
+        'qKVM runs in a container, and what it can look through is the network the container is on, which is usually not yours. ',
         'Type the addresses above instead, or start the container on the network of its host (--network host, on Linux).'),
       fresh.length > 0 && h('div', { class: 'actions' }, use));
     found.hidden = false;
@@ -989,7 +989,7 @@ function addDevicesForm(onAdded) {
       passwordBox),
     field('Group', groupName, 'Optional: a rack, a room, a customer. The wall can show one group at a time.'),
     h('p', { class: 'muted' },
-      'Each one is contacted to check the login. Its certificate is remembered, so QKVM will refuse to send the password to anything else at that address.'),
+      'Each one is contacted to check the login. Its certificate is remembered, so qKVM will refuse to send the password to anything else at that address.'),
     h('div', { class: 'actions' }, submit),
     results,
   );
@@ -1154,10 +1154,10 @@ async function certificateDialog(device, onDone) {
       onDone();
     }));
     body.append(
-      h('p', {}, 'Remembered by QKVM:', h('code', { class: 'fingerprint' }, cert.saved || 'none yet')),
+      h('p', {}, 'Remembered by qKVM:', h('code', { class: 'fingerprint' }, cert.saved || 'none yet')),
       h('p', {}, 'Presented by the device right now:', h('code', { class: 'fingerprint' }, cert.presented)),
       same
-        ? h('div', { class: 'note' }, 'They match. QKVM is talking to the same KVM as before.')
+        ? h('div', { class: 'note' }, 'They match. qKVM is talking to the same KVM as before.')
         : h('div', { class: 'note bad' },
           'A KVM gets a new certificate after a factory reset or some firmware updates. ',
           'If neither happened, something else may be answering at this address: do not trust it.'),
@@ -1629,7 +1629,7 @@ function actionsDialog(target) {
         device.kind === 'jetkvm' && h('p', { class: 'muted' },
           'A JetKVM shows its picture to one viewer at a time. Opening its console takes the picture from this wall until you choose Show here on the tile. Text is typed with a US keyboard layout.'),
         sharesOurName(device) && h('div', { class: 'note warn' },
-          `No link to its console is offered here: its page is at ${location.hostname}, the same name QKVM is looked at under, and a browser would hand that page your sign-in to QKVM. Look at one of the two under another name or address.`),
+          `No link to its console is offered here: its page is at ${location.hostname}, the same name qKVM is looked at under, and a browser would hand that page your sign-in to qKVM. Look at one of the two under another name or address.`),
         h('div', { class: 'action-grid' },
           consoleLink(device) && h('a', {
             class: 'btn', href: consoleLink(device), target: '_blank', rel: 'noopener noreferrer',
@@ -1744,8 +1744,8 @@ function recoveryKeyView(key) {
   });
   const save = h('button', { type: 'button' }, icon('download'), 'Save as a file');
   save.addEventListener('click', () => {
-    const text = `QKVM recovery key\n\n${key}\n\nWith this key the password of any QKVM account can be replaced.\n`
-      + 'Keep it somewhere safe that is not the computer QKVM runs on.\n';
+    const text = `qKVM recovery key\n\n${key}\n\nWith this key the password of any qKVM account can be replaced.\n`
+      + 'Keep it somewhere safe that is not the computer qKVM runs on.\n';
     const url = URL.createObjectURL(new Blob([text], { type: 'text/plain' }));
     const link = h('a', { href: url, download: 'qkvm-recovery-key.txt' });
     document.body.append(link);
@@ -1819,7 +1819,7 @@ function forgotDialog() {
       },
     },
       nameBox,
-      field('Recovery key', key, 'The key shown when QKVM was set up, or made later under Settings → Security.'),
+      field('Recovery key', key, 'The key shown when qKVM was set up, or made later under Settings → Security.'),
       first.el,
       coach.meter,
       second.el,
@@ -1829,14 +1829,14 @@ function forgotDialog() {
 
     body.append(h('div', { class: 'ways' },
       h('h3', {}, 'With the recovery key'),
-      hasRecovery ? withKey : h('p', { class: 'muted' }, 'No recovery key has been made for this copy of QKVM.'),
+      hasRecovery ? withKey : h('p', { class: 'muted' }, 'No recovery key has been made for this copy of qKVM.'),
       askName && h('h3', {}, 'With the help of an admin'),
       askName && h('p', {}, 'Any admin can set a new password for you under Settings → Accounts.'),
       h('h3', {}, 'Starting over'),
-      h('p', {}, 'If neither is possible, run this on the computer QKVM runs on, with QKVM stopped:'),
+      h('p', {}, 'If neither is possible, run this on the computer qKVM runs on, with qKVM stopped:'),
       h('p', {}, h('code', {}, 'qkvm --reset-password')),
       h('p', { class: 'muted' }, 'It removes every account and the saved KVM passwords. The list of KVMs and the other settings stay. ',
-        'Opening QKVM then starts with choosing a password, and the KVM passwords have to be entered again.'),
+        'Opening qKVM then starts with choosing a password, and the KVM passwords have to be entered again.'),
       h('h3', {}, 'Lost the phone with your authenticator app?'),
       h('p', { class: 'muted' }, 'An admin can switch two-factor sign-in off for your account under Settings → Accounts, or run ',
         h('code', {}, 'qkvm --disable-2fa NAME'), ' on that computer.')));
@@ -1940,14 +1940,14 @@ function twoFactorSetup(onDone) {
         qrPicture(setup.qr, 'QR code to scan with an authenticator app'),
         field('Or type the setup key', h('input', {
           type: 'text', readOnly: true, value: setup.secret, class: 'mono', spellcheck: false, onfocus: event => event.target.select(),
-        }), 'Time based. Name the account whatever you like, for example QKVM.'),
+        }), 'Time based. Name the account whatever you like, for example qKVM.'),
         h('p', { class: 'muted' }, 'Reading this on the phone itself? ', h('a', { href: setup.uri }, 'Open it in the app'), '.'),
         h('p', {}, h('strong', {}, '2. '), 'Enter the code the app shows now.'),
         field('Code', code),
         problem,
         h('p', { class: 'muted' }, 'Next you are given ten one-time codes for when the phone is not at hand. Beyond those, an admin ',
           'can take the second step off an account under Accounts, or run ', h('code', {}, 'qkvm --disable-2fa NAME'),
-          ' on the computer QKVM runs on.'),
+          ' on the computer qKVM runs on.'),
         h('div', { class: 'actions' }, turnOn)));
       code.focus();
     });
@@ -1968,7 +1968,7 @@ function oneTimeCodes(codes, done) {
   const save = h('button', { type: 'button' }, icon('download'), 'Save as a file');
   save.addEventListener('click', () => {
     const url = URL.createObjectURL(new Blob([
-      `QKVM one-time codes for ${me?.name || 'your account'}\n\n${text}\n\nEach signs you in once, in place of a code from the authenticator app.\n`,
+      `qKVM one-time codes for ${me?.name || 'your account'}\n\n${text}\n\nEach signs you in once, in place of a code from the authenticator app.\n`,
     ], { type: 'text/plain' }));
     const link = h('a', { href: url, download: 'qkvm-one-time-codes.txt' });
     document.body.append(link);
@@ -2002,7 +2002,7 @@ function mustEnroll() {
   const again = async () => {
     enrolling = false;
     // Who this is now was answered when the second step was switched on. It is asked once more, and an answer
-    // that does not come (QKVM busy at that moment, a cable out) is no reason to stay on this page: nothing
+    // that does not come (qKVM busy at that moment, a cable out) is no reason to stay on this page: nothing
     // on it leads anywhere any more.
     try {
       setMe((await api('GET', 'api/v1/session')).user);
@@ -2078,7 +2078,7 @@ async function tokensTab(refresh, does) {
   };
   return [
     h('p', { class: 'intro' },
-      'For using QKVM without a person signing in. A token lets a script look at the wall or act on machines; a link keeps ',
+      'For using qKVM without a person signing in. A token lets a script look at the wall or act on machines; a link keeps ',
       'a screen on the wall showing, and brings it back by itself after a restart. Each has the machines it is for, neither can ',
       'change settings or accounts, and both are shown once when they are made.'),
     listed(tokens.length > 0 && h('table', { class: 'rows' },
@@ -2126,7 +2126,7 @@ function tokenDialog(kind, devices, onDone) {
           body.replaceChildren(h('div', {}, display
             ? [
               h('p', {}, h('strong', {}, 'Open this address once in the browser of that screen. '),
-                'It then shows the wall as a display, and comes back by itself after QKVM was restarted. It is not shown again.'),
+                'It then shows the wall as a display, and comes back by itself after qKVM was restarted. It is not shown again.'),
               shownOnce(`${here}#display&key=${made.token}`, 'Display link'),
               h('p', { class: 'muted' }, 'Whoever has the address can look at these machines, and no more than look. Take it back under Tokens if a screen is given away.'),
             ]
@@ -2194,7 +2194,7 @@ function exportDialog() {
           body: JSON.stringify({ password: own.input.value, passphrase: typed, parts: wanted }),
         });
       } catch {
-        return fail('QKVM is not responding');
+        return fail('qKVM is not responding');
       }
       if (!reply.ok) {
         let said = null;
@@ -2210,7 +2210,7 @@ function exportDialog() {
       close();
       if (without) {
         toast(`Exported, without ${without === 1 ? 'one saved password or text that does' : `${without} saved passwords or texts that do`} not open any more. `
-          + `QKVM's log says which. Give ${without === 1 ? 'it' : 'them'} again on the wall, then export once more.`, 'error');
+          + `qKVM's log says which. Give ${without === 1 ? 'it' : 'them'} again on the wall, then export once more.`, 'error');
       } else {
         toast(typed ? 'Exported. The file opens with its passphrase only: keep the two apart.' : 'Exported, without passwords', 'ok');
       }
@@ -2219,7 +2219,7 @@ function exportDialog() {
       h('div', {}, parts.map(part => part.row)),
       passphrase.el,
       own.el,
-      h('p', { class: 'muted' }, 'Accounts, tokens and two-factor keys are not in the file: each belongs to the QKVM it was made on.'),
+      h('p', { class: 'muted' }, 'Accounts, tokens and two-factor keys are not in the file: each belongs to the qKVM it was made on.'),
       error,
       h('div', { class: 'actions' },
         h('button', { type: 'button', onclick: close }, 'Cancel'),
@@ -2255,7 +2255,7 @@ function importDialog(onDone) {
       if (!chosen) return;
       // (The server writes a plain file of up to four million characters, and a sealed one a third larger: it
       // has the last word on what is too large. This only keeps a film or a disk image from being read in.)
-      if (chosen.size > 8000000) return fail('The file is larger than anything QKVM writes.');
+      if (chosen.size > 8000000) return fail('The file is larger than anything qKVM writes.');
       const read = await chosen.text();
       if (mine !== turn) return;  // another file was chosen while this one was being read
       text = read;
@@ -2334,7 +2334,7 @@ function importDialog(onDone) {
       found.replaceChildren(...[
         h('p', { class: 'muted' }, [
           there.encrypted ? 'An encrypted file' : 'A plain file',
-          there.program && `made by QKVM ${there.program}`,
+          there.program && `made by qKVM ${there.program}`,
           there.made ? `on ${new Date(there.made * 1000).toLocaleDateString()}` : '',
         ].filter(Boolean).join(', ') + '.'),
         !there.encrypted && there.secrets && h('div', { class: 'note warn' }, 'This file holds passwords in plain text. Whoever wrote it chose to; delete it once it is taken in.'),
@@ -2364,7 +2364,7 @@ function importDialog(onDone) {
     }));
     passphrase.input.addEventListener('input', () => { if (!read.hidden) return; again(); });
     body.append(h('form', { onsubmit: event => { event.preventDefault(); if (!read.hidden) busy(read, look); } },
-      field('File', file, 'A .qkvm or .json file that QKVM exported.'),
+      field('File', file, 'A .qkvm or .json file that qKVM exported.'),
       passphrase.el,
       found,
       error,
@@ -2382,13 +2382,13 @@ async function filesTab(refresh, does) {
   fromFile.addEventListener('click', () => importDialog(() => { refresh(); reloadWall(); }));
   does.append(toFile, fromFile);
   return [
-    h('p', { class: 'intro' }, 'The KVMs and servers on this wall, the saved actions and the alert settings can be written to a file, and a file can be taken in here or on another QKVM.'),
+    h('p', { class: 'intro' }, 'The KVMs and servers on this wall, the saved actions and the alert settings can be written to a file, and a file can be taken in here or on another qKVM.'),
     block('A file is one of two kinds',
       setting('Encrypted (.qkvm)', 'Made with a passphrase you choose. It holds the passwords of the devices, the saved texts and the address alerts go to, and opens with that passphrase only.'),
       setting('Plain (.json)', 'Made without a passphrase. The same, with every password and saved text left out: its devices ask for their password where they are taken in.')),
     block('Taking a file in',
       setting('Adds what is not here yet', 'Nothing on this wall is changed or removed by it. The alert and wall settings are replaced only where you tick them.')),
-    h('p', { class: 'footnote' }, 'Accounts, tokens, two-factor keys and the recovery key are in no such file: each belongs to the QKVM it was made on. To keep a whole QKVM, accounts and all, keep a copy of its data folder.'),
+    h('p', { class: 'footnote' }, 'Accounts, tokens, two-factor keys and the recovery key are in no such file: each belongs to the qKVM it was made on. To keep a whole qKVM, accounts and all, keep a copy of its data folder.'),
   ];
 }
 
@@ -2416,9 +2416,9 @@ async function metricsTab(refresh, does) {
     how.textContent = 'On. The token was made just now.';
     const once = shownOnce(made.token, 'Metrics token');
     shown.replaceChildren(
-      h('div', { class: 'note' }, h('strong', {}, 'This token is shown once.'), ' QKVM keeps only what it needs to recognise it.'),
+      h('div', { class: 'note' }, h('strong', {}, 'This token is shown once.'), ' qKVM keeps only what it needs to recognise it.'),
       once,
-      h('p', { class: 'muted' }, 'For Prometheus, in the job that collects from QKVM:'),
+      h('p', { class: 'muted' }, 'For Prometheus, in the job that collects from qKVM:'),
       h('pre', { class: 'notes' }, `metrics_path: /metrics\nauthorization:\n  credentials: ${made.token}\nstatic_configs:\n  - targets: ['${location.host}']`));
     $('input', once).focus();
   }));
@@ -2436,13 +2436,13 @@ async function metricsTab(refresh, does) {
   does.append(off, make);
   const how = h('small', {}, state.enabled ? `On. The token was made ${ago(Date.now() / 1000 - state.created)}.` : 'Off: the address answers nobody.');
   return [
-    h('p', { class: 'intro' }, 'A monitoring system can collect the state of the wall from QKVM: how many machines are online, and for each one '
+    h('p', { class: 'intro' }, 'A monitoring system can collect the state of the wall from qKVM: how many machines are online, and for each one '
       + 'whether it answers, whether it has a picture, when it was last heard from and how warm it is.'),
     shown,
     block(null,
       h('div', { class: 'setting' }, h('div', { class: 'what' }, h('strong', {}, 'Collected from'), how), h('div', { class: 'does' }, h('code', {}, address)))),
     h('p', { class: 'footnote' }, 'It is given to whoever sends the token, without signing in, so the token is to be kept like a password. '
-      + 'It lets its holder read what is listed above and nothing else. While metrics are on, QKVM goes on watching the machines '
+      + 'It lets its holder read what is listed above and nothing else. While metrics are on, qKVM goes on watching the machines '
       + 'after the last person has signed out, as it does for alerts.'),
   ];
 }
@@ -2536,7 +2536,7 @@ async function alertsTab(refresh, does) {
         h('button', { type: 'button', onclick: pause(240) }, 'For four hours'))),
     h('p', { class: 'footnote' },
       'A single machine that is not to be heard about at all: Settings → KVMs → Edit. ',
-      'Without an address, changes are still written to the activity log. While alerts are on, QKVM keeps watching after ',
+      'Without an address, changes are still written to the activity log. While alerts are on, qKVM keeps watching after ',
       'everyone has signed out, which means the saved KVM passwords stay unlocked in its memory until it is restarted. ',
       'After a restart, watching begins when someone signs in. A JetKVM that is not on screen is only checked for answering, ',
       'not for its picture.'),
@@ -2549,7 +2549,7 @@ const SITE = 'https://qkvm.com';
 const REPO = 'https://github.com/qkvm/qkvm';
 const DOCS = 'https://docs.qkvm.com';
 const PYPV = 'https://pypv.com';
-const COPYRIGHT = '© 2026 QKVM';
+const COPYRIGHT = '© 2026 qKVM';
 const LICENCE = 'https://www.gnu.org/licenses/agpl-3.0.html';
 
 async function aboutTab() {
@@ -2565,17 +2565,17 @@ async function aboutTab() {
   return [
     h('div', { class: 'about-lead' },
       h('div', { class: 'brand' }, h('img', { src: 'static/favicon.svg', alt: '' }),
-        h('span', { class: 'wordmark' }, h('b', {}, 'Q'), 'KVM'),
+        h('span', { class: 'wordmark' }, h('b', {}, 'q'), 'KVM'),
         h('span', { class: 'muted' }, `Version ${running.version || version}`)),
       h('p', {}, 'A self-hosted screen wall and command center for IP KVMs and servers. Nothing goes through anyone’s cloud: ',
-        'QKVM talks to each KVM directly, over your network or VPN.')),
+        'qKVM talks to each KVM directly, over your network or VPN.')),
     block('Where to find it',
       place(SITE, 'Website'),
       place(DOCS, 'Documentation'),
       place(REPO, 'Source code, releases and the place to report a problem')),
     h('section', { class: 'block text' },
       h('h3', {}, 'Licence'),
-      h('p', {}, 'QKVM is free software under the ', outside(LICENCE, 'GNU Affero General Public License, version 3'),
+      h('p', {}, 'qKVM is free software under the ', outside(LICENCE, 'GNU Affero General Public License, version 3'),
         ` (${running.licence || 'AGPL-3.0-only'}). You may use it, study it, change it and share it.`),
       h('p', { class: 'muted' }, 'If you pass it on, or run a changed version for other people to use over a network, the licence asks you to offer ',
         'them the source of what you run, under the same licence. It comes with no warranty. The licence itself is in the file LICENSE of the source.')),
@@ -2587,15 +2587,15 @@ async function aboutTab() {
         h('thead', {}, h('tr', {}, h('th', {}, 'Library'), h('th', {}, 'Version'), h('th', {}, 'Licence'))),
         h('tbody', {}, running.libraries.map(library => h('tr', {},
           h('td', {}, library.name), h('td', {}, library.version), h('td', { class: 'wrap' }, library.licence))))))),
-    h('p', { class: 'footnote' }, COPYRIGHT, '. QKVM is part of ', h('strong', {}, outside(PYPV, 'PyPV, Python Platform Ventures')), '. ',
-      'QKVM is not affiliated with GL.iNet, PiKVM or JetKVM, or with the makers of the servers it talks to; those names belong to their owners.'),
+    h('p', { class: 'footnote' }, COPYRIGHT, '. qKVM is part of ', h('strong', {}, outside(PYPV, 'PyPV, Python Platform Ventures')), '. ',
+      'qKVM is not affiliated with GL.iNet, PiKVM or JetKVM, or with the makers of the servers it talks to; those names belong to their owners.'),
   ];
 }
 
 // --- settings ------------------------------------------------------------------------------------
 
 const EVENTS = {
-  setup: 'QKVM set up', login: 'Signed in', login_failed: 'Wrong password', logout: 'Signed out',
+  setup: 'qKVM set up', login: 'Signed in', login_failed: 'Wrong password', logout: 'Signed out',
   password_changed: 'Password changed', device_added: 'KVM added', device_changed: 'KVM changed',
   device_moved: 'KVM followed to its other address',
   device_removed: 'KVM removed', certificate_trusted: 'Certificate trusted', action: 'Action',
@@ -2638,14 +2638,14 @@ const SETTINGS = [
     ['devices', 'KVMs', 'The KVMs and servers on the wall: add, change, remove.', devicesTab],
     ['actions', 'Actions', 'Key combinations and text of your own, to run on any machine.', actionsTab],
     ['alerts', 'Alerts', 'Who is told when a machine changes, and how.', alertsTab],
-    ['files', 'Export and import', 'The wall as a file: to keep, or to take to another QKVM.', filesTab],
+    ['files', 'Export and import', 'The wall as a file: to keep, or to take to another qKVM.', filesTab],
   ]],
   ['People', [
     ['users', 'Accounts', 'Who may sign in, as what, and to which machines.', usersTab],
     ['tokens', 'Tokens', 'For scripts, and for screens on the wall.', tokensTab],
     ['security', 'Security', 'Your own password, second step and sessions.', securityTab],
   ]],
-  ['This QKVM', [
+  ['This qKVM', [
     ['network', 'Network', 'Where it listens, and how.', networkTab],
     ['metrics', 'Metrics', 'Numbers for a monitoring system to collect.', metricsTab],
     ['activity', 'Activity', 'Who signed in, changed what, and did what to which machine.', activityTab],
@@ -3043,13 +3043,13 @@ async function networkTab(refresh, does) {
     settings.bind_error && h('div', { class: 'note bad' },
       `The last change could not be applied and was undone: ${settings.bind_error}`),
     settings.overridden && h('div', { class: 'note warn' },
-      'QKVM was started with --bind or --port, which take priority over what is saved here.'),
+      'qKVM was started with --bind or --port, which take priority over what is saved here.'),
     form,
     block('As it runs now',
       setting('Listening on', null, h('span', { class: 'value' }, settings.listening.join('  ') || 'unknown')),
       settings.cert_fingerprint && setting('Certificate', 'Its SHA-256 fingerprint, to compare with what a browser shows.',
         h('code', {}, settings.cert_fingerprint)),
-      setting('Version', null, h('span', { class: 'value' }, `QKVM ${settings.version}, started ${ago(settings.uptime)}`))),
+      setting('Version', null, h('span', { class: 'value' }, `qKVM ${settings.version}, started ${ago(settings.uptime)}`))),
   ];
 }
 
@@ -3074,7 +3074,7 @@ async function followRestart(version) {
   for (const dialog of document.querySelectorAll('dialog[open]')) dialog.close();
   showAuth('plain',
     h('h2', {}, `Updating to ${version}`),
-    h('p', { class: 'loading' }, h('span', { class: 'spinner' }), 'QKVM is restarting. This page reloads by itself.'));
+    h('p', { class: 'loading' }, h('span', { class: 'spinner' }), 'qKVM is restarting. This page reloads by itself.'));
   for (let attempt = 0; attempt < 120; attempt++) {
     await sleep(1000);
     try {
@@ -3086,7 +3086,7 @@ async function followRestart(version) {
     } catch { /* still restarting */ }
   }
   showAuth('plain',
-    h('h2', {}, 'QKVM did not come back'),
+    h('h2', {}, 'qKVM did not come back'),
     h('p', {}, `Version ${version} was installed, but it is not answering. If the new version could not start, `
       + 'the previous one is started again automatically; check its window or qkvm.log.'),
     h('div', { class: 'actions' }, h('button', { type: 'button', class: 'primary', onclick: () => location.reload() }, 'Reload')));
@@ -3118,7 +3118,7 @@ function installUpdateDialog(status, onDone) {
           if (result.restarting) {
             followRestart(version);
           } else {
-            toast(`Version ${version} is installed. Restart QKVM to start using it.`, 'ok');
+            toast(`Version ${version} is installed. Restart qKVM to start using it.`, 'ok');
             refreshUpdateBadge();
             onDone();
           }
@@ -3126,9 +3126,9 @@ function installUpdateDialog(status, onDone) {
       },
     },
       h('p', {}, status.supervised
-        ? 'The new version is downloaded, checked, and installed next to the current one. QKVM then restarts by itself; everyone has to sign in again.'
-        : 'The new version is downloaded, checked, and installed next to the current one. It takes effect the next time QKVM is started.'),
-      h('p', { class: 'muted' }, 'If the new version cannot start, QKVM goes back to this one by itself.'),
+        ? 'The new version is downloaded, checked, and installed next to the current one. qKVM then restarts by itself; everyone has to sign in again.'
+        : 'The new version is downloaded, checked, and installed next to the current one. It takes effect the next time qKVM is started.'),
+      h('p', { class: 'muted' }, 'If the new version cannot start, qKVM goes back to this one by itself.'),
       h('input', { type: 'text', autocomplete: 'username', value: me?.name || 'admin', hidden: true }),
       el,
       error,
@@ -3168,7 +3168,7 @@ async function updatesTab(refresh, does) {
       'Updates are not set up. This copy does not know which GitHub repository its releases are published in; ',
       'see “Publishing releases” in the README.');
   } else if (status.installed && !status.supervised) {
-    notice = h('div', { class: 'note' }, `Version ${status.installed} is installed. Restart QKVM to start using it.`);
+    notice = h('div', { class: 'note' }, `Version ${status.installed} is installed. Restart qKVM to start using it.`);
   } else if (status.available) {
     state = 'A newer version is available.';
   } else if (status.checked_ago == null) {
@@ -3190,9 +3190,9 @@ async function updatesTab(refresh, does) {
       h('code', {}, 'docker compose pull && docker compose up -d')),
     status.available && !status.container && !status.installable && h('div', { class: 'note' },
       'This copy has no release key built in, so it cannot tell who published an update and does not install one by itself. ',
-      'Install the new version by hand, or start QKVM with ', h('code', {}, '--allow-unsigned-updates'), '.'),
+      'Install the new version by hand, or start qKVM with ', h('code', {}, '--allow-unsigned-updates'), '.'),
     block(null,
-      setting('This copy', state || 'The version that is running.', h('span', { class: 'value' }, `QKVM ${status.current}`)),
+      setting('This copy', state || 'The version that is running.', h('span', { class: 'value' }, `qKVM ${status.current}`)),
       status.available && setting(`Version ${latest.version}`,
         latest.published ? `Released ${new Date(latest.published).toLocaleDateString()}.` : null,
         /^https:\/\/github\.com\//.test(latest.url) && h('a', {
@@ -3207,7 +3207,7 @@ async function updatesTab(refresh, does) {
       status.signed
         ? 'A release is installed only if it carries a valid signature from the publisher.'
         : status.installable
-          ? 'QKVM was started with --allow-unsigned-updates: a download is only checked against the checksum published with it.'
+          ? 'qKVM was started with --allow-unsigned-updates: a download is only checked against the checksum published with it.'
           : 'This copy tells you about new versions and leaves installing them to you.'),
   ];
 }
@@ -3308,8 +3308,8 @@ async function securityTab(refresh) {
     h('p', { class: 'footnote' },
       'KVM passwords are stored encrypted, and each account’s password can unlock them for the running program. ',
       unattended
-        ? 'This QKVM opens them itself after a restart and carries on watching: the key for that is kept in its data folder, or where --unlock-file says. Whoever has that key and the data folder has the KVM passwords. Started with --locked-start, it keeps no such key.'
-        : 'After a restart this QKVM cannot reach the KVMs until someone signs in: it was started with --locked-start, or nobody has signed in yet since it was told otherwise.'),
+        ? 'This qKVM opens them itself after a restart and carries on watching: the key for that is kept in its data folder, or where --unlock-file says. Whoever has that key and the data folder has the KVM passwords. Started with --locked-start, it keeps no such key.'
+        : 'After a restart this qKVM cannot reach the KVMs until someone signs in: it was started with --locked-start, or nobody has signed in yet since it was told otherwise.'),
   ];
 }
 
@@ -3609,7 +3609,7 @@ class Feed {
       res = await fetch(this.getUrl(), { cache: 'no-store', signal: AbortSignal.timeout(12000) });
       if (res.ok) blob = await res.blob();
     } catch {
-      if (this.running) this.fail('wall', 'QKVM is not responding');
+      if (this.running) this.fail('wall', 'qKVM is not responding');
       return;
     } finally {
       this.slots?.release();
@@ -3673,7 +3673,7 @@ function applyResult(view, result) {
   }
 }
 
-// A server is seen through its management controller. Where that has a console QKVM reads (the status says
+// A server is seen through its management controller. Where that has a console qKVM reads (the status says
 // so), the server's screen is taken from it and shown as a KVM's is; where not, the tile says how the server is.
 function showsScreen(device, status) {
   return device.picture !== false || status?.screen === true;
@@ -4060,7 +4060,7 @@ function render(tile) {
   }
 }
 
-// When a switch goes away, or QKVM itself, every tile changes state within the same moment. The counts on
+// When a switch goes away, or qKVM itself, every tile changes state within the same moment. The counts on
 // the filters and the grid are then brought up to date once for all of them, not once for each: each time
 // is a pass over every tile and a new layout.
 let tallyDue = false;
@@ -4634,7 +4634,7 @@ async function pollStatus(run) {
         if (run !== wallRun) return;
         wallDown = true;
       }
-      setBanner(wallDown ? 'Lost contact with QKVM. Trying again…' : null);
+      setBanner(wallDown ? 'Lost contact with qKVM. Trying again…' : null);
       renderFocus();
     }
     await sleep(4000);
@@ -4715,7 +4715,7 @@ function sessionExpired() {
     return;
   }
   if (ssoOn) {
-    // The identity proxy has them signed in still, most likely: asked, QKVM signs them in again by that.
+    // The identity proxy has them signed in still, most likely: asked, qKVM signs them in again by that.
     reopening = true;
     api('GET', 'api/v1/session').then(session => {
       reopening = false;
@@ -4764,7 +4764,7 @@ async function openDisplay() {
         prefs.set('display-key', '');  // taken back, or run out: a person has to sign in, or bring a new link
         return false;
       }
-      await sleep(5000);  // QKVM is on its way back up: this screen waits for it
+      await sleep(5000);  // qKVM is on its way back up: this screen waits for it
     }
   }
 }
@@ -4799,7 +4799,7 @@ async function reloadIfOutdated() {
 async function signOut() {
   const sure = await confirmBox({
     title: 'Sign out?',
-    message: 'QKVM keeps running. You need your password to get back in.',
+    message: 'qKVM keeps running. You need your password to get back in.',
     action: 'Sign out',
     danger: false,
   });
@@ -5023,7 +5023,7 @@ async function boot() {
   else {
     // Signed in where the company signs in, and unknown here: said, so that nobody wonders which password is wanted.
     const stranger = session.sso?.name && !session.sso.known;
-    showLogin(stranger ? `You are signed in as ${session.sso.name}, and there is no QKVM account of that name. An admin can make one.` : undefined);
+    showLogin(stranger ? `You are signed in as ${session.sso.name}, and there is no qKVM account of that name. An admin can make one.` : undefined);
   }
 }
 

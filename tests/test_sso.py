@@ -1,4 +1,4 @@
-"""Signing in where the company signs in: a reverse proxy in front of QKVM says who it is (--sso-header)."""
+"""Signing in where the company signs in: a reverse proxy in front of qKVM says who it is (--sso-header)."""
 
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ def fast(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def through_proxy(admin: TestClient, said: str | None, port: int = 52000, address: str = PROXY) -> TestClient:
-    """A browser that reaches QKVM through the proxy, which says who it has signed in."""
+    """A browser that reaches qKVM through the proxy, which says who it has signed in."""
     headers = {"X-QKVM": "1", "X-Forwarded-For": "192.0.2.9", **({} if said is None else {"Remote-User": said})}
     client = TestClient(admin.app, headers=headers, client=(address, port))
     client.portal = admin.portal
@@ -50,7 +50,7 @@ def test_whoever_the_proxy_has_signed_in_is_signed_in(tmp_path: Path) -> None:
         assert said["authenticated"] is True and said["user"]["name"] == "olga@example.org" and said["user"]["sso"] is True
         assert said["sso"] == {"on": True, "name": "olga@example.org", "known": True}
         assert "httponly" in first.headers["set-cookie"].lower()
-        assert hers.get("/api/v1/wall").status_code == 200 and hers.get("/api/v1/users").status_code == 403  # the role is QKVM's to give
+        assert hers.get("/api/v1/wall").status_code == 200 and hers.get("/api/v1/users").status_code == 403  # the role is qKVM's to give
         assert hers.get("/api/v1/session").headers.get("set-cookie") is None  # signed in once, not at every look
         entry = next(e for e in admin.get("/api/v1/audit").json()["entries"] if e["event"] == "login")
         assert (entry["user"], entry["sso"], entry["ip"]) == ("olga@example.org", True, "192.0.2.9")  # who, how, and from where
@@ -75,7 +75,7 @@ def test_whoever_the_proxy_has_signed_in_is_signed_in(tmp_path: Path) -> None:
         doubled = through_proxy(admin, None, port=52004)
         assert doubled.get("/api/v1/session", headers=twice).json()["authenticated"] is False
         assert doubled.get("/api/v1/wall", headers=twice).status_code == 401
-        # Somebody the proxy knows and QKVM does not is told so, and is nobody here.
+        # Somebody the proxy knows and qKVM does not is told so, and is nobody here.
         stranger = through_proxy(admin, "nobody@example.org", port=52005)
         assert stranger.get("/api/v1/session").json()["sso"] == {"on": True, "name": "nobody@example.org", "known": False}
         assert stranger.get("/api/v1/wall").status_code == 401
@@ -110,7 +110,7 @@ def test_without_being_asked_to_qkvm_believes_no_header_about_who_somebody_is(tm
         assert caller.get("/api/v1/session").json()["authenticated"] is False and "sso" not in caller.get("/api/v1/session").json()
         assert caller.get("/api/v1/wall").status_code == 401
     # What it takes is said at start: a proxy that was named, and a way to open the saved passwords without anybody's
-    # (which QKVM has as it comes, and has not where it is started locked).
+    # (which qKVM has as it comes, and has not where it is started locked).
     key = tmp_path / "elsewhere.key"
     for options, complaint in (
         (["--sso-header", "Remote-User"], "--trusted-proxy"),

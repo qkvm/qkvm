@@ -53,7 +53,7 @@ VERSION = re.compile(r"\d+\.\d+(\.\d+)?")  # what an installed update is called,
 
 
 def data_dir(argv: list[str]) -> Path:
-    """Where settings (and installed updates) live: the value of -d / --data-dir, or the folder QKVM keeps at home."""
+    """Where settings (and installed updates) live: the value of -d / --data-dir, or the folder qKVM keeps at home."""
     # (Read the way the program itself reads its options, which takes no shortened names: an option the two
     # understood differently sent this part to another folder than the program.)
     said = None

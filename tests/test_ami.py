@@ -20,7 +20,7 @@ def test_messages_arrive_in_any_pieces_and_come_out_whole() -> None:
 
 
 def test_a_message_that_says_it_is_longer_than_any_is_not_waited_for() -> None:
-    # Believed, it would have QKVM keep whatever arrives for as long as the controller cares to send.
+    # Believed, it would have qKVM keep whatever arrives for as long as the controller cares to send.
     with pytest.raises(Garbled):
         ami.Messages().feed(bytes([ami.VIDEO, 0]) + (ami.LONGEST + 1).to_bytes(4, "little") + bytes(2))
 

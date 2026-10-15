@@ -71,7 +71,7 @@ def test_a_device_whose_address_has_no_port_to_speak_of_or_another_way_than_the_
 
 
 def test_a_token_is_never_an_admin_whatever_the_file_says(tmp_path: Path) -> None:
-    # No form makes one: what manages QKVM itself takes a person. Written into the file by hand, a token
+    # No form makes one: what manages qKVM itself takes a person. Written into the file by hand, a token
     # for a script administered: accounts, devices, other tokens, on the strength of a key and no password.
     saved_with(tmp_path, lambda saved: saved["tokens"][0].__setitem__("role", "admin"))
     said = refused(tmp_path)

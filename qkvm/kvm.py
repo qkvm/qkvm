@@ -19,7 +19,7 @@ import httpx
 from websockets.asyncio.client import ClientConnection
 from websockets.asyncio.client import connect as _ws_connect
 from websockets.exceptions import WebSocketException
-from websockets.frames import Opcode
+from websockets.frames import CloseCode, Opcode
 
 log = logging.getLogger("qkvm")
 
@@ -230,7 +230,7 @@ REJECTED = Rejected()
 
 def not_signing_in(why: str) -> KvmError:
     """What stands against a device that is there and does not sign this program in, for another reason than the password."""
-    return KvmError("no_sign_in", f"The device does not sign QKVM in ({why}). It is asked again shortly.", 503)
+    return KvmError("no_sign_in", f"The device does not sign qKVM in ({why}). It is asked again shortly.", 503)
 
 
 def went_out(ex: BaseException) -> bool:
@@ -671,10 +671,19 @@ class Listening:
         self._second, self._count = time.monotonic(), 0
 
     async def message(self, wait: float | None = None) -> str | bytes:
-        """The next message. TimeoutError where none begins within `wait` seconds (nothing is lost by that)."""
+        """The next message. TimeoutError where none begins within `wait` seconds (nothing is lost by that).
+
+        Waited for with `asyncio.timeout`, never `asyncio.wait_for`: up to Python 3.11 that hands back what came
+        where a stop came in the same moment, and the stop is lost. Against a device that keeps sending, the
+        reader could be in that moment at every stop (in the trials it was, on Windows, and on Linux with a
+        message every thousandth of a second), and went on after every one.
+        """
         pieces = self._ws.recv_streaming()
         try:
-            first = await asyncio.wait_for(anext(pieces), wait)
+            if wait is not None and wait <= 0:
+                raise TimeoutError  # (no time at all: none begins in it, whatever has arrived meanwhile)
+            async with asyncio.timeout(wait):
+                first = await anext(pieces)
             now = time.monotonic()
             if now - self._second >= 1.0:
                 self._second, self._count = now, 0
@@ -684,7 +693,8 @@ class Listening:
             parts, size, give_up = [first], len(first), now + MESSAGE_WITHIN
             while True:
                 try:
-                    piece = await asyncio.wait_for(anext(pieces), max(0.01, give_up - time.monotonic()))
+                    async with asyncio.timeout(max(0.01, give_up - time.monotonic())):
+                        piece = await anext(pieces)
                 except StopAsyncIteration:
                     break
                 except TimeoutError:
@@ -740,6 +750,17 @@ class _ToADevice(ClientConnection):
         if not self.transport.is_closing():
             super().start_keepalive()
 
+    async def close(self, code: int = CloseCode.NORMAL_CLOSURE, reason: str = "") -> None:
+        # The library says goodbye and waits for the device to answer it. Told to stop meanwhile (`stopped`, which
+        # retires a KVM's stream and a server's console, tells them again after half a second), it leaves the
+        # connection as it is: open, for as long as a device that does not answer likes, with nobody left to read
+        # it, and a console seat kept. Cut short in any way, the connection is ended here and now.
+        try:
+            await super().close(code, reason)
+        except BaseException:
+            self.transport.abort()
+            raise
+
     def process_event(self, event: Any) -> None:
         # (Every frame comes through here. Pings and pongs are no messages, and nothing else counts them; and
         # frames of no bytes by the hundred thousand are work for the one thread before they are a message.)
@@ -759,7 +780,7 @@ class ws_connect(_ws_connect):  # named like the function it takes the place of,
 
     The library would follow a redirect, to another host as well, taking the device's session cookie along;
     and it would go through whatever proxy this computer is set up to use for the web. A device does not get
-    to send QKVM anywhere, and a KVM is on the local network, where the company's web proxy is not.
+    to send qKVM anywhere, and a KVM is on the local network, where the company's web proxy is not.
 
     It would also offer the device to pack what it sends, and unpack that on the one thread there is before
     any limit of this program's counts: a kilobyte that is a megabyte unpacked, sent a thousand times a

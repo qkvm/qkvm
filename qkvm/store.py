@@ -118,7 +118,7 @@ class UserRecord:
 
 @dataclass
 class TokenRecord:
-    """Something that may use QKVM without a person signing in: a script, or a screen on the wall."""
+    """Something that may use qKVM without a person signing in: a script, or a screen on the wall."""
 
     id: str
     name: str  # what it is for, in its maker's words
@@ -441,7 +441,7 @@ class Store:
             if isinstance(record, (UserRecord, TokenRecord)) and record.role not in ROLES:
                 raise ValueError(f"{what}: \"role\" has to be one of {', '.join(ROLES)}")
             if isinstance(record, TokenRecord) and record.role == "admin":
-                # What manages QKVM itself takes a person: no form makes such a token, and one written into
+                # What manages qKVM itself takes a person: no form makes such a token, and one written into
                 # the file by hand administered (accounts, devices, other tokens) on the strength of a key.
                 raise ValueError(f"{what}: \"role\" has to be viewer or operator (no token does what an admin does)")
             if isinstance(record, DeviceRecord):

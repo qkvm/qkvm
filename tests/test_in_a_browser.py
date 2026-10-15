@@ -204,7 +204,7 @@ def test_the_first_run_from_a_password_to_a_picture(tmp_path: Path, browser: Bro
         page.get_by_label("I have saved the recovery key").check()
         onward.click()
 
-        expect(page.get_by_role("heading", name="Where should QKVM be reachable?")).to_be_visible()
+        expect(page.get_by_role("heading", name="Where should qKVM be reachable?")).to_be_visible()
         page.get_by_role("button", name="Continue").click()
 
         expect(page.get_by_role("heading", name="Add your KVMs")).to_be_visible()
@@ -849,7 +849,7 @@ def test_where_a_second_step_is_required_nothing_is_shown_until_it_is_set_up(tmp
         form.get_by_role("button", name="Turn on").click()
         expect(form.locator("pre.codes")).to_be_visible()
         # Before the wall is shown, it is asked once more who this is. An answer that does not come at that
-        # moment (QKVM busy, a cable out) left the person on a page with nothing more to press, under a notice
+        # moment (qKVM busy, a cable out) left the person on a page with nothing more to press, under a notice
         # that something went wrong. What switching the second step on answered is enough to go on with.
         page.route("**/api/v1/session", lambda route: route.abort())
         form.get_by_role("button", name="I have kept them").click()
@@ -996,7 +996,7 @@ def test_what_is_no_kvm_is_not_added_anyway_and_a_tile_that_signs_nobody_in_is_s
             form.locator("input[type=password]").fill("what would be sent there from then on")
             form.get_by_role("button", name="Check and add").click()
             expect(form.locator("ul.results li.bad")).to_have_count(1)
-            expect(form.locator("ul.results li.bad")).to_contain_text("does not sign QKVM in")
+            expect(form.locator("ul.results li.bad")).to_contain_text("does not sign qKVM in")
             expect(form.locator("ul.results li.bad button")).to_have_count(0)
             form.get_by_role("button", name="Close").click()
             assert page.locator("#wall article").count() == 1 and len(elsewhere.asked("POST", "/api/auth/login")) == 1
@@ -1012,7 +1012,7 @@ def test_what_is_no_kvm_is_not_added_anyway_and_a_tile_that_signs_nobody_in_is_s
             as_it_is = address.input_value()
             form.locator("input[type=text]").first.fill("Web server")
             form.get_by_role("button", name="Save", exact=True).click()
-            expect(form.locator("p.error")).to_contain_text("does not sign QKVM in")
+            expect(form.locator("p.error")).to_contain_text("does not sign qKVM in")
             anyway = form.get_by_role("button", name="Save without checking")
             expect(anyway).to_be_visible()
             # It is offered for what was refused, as it was sent. Another address in the box, and it is gone at
@@ -1023,7 +1023,7 @@ def test_what_is_no_kvm_is_not_added_anyway_and_a_tile_that_signs_nobody_in_is_s
             # adding what is there. (It answers its sign-in with an error too: the same words, and no button.)
             form.locator("input[type=password]").fill("what would be sent there from then on")
             form.get_by_role("button", name="Save", exact=True).click()
-            expect(form.locator("p.error")).to_contain_text("does not sign QKVM in")
+            expect(form.locator("p.error")).to_contain_text("does not sign qKVM in")
             expect(anyway).to_be_hidden()
             address.fill(as_it_is)
             form.locator("input[type=password]").fill("")

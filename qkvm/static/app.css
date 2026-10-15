@@ -333,7 +333,7 @@ select { height: 32px; padding: 0 8px; cursor: pointer; }
     var(--panel);
 }
 .brand { display: flex; align-items: center; gap: 10px; }
-/* The name: the "Q" in blue, "KVM" in the text colour. */
+/* The name: the "q" in blue, "KVM" in the text colour. */
 .wordmark { font-size: 16px; font-weight: 700; letter-spacing: -.02em; }
 .wordmark b { font-weight: 700; color: var(--accent-text); }
 .brand img { width: 24px; height: 24px; }

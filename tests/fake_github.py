@@ -7,8 +7,6 @@ import hashlib
 import io
 import re
 import socket
-import threading
-import time
 import zipfile
 from typing import Any
 
@@ -17,6 +15,8 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse, Response
+
+from tests import ServerThread
 
 
 def a_key() -> tuple[str, str]:
@@ -79,7 +79,8 @@ class FakeGitHub:
         self._sock.bind(("127.0.0.1", 0))
         self.url = f"http://127.0.0.1:{self._sock.getsockname()[1]}"
         self._server = uvicorn.Server(uvicorn.Config(self._app(), log_level="error", access_log=False))
-        self._thread = threading.Thread(target=self._server.run, kwargs={"sockets": [self._sock]}, daemon=True)
+        self._serving = ServerThread("fake GitHub", lambda: self._server.run(sockets=[self._sock]), lambda: self._server.started)
+        self._thread = self._serving.thread
 
     def publish(self, version: str, wheel: bytes, *, notes: str = "", sums: bool = True, signed_by: str | None = None) -> None:
         """Make `version` the newest release, with a correct checksum list unless told otherwise.
@@ -120,12 +121,7 @@ class FakeGitHub:
         return app
 
     def start(self) -> FakeGitHub:
-        self._thread.start()
-        deadline = time.monotonic() + 10
-        while not self._server.started:
-            if time.monotonic() > deadline:
-                raise RuntimeError("fake GitHub did not start")
-            time.sleep(0.02)
+        self._serving.start()
         return self
 
     def stop(self) -> None:

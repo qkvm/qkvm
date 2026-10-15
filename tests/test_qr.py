@@ -13,7 +13,7 @@ def test_the_code_for_a_known_text_has_not_changed() -> None:
     # This exact pattern was read back with two independent QR readers when the generator was
     # written (all six sizes, all eight masks). The fingerprint keeps a later edit from quietly
     # producing codes that look fine and do not scan.
-    text = "otpauth://totp/QKVM%3Aadmin?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ&issuer=QKVM"
+    text = "otpauth://totp/QKVM%3Aadmin?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ&issuer=QKVM"  # the text the pattern was read back from, as it was
     rows = qr.matrix(text)
     assert hashlib.sha256("\n".join(rows).encode()).hexdigest() == (
         "84cdc9cf0f4748c153c128070db5d27f14cd79d8e891025ec19e8b631a8fc87a"

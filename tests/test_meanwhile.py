@@ -303,8 +303,8 @@ def test_a_session_made_on_the_proxys_word_is_not_somebody_elses_when_the_proxy_
         his = {"Remote-User": "victor"}
         session = shared.get("/api/v1/session", headers=his).json()
         users = shared.get("/api/v1/users", headers=his)
-        print(f"\nthe proxy says victor (a viewer); QKVM says: {session['user']['name']} ({session['user']['role']}); the list of accounts, which takes an admin: HTTP {users.status_code}")
-        assert session["user"]["name"] == "victor", "the proxy names victor, and QKVM goes on treating the browser as olga"
+        print(f"\nthe proxy says victor (a viewer); qKVM says: {session['user']['name']} ({session['user']['role']}); the list of accounts, which takes an admin: HTTP {users.status_code}")
+        assert session["user"]["name"] == "victor", "the proxy names victor, and qKVM goes on treating the browser as olga"
 
 
 # --- 8: first-run setup, and the round that locks up when nobody is signed in --------------------------------

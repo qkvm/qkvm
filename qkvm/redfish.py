@@ -6,7 +6,7 @@ gives the wall is whether the server is on, how it is doing (health, temperature
 and its power button.
 
 What it does not give is a picture of the screen: the standard has none, and the consoles
-the vendors build on top each speak a protocol of their own. Where that protocol is one QKVM
+the vendors build on top each speak a protocol of their own. Where that protocol is one qKVM
 reads (AMI's, see ami.py), the console is held open while the wall is watched and the tile
 shows the server's screen. Elsewhere a server's tile shows its state instead, and "Open
 console" leads to the controller's own page.
@@ -127,7 +127,7 @@ LET_IN_AT_MOST = 8  # times in one session that somebody asking for the console 
 # takes seconds: on the threads that check passwords and write the settings, a few busy screens (or a
 # controller that means it) would keep people from signing in. Two at a time, the rest wait their turn.
 _READERS = ThreadPoolExecutor(max_workers=2, thread_name_prefix="screen")
-UNREADABLE = 3  # this many frames in a row that cannot be read, and it is not a picture QKVM reads
+UNREADABLE = 3  # this many frames in a row that cannot be read, and it is not a picture qKVM reads
 QUANTIZER = {"480": 3, "640": 3, "960": 2, FULL: 2}  # JPEG strength by size, as for the other pictures made here
 # What a controller may hand out to be sent back to it in a header (a session, its token): what a cookie may be
 # made of, which is nothing that could end the header line or begin another.
@@ -136,7 +136,7 @@ CONSOLE_PASS = re.compile(r"[!-~]{1,128}")  # (this one travels in a message of 
 PASS_REFUSED = {
     0: "its console did not accept the pass it had given out",
     2: "this user is not allowed to use its console",
-    3: "its console did not accept what QKVM said of itself",
+    3: "its console did not accept what qKVM said of itself",
     8: "its console does not know the session any more",
 }
 
@@ -296,7 +296,7 @@ class RedfishDevice(Device):
         self._console_refusal: KvmError | None = None  # why the last attempt came to nothing
         self._leaving: set[asyncio.Future[None]] = set()  # sign-outs of its web page that are under way
         self._no_screen: str | None = None  # why there is no picture to be had at all, for now (said on the tile)
-        self._has_console: bool | None = None  # whether this controller has a console QKVM reads; None: not asked yet
+        self._has_console: bool | None = None  # whether this controller has a console qKVM reads; None: not asked yet
         self._console_failures = 0  # attempts in a row that came to nothing
         self._complete_first: bool | None = None  # how its console wants to be greeted (see ami.hello); None: not known yet
         self._encode_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
@@ -585,7 +585,7 @@ class RedfishDevice(Device):
             self._console_retry_at = time.monotonic() + wait
             if self._has_console is False:
                 # A controller of another make. Nothing is wrong with it, and its tile says how the server is.
-                log.info("%s: this controller has no console QKVM reads; its tile shows how the server is", self.label)
+                log.info("%s: this controller has no console qKVM reads; its tile shows how the server is", self.label)
             else:
                 self._no_screen = ex.message if standing else None
                 log.log(
@@ -627,7 +627,7 @@ class RedfishDevice(Device):
         if self._has_console is None:
             # AMI's firmware has this address and wants a sign-in for it. A controller that does not know it has another console.
             # (One that answers with an error of its own just then has said neither: asked once, at one of its
-            # moments, the server's screen was gone until QKVM was started again.)
+            # moments, the server's screen was gone until qKVM was started again.)
             asked = await self._web("GET", "/api/kvm/token")
             if asked.status_code not in (401, 404, 405, 410):
                 # (Neither "sign in first" nor "there is no such thing here": too many requests, a moment of
@@ -635,7 +635,7 @@ class RedfishDevice(Device):
                 raise KvmError("bad_response", f"The controller did not say whether it has a console (HTTP {asked.status_code})")
             self._has_console = asked.status_code == 401
         if not self._has_console:
-            raise KvmError("no_picture", "This controller has no console that QKVM reads yet", 404)
+            raise KvmError("no_picture", "This controller has no console that qKVM reads yet", 404)
         if not self.spec.password:
             raise KvmError("no_password", "No password saved for this device")
         # The controller's own web page is signed in to with the same password, and a wrong one there counts
@@ -733,7 +733,7 @@ class RedfishDevice(Device):
                 raise KvmError("no_picture", f"The controller gave no pass for its console (HTTP {asked.status_code})", 404)
             if said_yes(given.get("automatic_off")) and said_yes(given.get("local_monitor_off")):
                 # Whoever stands at the server would see that. It is not "only looking" any more.
-                raise KvmError("no_picture", "The controller is set to switch the server's own monitor off while its console is open, so QKVM leaves the console alone", 404)
+                raise KvmError("no_picture", "The controller is set to switch the server's own monitor off while its console is open, so qKVM leaves the console alone", 404)
             if self._complete_first is None:
                 # The firmware says what it can do. Whether a console may reconnect decides how it wants to be greeted.
                 try:
@@ -779,8 +779,11 @@ class RedfishDevice(Device):
         async def send(data: bytes) -> None:
             # Within a time: a controller that has stopped listening would hold this for ever, and with it the
             # two checks that end a session (nobody looking, nothing heard), which are made between two things said.
+            # (Not wait_for, which up to Python 3.11 loses a stop that comes as the sending is done: this is said
+            # in the loop that reads the console, and the loop went on. See Listening.message.)
             try:
-                await asyncio.wait_for(connection.send(data if plain_bytes else base64.b64encode(data).decode()), CONSOLE_SAY)
+                async with asyncio.timeout(CONSOLE_SAY):
+                    await connection.send(data if plain_bytes else base64.b64encode(data).decode())
             except TimeoutError:
                 raise KvmError("dropped", "The controller's console stopped taking what is said to it") from None
             except ConnectionClosed:
@@ -893,7 +896,7 @@ class RedfishDevice(Device):
                         except Garbled as ex:
                             frames, unread = ami.Frames(), unread + 1
                             if unread >= UNREADABLE:
-                                raise KvmError("no_picture", f"The controller sends a picture QKVM does not read yet ({ex})", 404) from None
+                                raise KvmError("no_picture", f"The controller sends a picture qKVM does not read yet ({ex})", 404) from None
                 if read_any and time.monotonic() - said_at > 1.0:
                     await send(ami.message(ami.BEHIND))  # "every frame so far has been drawn"
                     said_at = time.monotonic()
@@ -905,11 +908,19 @@ class RedfishDevice(Device):
                     # Said as the controller's own page says it when its window is closed: a console that just goes
                     # away is waited for by the controller, which is then slow to answer anybody. Said from the
                     # greeting on, not from the pass being found good: who else is there is said before that.
-                    await asyncio.wait_for(send(ami.goodbye()), 2)
+                    async with asyncio.timeout(2):
+                        await send(ami.goodbye())
             except (TimeoutError, OSError, WebSocketException, KvmError):
                 pass  # it is not listening (which may be why this is the end): the connection is closed all the same
+            except BaseException:
+                # Told to stop once more while the goodbye was being said (whoever retires a device tells its tasks
+                # again after half a second): the connection is ended here and now. Left to the close below, which
+                # this skips, it stayed open, and the controller kept the console's seat for as long as it liked.
+                connection.transport.abort()
+                raise
             try:
-                await asyncio.wait_for(connection.close(), 3)
+                async with asyncio.timeout(3):
+                    await connection.close()
             except (TimeoutError, OSError, WebSocketException):
                 pass
 

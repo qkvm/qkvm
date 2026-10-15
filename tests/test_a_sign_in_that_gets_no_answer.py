@@ -561,7 +561,7 @@ def test_a_new_connection_does_not_say_rejected_of_a_web_page_that_did_not_answe
 @pytest.mark.parametrize("once", [503, 429, 403, 408])
 def test_a_controller_asked_about_its_console_at_a_bad_moment_is_asked_again(once: int, odd: Odd, scaled: None) -> None:
     # Whether it has a console was asked once, and whatever it answered but "sign in first" meant no. One 503
-    # just then (or "too many requests", or "too slow"), and the server's screen was gone until QKVM was
+    # just then (or "too many requests", or "too slow"), and the server's screen was gone until qKVM was
     # started again. "No" is "there is no such thing here", and nothing else.
     odd.token_says_once = once
     server = FakeBmc(BmcState(own_console=True)).start()

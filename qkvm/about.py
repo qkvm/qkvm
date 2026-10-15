@@ -9,7 +9,7 @@ from importlib import metadata
 from ._version import __version__
 
 LICENCE = "AGPL-3.0-only"  # as in pyproject.toml
-# The libraries QKVM is built on and brings along; the last two only where JetKVM support is installed.
+# The libraries qKVM is built on and brings along; the last two only where JetKVM support is installed.
 LIBRARIES = ("fastapi", "starlette", "uvicorn", "pydantic", "httpx", "httpcore", "h11", "anyio", "websockets", "cryptography", "aiortc", "av")
 
 

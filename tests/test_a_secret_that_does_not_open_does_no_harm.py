@@ -86,7 +86,7 @@ def test_the_way_out_the_answer_names_works_on_a_key_that_does_not_open(tmp_path
     with wall(tmp_path, sign_in=False) as visitor:
         refused = visitor.post("/api/v1/login", json={"password": PASSWORD, "code": code_for(begun["secret"])})
         assert (refused.status_code, refused.json()["code"]) == (409, "no_second_step")
-    assert run_cli(["--data-dir", str(tmp_path), "--disable-2fa", "admin"]) == 0  # (with QKVM stopped: it says so otherwise)
+    assert run_cli(["--data-dir", str(tmp_path), "--disable-2fa", "admin"]) == 0  # (with qKVM stopped: it says so otherwise)
     with wall(tmp_path, sign_in=False) as visitor:
         assert visitor.post("/api/v1/login", json={"password": PASSWORD}).status_code == 200
 

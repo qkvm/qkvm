@@ -129,7 +129,7 @@ def _address(text: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
 
 
 def _believed(request: Request, address: ipaddress.IPv4Address | ipaddress.IPv6Address | None) -> bool:
-    """Whether what this address says about who is calling is believed: a proxy that QKVM was told
+    """Whether what this address says about who is calling is believed: a proxy that qKVM was told
     about when it was started; or, where it was told of none, one on this machine (`tailscale serve`).
 
     Any program on this machine can connect from there and say it passes on whichever address it likes:
@@ -146,7 +146,7 @@ def _believed(request: Request, address: ipaddress.IPv4Address | ipaddress.IPv6A
 
 
 def sso_name(request: Request, header: str) -> str | None:
-    """Who the identity proxy in front of QKVM says has signed in there. None: nobody that QKVM would believe it of.
+    """Who the identity proxy in front of qKVM says has signed in there. None: nobody that qKVM would believe it of.
 
     Believed of a proxy that was named at start (--trusted-proxy) and of nobody else: not of this
     computer itself, where any program can connect and say what it likes. And only where the header comes
@@ -166,7 +166,7 @@ def is_local(request: Request) -> bool:
 
 
 def client_allowed(request: Request) -> bool:
-    """Whether the caller is one of those QKVM was told to answer (--allow-from). Without that option: anybody.
+    """Whether the caller is one of those qKVM was told to answer (--allow-from). Without that option: anybody.
 
     This computer itself is always answered, as long as nobody is being passed on through it: the
     container's own health check asks from there, and so does whoever has to put a wrong list right.
@@ -200,7 +200,7 @@ def client_ip(request: Request) -> str:
 
 
 def is_secure(request: Request) -> bool:
-    """Whether the browser reached QKVM over HTTPS: directly, or as far as a believed proxy that says so."""
+    """Whether the browser reached qKVM over HTTPS: directly, or as far as a believed proxy that says so."""
     if request.scope.get("scheme") == "https":
         return True
     host = request.client.host if request.client else ""
@@ -215,7 +215,7 @@ class Session:
     ttl: float
     ip: str
     user: str = ""  # id of the account that signed in
-    sso: bool = False  # signed in by the identity proxy in front of QKVM, not by a password given here
+    sso: bool = False  # signed in by the identity proxy in front of qKVM, not by a password given here
     mark: str = ""  # of the account's password as it was when they signed in (see Sessions.load)
     # How old it was when this program took it up (0 for one made here), and when that was on the clock that
     # only goes forward: its age is counted from there, and a clock that is put right neither ends it nor keeps it.
@@ -553,6 +553,7 @@ class Sessions:
 class _Guesses:
     by_account: dict[str, int]  # wrong guesses, by the account they were made at ("": at nobody's in particular)
     locked_until: float = 0.0
+    lock: float = 0.0  # how long the lock that ends at locked_until was set for
     last: float = 0.0
 
 
@@ -594,7 +595,11 @@ class Limiter:
         if time.monotonic() - entry.last > self.FORGET:
             del self._failures[key]
             return 0.0
-        return max(0.0, entry.locked_until - time.monotonic())
+        # (Never more than the lock was set for. Its end is "now plus the lock", and this is "that minus now":
+        # where the clock stands still, as Windows' does for sixteen thousandths of a second at a time before
+        # Python 3.13, that is the same now, and floating point can make it a hair more than the lock, which
+        # whoever rounds the wait up to whole seconds would say as one second more.)
+        return max(0.0, min(entry.lock, entry.locked_until - time.monotonic()))
 
     def fail(self, ip: str, account: str = "") -> None:
         """One more wrong guess from this address, at this account's password or code."""
@@ -609,7 +614,7 @@ class Limiter:
         count = sum(entry.by_account.values())
         # (The doubling is stopped where it no longer matters: left to run, it outgrows what a number can hold.)
         lock = min(self.LONGEST, self.BASE * 2 ** min(count - self.FREE, 32)) if count >= self.FREE else 0.0
-        entry.locked_until, entry.last = now + lock, now
+        entry.locked_until, entry.lock, entry.last = now + lock, lock, now
 
     def reset(self, ip: str, account: str) -> None:
         """This account signed in from this address: its own slips are forgotten.

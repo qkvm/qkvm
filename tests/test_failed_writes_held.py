@@ -69,7 +69,7 @@ def test_what_takes_access_away_through_saved_is_refused_and_put_back(tmp_path: 
             assert (answer.status_code, answer.json()["code"]) == (507, "not_saved"), what
             assert not {"token", "recovery_key", "recovery_codes"} & set(answer.json()), what  # and nothing new is shown to anybody
         disk["full"] = False
-        # As it was, while QKVM runs ...
+        # As it was, while qKVM runs ...
         assert admin.get("/api/v1/wall", headers={"Authorization": f"Bearer {token['token']}"}).status_code == 200
         assert hers.get("/api/v1/session").json()["user"]["role"] == "operator"
         assert admin.get("/api/v1/session").json()["user"]["totp"] is True

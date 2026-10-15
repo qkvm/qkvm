@@ -53,7 +53,7 @@ ODD: dict[str, Any] = {"a number": 5, "yes": True, "a record": {"a": 1}, "a part
 @pytest.mark.parametrize("what", ["Temperatures", "Fans"])
 @pytest.mark.parametrize("kind", list(ODD))
 def test_its_temperatures_or_its_fans_are_no_list(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, what: str, kind: str) -> None:
-    # The tile said "something went wrong inside QKVM", with the whole error in the log at every look.
+    # The tile said "something went wrong inside qKVM", with the whole error in the log at every look.
     # A controller that says so has no temperatures to show: the server is there all the same.
     on = [False]
 
@@ -82,7 +82,7 @@ def test_its_temperatures_or_its_fans_are_no_list(tmp_path: Path, monkeypatch: p
 @pytest.mark.parametrize("where", ["on the action", "the parameters of its description", "in its description"])
 @pytest.mark.parametrize("kind", ["a number", "yes", "a part of a number"])
 def test_a_power_button_where_the_kinds_it_offers_are_no_list(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, where: str, kind: str) -> None:
-    # Pressed, a power button was "something went wrong inside QKVM", and the press was in no log. A
+    # Pressed, a power button was "something went wrong inside qKVM", and the press was in no log. A
     # controller that does not say which kinds of reset it takes is asked for the usual one, as always.
     def changed(path: str, said: Any) -> None:
         if path.endswith("/Systems/Self") and where == "on the action":

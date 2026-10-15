@@ -1,4 +1,4 @@
-"""Exit 0 if QKVM answers on this machine: python -m qkvm.healthcheck [port].
+"""Exit 0 if qKVM answers on this machine: python -m qkvm.healthcheck [port].
 
 For a container's HEALTHCHECK or a watchdog. Works whether HTTPS is switched on or not.
 """

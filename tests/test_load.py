@@ -128,7 +128,7 @@ def test_a_kvm_never_heard_from_is_not_waited_for(tmp_path: Path, fake: FakeKvm,
         device = add(client, fake.url)
     fake.state.stall = 30
     monkeypatch.setattr(kvm, "FIRST_CONTACT_WAIT", 0.2)
-    with wall(tmp_path) as client:  # QKVM starts again, and this time the KVM says nothing
+    with wall(tmp_path) as client:  # qKVM starts again, and this time the KVM says nothing
         for _ in range(3):
             began = time.monotonic()
             reply = client.get(snap(device))
@@ -156,7 +156,7 @@ def test_requests_that_fail_together_count_as_one_failed_attempt(monkeypatch: py
 
 @pytest.mark.parametrize("change", ["edit", "remove", "sign out"])
 def test_a_picture_under_way_survives_its_kvm_being_changed(tmp_path: Path, fake: FakeKvm, change: str) -> None:
-    # (The last sign-out takes the connections to the KVMs away where QKVM was started locked. As it comes, it
+    # (The last sign-out takes the connections to the KVMs away where qKVM was started locked. As it comes, it
     # goes on watching, and a picture under way simply arrives.)
     with wall(tmp_path, locked_start=change == "sign out") as admin:
         device = add(admin, fake.url)
@@ -176,7 +176,7 @@ def test_a_picture_under_way_survives_its_kvm_being_changed(tmp_path: Path, fake
             else:  # both browsers are signed in to the one account: this signs out the last of them
                 assert admin.post("/api/v1/logout", json={"scope": "all"}).status_code == 200
             reply = picture.result(timeout=10)
-        # The connection it was coming over is gone. The tile is told to ask again; nothing "went wrong inside QKVM".
+        # The connection it was coming over is gone. The tile is told to ask again; nothing "went wrong inside qKVM".
         assert (reply.status_code, reply.json()["code"]) == (503, "no_stream"), reply.text
         if change == "edit":
             assert admin.get(snap(device)).status_code == 200  # and the next request finds the new connection
@@ -653,7 +653,7 @@ def test_raising_the_allowance_for_open_files_never_fails() -> None:
 
 def test_a_log_line_does_not_wait_for_whatever_it_is_written_to(tmp_path: Path) -> None:
     # A warning is written from wherever in the program something goes wrong, which is the one thread that
-    # serves every browser and looks at every device. On Windows, a click into the window QKVM was started
+    # serves every browser and looks at every device. On Windows, a click into the window qKVM was started
     # in stops everything written to that window until a key is pressed: the wall with it, every tile.
     import logging
 

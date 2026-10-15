@@ -1,4 +1,4 @@
-"""What installing QKVM pulls in is decided on purpose, not by accident."""
+"""What installing qKVM pulls in is decided on purpose, not by accident."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import pytest
 
 PROJECT = tomllib.loads((Path(__file__).parent.parent / "pyproject.toml").read_text(encoding="utf-8"))["project"]
 
-# Every package QKVM asks for, and what for. Each is something to keep up to date, to trust, and to
+# Every package qKVM asks for, and what for. Each is something to keep up to date, to trust, and to
 # answer for when it has a hole. One more needs a reason that fits on a line here, and that the
 # standard library or a few lines of our own would not do.
 NEEDED = {
@@ -20,7 +20,7 @@ NEEDED = {
     "httpx": "talking to the KVMs, the alert address and GitHub",
     "sniffio": "looked for by httpx on every request; without it, each look costs most of a millisecond",
     "websockets": "keeps a KVM's video stream awake; JetKVM signalling",
-    "cryptography": "the vault, the signature on updates, QKVM's own certificate",
+    "cryptography": "the vault, the signature on updates, qKVM's own certificate",
     "aiortc": "a JetKVM sends its picture as WebRTC video and nothing else; by far the largest of these, loaded only for a JetKVM",
     "anyio": "used by the above; named for a minimum version without a known hole",
     "idna": "used by the above; named for a minimum version without a known hole",
@@ -34,7 +34,7 @@ def names(requirements: list[str]) -> list[str]:
 
 def test_the_packages_asked_for_are_the_few_that_are_needed() -> None:
     assert names(PROJECT["dependencies"]) == sorted(NEEDED)
-    # Nothing is left for "extras": whoever installs QKVM can add every device it knows. A JetKVM that
+    # Nothing is left for "extras": whoever installs qKVM can add every device it knows. A JetKVM that
     # answered "install another package first" was the first thing its owner met.
     assert "optional-dependencies" not in PROJECT
 

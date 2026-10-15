@@ -1,4 +1,4 @@
-"""Using QKVM without a person signing in: a token for a script, and a link for a screen on the wall."""
+"""Using qKVM without a person signing in: a token for a script, and a link for a screen on the wall."""
 
 from __future__ import annotations
 
@@ -129,7 +129,7 @@ def test_a_token_reaches_nothing_while_nobody_has_unlocked_the_wall(tmp_path: Pa
 
 
 def test_a_screen_on_the_wall_stays_on_across_restarts_with_a_link_of_its_own(tmp_path: Path, pair: tuple[FakeKvm, FakeKvm]) -> None:
-    # A wall screen was a viewer account "kept signed in": for thirty days, and until QKVM restarted, after
+    # A wall screen was a viewer account "kept signed in": for thirty days, and until qKVM restarted, after
     # which somebody had to stand at the screen with a keyboard. A display link is opened there once.
     one, two = pair
     data = tmp_path / "data"

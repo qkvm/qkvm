@@ -47,7 +47,7 @@ def test_codes_match_the_standard() -> None:
     assert totp.matching_step(secret, "287082", now=59 + 90) is None
     assert totp.matching_step(secret, "28708", now=59) is None
     assert totp.matching_step(secret, "".join(chr(0x660 + int(d)) for d in "287082"), now=59) is None  # other scripts' digits
-    assert totp.setup_uri("ABCD", "olga").startswith("otpauth://totp/QKVM%3Aolga?secret=ABCD&issuer=QKVM")
+    assert totp.setup_uri("ABCD", "olga").startswith("otpauth://totp/qKVM%3Aolga?secret=ABCD&issuer=qKVM")
     assert len(totp.new_secret()) == 32 and totp.spaced("ABCDEFGH") == "ABCD EFGH"
 
 
@@ -56,7 +56,7 @@ def test_signing_in_then_needs_the_code_as_well(tmp_path: Path) -> None:
         assert admin.get("/api/v1/session").json()["user"]["totp"] is False
         assert admin.post("/api/v1/totp/begin", json={"password": "not my password"}).status_code == 401
         begun = admin.post("/api/v1/totp/begin", json={"password": PASSWORD}).json()
-        assert begun["uri"].startswith("otpauth://totp/QKVM%3Aadmin?secret=")
+        assert begun["uri"].startswith("otpauth://totp/qKVM%3Aadmin?secret=")
         # Not on until the app has proven it holds the key.
         assert admin.post("/api/v1/totp/enable", json={"code": "000000"}).status_code == 401
         assert admin.get("/api/v1/session").json()["user"]["totp"] is False
@@ -114,7 +114,7 @@ def test_an_admin_or_the_command_line_can_switch_it_off_for_a_lost_phone(tmp_pat
 
 def test_one_time_codes_stand_in_for_a_phone_that_is_not_at_hand(tmp_path: Path) -> None:
     # A lost phone used to mean asking an admin, or, for the only admin, the command line on the computer
-    # QKVM runs on. Switching the second step on now hands out ten codes, each good for one sign-in.
+    # qKVM runs on. Switching the second step on now hands out ten codes, each good for one sign-in.
     with wall(tmp_path) as admin:
         begun = admin.post("/api/v1/totp/begin", json={"password": PASSWORD}).json()
         enabled = admin.post("/api/v1/totp/enable", json={"code": code_for(begun["secret"])}).json()
@@ -257,7 +257,7 @@ def codes_around_now(spaced_secret: str) -> tuple[str, str, str]:
 
 
 def test_a_code_that_was_used_stays_used_over_a_restart(tmp_path: Path) -> None:
-    # Which code was accepted last was only remembered while QKVM ran. Somebody who had the password and had
+    # Which code was accepted last was only remembered while qKVM ran. Somebody who had the password and had
     # seen a code being typed could use that code again after a restart, while its half minute lasted.
     with wall(tmp_path) as admin:
         secret = str(admin.post("/api/v1/totp/begin", json={"password": PASSWORD}).json()["secret"])

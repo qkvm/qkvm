@@ -292,7 +292,7 @@ def test_the_activity_log_keeps_what_it_is_given_and_makes_nobody_wait(tmp_path:
 
 
 def test_what_only_an_admin_needs_to_know_about_a_device_is_told_to_an_admin_only(tmp_path: Path, fake: FakeKvm) -> None:
-    # The wall needs a name, an address to show and a link to the console. How QKVM signs in to the device,
+    # The wall needs a name, an address to show and a link to the console. How qKVM signs in to the device,
     # and whether its certificate is checked, is for whoever edits it: every account that may look at the
     # wall used to be handed the lot.
     with wall(tmp_path) as admin:

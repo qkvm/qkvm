@@ -125,7 +125,7 @@ def test_alerts_are_posted_when_a_kvm_changes(tmp_path: Path, inbox: Inbox) -> N
             assert inbox.url not in json.dumps(admin.get("/api/v1/alerts").json())  # and never sent back to a browser
 
             assert admin.post("/api/v1/alerts/test").status_code == 200
-            assert inbox.titles() == ["Test alert from QKVM"]
+            assert inbox.titles() == ["Test alert from qKVM"]
             assert admin.get(snap(device)).status_code == 200
             baseline()
 

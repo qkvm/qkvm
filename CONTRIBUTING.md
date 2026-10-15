@@ -1,7 +1,7 @@
-# Contributing to QKVM
+# Contributing to qKVM
 
-QKVM is written and maintained by its publisher alone. **Reports are welcome; pull requests are
-not taken.** QKVM holds the passwords of KVMs and can press the power button of the machines
+qKVM is written and maintained by its publisher alone. **Reports are welcome; pull requests are
+not taken.** qKVM holds the passwords of KVMs and can press the power button of the machines
 behind them, so every line of it is written, reviewed and answered for in one place. That is a
 decision about trust, and no judgement of what you would have sent.
 
@@ -22,18 +22,18 @@ A pull request that is opened all the same is closed with a pointer to this page
 
 ## Your own version
 
-The licence lets you change QKVM and run what you changed: the GNU Affero General Public
+The licence lets you change qKVM and run what you changed: the GNU Affero General Public
 License, version 3 (see `LICENSE`). If you run a changed version for others, or pass it on,
 you owe them its source under the same licence. A fork that publishes releases of its own
 needs its own repository and its own signing key: *Publishing releases* in the README says
-how. The name QKVM and its logo are not covered by the licence.
+how. The name qKVM and its logo are not covered by the licence.
 
 To run the tests of a copy you changed: `python -m pytest`. They use stand-in KVMs, so no
 hardware is needed.
 
 ## Why so few dependencies
 
-QKVM depends on few packages, and that is on purpose: each one has to be kept up to date,
+qKVM depends on few packages, and that is on purpose: each one has to be kept up to date,
 trusted, and answered for when it has a hole. The list, with what each package is for, is in
 `tests/test_packaging.py`, and a test fails when the list and `pyproject.toml` disagree. The
 page uses no JavaScript libraries and loads nothing from other servers.

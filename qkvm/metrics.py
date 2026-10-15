@@ -1,7 +1,7 @@
-"""What a monitoring system can collect from QKVM: the Prometheus text format, at /metrics.
+"""What a monitoring system can collect from qKVM: the Prometheus text format, at /metrics.
 
 Off until an admin makes a token for it (Settings -> Metrics). The token is what a collector sends
-(`Authorization: Bearer ...`); QKVM keeps only its hash. What is told is what the wall shows: how many
+(`Authorization: Bearer ...`); qKVM keeps only its hash. What is told is what the wall shows: how many
 devices are in which state, and for each one whether it answers, whether it has a picture, when it was
 last heard from, and how warm it is. Nothing that could be used to reach or to operate a device.
 """
@@ -45,11 +45,11 @@ def render(*, started: float, unlocked: bool, sessions: int, devices: Iterable[t
         lines.extend(f"{name}{labels} {value:g}" if isinstance(value, float) and not value.is_integer() else f"{name}{labels} {int(value)}" for labels, value in values)
 
     devices = list(devices)
-    metric("qkvm_info", "gauge", "The version of QKVM that is running.", [(f'{{version="{label(__version__)}"}}', 1)])
-    metric("qkvm_start_time_seconds", "gauge", "When this copy of QKVM was started, in seconds since 1970.", [("", int(started))])
-    metric("qkvm_unlocked", "gauge", "1 while QKVM can talk to its devices: somebody has signed in since it was started.", [("", int(unlocked))])
+    metric("qkvm_info", "gauge", "The version of qKVM that is running.", [(f'{{version="{label(__version__)}"}}', 1)])
+    metric("qkvm_start_time_seconds", "gauge", "When this copy of qKVM was started, in seconds since 1970.", [("", int(started))])
+    metric("qkvm_unlocked", "gauge", "1 while qKVM can talk to its devices: somebody has signed in since it was started.", [("", int(unlocked))])
     metric("qkvm_sessions", "gauge", "Browsers that are signed in.", [("", sessions)])
-    metric("qkvm_update_available", "gauge", "1 when a newer version of QKVM has been published.", [("", int(update_available))])
+    metric("qkvm_update_available", "gauge", "1 when a newer version of qKVM has been published.", [("", int(update_available))])
     metric("qkvm_devices_configured", "gauge", "Devices on the wall.", [("", len(devices))])
 
     known = [(record, status) for record, status in devices if status is not None]

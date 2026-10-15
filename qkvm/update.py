@@ -354,7 +354,7 @@ class Updater:
             if not self.keys and not self.allow_unsigned:
                 raise UpdateError(
                     "This copy has no release key built in, so it cannot tell who published an update and "
-                    "does not install one by itself. Install the new version by hand, or start QKVM with "
+                    "does not install one by itself. Install the new version by hand, or start qKVM with "
                     "--allow-unsigned-updates."
                 )
             if release.sums_url is None:

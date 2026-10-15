@@ -137,7 +137,7 @@ def test_what_does_not_pass_is_left_out_and_said_and_the_rest_is_read(tmp_path: 
     odd: list[Any] = [
         good,
         {**good, "url": "https://192.168.1.20"},  # the same address twice
-        {**good, "url": "192.168.1.21"},  # written by QKVM, an address says how it is talked to
+        {**good, "url": "192.168.1.21"},  # written by qKVM, an address says how it is talked to
         {**good, "url": "https://user:pw@192.168.1.22"},
         {**good, "url": "ftp://192.168.1.23"},
         {**good, "url": "https://192.168.1.24", "kind": "something-new"},

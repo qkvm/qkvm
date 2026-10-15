@@ -102,7 +102,7 @@ def test_a_display_link_that_ran_out_or_was_taken_back_lets_no_screen_in_after_a
 
 
 def test_a_settings_file_that_was_damaged_does_not_bring_back_what_was_taken_away_last(tmp_path: Path, fake: FakeKvm) -> None:
-    # README: "an admin can take either back at any moment" and "If qkvm.json is ever unreadable, QKVM starts
+    # README: "an admin can take either back at any moment" and "If qkvm.json is ever unreadable, qKVM starts
     # from the backup". The backup is the file as it was before the last change.
     data = tmp_path / "data"
     with wall(data) as admin:
@@ -135,7 +135,7 @@ def test_the_recovery_key_that_was_replaced_opens_nothing_that_is_left_in_the_fo
 
 
 def test_a_program_that_is_gone_back_to_keeps_what_the_newer_one_wrote(tmp_path: Path) -> None:
-    # README: "If the new version won't start, QKVM goes back to the previous one by itself." 0.1.0 is the
+    # README: "If the new version won't start, qKVM goes back to the previous one by itself." 0.1.0 is the
     # version every later one goes back to. What it does with a settings file a later version wrote:
     data = tmp_path / "data"
     with wall(data) as admin:

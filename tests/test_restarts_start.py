@@ -111,8 +111,8 @@ def test_after_forgetting_the_accounts_alerts_are_not_said_to_be_set_up_when_the
 
 
 def test_one_start_in_which_its_key_could_not_be_read_does_not_end_carrying_on_for_good(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    # README: "Carrying on after a restart: QKVM opens the saved device passwords itself at start". unlock.py:
-    # "OSError: none could be kept ... and then QKVM starts as with --locked-start."
+    # README: "Carrying on after a restart: qKVM opens the saved device passwords itself at start". unlock.py:
+    # "OSError: none could be kept ... and then qKVM starts as with --locked-start."
     data = tmp_path / "data"
     with wall(data) as admin:
         cookie = kept_sign_in(admin)

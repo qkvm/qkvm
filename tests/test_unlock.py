@@ -1,4 +1,4 @@
-"""Carrying on by itself after a restart: the saved passwords opened at start by a key of QKVM's own (as it comes),
+"""Carrying on by itself after a restart: the saved passwords opened at start by a key of qKVM's own (as it comes),
 by one in a file kept elsewhere (--unlock-file), or by nobody but whoever signs in (--locked-start)."""
 
 from __future__ import annotations
@@ -47,7 +47,7 @@ def fits(client: object) -> bool:
 
 
 def test_started_with_its_unlock_file_a_wall_watches_without_anybody_signing_in(tmp_path: Path, fake: FakeKvm) -> None:
-    # After a restart QKVM can reach no device until somebody signs in: the devices' passwords are encrypted
+    # After a restart qKVM can reach no device until somebody signs in: the devices' passwords are encrypted
     # and only an account's password opens them. After a power cut, at three in the morning, that is when it
     # was wanted. Started with an unlock file it opens them itself, from the second start on: the first
     # sign-in is what makes the file fit this data folder.
@@ -75,7 +75,7 @@ def test_started_with_its_unlock_file_a_wall_watches_without_anybody_signing_in(
         assert fake.state.logins >= 1  # signed in to the KVM with the password that was saved
         assert "unlocked_at_start" in [entry["event"] for entry in nobody.core.audit.tail(5)]  # type: ignore[attr-defined]
 
-    with wall(data, sign_in=False) as nobody:  # started without the file: the key QKVM then keeps for itself is another one
+    with wall(data, sign_in=False) as nobody:  # started without the file: the key qKVM then keeps for itself is another one
         assert nobody.get("/healthz").json()["locked"] is True
         assert "qkvm_unlocked 0" in nobody.get("/metrics", headers=collector).text
         # And the file opens nothing any more: taking the option away is how it is switched off.
@@ -226,7 +226,7 @@ def test_switched_off_the_unlock_file_opens_no_copy_that_is_still_lying_there(tm
     assert json.loads((data / "qkvm.bak").read_text(encoding="utf-8")).get("unlock")
     with wall(data, sign_in=False) as nobody:  # started without the option
         assert not fits(nobody)
-    for name in ("qkvm.json", "qkvm.bak"):  # what the file opened is gone from the copy QKVM keeps of its settings too
+    for name in ("qkvm.json", "qkvm.bak"):  # what the file opened is gone from the copy qKVM keeps of its settings too
         assert not json.loads((data / name).read_text(encoding="utf-8")).get("unlock"), name
 
 
@@ -259,7 +259,7 @@ def test_as_it_comes_a_wall_carries_on_by_itself_after_a_restart(tmp_path: Path,
         device = add(admin, fake.url)
         ordinary = str(admin.cookies.get(COOKIE))  # the sign-in `wall` made: without the box ticked
         cookie = kept_sign_in(admin)
-        wait_until(lambda: fits(admin), "QKVM's own key was never made to fit this data folder")
+        wait_until(lambda: fits(admin), "qKVM's own key was never made to fit this data folder")
         assert admin.get("/api/v1/session").json()["unlocks_at_start"] is True
     assert (data / "unlock.key").is_file() and len((data / "unlock.key").read_text(encoding="ascii").strip()) >= unlock.SHORTEST
     written = (data / "sessions.json").read_text(encoding="ascii")
@@ -406,7 +406,7 @@ def test_a_sign_out_is_not_undone_by_a_restart_when_it_could_not_be_written_down
         disk.update(full=True, held=True)
         everywhere = admin.post(f"/api/v1/users/{me}/logout")
         assert (everywhere.status_code, everywhere.json()["code"]) == (507, "not_saved") and "restart" in everywhere.json()["message"]
-        assert not let_in(visitor(admin, 50004), other)  # signed out all the same, for as long as QKVM runs
+        assert not let_in(visitor(admin, 50004), other)  # signed out all the same, for as long as qKVM runs
         admin.cookies.set(COOKIE, cookie)
         refused = admin.post("/api/v1/logout", json={"scope": "this"})
         assert (refused.status_code, refused.json()["code"]) == (507, "not_saved") and "restart" in refused.json()["message"]

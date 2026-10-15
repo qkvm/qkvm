@@ -48,7 +48,7 @@ def with_screen() -> Iterator[FakeBmc]:
 
 
 def test_an_edit_of_the_tile_does_not_throw_a_person_out_of_a_jetkvms_console(tmp_path: Path, jet: FakeJetKvm) -> None:
-    # The same promise, with QKVM running on: an edit of the device (a new name) makes a new client for it.
+    # The same promise, with qKVM running on: an edit of the device (a new name) makes a new client for it.
     leave, seen = threading.Event(), {}
 
     def at_the_console() -> None:

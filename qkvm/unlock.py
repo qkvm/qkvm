@@ -1,12 +1,12 @@
-"""The key that opens the saved passwords at start, so that QKVM carries on by itself after a restart.
+"""The key that opens the saved passwords at start, so that qKVM carries on by itself after a restart.
 
-The devices' passwords are saved encrypted, and an account's password opens them. Left at that, QKVM can
+The devices' passwords are saved encrypted, and an account's password opens them. Left at that, qKVM can
 reach no device after a restart until somebody signs in: after a power cut nothing is watched, no alert
 goes out, no collector is answered and every screen on a wall asks for a password, until a person has
 been by. Its owner met that on the first day and chose otherwise, so there are three ways, and the first
 is how it comes:
 
-* A key of QKVM's own, in the data folder (`own_secret`). It carries on by itself, and that is said as
+* A key of qKVM's own, in the data folder (`own_secret`). It carries on by itself, and that is said as
   what it is: the key lies beside what it opens, so a copy of the data folder is all it takes to read
   the saved device passwords. The accounts' own passwords are not in it either way.
 * --unlock-file FILE: the same, with the key kept where the data folder and its backups do not go (a
@@ -27,14 +27,14 @@ from pathlib import Path
 
 SHORTEST = 32  # characters; a secret that somebody made up themselves is refused below this
 LONGEST = 4096  # bytes; a secret is a line, not whatever file the option happened to be pointed at
-OWN = "unlock.key"  # the key QKVM keeps for itself, in the data folder
+OWN = "unlock.key"  # the key qKVM keeps for itself, in the data folder
 
 
 def own_secret(data_dir: Path) -> str:
-    """The key QKVM keeps in its data folder to carry on by itself after a restart. Made if it is not there.
+    """The key qKVM keeps in its data folder to carry on by itself after a restart. Made if it is not there.
 
     For its owner alone, and never over a file that appeared in the meantime. OSError: none could be kept
-    (a folder that cannot be written to), and then QKVM starts as with --locked-start.
+    (a folder that cannot be written to), and then qKVM starts as with --locked-start.
     """
     path = data_dir / OWN
     for _ in range(2):
@@ -56,7 +56,7 @@ def own_secret(data_dir: Path) -> str:
 
 
 def forget_own(data_dir: Path) -> None:
-    """Take QKVM's own key out of the data folder: it was started with a key kept elsewhere, or with none.
+    """Take qKVM's own key out of the data folder: it was started with a key kept elsewhere, or with none.
 
     Raises OSError where it can be neither removed nor emptied: it then still lies there, and still opens
     whatever copy of the settings it fits. Whoever asked for it to be gone has to hear of that.
@@ -85,7 +85,7 @@ def lies_in(path: Path, folder: Path) -> bool:
 def secret_in(path: Path, data_dir: Path) -> tuple[str, bool]:
     """The secret in the unlock file, and whether the file was made just now (it is, if it is not there).
 
-    ValueError says, for whoever started QKVM, why this file will not do.
+    ValueError says, for whoever started qKVM, why this file will not do.
     """
     try:
         inside = lies_in(path, data_dir)
@@ -117,7 +117,7 @@ def secret_in(path: Path, data_dir: Path) -> tuple[str, bool]:
     if len(secret) < SHORTEST:
         raise ValueError(
             f"{path}: what is in the unlock file is too short to protect anything "
-            f"({len(secret)} characters, where {SHORTEST} are the least). Delete it and QKVM makes one."
+            f"({len(secret)} characters, where {SHORTEST} are the least). Delete it and qKVM makes one."
         )
     return secret, made
 

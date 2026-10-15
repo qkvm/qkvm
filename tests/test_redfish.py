@@ -80,7 +80,7 @@ def test_a_server_is_recognised_from_its_address_and_shows_how_it_is(tmp_path: P
             {"name": "CPU0_FAN", "reading": 1650, "unit": "RPM", "ok": True},
             {"name": "CPU1_FAN", "reading": 450, "unit": "RPM", "ok": False},
         ]
-        # This controller has no console QKVM reads. That is found out by asking once, without the password,
+        # This controller has no console qKVM reads. That is found out by asking once, without the password,
         # and from then on the tile is told plainly that there is no picture, rather than left to guess.
         assert status["screen"] is True  # (not known yet)
         wait_until(lambda: client.get(snap(added["device"]["id"])).status_code == 404, "it was never said that there is no picture")
@@ -607,7 +607,7 @@ def test_a_command_that_was_accepted_and_not_carried_out_is_not_called_done(tmp_
 
 
 def test_a_power_command_whose_connection_is_retired_while_it_is_confirmed_is_not_said_to_have_failed(bmc: FakeBmc, monkeypatch: pytest.MonkeyPatch) -> None:
-    # The controller accepts the command, and for some seconds QKVM looks whether the server did change. The tile
+    # The controller accepts the command, and for some seconds qKVM looks whether the server did change. The tile
     # saved in those seconds (or the last person signing out) takes the connection away: every look after that
     # failed, each was taken for one of the controller's moments, and when the time was up the operator was
     # told "the command was not carried out", of a server that may have been switching on. What is said then is
@@ -1099,6 +1099,42 @@ def test_a_controller_that_stops_listening_does_not_keep_the_console_open_for_ev
         client.get(snap(device))
         wait_until(lambda: bmc.state.web_logins == 1, "the console was never asked for")
         wait_until(lambda: (bmc.state.watching, bmc.state.web_sessions) == (0, {}), "the console stayed open, stuck in something it was saying", timeout=8)
+
+
+class SlowToTakeTheGoodbye:
+    """A console connection whose other end takes everything but the goodbye, which it does not take at all."""
+
+    def __init__(self, real: Any) -> None:
+        self._real = real
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._real, name)
+
+    async def send(self, data: Any) -> None:
+        if data == ami.goodbye():
+            await asyncio.Event().wait()  # for ever
+        await self._real.send(data)
+
+
+def test_a_server_taken_off_the_wall_while_its_console_takes_its_time_over_the_goodbye_gives_the_console_back(tmp_path: Path, with_screen: FakeBmc, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Taken off the wall, the console says goodbye, and closes. Whoever retires a device tells its tasks to stop
+    # again after half a second: told again while the goodbye was still being said, the console left without
+    # closing, the connection stayed open, and the controller kept the seat for as long as it liked.
+    really = redfish.ws_connect
+    opened: list[Any] = []  # (held here: a connection that nobody holds is closed by the garbage collector, sooner or later)
+
+    async def slow(url: str, **options: Any) -> Any:
+        opened.append(await really(url, **options))
+        return SlowToTakeTheGoodbye(opened[-1])
+
+    monkeypatch.setattr(redfish, "ws_connect", slow)
+    bmc = with_screen
+    with wall(tmp_path) as client:
+        device = add(client, bmc.url)
+        picture_of(client, device)
+        assert bmc.state.watching == 1
+        assert client.delete(f"/api/v1/devices/{device}").status_code == 200
+        wait_until(lambda: bmc.state.watching == 0, "the server is off the wall, and its console is still open")
 
 
 def test_a_picture_that_cannot_be_made_this_moment_is_asked_for_again_and_is_no_error(tmp_path: Path, with_screen: FakeBmc, monkeypatch: pytest.MonkeyPatch) -> None:

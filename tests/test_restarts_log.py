@@ -1,4 +1,4 @@
-"""What was done to a machine is in the activity log although QKVM was stopped before the machine answered."""
+"""What was done to a machine is in the activity log although qKVM was stopped before the machine answered."""
 
 from __future__ import annotations
 
@@ -66,7 +66,7 @@ def test_a_power_cut_that_went_out_is_in_the_activity_log_though_qkvm_was_stoppe
         pressing.start()
         wait_until(lambda: bmc.state.actions == ["system ForceOff"], "the command never went out", timeout=20)
         time.sleep(0.5)
-        # QKVM is stopped, or its listeners are re-opened: what core.stop does (an update is installed, the port
+        # qKVM is stopped, or its listeners are re-opened: what core.stop does (an update is installed, the port
         # is changed in the settings, `qkvm restart`, the service manager).
         server.should_exit = True
         serving.join(30)

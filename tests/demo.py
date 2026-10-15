@@ -43,7 +43,7 @@ def main() -> None:
     # Servers, seen through their management controller: running with one slow fan, switched off, and faulty.
     servers = {
         # As a real controller does: it takes a change and shows it a few seconds later.
-        # These two are of the make whose console QKVM reads: their tiles show their screens.
+        # These two are of the make whose console qKVM reads: their tiles show their screens.
         "Database server": FakeBmc(BmcState(health="Warning", console=None, slow_to_act=4.0, blink_lasts=15.0, own_console=True, screen=[console_screen(seed=3)])),
         # This one hands out a way into its console, so "Open console" leads straight in.
         "Spare server": FakeBmc(BmcState(power="Off", model="SRV-1100")),

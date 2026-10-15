@@ -192,7 +192,7 @@ ASKS = [
 
 @pytest.mark.parametrize("line", list(ODD_LINES))
 def test_a_line_of_the_activity_log_that_is_a_record_and_no_entry(tmp_path: Path, line: str) -> None:
-    # The log was "something went wrong inside QKVM" for whoever opened it, or asked for it as a file: a list
+    # The log was "something went wrong inside qKVM" for whoever opened it, or asked for it as a file: a list
     # where the event belongs cannot be looked up among the kinds of event, and a value nested a few
     # hundred deep is more than the framework writes out. An entry is what the program writes; a line
     # that is something else is no entry, and the entries around it are shown.
@@ -214,7 +214,7 @@ def test_a_line_of_the_activity_log_that_is_a_record_and_no_entry(tmp_path: Path
 def test_something_nested_inside_what_the_settings_file_keeps_sealed(tmp_path: Path, where: str, depth: int) -> None:
     # Any record that is not empty was taken for a sealed one, whatever was in it. Nested a thousand deep,
     # the wall started, and from then on every change was answered "not saved": what is read is copied at
-    # every save, and the copying gives up far earlier than the reading. Nothing QKVM writes is nested
+    # every save, and the copying gives up far earlier than the reading. Nothing qKVM writes is nested
     # like that, anywhere in the file: such a file is a damaged one, and the second copy is used.
     folder = tmp_path / "wall"
     fake = FakeKvm().start()

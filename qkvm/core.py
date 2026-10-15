@@ -54,14 +54,14 @@ class Core:
         # HTTPS because it was said at start, whatever the settings say; and with whose certificate.
         self.https_forced = https or tls_files is not None
         self.tls_files = tls_files  # (certificate, key) of the owner's own, instead of one made here
-        # Proxies in front of QKVM that are believed about who is calling (see security.client_ip).
+        # Proxies in front of qKVM that are believed about who is calling (see security.client_ip).
         self.trusted_proxies = proxy_networks(trusted_proxies)
-        # What opens the saved passwords without anybody signing in, so that QKVM carries on by itself after a
+        # What opens the saved passwords without anybody signing in, so that qKVM carries on by itself after a
         # restart (see unlock.py): what the unlock file given at start holds; or, as it comes, a key of its own
         # in the data folder; or nothing, where it was started with --locked-start.
         self.locked_start = locked_start
         self.own_key = False
-        self.key_unread: str | None = None  # why QKVM's own key could not be read or made at this start, where it could not
+        self.key_unread: str | None = None  # why qKVM's own key could not be read or made at this start, where it could not
         self.key_left: str | None = None  # why it could not be taken out of the data folder, where it was to be
         if unlock_secret is None and not locked_start:
             try:
@@ -97,7 +97,7 @@ class Core:
         self.limiter = Limiter()
         # What each machine was last seen as, for alerts: kept over a restart, and over the listeners being reopened.
         self.watcher = Watcher(data_dir / "watch.json")
-        # Where QKVM was started with --setup-code: printed where it runs, and asked of whoever sets the first
+        # Where qKVM was started with --setup-code: printed where it runs, and asked of whoever sets the first
         # password from another computer, as proof that they can see that. None: nothing is asked but the
         # password, and whoever opens a new wall first chooses it.
         self.setup_code: str | None = f"{secrets.randbelow(10**8):08d}" if setup_code else None
@@ -171,9 +171,9 @@ class Core:
         return [f"{scheme}://{host}:{port}/" for host in dict.fromkeys(hosts)]
 
     def unlock_at_start(self) -> str | None:
-        """Open the saved passwords with the unlock file's secret, if QKVM was started with one.
+        """Open the saved passwords with the unlock file's secret, if qKVM was started with one.
 
-        Once, before anything is served. Returns a line for whoever started QKVM where there is
+        Once, before anything is served. Returns a line for whoever started qKVM where there is
         something they should know, and None otherwise.
         """
         if self.store.restored:
@@ -186,7 +186,7 @@ class Core:
                 # Not asked to start locked: the key could not be read, this once. What it fits is left as it
                 # is, and the next start tries again. (The browsers that were kept signed in sign in once more.)
                 return (
-                    f"the key QKVM keeps to carry on after a restart could not be read ({self.key_unread}): nothing is watched until somebody signs in, "
+                    f"the key qKVM keeps to carry on after a restart could not be read ({self.key_unread}): nothing is watched until somebody signs in, "
                     "and browsers that were kept signed in sign in once more"
                 )
             left = f" The key that opened them could not be taken out of the data folder ({self.key_left}): remove {unlock.OWN} there by hand." if self.key_left else ""
@@ -203,7 +203,7 @@ class Core:
             if not self.initialized:
                 return None
             if self.own_key:
-                return "QKVM carries on by itself after a restart from the next sign-in on: until then nothing is watched"
+                return "qKVM carries on by itself after a restart from the next sign-in on: until then nothing is watched"
             return "the unlock file is in use from the next sign-in on: until then nothing is watched"
         try:
             key = Vault.open(fitted, secret)
@@ -218,7 +218,7 @@ class Core:
             self.sessions.forget_kept(for_good=False)
             if self.own_key:
                 log.warning("the key in the data folder does not open it: it is another one than the one that was in use")
-                return f"the key QKVM keeps to carry on after a restart does not fit this data folder (the folder was put together from two, or was used with an unlock file before). It will fit again after the next sign-in; until then nothing is watched.{old}"
+                return f"the key qKVM keeps to carry on after a restart does not fit this data folder (the folder was put together from two, or was used with an unlock file before). It will fit again after the next sign-in; until then nothing is watched.{old}"
             log.warning("the unlock file does not open this data folder: it is another file than the one that was in use")
             return f"the unlock file does not fit this data folder (it was replaced, or this is another folder). It will fit again after the next sign-in; until then nothing is watched.{old}"
         self.vault.adopt(key)

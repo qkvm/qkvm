@@ -259,7 +259,7 @@ class TokenIn(BaseModel):
     _groups = field_validator("groups")(_group_names)
     name: str = Field(min_length=1, max_length=60)
     kind: Literal["api", "display"] = "api"
-    role: Literal["viewer", "operator"] = "viewer"  # never an admin: what manages QKVM itself takes a person
+    role: Literal["viewer", "operator"] = "viewer"  # never an admin: what manages qKVM itself takes a person
     devices: list[str] | None = Field(None, max_length=1000)  # the KVMs it is for; None: all of them
     groups: list[str] = Field(default_factory=list, max_length=100)  # and every KVM of these groups, now and later
     days: int | None = Field(None, ge=1, le=3650)  # how long it works; None: until it is taken back
@@ -551,7 +551,8 @@ async def listens(url: str) -> bool:
     parts = urlsplit(url)
     port = parts.port or (443 if parts.scheme == "https" else 80)
     try:
-        found = await asyncio.wait_for(asyncio.get_running_loop().getaddrinfo(parts.hostname, port, type=socket.SOCK_STREAM), 3.0)
+        async with asyncio.timeout(3.0):  # (never wait_for, which loses a stop up to Python 3.11: see kvm.Listening.message)
+            found = await asyncio.get_running_loop().getaddrinfo(parts.hostname, port, type=socket.SOCK_STREAM)
     except (OSError, TimeoutError):
         return True  # where it is cannot be found out just now: not "nothing is there"
     addresses = list(dict.fromkeys(str(entry[4][0]) for entry in found))
@@ -564,7 +565,8 @@ async def listens(url: str) -> bool:
         # Each address by itself: asked for by name, two refusals come back as one error that does not say
         # what it is made of, and on Windows a refusal takes two seconds, so that two were never both heard.
         try:
-            _, writer = await asyncio.wait_for(asyncio.open_connection(address, port), 4.0)
+            async with asyncio.timeout(4.0):
+                _, writer = await asyncio.open_connection(address, port)
         except ConnectionRefusedError:
             return True
         except TimeoutError:
@@ -593,7 +595,7 @@ def view(record: DeviceRecord, editing: bool = True) -> dict[str, Any]:
     """What a browser may know about a device. Never the password.
 
     `editing`: for somebody who may change it. Whoever may only look, or act, is told what a tile shows,
-    and not how QKVM signs in to the device or how its certificate is checked.
+    and not how qKVM signs in to the device or how its certificate is checked.
     """
     shown = {
         "id": record.id,
@@ -638,7 +640,7 @@ def create_app(core: Core) -> FastAPI:
                 # same thing all the same: not saved. Said as that, so that the change is taken back the way
                 # it is for a full disk, and not kept in memory until the next restart undoes it.
                 log.exception("the settings could not be saved")
-                raise OSError(f"{type(ex).__name__} inside QKVM; the details are in its log") from ex
+                raise OSError(f"{type(ex).__name__} inside qKVM; the details are in its log") from ex
 
     async def save_in_turn() -> None:
         """Save, for something the program changes by itself: when no change of anybody's is half made."""
@@ -807,7 +809,7 @@ def create_app(core: Core) -> FastAPI:
     def keep_unlocked() -> bool:
         """While alerts are on, or metrics are collected, the KVMs are watched after the last person signs out too.
 
-        And always where QKVM has a key that opens the saved passwords at start (its own, or an unlock
+        And always where qKVM has a key that opens the saved passwords at start (its own, or an unlock
         file's): what opens them is on this computer anyway, and forgetting them here would only mean
         opening them again.
         """
@@ -816,7 +818,7 @@ def create_app(core: Core) -> FastAPI:
     background: set[asyncio.Task[None]] = set()  # things set going by a request that it does not wait for
 
     async def fit_unlock_file() -> None:
-        """Make the unlock file QKVM was started with fit this data folder, now that a password has opened it."""
+        """Make the unlock file qKVM was started with fit this data folder, now that a password has opened it."""
         async with one_change:
             if core.unlock_secret is None or store.unlock is not None or not core.vault.unlocked:
                 return
@@ -891,20 +893,20 @@ def create_app(core: Core) -> FastAPI:
         await asyncio.to_thread(core.audit.flush)  # what was done last is on disk before the program ends
         await asyncio.to_thread(core.sessions.flush)  # ...and so is who signed out last
 
-    app = FastAPI(title="QKVM", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
+    app = FastAPI(title="qKVM", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
     app.state.trusted_proxies = core.trusted_proxies
     app.state.allowed_clients = core.allowed_clients
 
     async def screened(request: Request, call_next: Callable[[Request], Awaitable[Response]], path: str) -> Response:
         """Decide whether a request may go ahead, and let it."""
         if not client_allowed(request):
-            # Before anything else: to an address that was not named there is no QKVM here to talk to.
-            return PlainTextResponse("This address is not allowed to use QKVM.", status_code=403)
+            # Before anything else: to an address that was not named there is no qKVM here to talk to.
+            return PlainTextResponse("This address is not allowed to use qKVM.", status_code=403)
         host = request.headers.get("host", "")
         if not host_allowed(host, store.server.allowed_hosts):
             return PlainTextResponse(
                 f"Host {host!r} is not allowed. Use the IP address, or add this name to "
-                "allowed_hosts in QKVM's settings file (qkvm.json).",
+                "allowed_hosts in qKVM's settings file (qkvm.json).",
                 status_code=400,
             )
         changing = request.method not in ("GET", "HEAD")
@@ -931,7 +933,7 @@ def create_app(core: Core) -> FastAPI:
                 return fail(403, "not_allowed", "A token has nothing to sign out of")
             if not core.vault.unlocked:
                 # Said, and not left to look like "no devices": a script that runs at night meets this after every restart.
-                return fail(503, "locked", "QKVM was restarted and nobody has signed in since, so it cannot reach its devices. Started with --unlock-file, it can.")
+                return fail(503, "locked", "qKVM was restarted and nobody has signed in since, so it cannot reach its devices. Started with --unlock-file, it can.")
             sent.used = time.time()
         if user is not None and must_enroll(user, request) and not _ENROLLING.fullmatch(f"{request.method} {path}"):
             # Signed in by password alone where that is not enough: all there is to do is to put that right.
@@ -940,7 +942,8 @@ def create_app(core: Core) -> FastAPI:
             # The whole request is in hand before anything is done or held for it. A sender that
             # stops halfway (by accident or to be a nuisance) holds up nobody but itself, and not for long.
             try:
-                await asyncio.wait_for(request.body(), BODY_TIMEOUT)
+                async with asyncio.timeout(BODY_TIMEOUT):  # (never wait_for, which loses a stop up to Python 3.11: see kvm.Listening.message)
+                    await request.body()
             except TimeoutError:
                 return fail(408, "timeout", "The request took too long to arrive")
             except ClientDisconnect:
@@ -982,7 +985,7 @@ def create_app(core: Core) -> FastAPI:
             # A bug in a check or in a handler: record it, keep serving, and tell the page nothing about
             # the internals. Whatever happened, the answer leaves with the security headers below.
             log.exception("unhandled error in %s %s", request.method, path)
-            response = fail(500, "internal", "Something went wrong inside QKVM. The details are in its log.")
+            response = fail(500, "internal", "Something went wrong inside qKVM. The details are in its log.")
         response.headers.update(SECURITY_HEADERS)
         if is_secure(request):
             response.headers["Strict-Transport-Security"] = "max-age=31536000"
@@ -1166,7 +1169,7 @@ def create_app(core: Core) -> FastAPI:
         """Whether this account has to have two-factor sign-in here, and has not.
 
         `request`: asked of whoever is making it. Somebody the identity proxy signed in has had their
-        second step where they signed in: QKVM's own is for those who sign in with a password here.
+        second step where they signed in: qKVM's own is for those who sign in with a password here.
         """
         level = store.server.require_totp
         # (The rule is about accounts. A token is made by an admin for one job, and has no phone.)
@@ -1214,7 +1217,7 @@ def create_app(core: Core) -> FastAPI:
     async def written_down() -> JSONResponse | None:
         """Wait until a sign-out is on disk as well. Where it could not be put there: the answer that says so.
 
-        Ended here, a sign-in is ended for as long as QKVM runs. A browser that asked to be kept signed in
+        Ended here, a sign-in is ended for as long as qKVM runs. A browser that asked to be kept signed in
         is also written down, to outlast a restart; if that could neither be written anew nor taken away,
         a restart would let whoever holds a copy of its cookie in again, and "signed out" would not be true.
         """
@@ -1224,8 +1227,8 @@ def create_app(core: Core) -> FastAPI:
         log.error("A sign-out could not be written down: %s", why)
         return fail(
             507, "not_saved",
-            f"Signed out, but that could not be written down ({why}). If QKVM is restarted before it can be, the sign-in "
-            "that was ended works again for whoever kept a copy of it. Make room where QKVM keeps its settings; the next sign-in or sign-out then puts it right.",
+            f"Signed out, but that could not be written down ({why}). If qKVM is restarted before it can be, the sign-in "
+            "that was ended works again for whoever kept a copy of it. Make room where qKVM keeps its settings; the next sign-in or sign-out then puts it right.",
         )  # fmt: skip
 
     def still_allowed(request: Request, was: UserRecord | None = None) -> JSONResponse | None:
@@ -1361,7 +1364,7 @@ def create_app(core: Core) -> FastAPI:
         token: str | None = None
         sso: dict[str, Any] = {}
         if core.sso_header:
-            # Somebody the proxy in front of QKVM has signed in is signed in here, as the account of that
+            # Somebody the proxy in front of qKVM has signed in is signed in here, as the account of that
             # name, if there is one that may. The page asks this first thing, and again when its session is gone.
             name = None if user is not None else sso_name(request, core.sso_header)
             known = store.user_named(name) if name else None
@@ -1385,7 +1388,7 @@ def create_app(core: Core) -> FastAPI:
             "recovery_created": store.recovery_created if user is not None and user.role == "admin" else None,
             "setup_code_required": core.setup_code is not None and not core.initialized and not is_local(request),
             "min_password": MIN_PASSWORD,
-            # Whether QKVM carries on by itself after a restart (it was started with an unlock file that fits).
+            # Whether qKVM carries on by itself after a restart (it was started with an unlock file that fits).
             "unlocks_at_start": user is not None and core.unlock_secret is not None and store.unlock is not None,
         }
         response = JSONResponse(said)
@@ -1395,16 +1398,16 @@ def create_app(core: Core) -> FastAPI:
     async def setup(body: SetupIn, request: Request) -> Response:
         ip = client_ip(request)
         if core.initialized:
-            return fail(409, "initialized", "QKVM is already set up")
+            return fail(409, "initialized", "qKVM is already set up")
         if blocked := throttled(ip):
             return blocked
-        # Where it was started with --setup-code: from another machine, the code printed where QKVM runs proves you own it.
+        # Where it was started with --setup-code: from another machine, the code printed where qKVM runs proves you own it.
         if core.setup_code is not None and not is_local(request) and not same_text(body.setup_code.strip(), core.setup_code):
             core.limiter.fail(ip)
-            return fail(403, "bad_setup_code", "That is not the setup code shown in QKVM's terminal")
+            return fail(403, "bad_setup_code", "That is not the setup code shown in qKVM's terminal")
         async with setting_up:
             if core.initialized:  # someone else finished setting up while this request waited
-                return fail(409, "initialized", "QKVM is already set up")
+                return fail(409, "initialized", "qKVM is already set up")
             auth = await asyncio.to_thread(core.vault.create, body.password)
             user = UserRecord(id=secrets.token_hex(4), name=body.name, role="admin", auth=auth, created=time.time())
             before = (store.users, store.unlock, store.recovery, store.recovery_created)
@@ -1427,7 +1430,7 @@ def create_app(core: Core) -> FastAPI:
     async def login(body: LoginIn, request: Request) -> Response:
         ip = client_ip(request)
         if not core.initialized:
-            return fail(409, "not_initialized", "QKVM has not been set up yet")
+            return fail(409, "not_initialized", "qKVM has not been set up yet")
         if blocked := throttled(ip):
             return blocked
         name = body.name.strip()
@@ -1505,10 +1508,10 @@ def create_app(core: Core) -> FastAPI:
                             no_step_said.clear()
                         no_step_said[user.id] = time.monotonic()
                         log.error("%s: the key of this account's second step does not open (the settings file was edited, or is damaged)", plain(user.name) or user.id)
-                    return fail(409, "no_second_step", "The second step of this account cannot be checked: its saved key does not open any more. On the computer QKVM runs on, `qkvm --disable-2fa NAME` switches it off.")
+                    return fail(409, "no_second_step", "The second step of this account cannot be checked: its saved key does not open any more. On the computer qKVM runs on, `qkvm --disable-2fa NAME` switches it off.")
                 # A code of the app works once as well, a restart later too. Which one was accepted last is
                 # kept with the account, and that is saved before anybody is let in on the code: what was only
-                # remembered while QKVM ran could be typed again after a restart, while its half minute lasted.
+                # remembered while qKVM ran could be typed again after a restart, while its half minute lasted.
                 # One sign-in at a time, so that the same code sent twice at once is taken once.
                 async with one_change:
                     if refused := turned_away(user, checked, ip) or held_for_codes(user):
@@ -1603,7 +1606,7 @@ def create_app(core: Core) -> FastAPI:
         """Set a new password for an account, proving the right to with the recovery key instead of the old one."""
         ip = client_ip(request)
         if not core.initialized:
-            return fail(409, "not_initialized", "QKVM has not been set up yet")
+            return fail(409, "not_initialized", "qKVM has not been set up yet")
         if blocked := throttled(ip):
             return blocked
         name = body.name.strip()
@@ -1771,7 +1774,7 @@ def create_app(core: Core) -> FastAPI:
 
     @app.post("/api/v1/tokens")
     async def create_token(body: TokenIn, request: Request) -> Response:
-        """Make a token for a script, or a link for a wall screen. It is shown this once; QKVM keeps what recognises it."""
+        """Make a token for a script, or a link for a wall screen. It is shown this once; qKVM keeps what recognises it."""
         key, kept = metrics.new_token()
         known, now = {d.id for d in store.devices}, time.time()
         record = TokenRecord(
@@ -2085,7 +2088,7 @@ def create_app(core: Core) -> FastAPI:
         except Exception:
             log.exception("%s: the device answered in a way that was not expected", record.url)
             await client.close()
-            raise KvmError("bad_response", "The device answered in a way QKVM does not understand") from None
+            raise KvmError("bad_response", "The device answered in a way qKVM does not understand") from None
         record.cert_pem = client.spec.cert_pem  # keep what was trusted on first contact
         said = about.pop("ident", None)  # what it says it is: for telling it from the others, not for the page
         if isinstance(said, str) and IDENT.fullmatch(said) and not record.ident.startswith("own:"):
@@ -2412,9 +2415,9 @@ def create_app(core: Core) -> FastAPI:
             audit.write("action_failed", client_ip(request), error=ex.message, **detail)
             return fail(ex.status, ex.code, ex.message)
         except asyncio.CancelledError:
-            # QKVM is being stopped, or its listeners reopened, and this request is cut off. What was sent may
+            # qKVM is being stopped, or its listeners reopened, and this request is cut off. What was sent may
             # have been carried out: whoever reads the log is to find that it was sent.
-            audit.write("action_failed", client_ip(request), error="QKVM was stopped or restarted before the machine answered: it may have been done", **detail)
+            audit.write("action_failed", client_ip(request), error="qKVM was stopped or restarted before the machine answered: it may have been done", **detail)
             raise
         finally:
             acted_on.discard(device_id)
@@ -2568,7 +2571,7 @@ def create_app(core: Core) -> FastAPI:
 
         addresses, _ = await asyncio.to_thread(resolve, core.bind)
         if core.https:
-            # Made before anything is saved: HTTPS that is switched on and has no certificate is a QKVM that
+            # Made before anything is saved: HTTPS that is switched on and has no certificate is a qKVM that
             # does not start again. And made now so the page can show the fingerprint before the browser's
             # warning appears.
             try:
@@ -2581,7 +2584,7 @@ def create_app(core: Core) -> FastAPI:
             # It was made anew (another address to be good for, or its time nearly up): served from now on,
             # and not only shown. Shown and not served, whoever compares the two sees an attack that is none.
             restart = restart or (was and core.cert_fingerprint != shown)
-        # (Where QKVM listens, of all things, must not be changed by whatever is saved next, after this was refused.)
+        # (Where qKVM listens, of all things, must not be changed by whatever is saved next, after this was refused.)
         if refused := await saved("These settings", as_it_was):
             return refused
         core.bind_error = None
@@ -3049,7 +3052,7 @@ def create_app(core: Core) -> FastAPI:
         target = alert_address()
         if target is None:
             return fail(409, "no_webhook", "Save an address to send alerts to first")
-        sample = alerts.Alert("test", "QKVM", "", "online", "online", "Test alert from QKVM", "If you can read this, alerts will reach you.")
+        sample = alerts.Alert("test", "qKVM", "", "online", "online", "Test alert from qKVM", "If you can read this, alerts will reach you.")
         sample.link = store.alerts.link
         try:
             await outbox.send(*target, sample)  # at once and one attempt: whoever pressed the button is waiting

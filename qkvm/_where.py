@@ -1,4 +1,4 @@
-"""Where QKVM keeps its settings when nothing says otherwise.
+"""Where qKVM keeps its settings when nothing says otherwise.
 
 In a file of its own because two parts of the program have to agree on it without one loading
 the other: the starter (__main__), which looks there for an installed update before anything

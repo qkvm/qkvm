@@ -1,4 +1,4 @@
-"""Promises that have to hold over a restart of QKVM, and whatever the computer's clock does: alerts, kept sign-ins, lock-outs, pauses, the settings file."""
+"""Promises that have to hold over a restart of qKVM, and whatever the computer's clock does: alerts, kept sign-ins, lock-outs, pauses, the settings file."""
 
 from __future__ import annotations
 
@@ -56,8 +56,8 @@ def state_of(client: TestClient, device: str) -> str | None:
 
 
 def test_a_machine_that_did_not_come_back_with_qkvm_is_told(tmp_path: Path, inbox: Inbox) -> None:
-    # README: "After a restart QKVM goes on alerting by itself, as it goes on watching." The power cut is what
-    # that was built for. QKVM comes back from it; one machine does not.
+    # README: "After a restart qKVM goes on alerting by itself, as it goes on watching." The power cut is what
+    # that was built for. qKVM comes back from it; one machine does not.
     data = tmp_path / "data"
     fake = FakeKvm().start()
     try:
@@ -68,7 +68,7 @@ def test_a_machine_that_did_not_come_back_with_qkvm_is_told(tmp_path: Path, inbo
             assert admin.get(snap(device)).status_code == 200
             time.sleep(0.6)  # the watcher knows it as online
             assert state_of(admin, device) == "online"
-        fake.stop()  # the power cut: QKVM and the machine go down together, and only QKVM comes back
+        fake.stop()  # the power cut: qKVM and the machine go down together, and only qKVM comes back
         with wall(data, sign_in=False) as later:
             assert later.get("/healthz").json()["locked"] is False  # it carries on by itself, as promised
             assert later.post("/api/v1/login", json={"password": PASSWORD}).status_code == 200  # only to look at the state
@@ -99,7 +99,7 @@ def test_what_a_pause_held_back_is_told_after_it_although_qkvm_was_restarted_mea
                 return any(e["event"] == "alert" and e.get("held") for e in admin.get("/api/v1/audit").json()["entries"])
 
             wait_until(held, "the change was never noticed")
-        with wall(data) as later:  # restarted within the pause (an update of QKVM was part of the maintenance)
+        with wall(data) as later:  # restarted within the pause (an update of qKVM was part of the maintenance)
             assert later.get("/api/v1/alerts").json()["paused_until"] is not None  # the pause outlasted the restart...
             time.sleep(0.6)
             assert later.post("/api/v1/alerts/pause", json={"minutes": 0}).status_code == 200  # ...and is over now
@@ -113,7 +113,7 @@ def test_what_a_pause_held_back_is_told_after_it_although_qkvm_was_restarted_mea
 
 def test_a_change_is_told_although_the_listeners_were_reopened_meanwhile(tmp_path: Path, inbox: Inbox) -> None:
     # The listeners are re-opened, with the program running on, when the port or the addresses are changed in
-    # the settings, and by themselves when an address QKVM listens on by name changes (a new lease, Tailscale
+    # the settings, and by themselves when an address qKVM listens on by name changes (a new lease, Tailscale
     # coming up after the computer did): cli.serve calls create_app(core) again.
     data = tmp_path / "data"
     fake = FakeKvm().start()

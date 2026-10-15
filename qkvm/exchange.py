@@ -45,7 +45,7 @@ MAX_FILE = 4_000_000  # characters of what a file holds, written out plain: the 
 # A sealed file is that (written without its blanks), encrypted, and the result written as text, which
 # is a third more; and its lock. One number for both let a wall write a sealed file that it would not read.
 MAX_SEALED = MAX_FILE * 4 // 3 + 4096
-TOO_MUCH = "This wall holds more than a file of QKVM's can. Nothing was written."
+TOO_MUCH = "This wall holds more than a file of qKVM's can. Nothing was written."
 MOST_DEVICES = 2000
 MOST_ACTIONS = 500
 MIN_PASSPHRASE = 10  # as for an account's password
@@ -214,7 +214,7 @@ def pack(parts: dict[str, Any], passphrase: str, program: str) -> str:
     # is needed, or to have lost its last devices, is worse than none. ExchangeError "too_large".
     for part, most, what in (("devices", MOST_DEVICES, "devices"), ("actions", MOST_ACTIONS, "saved actions")):
         if len(parts.get(part) or ()) > most:
-            raise ExchangeError("too_large", f"This wall has {len(parts[part])} {what}, and a file of QKVM's holds {most}. Nothing was written: leave that part out, or have fewer.")
+            raise ExchangeError("too_large", f"This wall has {len(parts[part])} {what}, and a file of qKVM's holds {most}. Nothing was written: leave that part out, or have fewer.")
     inside = json.dumps(whole, indent=2) + "\n" if not passphrase else json.dumps(whole, separators=(",", ":"))
     if len(inside) > MAX_FILE:
         raise ExchangeError("too_large", TOO_MUCH)
@@ -231,20 +231,20 @@ def pack(parts: dict[str, Any], passphrase: str, program: str) -> str:
 
 def _parsed(text: str) -> dict[str, Any]:
     if len(text) > MAX_SEALED:
-        raise ExchangeError("too_large", "The file is larger than anything QKVM writes")
+        raise ExchangeError("too_large", "The file is larger than anything qKVM writes")
     try:
         said = _whole(json.loads(text))
     except (ValueError, RecursionError):
-        raise ExchangeError("not_a_file", "This is not a file that QKVM made") from None
+        raise ExchangeError("not_a_file", "This is not a file that qKVM made") from None
     if not isinstance(said, dict) or said.get("format") != FORMAT:
-        raise ExchangeError("not_a_file", "This is not a file that QKVM made")
+        raise ExchangeError("not_a_file", "This is not a file that qKVM made")
     if "sealed" not in said and len(text) > MAX_FILE:
-        raise ExchangeError("too_large", "The file is larger than anything QKVM writes")
+        raise ExchangeError("too_large", "The file is larger than anything qKVM writes")
     version = said.get("version")
     if not isinstance(version, int) or isinstance(version, bool) or version < 1:
-        raise ExchangeError("not_a_file", "This is not a file that QKVM made")
+        raise ExchangeError("not_a_file", "This is not a file that qKVM made")
     if version > VERSION:
-        raise ExchangeError("newer", "This file was made by a later version of QKVM than this one. Update this one first.")
+        raise ExchangeError("newer", "This file was made by a later version of qKVM than this one. Update this one first.")
     return said
 
 
@@ -282,12 +282,12 @@ def unpack(text: str, passphrase: str) -> Content:
         try:
             inside = file_key.decrypt(said["sealed"], SEALED_FOR)
             if len(inside) > MAX_FILE:
-                raise ExchangeError("too_large", "The file is larger than anything QKVM writes")
+                raise ExchangeError("too_large", "The file is larger than anything qKVM writes")
             said = _whole(json.loads(inside))
         except (InvalidTag, KeyError, TypeError, ValueError, RecursionError):
             raise ExchangeError("damaged", "The file is damaged: what is in it does not open with its own key") from None
         if not isinstance(said, dict):
-            raise ExchangeError("damaged", "The file is damaged: what is in it is not what QKVM writes")
+            raise ExchangeError("damaged", "The file is damaged: what is in it is not what qKVM writes")
     made = said.get("made")
     content = Content(
         sealed=sealed,

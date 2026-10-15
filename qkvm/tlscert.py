@@ -26,7 +26,7 @@ def _fingerprint(cert: x509.Certificate) -> str:
 def _names(addresses: Iterable[str]) -> tuple[set[str], set[str]]:
     host = socket.gethostname().lower()
     # A computer's name with letters outside ASCII in it ("büro-pc") cannot be written into a certificate as it
-    # is, and one that tried was a QKVM that did not start: it is reached by its addresses and as localhost.
+    # is, and one that tried was a qKVM that did not start: it is reached by its addresses and as localhost.
     dns = {"localhost", *([host] if host and host.isascii() and " " not in host else [])}
     # An address as it stands in a certificate: without the "%3" that says which network card (a certificate
     # has no place for that, and one that was compared with it never matched and was made anew at every look).
@@ -74,7 +74,7 @@ def ensure_certificate(directory: Path, addresses: Iterable[str]) -> tuple[Path,
             pass  # unreadable: replace it
 
     key = ec.generate_private_key(ec.SECP256R1())
-    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "QKVM")])
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "qKVM")])
     san = [x509.DNSName(d) for d in sorted(dns)] + [x509.IPAddress(ipaddress.ip_address(i)) for i in sorted(ips)]
     cert = (
         x509.CertificateBuilder()

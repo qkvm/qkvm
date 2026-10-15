@@ -50,9 +50,9 @@ class Watcher:
 
     What each was last known to be is written down (`kept_in`), and taken up again at the next start.
     Without that, the first look after a start is the first thing known, and "is not a change": a power
-    cut after which QKVM comes back and a machine does not is then never told, which is the one thing an
+    cut after which qKVM comes back and a machine does not is then never told, which is the one thing an
     alert is most wanted for. For the first while after a start (STARTING) nothing that differs from what
-    was written down is believed yet: a network that comes up after QKVM would make everything look gone.
+    was written down is believed yet: a network that comes up after qKVM would make everything look gone.
     """
 
     def __init__(self, kept_in: Path | None = None) -> None:

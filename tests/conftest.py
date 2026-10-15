@@ -14,7 +14,7 @@ SCALE = 300.0  # how much shorter every wait is for a test that asks for `scaled
 
 @pytest.fixture(autouse=True)
 def home(tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """A home folder that is nobody's. QKVM keeps things at home (its settings when it is told no other place,
+    """A home folder that is nobody's. qKVM keeps things at home (its settings when it is told no other place,
     and a note of the other places walls were started with): the tests are not to leave any of that with
     whoever runs them, nor to find there what that person's own wall left."""
     folder = tmp_path_factory.mktemp("home")

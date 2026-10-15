@@ -56,7 +56,7 @@ def matching_step(secret: str, code: str, now: float | None = None) -> int | Non
     return found
 
 
-def setup_uri(secret: str, account: str, issuer: str = "QKVM") -> str:
+def setup_uri(secret: str, account: str, issuer: str = "qKVM") -> str:
     """What an authenticator app opens (or reads from a QR code) to add the account."""
     # Algorithm, digits and period are left out: they are every app's defaults, and a shorter
     # address makes a QR code that is easier to scan.

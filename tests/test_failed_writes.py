@@ -66,12 +66,12 @@ def test_a_start_that_could_not_finish_restoring_the_backup_does_not_leave_a_wal
     assert json.loads((data / "qkvm.bak").read_text(encoding="utf-8"))["devices"]
 
     # The settings file is unreadable at the next start (an editor that saved it on a full disk leaves it cut short),
-    # and the disk is still full when QKVM, having read the backup, writes the settings anew.
+    # and the disk is still full when qKVM, having read the backup, writes the settings anew.
     (data / "qkvm.json").write_text('{"version": 1, "server": {', encoding="utf-8")
     disk = refuse_writes(monkeypatch)
     disk["full"] = True
     with pytest.raises(OSError):
-        Core(data)  # this start ends in a traceback; a service manager starts QKVM again
+        Core(data)  # this start ends in a traceback; a service manager starts qKVM again
     print("after the failed start:", sorted(p.name for p in data.iterdir()))
 
     disk["full"] = False  # (it makes no difference whether there is room again)
@@ -126,7 +126,7 @@ def test_where_qkvm_listens_is_not_changed_by_a_later_save_after_the_change_itse
         print("activity log, newest first:", [entry["event"] for entry in admin.get("/api/v1/audit").json()["entries"]])
     on_disk = json.loads((data / "qkvm.json").read_text(encoding="utf-8"))["server"]["bind"]
     print("bind before:", before["bind"], "| bind in qkvm.json now:", on_disk)
-    assert on_disk == before["bind"], "the refused change was written by the next save: at the next start QKVM listens on every address"
+    assert on_disk == before["bind"], "the refused change was written by the next save: at the next start qKVM listens on every address"
 
 
 def test_a_setup_that_could_not_be_saved_has_not_set_the_wall_up(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -307,7 +307,7 @@ def test_the_same_when_only_the_copy_to_qkvm_bak_is_refused_which_nobody_is_told
     assert json.loads((data / "qkvm.json").read_text(encoding="utf-8"))["unlock"] is None
 
     # Where it can be neither renewed nor taken away, it still holds what the old key opens, and that is said to
-    # whoever starts QKVM: it is theirs to remove.
+    # whoever starts qKVM: it is theirs to remove.
     monkeypatch.undo()
     data = tmp_path / "another"
     with wall(data) as admin:
@@ -400,7 +400,7 @@ def test_an_action_that_reached_the_machine_is_in_the_activity_log_though_the_li
             deadline = time.monotonic() + 5
             while "atx power_long" not in state.actions and time.monotonic() < deadline:
                 time.sleep(0.02)
-            # Where QKVM listens was changed in the settings, or its Tailscale address is another one: the listeners are reopened.
+            # Where qKVM listens was changed in the settings, or its Tailscale address is another one: the listeners are reopened.
             live._server.should_exit = True  # what Core.request_restart does, through core.stop
             pressing.join(timeout=20)
         lines = [json.loads(line) for line in (data / "audit.log").read_text(encoding="utf-8").splitlines()]

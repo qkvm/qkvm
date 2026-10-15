@@ -85,7 +85,7 @@ def test_a_change_that_is_answered_as_failed_is_not_kept_until_the_restart(tmp_p
         works_later = visitor(later, 50006).get("/api/v1/wall", headers=bearer).status_code
         hers = visitor(later, 50007).post("/api/v1/login", json={"name": "olga", "password": OTHER}).status_code
         print("after a restart: the token is answered", works_later, "| olga signs in:", hers)
-    assert works_at_once == works_later, "taken back while QKVM ran (and answered 500), and working again after the restart"
+    assert works_at_once == works_later, "taken back while qKVM ran (and answered 500), and working again after the restart"
 
 
 def test_a_settings_file_nested_too_deep_to_read_is_a_damaged_file_like_any_other(tmp_path: Path) -> None:

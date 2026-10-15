@@ -1,12 +1,12 @@
 [project]
 name = "qkvm"
 dynamic = ["version"]
-description = "Self-hosted screen wall and command center for IP KVMs and servers (GL.iNet Comet, PiKVM-style, JetKVM, Redfish)"
+description = "qKVM: the self-hosted screen wall and command center for IP KVMs and servers (GL.iNet Comet, PiKVM-style, JetKVM, Redfish)"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "AGPL-3.0-only"
 license-files = ["LICENSE"]
-authors = [{ name = "QKVM" }]
+authors = [{ name = "qKVM" }]
 keywords = ["kvm", "ip-kvm", "kvm-over-ip", "pikvm", "jetkvm", "glinet", "redfish", "bmc", "homelab", "self-hosted"]
 classifiers = [
     "Development Status :: 4 - Beta",

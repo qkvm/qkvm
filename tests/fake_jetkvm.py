@@ -18,7 +18,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
-import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -33,7 +32,7 @@ from aiortc.mediastreams import MediaStreamTrack
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
-from tests import local_socket
+from tests import ServerThread, local_socket
 from tests.fake_kvm import make_device_certificate
 
 
@@ -260,15 +259,11 @@ class FakeJetKvm:
         self.url = f"{'https' if tls else 'http'}://127.0.0.1:{self.port}"
         config = uvicorn.Config(make_fake_jetkvm(self.state), log_level="error", access_log=False, **tls)
         self._server = uvicorn.Server(config)
-        self._thread = threading.Thread(target=self._server.run, kwargs={"sockets": [self._sock]}, daemon=True)
+        self._serving = ServerThread("fake JetKVM", lambda: self._server.run(sockets=[self._sock]), lambda: self._server.started)
+        self._thread = self._serving.thread
 
     def start(self) -> FakeJetKvm:
-        self._thread.start()
-        deadline = time.monotonic() + 10
-        while not self._server.started:
-            if time.monotonic() > deadline:
-                raise RuntimeError("fake JetKVM did not start")
-            time.sleep(0.02)
+        self._serving.start()
         return self
 
     def stop(self) -> None:

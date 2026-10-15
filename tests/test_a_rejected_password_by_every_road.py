@@ -5,7 +5,7 @@ the device how often it was offered:
 
 * The count was kept in the connection to the device, and a connection is made anew when the saved
   passwords were locked and are opened again, when the listeners are reopened, when the tile is saved
-  under another name. Each new one began at nothing. Where QKVM is started to lock itself after the last
+  under another name. Each new one began at nothing. Where qKVM is started to lock itself after the last
   sign-out, a viewer signing in and out six times had the password offered six times in a tenth of a second.
 * A server's controller with a console of its own is signed in to a second time, at its web page, with the
   same password. That road asked nothing of the wait: every ten minutes for good, the tile saying "online".

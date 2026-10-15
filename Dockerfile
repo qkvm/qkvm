@@ -1,4 +1,4 @@
-# QKVM as a container. The published image is built from this file; to build it yourself:
+# qKVM as a container. The published image is built from this file; to build it yourself:
 #     docker build -t qkvm/qkvm .
 #     docker compose up -d          (see docker-compose.yml)
 FROM python:3.13-slim

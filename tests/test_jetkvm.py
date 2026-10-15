@@ -518,8 +518,15 @@ def test_a_jetkvm_that_falls_silent_is_not_shown_as_if_it_were_live(
         assert time.monotonic() - began < 10
         jet.state.frozen = False  # and when it is back, the wall has it again without being told
         picture(client, device)
-        wait_until(lambda: client.get("/api/v1/status").json()[device]["state"] == "online", "it was not called online again")
-        assert client.get("/api/v1/status").json()[device]["last_seen_ago"] <= 2  # heard from just now, and says so
+        # Called online again, and heard from just now: both in one look. (Two looks, one for each, were two
+        # moments. With the video taken for stopped after one second here, where it is five, a machine slow
+        # enough to leave a second between two pictures had it called stopped again in between.)
+
+        def back() -> bool:
+            said = client.get("/api/v1/status").json()[device]
+            return bool(said["state"] == "online" and said["last_seen_ago"] is not None and said["last_seen_ago"] <= 2)
+
+        wait_until(back, "it was not called online again, heard from just now", timeout=20)
 
 
 def test_without_the_webrtc_package_the_wall_says_what_to_install(

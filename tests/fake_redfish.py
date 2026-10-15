@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import asyncio
 import secrets
-import threading
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
@@ -25,7 +24,7 @@ from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from qkvm import ami
-from tests import local_socket
+from tests import ServerThread, local_socket
 from tests.fake_kvm import make_device_certificate
 
 PROCESSOR = "Intel Xeon Silver 4410Y"
@@ -485,15 +484,11 @@ class FakeBmc:
             tls = {"ssl_certfile": str(cert), "ssl_keyfile": str(key)}
         self.url = f"{'https' if tls else 'http'}://127.0.0.1:{self.port}"
         self._server = uvicorn.Server(uvicorn.Config(make_fake_bmc(self.state), log_level="error", access_log=False, **tls))
-        self._thread = threading.Thread(target=self._server.run, kwargs={"sockets": [self._sock]}, daemon=True)
+        self._serving = ServerThread("fake controller", lambda: self._server.run(sockets=[self._sock]), lambda: self._server.started)
+        self._thread = self._serving.thread
 
     def start(self) -> FakeBmc:
-        self._thread.start()
-        deadline = time.monotonic() + 10
-        while not self._server.started:
-            if time.monotonic() > deadline:
-                raise RuntimeError("fake controller did not start")
-            time.sleep(0.02)
+        self._serving.start()
         return self
 
     def stop(self) -> None:

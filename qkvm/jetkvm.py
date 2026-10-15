@@ -20,7 +20,7 @@ by itself. Never back onto plain HTTP by itself: there nothing is checked any mo
 answers nor who listens, and that it was the owner who switched HTTPS off is only the word of
 whatever answers now. The tile says so, and a person decides (see `_ask_the_other_way`).
 
-WebRTC is the `aiortc` package, which is installed with QKVM. It is loaded when the first JetKVM is
+WebRTC is the `aiortc` package, which is installed with qKVM. It is loaded when the first JetKVM is
 connected to and not before: it brings a video decoder, and a wall without a JetKVM has no use for one.
 """
 
@@ -108,7 +108,7 @@ QUANTIZER = {"480": 3, "640": 3, "960": 2, FULL: 2}
 # For a copy that runs from the source without having been installed: an installed one has the package.
 MISSING_DRIVER = KvmError(
     "missing_driver",
-    "JetKVM support needs the aiortc package, which is installed with QKVM but is missing from this Python. Install it with: pip install aiortc",
+    "JetKVM support needs the aiortc package, which is installed with qKVM but is missing from this Python. Install it with: pip install aiortc",
     501,
 )
 
@@ -612,7 +612,8 @@ class JetKvmDevice(Device):
                 # Given a few seconds, and then left to finish by itself: whoever waits for this is holding
                 # up a change to the wall, or the program's way out.
                 try:
-                    await asyncio.wait_for(asyncio.shield(session.pc.close()), 5)
+                    async with asyncio.timeout(5):  # (not wait_for, which loses a stop up to Python 3.11: see Listening.message)
+                        await asyncio.shield(session.pc.close())
                 except TimeoutError:
                     log.warning("%s: the video connection is taking its time to close", self.label)
 
@@ -764,7 +765,10 @@ class JetKvmDevice(Device):
                 # with nobody to ask, and a key pressed on the page was an error inside the program.
                 self._no_more_asking(session)
                 raise KvmError("dropped", "The JetKVM closed the channel it is asked over") from None
-            reply = await asyncio.wait_for(future, timeout=RPC_TIMEOUT)
+            # (Not wait_for, which up to Python 3.11 loses a stop that comes with the answer: a text being typed
+            # went on with the next key, and the rest. See Listening.message.)
+            async with asyncio.timeout(RPC_TIMEOUT):
+                reply = await future
         except TimeoutError:
             raise KvmError("timeout", "The JetKVM did not answer in time", 504) from None
         finally:

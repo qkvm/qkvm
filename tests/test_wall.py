@@ -102,7 +102,7 @@ def test_first_run_setup_then_login(tmp_path: Path) -> None:
         assert "httponly" in cookie and "samesite=strict" in cookie
         # Made to carry on by itself after a restart, which is done beside the sign-in and takes a moment:
         # whether it is done yet when the next request arrives is up to the machine, so it is waited for.
-        wait_until(lambda: client.core.store.unlock is not None, "QKVM's own key was never made to fit")  # type: ignore[attr-defined]
+        wait_until(lambda: client.core.store.unlock is not None, "qKVM's own key was never made to fit")  # type: ignore[attr-defined]
         session = client.get("/api/v1/session").json()
         account = session.pop("user")
         assert session.pop("recovery") is True and session.pop("recovery_created") > 0  # setup made the recovery key
@@ -124,8 +124,8 @@ def test_first_run_setup_then_login(tmp_path: Path) -> None:
 def test_setting_up_from_another_machine_takes_a_password_and_nothing_else(tmp_path: Path) -> None:
     # The first-run page of a wall just installed on a small server asked for a setup code: a step no other
     # program of this kind has, met by the first person who installed one. The rule since: the default is an
-    # install in three easy steps. A code printed where QKVM runs was asked of everybody who set it up from
-    # another computer, which is everybody who installs it on a server. It is asked where QKVM was started
+    # install in three easy steps. A code printed where qKVM runs was asked of everybody who set it up from
+    # another computer, which is everybody who installs it on a server. It is asked where qKVM was started
     # with --setup-code, and nowhere else.
     with wall(tmp_path, sign_in=False, address="192.168.1.50") as client:
         assert client.core.setup_code is None  # type: ignore[attr-defined]
@@ -162,7 +162,7 @@ def test_wrong_passwords_lock_the_address_out(tmp_path: Path) -> None:
 
 
 def test_logout_locks_the_vault(tmp_path: Path) -> None:
-    # Where QKVM is started locked. As it comes it keeps a key of its own and goes on watching (see test_unlock.py).
+    # Where qKVM is started locked. As it comes it keeps a key of its own and goes on watching (see test_unlock.py).
     with wall(tmp_path, locked_start=True) as client:
         core = client.core  # type: ignore[attr-defined]
         assert core.vault.unlocked
@@ -263,7 +263,7 @@ def test_a_bug_in_a_handler_is_contained(tmp_path: Path, monkeypatch: pytest.Mon
         monkeypatch.setattr(client.core.audit, "tail", lambda limit: 1 / 0)  # type: ignore[attr-defined]
         broken = client.get("/api/v1/audit")
         assert broken.status_code == 500
-        assert broken.json() == {"code": "internal", "message": "Something went wrong inside QKVM. The details are in its log."}
+        assert broken.json() == {"code": "internal", "message": "Something went wrong inside qKVM. The details are in its log."}
         assert "x-frame-options" in broken.headers
         assert client.get("/api/v1/wall").status_code == 200  # still serving
 
@@ -936,7 +936,7 @@ def test_wall_certificate_is_reused_until_it_no_longer_fits(tmp_path: Path) -> N
 
 
 def test_an_address_that_changes_is_followed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    # Told to listen on "the local network", QKVM looked up what address that is once, when it started. A
+    # Told to listen on "the local network", qKVM looked up what address that is once, when it started. A
     # new lease from the router, or a cable moved to another network, and the wall answered only on the
     # computer it runs on until somebody restarted it.
     from qkvm import server

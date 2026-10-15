@@ -125,7 +125,7 @@ def test_a_question_that_cannot_be_sent_is_the_devices_fault_and_is_not_left_wai
 
 
 def test_a_key_pressed_meanwhile_is_answered_as_the_devices_fault_and_works_again_after(tmp_path: Path, closes_once: list[RTCDataChannel]) -> None:
-    # On the page: Enter pressed on such a JetKVM was "something went wrong inside QKVM" (500), with its picture
+    # On the page: Enter pressed on such a JetKVM was "something went wrong inside qKVM" (500), with its picture
     # still coming. It is the device that dropped out, and is said so; a moment later the key goes through.
     fake = FakeJetKvm().start()
     try:
