@@ -234,4 +234,3 @@ class SerialConsole:
             return KvmError("dropped", f"Its serial console: {ex.message}", 502)
         # (A sign-in that came to nothing after the password went out stays as `sent` noted it: not offered again at once.)
         return KvmError("bad_response", f"Its serial console: {ex.message}")
-
