@@ -107,3 +107,44 @@ def test_a_frame_that_says_it_is_longer_than_any_is_not_collected() -> None:
     said[69:72] = (ami.LONGEST + 1).to_bytes(3, "little")
     with pytest.raises(Garbled):
         ami.Frames().piece(bytes(2) + bytes(said) + frame.data)
+
+
+def one_hid(packet: bytes) -> tuple[bytes, bytes]:
+    """The one HID message `packet` is, as (the thirty-two byte IUSB header, the report after its length byte)."""
+    found = ami.Messages().feed(packet)
+    assert len(found) == 1 and found[0].kind == ami.HID, found
+    body = found[0].body
+    assert body[:8] == b"IUSB    " and sum(body[:32]) & 0xFF == 0, "the header names IUSB and sums to zero"
+    assert body[32] == len(body[33:]), "the report length byte matches"
+    return body[:32], body[33:]
+
+
+def test_a_keyboard_report_is_the_modifiers_and_the_keys_down() -> None:
+    header, report = one_hid(ami.keyboard(0x05, [0x04, 0x05], 7))
+    assert header[17] == 0x30 and header[18] == 0x10, "a keyboard report, for the virtual USB keyboard"
+    assert report == bytes([0x05, 0, 0x04, 0x05, 0, 0, 0, 0]), "the modifier byte, a reserved zero, then the keys down in six slots"
+    # The whole keyboard every time: nothing down is an empty report, and no more than six keys go (the first six
+    # given; the live line hands over the six newest, dropping the oldest as a keyboard does: live.RedfishHid).
+    assert one_hid(ami.keyboard(0, []))[1] == bytes(8)
+    assert list(one_hid(ami.keyboard(0, [4, 5, 6, 7, 8, 9, 10]))[1][2:]) == [4, 5, 6, 7, 8, 9]
+
+
+def test_the_sequence_number_goes_up_and_the_checksum_catches_a_changed_byte() -> None:
+    # The controller checks the header sums to zero; a byte flipped on the way would be caught. And every report
+    # carries a number one higher than the last, as the controller's own viewer sends them.
+    assert ami.keyboard(0, [4], 1) != ami.keyboard(0, [4], 2)  # the sequence number is in the header
+    bad = bytearray(ami.keyboard(0, [4], 1))
+    bad[8 + 20] ^= 0x01  # a byte of the IUSB header (past the message's own eight-byte head)
+    assert sum(bad[8 : 8 + 32]) & 0xFF != 0, "the header no longer sums to zero"
+
+
+def test_an_absolute_mouse_report_carries_the_place_and_a_relative_one_the_move() -> None:
+    header, report = one_hid(ami.mouse_abs(0x01, 16384, 32767, 0, 3))
+    assert header[17] == 0x31 and header[18] == 0x20, "a mouse report, for the virtual USB mouse"
+    import struct
+
+    buttons, x, y, wheel = struct.unpack("<BHHb", report)
+    assert (buttons, x, y, wheel) == (0x01, 16384, 32767, 0)
+    # A place past the far edge is held at it; a relative report is four bytes of buttons and a signed move.
+    assert struct.unpack("<BHHb", one_hid(ami.mouse_abs(0, 99999, -5, -1))[1]) == (0, 0x7FFF, 0, -1)
+    assert struct.unpack("<Bbbb", one_hid(ami.mouse_rel(0x04, -3, 7, 1))[1]) == (0x04, -3, 7, 1)

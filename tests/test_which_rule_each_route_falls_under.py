@@ -52,17 +52,22 @@ ROUTES: dict[tuple[str, str], tuple[str, str]] = {
     ("GET", "/api/v1/wall"): ("viewer", ""),
     ("GET", "/api/v1/status"): ("viewer", ""),
     ("GET", "/api/v1/devices/{device_id}/snapshot"): ("viewer", ""),
+    ("GET", "/api/v1/devices/{device_id}/history"): ("viewer", ""),  # reads what the wall saw of the machine (history.py)
     ("GET", "/api/v1/actions"): ("operator", ""),
     ("GET", "/api/v1/devices/{device_id}/wol"): ("operator", ""),
     ("POST", "/api/v1/devices/{device_id}/actions"): ("operator", ""),  # done on the device; nothing of the wall's is saved
+    ("POST", "/api/v1/devices/{device_id}/live"): ("viewer", ""),  # a pass for a live line, in memory (live.py)
     ("POST", "/api/v1/devices/{device_id}/console"): ("operator", ""),  # asks the device for a way in
+    ("POST", "/api/v1/devices/{device_id}/kvm"): ("admin", ""),  # a setting of the PC's, changed on its engine; nothing of the wall's is saved
     ("PUT", "/api/v1/wall/order"): ("admin", "C"),
     ("POST", "/api/v1/devices"): ("admin", "T"),
     ("PUT", "/api/v1/devices/{device_id}"): ("admin", "T"),
     ("DELETE", "/api/v1/devices/{device_id}"): ("admin", "C"),
+    ("POST", "/api/v1/devices/remove"): ("admin", "C"),  # several at once: all of them, or none
     ("GET", "/api/v1/devices/{device_id}/certificate"): ("admin", ""),
     ("POST", "/api/v1/devices/{device_id}/trust"): ("admin", "T"),
     ("POST", "/api/v1/discover"): ("admin", ""),  # looks, and saves nothing
+    ("POST", "/api/v1/proxmox/guests"): ("admin", ""),  # asks a Proxmox which guests a token sees, and saves nothing
     ("POST", "/api/v1/actions"): ("admin", "C"),
     ("PUT", "/api/v1/actions/{action_id}"): ("admin", "C"),
     ("DELETE", "/api/v1/actions/{action_id}"): ("admin", "C"),
@@ -96,6 +101,9 @@ ROUTES: dict[tuple[str, str], tuple[str, str]] = {
     ("POST", "/api/v1/import/read"): ("admin", "F"),  # reads the file, and saves nothing
     ("POST", "/api/v1/import"): ("admin", "TF"),
 }
+# The lines that are no request over HTTP: a WebSocket. The guard does not run for one, and no rule above is asked:
+# it is let in by a pass from the route of the same path (live.py), or closed.
+LINES = {"/api/v1/devices/{device_id}/live"}
 
 
 NAMED = re.compile("{[^}]+}")  # where a path has a name in it: {device_id}
@@ -110,8 +118,12 @@ def app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
 def test_every_route_falls_under_the_rule_it_is_meant_to(app: object) -> None:
     found: dict[tuple[str, str], tuple[str, str]] = {}
     handlers: dict[tuple[str, str], object] = {}
+    lines: set[str] = set()
     for route in app.routes:  # type: ignore[attr-defined]
         sample = NAMED.sub("ab12cd34", route.path)
+        if getattr(route, "methods", None) is None:  # a WebSocket
+            lines.add(route.path)
+            continue
         for method in route.methods:
             call = f"{method} {sample}"
             role = "nobody" if sample in server.PUBLIC or sample.startswith("/static/") else server.required_role(method, sample)
@@ -129,9 +141,10 @@ def test_every_route_falls_under_the_rule_it_is_meant_to(app: object) -> None:
             found[(method, route.path)] = (role, marks)
             handlers[(method, route.path)] = route.endpoint
     assert found == ROUTES, {key: (found.get(key), ROUTES.get(key)) for key in found.keys() | ROUTES.keys() if found.get(key) != ROUTES.get(key)}
+    assert lines == LINES
     # Everything of the wall's own is under the one version, and nothing without one.
     api = [path for _, path in found if path.startswith("/api/")]
-    assert len(api) == 58 and all(path.startswith("/api/v1/") for path in api)
+    assert len(api) == 63 and all(path.startswith("/api/v1/") for path in api) and all(path.startswith("/api/v1/") for path in lines)
     # What was public before a sign-in, and no more than that.
     assert {path for (_, path), (role, _) in ROUTES.items() if role == "nobody" and not path.startswith("/static/")} == server.PUBLIC
 

@@ -251,7 +251,14 @@ def test_an_admin_changes_their_own_password_where_the_current_one_is_asked_for(
 
 
 def codes_around_now(spaced_secret: str) -> tuple[str, str, str]:
-    """The code of the time step before this one, of this one and of the next: all three count as "now" (clocks differ)."""
+    """The code of the time step before this one, of this one and of the next: all three count as "now" (clocks differ).
+
+    Taken where at least three seconds of this step are left, or else just after the next one has begun: where a step
+    ended between taking the codes and the wall checking one, the one before was two steps old by then and refused,
+    rightly (Windows with Python 3.11, loaded, on 2026-10-15: switching the second step on was answered 401)."""
+    left = totp.STEP - time.time() % totp.STEP
+    if left < 3:
+        time.sleep(left + 0.05)
     key, step = spaced_secret.replace(" ", ""), int(time.time() // totp.STEP)
     return totp.code_at(key, step - 1), totp.code_at(key, step), totp.code_at(key, step + 1)
 

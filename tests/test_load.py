@@ -54,7 +54,11 @@ def spec(url: str) -> DeviceSpec:
 
 
 def test_a_kvm_that_went_silent_holds_up_no_tile(tmp_path: Path, fake: FakeKvm, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(kvm, "WAITS", httpx.Timeout(0.5))
+    # (A request that went to the KVM would take as long as giving up on it takes, `give_up`; one answered from what is known
+    # takes a round trip through the wall. Half a second against 0.4 left a busy computer no room: one request took 0.77 s.
+    # So giving up takes two seconds here, and a request that waited would take at least that.)
+    give_up = 2.0
+    monkeypatch.setattr(kvm, "WAITS", httpx.Timeout(give_up))
     monkeypatch.setattr(kvm, "ERROR_HOLD", 1.0)
     monkeypatch.setattr(kvm, "FIRST_CONTACT_WAIT", 0.1)
     with wall(tmp_path) as client:
@@ -64,12 +68,12 @@ def test_a_kvm_that_went_silent_holds_up_no_tile(tmp_path: Path, fake: FakeKvm, 
         assert client.get(snap(device)).json()["code"] == "timeout"  # the one request that finds out
 
         # From here on its tile is answered from what is known. Had each request gone to the KVM
-        # to see for itself, each would have taken the half second it takes to give up.
+        # to see for itself, each would have taken the time it takes to give up.
         asked = fake.state.requests
-        began = time.monotonic()
         for _ in range(10):
+            began = time.monotonic()
             assert client.get(snap(device)).json()["code"] == "timeout"
-        assert time.monotonic() - began < 0.4
+            assert time.monotonic() - began < give_up / 2
         assert fake.state.requests == asked  # nobody even looks before the pause after the failure is over
 
         # When it is, the status refresh looks, in the background. The first such look gets a moment
@@ -78,8 +82,8 @@ def test_a_kvm_that_went_silent_holds_up_no_tile(tmp_path: Path, fake: FakeKvm, 
         for _ in range(2):
             began = time.monotonic()
             assert client.get(snap(device)).json()["code"] == "timeout"
-            assert time.monotonic() - began < 0.4
-            time.sleep(0.7)  # the look gives up after half a second
+            assert time.monotonic() - began < give_up / 2
+            time.sleep(give_up + 0.2)  # the look gives up after `give_up`
         assert 1 <= fake.state.requests - asked <= 2
 
         fake.state.stall = 0  # and that refresh is what notices that it is back
@@ -91,12 +95,14 @@ def test_one_request_that_failed_does_not_black_out_a_kvm_that_is_there(
 ) -> None:
     monkeypatch.setattr(kvm, "ERROR_HOLD", 0.2)
     monkeypatch.setattr(kvm, "STATUS_TTL", 30)  # nothing else looks at the KVM during this test
-    monkeypatch.setattr(kvm, "WAITS", httpx.Timeout(0.3))
+    # (Every request is given two seconds, the press that hangs thirty: given 0.3 s, a busy computer's ordinary answer
+    # took longer, and the picture asked for after it was a 504.)
+    monkeypatch.setattr(kvm, "WAITS", httpx.Timeout(2.0))
     with wall(tmp_path) as client:
         device = add(client, fake.url)
         assert client.get(snap(device)).status_code == 200
         assert client.get("/api/v1/status").json()[device]["state"] == "online"
-        fake.state.slow["/api/hid/events/send_shortcut"] = 5  # the KVM is slow to press keys, this once
+        fake.state.slow["/api/hid/events/send_shortcut"] = 30  # the KVM is slow to press keys, this once
         pressed = client.post(f"/api/v1/devices/{device}/actions", json={"action": "ctrl_alt_del"})
         assert pressed.json()["code"] == "timeout"
         fake.state.slow.clear()
@@ -109,13 +115,15 @@ def test_a_detail_of_the_status_that_hangs_does_not_take_the_pictures_away(
     tmp_path: Path, fake: FakeKvm, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(kvm, "ERROR_HOLD", 1.0)
-    monkeypatch.setattr(kvm, "WAITS", httpx.Timeout(0.3))
+    # (Every request is given two seconds, the detail that hangs thirty, and the page looks for three times the two: given
+    # 0.3 s, a busy computer's ordinary answer took longer, and a picture was a 504.)
+    monkeypatch.setattr(kvm, "WAITS", httpx.Timeout(2.0))
     with wall(tmp_path) as client:
         device = add(client, fake.url)
         assert client.get(snap(device)).status_code == 200
-        fake.state.slow["/api/atx"] = 5  # one of the things the status is made of never arrives in time
+        fake.state.slow["/api/atx"] = 30  # one of the things the status is made of never arrives in time
         began = time.monotonic()
-        while time.monotonic() - began < 2.0:  # the page: status and pictures, over and over
+        while time.monotonic() - began < 6.0:  # the page: status and pictures, over and over
             assert client.get("/api/v1/status").json()[device]["state"] == "online"
             assert client.get(snap(device)).status_code == 200
             time.sleep(0.1)
@@ -187,9 +195,17 @@ def test_requests_waiting_for_a_connection_do_not_go_out_once_the_kvm_is_retired
         device = KvmDevice(spec(fake.url))
         await device.snapshot(640)  # signed in, and the status is known
         fake.state.stall = 30
+        before = fake.state.requests
         asking = [asyncio.ensure_future(device._get_result("/api/info", urgent=True)) for _ in range(14)]
-        await asyncio.sleep(0.4)
-        reached = fake.state.requests  # eight are with the KVM, six wait for one of the eight connections
+        # Eight are with the KVM, six wait for one of the eight connections. (Waited for: after a fixed 0.4 s a busy
+        # computer had only seven there, and the eighth, on its way already, reached the KVM after the count was taken.)
+        for _ in range(3000):
+            if fake.state.requests - before >= 8:
+                break
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.2)  # (and a moment for a ninth, which must not come)
+        reached = fake.state.requests
+        assert reached - before == 8, f"{reached - before} requests reached the KVM, of fourteen over eight connections"
         await device.close()
         fake.state.stall = 0  # the eight are let go: connections come free
         answers = await asyncio.gather(*asking, return_exceptions=True)

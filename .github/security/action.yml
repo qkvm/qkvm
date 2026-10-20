@@ -1,0 +1,74 @@
+name: Build and scan the release image
+description: Build one OCI archive, verify its runtime assumptions, then audit that exact archive.
+inputs:
+  arch:
+    description: Linux architecture (amd64 or arm64)
+    required: true
+runs:
+  using: composite
+  steps:
+    - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+    - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+    - name: Install the image transfer tool
+      shell: bash
+      run: |
+        sudo apt-get update --quiet
+        sudo apt-get install --yes --no-install-recommends skopeo
+    - name: Prepare the archive destination
+      shell: bash
+      env:
+        ARCH: ${{ inputs.arch }}
+      run: mkdir -p "image-$ARCH"
+    - name: Build once, without registry credentials
+      uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+      with:
+        context: .
+        platforms: linux/${{ inputs.arch }}
+        pull: true
+        no-cache: true
+        outputs: type=oci,dest=image-${{ inputs.arch }}/image.tar
+        provenance: true
+        sbom: true
+        labels: |
+          org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          org.opencontainers.image.revision=${{ github.sha }}
+    - name: Test the image and the exception preconditions
+      shell: bash
+      env:
+        ARCH: ${{ inputs.arch }}
+      run: |
+        skopeo --override-os linux --override-arch "$ARCH" copy \
+          "oci-archive:image-$ARCH/image.tar" docker-daemon:qkvm:security
+        docker run --rm --pull=never --platform "linux/$ARCH" -i --network none \
+          --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges:true \
+          --entrypoint python qkvm:security -P - < .github/security/check-image-runtime.py
+        trap 'docker logs qkvm-security; docker rm --force --volumes qkvm-security' EXIT
+        docker run -d --name qkvm-security --pull=never --platform "linux/$ARCH" \
+          --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges:true \
+          -p 127.0.0.1:8787:8787 qkvm:security
+        for _ in $(seq 1 45); do
+          [ "$(docker inspect -f '{{.State.Health.Status}}' qkvm-security)" = healthy ] && break
+          sleep 2
+        done
+        test "$(docker inspect -f '{{.State.Health.Status}}' qkvm-security)" = healthy
+        curl --fail --silent --show-error http://127.0.0.1:8787/healthz
+    - name: Fresh vulnerability scan of the archive that will be published
+      shell: bash
+      env:
+        ARCH: ${{ inputs.arch }}
+      run: bash .github/security/scan-image.sh "image-$ARCH/image.tar" "$ARCH" "image-$ARCH/evidence"
+    - name: Record the immutable archive checksum
+      shell: bash
+      env:
+        ARCH: ${{ inputs.arch }}
+      run: |
+        cd "image-$ARCH" || exit
+        sha256sum image.tar > SHA256SUMS
+    - name: Retain scan results, including blocked findings
+      if: always()
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: container-security-${{ inputs.arch }}
+        path: image-${{ inputs.arch }}/evidence/
+        if-no-files-found: warn
+        retention-days: 90

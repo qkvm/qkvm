@@ -4,6 +4,7 @@
 # To publish version 1.2.3: set __version__ = "1.2.3" in qkvm/_version.py, commit, then create a
 # GitHub release with the tag v1.2.3. This workflow then
 #
+#   audits the installed wheel and both final container archives against fresh vulnerability data
 #   attaches to the release      qkvm-1.2.3-py3-none-any.whl, SHA256SUMS,
 #                                SHA256SUMS.sig (made with the RELEASE_SIGNING_KEY secret: a version that has
 #                                a release key built in is not published without it, anywhere)
@@ -43,7 +44,38 @@ env:
   TAG: ${{ github.event.release.tag_name }}
 
 jobs:
+  # A release cannot bypass browser, lint/type, platform-matrix and required integration CI.
+  tested_commit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 46
+    permissions:
+      actions: read
+    steps:
+      - name: Require successful Tests for this exact commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 180); do
+            runs=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow tests.yml \
+              --commit "$GITHUB_SHA" --limit 100 --json databaseId,createdAt,headSha,status,conclusion,event)
+            latest=$(jq --arg sha "$GITHUB_SHA" \
+              '[.[] | select(.headSha == $sha and (.event == "push" or .event == "workflow_dispatch"))] | sort_by(.createdAt, .databaseId) | last' <<< "$runs")
+            if jq --exit-status '.status == "completed" and .conclusion == "success"' <<< "$latest" > /dev/null; then
+              echo "Required CI passed for $GITHUB_SHA"
+              exit 0
+            fi
+            if [ "$attempt" -gt 4 ] && ! jq --exit-status '. != null and .status != "completed"' <<< "$latest" > /dev/null; then
+              echo 'No successful Tests run for this commit. Run/retry Tests at the release tag, then retry the release.' >&2
+              exit 1
+            fi
+            sleep 15
+          done
+          echo 'Timed out waiting for required CI; no release artifacts were published.' >&2
+          exit 1
+
   build:
+    needs: tested_commit
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -76,6 +108,17 @@ jobs:
           /tmp/installed/bin/pip install dist/*.whl
           cd /tmp && test "$(/tmp/installed/bin/qkvm --version)" = "qkvm ${TAG#v}"
 
+      - name: Fresh dependency audit of the built wheel
+        run: bash .github/security/audit-wheel.sh dist/*.whl dependency-audit
+      - name: Retain dependency audit evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dependency-security
+          path: dependency-audit/
+          if-no-files-found: warn
+          retention-days: 90
+
       # In a folder of their own: what goes to PyPI is the packages and nothing else.
       - name: Checksums
         run: |
@@ -94,10 +137,34 @@ jobs:
           path: release/
           if-no-files-found: error
 
+  # Both architectures are built, exercised and scanned without write permissions or secrets.
+  # The resulting OCI archives (including SBOM/provenance) are the only images allowed to publish.
+  images:
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/security
+        with:
+          arch: ${{ matrix.arch }}
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-image-${{ matrix.arch }}
+          path: image-${{ matrix.arch }}/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
   # Signs what was built, and attaches it to the release. Nothing from PyPI is installed or run here: the
   # system's own Python, its packaged cryptography library, and qkvm/release.py as it is at the tag.
   attach:
-    needs: build
+    needs: [build, images]
     runs-on: ubuntu-latest
     environment: release  # where the signing key is kept
     permissions:
@@ -129,7 +196,7 @@ jobs:
 
   # The same files that were built and checked above, not built again.
   pypi:
-    needs: [build, attach]
+    needs: [build, images, attach]
     runs-on: ubuntu-latest
     environment:
       name: pypi
@@ -143,21 +210,28 @@ jobs:
           path: dist/
       - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
 
+  # Transfer the scanned bytes; no Dockerfile, dependency installation or image rebuild runs here.
   image:
-    needs: [build, attach]  # only once the tag is known to match the code, and the release has its files
+    needs: [build, images, attach]
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write  # to push to ghcr.io
+      packages: write
     env:
       DOCKERHUB_IMAGE: ${{ vars.DOCKERHUB_IMAGE }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          persist-credentials: false
-      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+          pattern: release-image-*
+          path: images/
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-
+      - name: Install the image transfer tool and verify both archives
+        run: |
+          sudo apt-get update --quiet
+          sudo apt-get install --yes --no-install-recommends skopeo
+          for arch in amd64 arm64; do
+            (cd "images/release-image-$arch" && sha256sum --check --strict SHA256SUMS)
+          done
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
@@ -168,7 +242,6 @@ jobs:
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-
       - id: where
         name: Where the image goes
         run: |
@@ -178,7 +251,6 @@ jobs:
             if [ -n "$DOCKERHUB_IMAGE" ]; then echo "docker.io/$DOCKERHUB_IMAGE"; fi
             echo "END"
           } >> "$GITHUB_OUTPUT"
-
       - id: names
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
@@ -186,14 +258,28 @@ jobs:
           tags: |
             type=semver,pattern={{version}},value=${{ env.TAG }}
             type=semver,pattern={{major}}.{{minor}},value=${{ env.TAG }}
-
-      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
-        with:
-          context: .
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.names.outputs.tags }}
-          labels: ${{ steps.names.outputs.labels }}
-          # Recorded with the image: what it was built from, and what is in it.
-          provenance: true
-          sbom: true
+      - name: Publish the verified archives and their multiarchitecture index
+        env:
+          IMAGES: ${{ steps.where.outputs.images }}
+          TAGS: ${{ steps.names.outputs.tags }}
+        run: |
+          set -euo pipefail
+          while IFS= read -r image; do
+            sources=()
+            for arch in amd64 arm64; do
+              archive="images/release-image-$arch/image.tar"
+              expected=$(skopeo inspect --raw "oci-archive:$archive" | sha256sum | cut -d ' ' -f 1)
+              skopeo copy --all --preserve-digests \
+                --authfile "${DOCKER_CONFIG:-$HOME/.docker}/config.json" \
+                --digestfile "digest-$arch.txt" "oci-archive:$archive" "docker://$image:${TAG#v}-$arch"
+              test "$(cat "digest-$arch.txt")" = "sha256:$expected"
+              sources+=("$image@sha256:$expected")
+            done
+            tag_args=()
+            while IFS= read -r tag; do
+              if [[ "$tag" == "$image:"* ]]; then tag_args+=(--tag "$tag"); fi
+            done <<< "$TAGS"
+            test "${#tag_args[@]}" -gt 0
+            # Flatten the two single-platform indexes; preserve their image and attestation manifests.
+            docker buildx imagetools create "${tag_args[@]}" "${sources[@]}"
+          done <<< "$IMAGES"

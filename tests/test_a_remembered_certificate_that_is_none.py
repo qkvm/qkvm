@@ -20,7 +20,7 @@ import pytest
 
 from qkvm import kvm, update, vault
 from tests.fake_kvm import FakeKvm
-from tests.test_wall import add, snap, wall
+from tests.test_wall import add, snap, wait_until, wall
 
 NONE_OF_THEM: dict[str, Any] = {
     "cut short": lambda pem: pem[:400],
@@ -85,7 +85,8 @@ def test_a_tile_whose_certificate_is_none_is_left_alone_says_so_once_and_can_be_
             asked = admin.get(f"/api/v1/devices/{tile}/certificate").json()
             assert asked["presented"] == real
             assert admin.post(f"/api/v1/devices/{tile}/trust", json={"fingerprint": real}).status_code == 200
-            assert admin.get(snap(tile)).status_code == 200
+            # (Its picture comes once the new connection is up: 503 "Connecting" meanwhile, which a busy computer answered.)
+            wait_until(lambda: admin.get(snap(tile)).status_code == 200, "trusting the certificate did not bring the picture back", timeout=30)
             print(f">>> {what}: the fingerprint shown for the tile before it was put right: {shown}; in the dialog, as remembered: {asked['saved']}")
             assert shown is None and asked["saved"] is None, "the tile says its certificate cannot be read, and the dialog shows a fingerprint as remembered for it"
     finally:

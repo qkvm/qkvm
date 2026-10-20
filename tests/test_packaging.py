@@ -25,6 +25,7 @@ NEEDED = {
     "anyio": "used by the above; named for a minimum version without a known hole",
     "idna": "used by the above; named for a minimum version without a known hole",
     "h11": "reads every request, for uvicorn; named for a minimum version without a known hole",
+    "packaging": "validates update dependency versions and environment markers before activation",
 }
 
 

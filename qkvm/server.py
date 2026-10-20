@@ -6,7 +6,6 @@ import asyncio
 import contextvars
 import csv
 import dataclasses
-import errno
 import hashlib
 import io
 import json
@@ -15,26 +14,29 @@ import math
 import os
 import re
 import secrets
-import socket
+import shutil
+import tempfile
+import threading
 import time
 import unicodedata
+import weakref
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, TypeVar
 from urllib.parse import urlsplit
 
 import httpx
-from fastapi import FastAPI, Query, Request
+from fastapi import FastAPI, Query, Request, WebSocket
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, PlainTextResponse, Response
+from fastapi.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 from starlette.requests import ClientDisconnect
 
-from . import about, alerts, discover, exchange, metrics, qr, totp
+from . import about, activity, alerts, amt, discover, exchange, history, live, metrics, proxmox, qr, totp, vncdevice
 from ._version import __version__
 from .core import Core, DeviceManager, auth_mark, driver_for, identity
-from .kvm import KEYS, MAX_PROBE, MAX_TEXT, REJECTED, RETIRED, AlreadySo, Device, KvmError, bounded, fetch_certificate, fingerprint, other_way, plain, publicly_trusted, read_json, saved_fingerprint
+from .kvm import FINGERBOT_PRESSES, KEYS, MAX_PROBE, MAX_TEXT, PRESS_ANSWERED, PRESS_SENT, REJECTED, RETIRED, AlreadySo, Device, KvmError, bounded, can_do, fetch_certificate, fingerprint, listens, other_way, plain, publicly_trusted, read_json, saved_fingerprint
 from .netbind import BindError, lan_ip, normalize, resolve, tailscale_ip
 from .security import (
     COOKIE,
@@ -49,7 +51,7 @@ from .security import (
     same_text,
     sso_name,
 )
-from .store import ROLES, ActionRecord, AuditLog, DeviceRecord, TokenRecord, UserRecord, as_a_line, device_url
+from .store import FINGERBOT_STRENGTHS, ROLES, ActionRecord, AuditLog, DeviceRecord, TokenRecord, UserRecord, as_a_line, device_url
 from .update import UpdateError
 from .vault import NoMemory, Vault, VaultLocked, new_recovery_key, tidy_recovery_key
 
@@ -61,6 +63,9 @@ ASSET_TYPES = {
     "app.css": "text/css",
     "theme.js": "text/javascript",
     "favicon.svg": "image/svg+xml",
+    # The words the page shows for a state, a device's trouble and a kind of device, and every code the wall
+    # answers with: one file, read by the page, and by the other programs that talk to a wall when they are built.
+    "words.json": "application/json",
 }
 # Answered without a session. (/metrics asks for a token of its own instead: see there.)
 # The API has a version in its path, /api/v1/..., since before the first release: what a script or another
@@ -83,8 +88,25 @@ MIN_PASSWORD = 10
 DISPLAY_SESSIONS = 10  # browsers one display link keeps signed in at a time; one more, and the oldest gives way
 MAX_PASSWORD_CHECKS = 6  # scrypt runs queued at once; each one holds ~130 MB
 UPDATE_CHECK_EVERY = 24 * 3600.0
-BACKGROUND_OWED = 5.0  # seconds a stopping wall gives what a sign-in set going to finish (see lifespan)
+BACKGROUND_OWED = 5.0  # seconds a stopping wall gives what a request set going to finish (see lifespan)
 HOUSEKEEPING_EVERY = 30.0  # seconds between the rounds that tidy up, lock up, and look whether the addresses are still the same
+HISTORY_LOOK_EVERY = 60.0  # seconds between the looks the history takes at every machine by itself (see history.py)
+HISTORY_READS_AT_ONCE = 3  # reads of the history under way at once, from everybody together; beyond that: come back in a moment
+# Of one account or token, one read of the history at a time: the next waits its turn for so many seconds at the most
+# (with one waiting already, or longer than that: come back in a moment). And after a read the same one waits as long
+# as that read took before its next begins. A viewer whose script asked again and again had the three reads to itself,
+# and everybody else was told to come back.
+HISTORY_TURN_WAIT = history.READ_WAIT + history.READ_PATIENCE
+HISTORY_TURNS_KEPT = 256  # accounts and tokens whose last turn is remembered, before those that are done with it are let go of
+# The activity log is read by the same rule (W4b's): so many reads at once from everybody together, one at a time of each
+# account, and after a read the same one waits as long as it took. A read waits for the index for CATCH_UP at the most,
+# and then reads the text files where the index is behind.
+ACTIVITY_READS_AT_ONCE = 3
+ACTIVITY_TURN_WAIT = activity.CATCH_UP + activity.READ_PATIENCE
+SPOOL_IN_MEMORY = 8_000_000  # bytes of a download of the activity log made in memory; beyond that in a temporary file in the data folder
+DOWNLOADS_AT_ONCE = 3  # downloads of the activity log made or being sent at once, from everybody together (one of each account)
+# The actions the history keeps as power events, pressed from the wall. The rest (keys, text) is the activity log's.
+POWER_ACTIONS = frozenset({"atx_power", "atx_power_long", "atx_reset", "fingerbot_power", "fingerbot_power_long", "power_on", "power_off", "bios_setup", "wol", "reboot"})
 # Hostnames every device has out of the box; useless as a tile name.
 GENERIC_NAMES = {"", "glkvm", "pikvm", "localhost", "localhost.localdomain"}
 
@@ -94,7 +116,7 @@ IDENT = re.compile(r"[a-z]{2,12}:[0-9a-f]{16,64}")  # what a driver may say a de
 RANK = {role: rank for rank, role in enumerate(reversed(ROLES))}  # viewer 0, operator 1, admin 2
 _DEVICE = r"/api/v1/devices/[^/]+"
 _VIEWER = re.compile(
-    rf"GET (/api/v1/wall|/api/v1/status|/api/v1/about|{_DEVICE}/snapshot)|POST (/api/v1/logout|/api/v1/password|/api/v1/totp/(begin|enable|disable|codes))"
+    rf"GET (/api/v1/wall|/api/v1/status|/api/v1/about|{_DEVICE}/snapshot|{_DEVICE}/history)|POST (/api/v1/logout|/api/v1/password|/api/v1/totp/(begin|enable|disable|codes)|{_DEVICE}/live)"
 )
 # What an account does for itself. A token is nobody's account: it has no password to change or to be asked for.
 _OWN_ACCOUNT = re.compile(r"POST /api/v1/(password|totp/(begin|enable|disable|codes))")
@@ -111,6 +133,7 @@ _OPERATOR = re.compile(rf"GET (/api/v1/actions|{_DEVICE}/wol)|POST {_DEVICE}/(ac
 _CHANGES = re.compile(
     r"(POST|PUT|DELETE) /api/v1/(setup|recover|recovery|password|totp/(enable|disable|codes)|users(/[^/]+)?"
     r"|actions(/[^/]+)?|settings|alerts(/pause)?|update|metrics/token|security|tokens(/[^/]+)?|wall/order)|DELETE /api/v1/devices/[^/]+"
+    r"|POST /api/v1/devices/remove"
 )
 
 # What no path of this program has in it: a character that is none (a line feed, a tab, a zero).
@@ -130,41 +153,12 @@ def required_role(method: str, path: str) -> str:
     return "admin"
 
 
-# What the activity log's entries are about, for whoever wants to see one kind of them. "change" is the rest.
-AUDIT_KINDS = {
-    "signin": {"login", "login_failed", "login_code_asked", "logout", "setup", "password_recovered", "recovery_failed", "display_opened"},
-    "action": {"action", "action_failed", "console_opened"},
-    "alert": {"alert", "alerts_paused", "alerts_resumed"},
-}
-# (A file made of the wall, and one taken in, are changes: "export_made" and "import_done" are found under those.)
+# (What the activity log's entries are about, for whoever wants to see one kind of them, is activity.KINDS.)
 AUDIT_COLUMNS = ("time", "event", "user", "ip", "device", "action")  # a column each in the table; the rest of an entry goes into one
 
 
-def audit_filter(texts: list[str], kind: str, before: float | None) -> Callable[[dict[str, Any]], bool]:
-    """Which entries of the activity log are asked for: with any of these words in them, of this kind, older than this.
-
-    Any of several, because what the page calls a thing is not what the log calls it ("Keep awake" is
-    jiggler_on there): the page asks for what was typed and for what that is called in here.
-    """
-    words = [text.strip().casefold()[:100] for text in texts[:20] if text.strip()]
-    of_a_kind = set().union(*AUDIT_KINDS.values())
-
-    def wanted(entry: dict[str, Any]) -> bool:
-        event, at = entry.get("event"), entry.get("time")
-        if before is not None and not (isinstance(at, (int, float)) and at < before):
-            return False
-        if kind and (event not in of_a_kind if kind == "change" else event in AUDIT_KINDS[kind]) is False:
-            return False
-        if not words:
-            return True
-        said = " ".join(str(value) for value in entry.values()).casefold()
-        return any(word in said for word in words)
-
-    return wanted
-
-
-def audit_table(entries: list[dict[str, Any]]) -> str:
-    """The entries as a table for a spreadsheet (CSV)."""
+def audit_table(entries: list[dict[str, Any]], heading: bool = True) -> str:
+    """The entries as a table for a spreadsheet (CSV): with its heading, or (a later page of one) without."""
 
     def cell(value: Any) -> str:
         text = "" if value is None else str(value)
@@ -173,7 +167,8 @@ def audit_table(entries: list[dict[str, Any]]) -> str:
 
     out = io.StringIO()
     table = csv.writer(out, lineterminator="\n")
-    table.writerow([*AUDIT_COLUMNS, "more"])
+    if heading:
+        table.writerow([*AUDIT_COLUMNS, "more"])
     for entry in entries:
         at = entry.get("time")
         when = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(at)) if isinstance(at, (int, float)) and 0 <= at < 1e11 else ""
@@ -195,6 +190,9 @@ class Attributed:
 
     def tail(self, limit: int, wanted: Callable[[dict[str, Any]], bool] | None = None) -> list[dict[str, Any]]:
         return self._log.tail(limit, wanted)
+
+    def flush(self, within: float = 5.0) -> None:
+        self._log.flush(within)
 
     @property
     def missing(self) -> dict[str, Any] | None:
@@ -253,6 +251,12 @@ class AlertsIn(BaseModel):
 
 class OrderIn(BaseModel):
     ids: list[str] = Field(max_length=5000)  # device ids, first to last
+
+
+class RemoveIn(BaseModel):
+    # The machines to take off the wall, all of them or none. Each an id as this program gives them and its settings
+    # file takes them (store._ID): what is no id at all is refused here, and never written back into an answer.
+    ids: list[Annotated[str, Field(pattern=r"^[A-Za-z0-9_-]{1,64}$")]] = Field(min_length=1, max_length=5000)
 
 
 class TokenIn(BaseModel):
@@ -339,11 +343,23 @@ class DeviceIn(BaseModel):
     open_url: str = Field("", max_length=255)
     # How the device's certificate is checked. None: as it was (an edit), or as suits the device (a new one).
     tls: Literal["pinned", "system", "insecure"] | None = None
-    kind: Literal["auto", "kvmd", "jetkvm", "redfish"] = "auto"  # "auto": ask the device what it is
+    # "auto": ask the device what it is; "vnc": a VNC server, which is not asked; "proxmox": a guest of Proxmox VE, named by its address
+    kind: Literal["auto", "kvmd", "jetkvm", "redfish", "amt", "vnc", "proxmox"] = "auto"
     group: str = Field("", max_length=4 * 40)
     alerts: bool | None = None  # whether anybody is told when it changes; None: as it was (told, for a new one)
+    # How hard a Fingerbot paired with the KVM presses its power button; None: as it was ("firm", for a new one).
+    fingerbot_strength: Literal["firm", "light"] | None = None
     force: bool = False  # save even though the device could not be checked
     keep_both: bool = False  # it is the same device as one already on the wall, and is to have a tile of its own all the same
+
+
+class ProxmoxIn(BaseModel):
+    """A Proxmox, and the API token to list its guests with (see POST /api/v1/proxmox/guests)."""
+
+    _user = field_validator("username")(_a_line(64, otherwise="admin"))
+    url: str = Field(min_length=1, max_length=255)
+    username: str = Field(min_length=1, max_length=4 * 64)  # the token's ID
+    password: str = Field(min_length=1, max_length=256)  # its secret
 
 
 class TrustIn(BaseModel):
@@ -352,7 +368,7 @@ class TrustIn(BaseModel):
 
 class ActionIn(BaseModel):
     action: Literal[
-        "reboot", "ctrl_alt_del", "atx_power", "atx_power_long", "atx_reset", "power_on", "power_off",
+        "reboot", "ctrl_alt_del", "atx_power", "atx_power_long", "atx_reset", "fingerbot_power", "fingerbot_power_long", "power_on", "power_off", "bios_setup",
         "jiggler_on", "jiggler_off", "wol", "keys", "text", "custom", "port", "resume", "locate_on", "locate_off",
     ]  # fmt: skip
     mac: str = Field("", max_length=17)  # for "wol"
@@ -363,6 +379,13 @@ class ActionIn(BaseModel):
     custom_id: str = Field("", max_length=32)  # for "custom": a saved action
     custom_changed: int | None = None  # ...as it was when the sender looked at it (see ActionRecord.changed)
     batch: str = Field("", max_length=40, pattern=r"^[A-Za-z0-9-]*$")  # ties the entries of one bulk run together
+    # The sender has this machine's large view or live view open: a PC with Intel AMT then opens a session before switching
+    # on (or starting into its BIOS setup), so the start shows from the first moment.
+    watching: bool = False
+
+
+class KvmSwitchIn(BaseModel):
+    on: bool  # a PC's Intel AMT KVM on (true) or off, on its management engine
 
 
 class CustomActionIn(BaseModel):
@@ -420,6 +443,143 @@ def fail(status: int, code: str, message: str, **headers: str) -> JSONResponse:
     return JSONResponse({"code": code, "message": message}, status_code=status, headers=headers or None)
 
 
+@dataclasses.dataclass
+class HistoryTurn:
+    """One account's or token's turn at reading the history (see device_history and HISTORY_TURN_WAIT), or the activity log."""
+
+    lock: asyncio.Lock = dataclasses.field(default_factory=asyncio.Lock)  # held from its turn until its read's thread is done
+    waiting: int = 0  # requests waiting for the lock: one at the most
+    free_at: float = 0.0  # time.monotonic() at which its next read may begin
+
+    def idle(self, now: float) -> bool:
+        return not self.lock.locked() and not self.waiting and self.free_at <= now
+
+
+class Downloads:
+    """Downloads of the activity log made or being sent at once (each holds a file as large as what it holds): so many from
+    everybody together, and one of each account."""
+
+    def __init__(self, at_once: int) -> None:
+        self._lock = threading.Lock()  # (given back from the loop, and from whatever thread lets go of an answer never sent)
+        self._at_once = at_once
+        self._of: set[str] = set()
+
+    def take(self, asker: str) -> Callable[[], None] | None:
+        """A place for one, and what gives it back (once, however often it is called); None where there is none."""
+        with self._lock:
+            if len(self._of) >= self._at_once or asker in self._of:
+                return None
+            self._of.add(asker)
+        given: list[bool] = []
+
+        def give_back() -> None:
+            with self._lock:
+                if not given:
+                    given.append(True)
+                    self._of.discard(asker)
+
+        return give_back
+
+
+class Handed(StreamingResponse):
+    """An answer that lets go of what it was made from once it is sent, or could not be, or is never sent at all."""
+
+    def __init__(self, content: AsyncIterator[bytes], done: Callable[[], None], **how: Any) -> None:
+        super().__init__(content, **how)
+        self._done = done
+        weakref.finalize(self, done)  # (an answer never sent: let go of when it is)
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            self._done()
+
+
+class TurnRefused(Exception):
+    """A read that is not let in now (Reads.run): the answer to give."""
+
+    def __init__(self, reply: JSONResponse) -> None:
+        super().__init__(reply.status_code)
+        self.reply = reply
+
+
+T = TypeVar("T")
+
+
+class Reads:
+    """Reads of a store that take a worker thread for seconds (the history, the activity log), as W4b set them: so many at
+    once from everybody together, and of each account or token one at a time, the next waiting its turn for `wait` seconds
+    at the most (with one waiting already, or longer than that: come back in a moment); and after a read the same one waits
+    as long as that read took before its next begins. A viewer whose script asked again and again had the reads to itself,
+    and everybody else was told to come back."""
+
+    def __init__(self, at_once: int, wait: float, what: str) -> None:
+        self.places = asyncio.Semaphore(at_once)
+        self.turns: dict[str, HistoryTurn] = {}
+        self.wait = wait
+        self.what = what  # "the history": as it is said to whoever is told to come back
+
+    def turn(self, asker: str) -> HistoryTurn:
+        turn = self.turns.get(asker)
+        if turn is None:
+            if len(self.turns) >= HISTORY_TURNS_KEPT:
+                now = time.monotonic()
+                for done in [key for key, each in self.turns.items() if each.idle(now)]:
+                    del self.turns[done]
+            turn = self.turns[asker] = HistoryTurn()
+        return turn
+
+    async def run(self, asker: str, work: Callable[[], T], patient: bool = False) -> T:
+        """`work` in a worker thread, in its turn. TurnRefused where it is not let in now. `patient`: the next page of a
+        download that is under way, which waits for its turn and a place however long (a download cut off ends the wait)."""
+        turn = self.turn(asker)
+        yours = f"This account or token is reading {self.what} already. Try again in a moment."
+        if turn.waiting and not patient:
+            raise TurnRefused(fail(503, "busy", yours, **{"Retry-After": "2"}))
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.wait
+        turn.waiting += 1
+        try:
+            if patient:
+                await turn.lock.acquire()
+            else:
+                async with asyncio.timeout_at(deadline):
+                    await turn.lock.acquire()
+        except TimeoutError:
+            raise TurnRefused(fail(503, "busy", yours, **{"Retry-After": "2"})) from None
+        finally:
+            turn.waiting -= 1
+        reading: asyncio.Task[T] | None = None
+        try:
+            pause = turn.free_at - time.monotonic()
+            if pause > deadline - loop.time() and not patient:
+                raise TurnRefused(fail(503, "busy", yours, **{"Retry-After": str(math.ceil(pause))}))
+            if pause > 0:
+                await asyncio.sleep(pause)
+            if patient:
+                await self.places.acquire()
+            elif self.places.locked():
+                raise TurnRefused(fail(503, "busy", f"{self.what[0].upper()}{self.what[1:]} is being read by others just now. Try again in a moment.", **{"Retry-After": "2"}))
+            else:
+                await self.places.acquire()  # (free: taken at once)
+            began = time.monotonic()
+
+            def read_done(_: object) -> None:
+                # The turn and the place are given back when the thread is done, and not before: a request that is cut off
+                # leaves its thread reading for up to the time a read may take, which counts as a read under way all that time.
+                turn.free_at = time.monotonic() + (time.monotonic() - began)
+                self.places.release()
+                turn.lock.release()
+
+            reading = asyncio.create_task(asyncio.to_thread(work))
+            reading.add_done_callback(read_done)
+            return await asyncio.shield(reading)
+        finally:
+            if reading is None:
+                turn.lock.release()
+
+
 _open_url = exchange.console_link
 
 
@@ -468,6 +628,14 @@ def action_view(record: ActionRecord) -> dict[str, Any]:
     }
 
 
+# How long what is being added has to say what it is: a device's own patience to begin an answer (kvm.WAITS),
+# not less. An older server's controller took 3.2 s to show the root of its Redfish service; asked with three,
+# it was taken for a KVM, and the one adding it was told "did not respond in time" though the login was right.
+# The questions are asked together, so an address where nothing answers costs one wait, not one per make.
+RECOGNISE = httpx.Timeout(8.0, connect=1.5)
+RECOGNISE_WITHIN = 10.0
+
+
 async def detect_kind(url: str, scheme_given: bool, port: int | None = None) -> tuple[str, str]:
     """What answers at `url`: (driver kind, the address to use for it). `port`: the port that was typed, where one was.
 
@@ -489,12 +657,12 @@ async def detect_kind(url: str, scheme_given: bool, port: int | None = None) -> 
         twin = other_way(url)
     candidates = sorted({url, twin or url}, key=lambda address: not address.startswith("https://"))
     # No credentials are sent and the answer only picks a driver, so the certificate is not checked here.
-    async with httpx.AsyncClient(verify=False, timeout=httpx.Timeout(3.0, connect=1.5), trust_env=False) as client:
+    async with httpx.AsyncClient(verify=False, timeout=RECOGNISE, trust_env=False) as client:
 
         async def said(address: str) -> tuple[bool, Any]:
             """(whether anything answered there at all, what it said where that was a plain yes in JSON)"""
             try:
-                reply = await bounded(client, client.build_request("GET", address), MAX_PROBE, 5.0)
+                reply = await bounded(client, client.build_request("GET", address), MAX_PROBE, RECOGNISE_WITHIN)
             except KvmError as ex:
                 return ex.code != "timeout", None  # too much, or packed oddly: somebody is there all the same
             except httpx.HTTPError:
@@ -533,51 +701,16 @@ async def detect_kind(url: str, scheme_given: bool, port: int | None = None) -> 
             return "jetkvm", candidate
     if isinstance(root, dict) and "RedfishVersion" in root:
         return "redfish", url
+    # A PC with Intel AMT answers on ports of its own (16993 with TLS, 16992 plain), and says what it is to anybody.
+    found = await amt.detect(url, scheme_given, port)
+    if found is not None:
+        return found
     return "kvmd", url
 
 
-MOST_ASKED = 4  # addresses of one name that are each asked whether anything listens there
 # Characters that are not drawn and are not of the kind that says so of itself ("format"): letters that
 # are blanks, and the marks that pick one drawing of the letter before them or join it to the next.
 NOT_DRAWN = frozenset({0x034F, 0x115F, 0x1160, 0x17B4, 0x17B5, 0x2800, 0x3164, 0xFFA0, *range(0x180B, 0x1810), *range(0xFE00, 0xFE10), *range(0xE0100, 0xE01F0)})
-
-
-async def listens(url: str) -> bool:
-    """Whether anything takes connections at the host and port of `url`, or may: False only where it was plainly refused.
-
-    A JetKVM as it comes has nothing on its HTTPS port, and says so at once. A port that takes a connection,
-    or lets one wait (a device slow to wake, a firewall that drops instead of refusing), is not that.
-    """
-    parts = urlsplit(url)
-    port = parts.port or (443 if parts.scheme == "https" else 80)
-    try:
-        async with asyncio.timeout(3.0):  # (never wait_for, which loses a stop up to Python 3.11: see kvm.Listening.message)
-            found = await asyncio.get_running_loop().getaddrinfo(parts.hostname, port, type=socket.SOCK_STREAM)
-    except (OSError, TimeoutError):
-        return True  # where it is cannot be found out just now: not "nothing is there"
-    addresses = list(dict.fromkeys(str(entry[4][0]) for entry in found))
-    if len(addresses) > MOST_ASKED:
-        # Not all of them are asked, so "every one refused" cannot be said: and that is the answer on which
-        # a password goes out in the clear to what answers the plain way.
-        return True
-
-    async def refuses(address: str) -> bool:
-        # Each address by itself: asked for by name, two refusals come back as one error that does not say
-        # what it is made of, and on Windows a refusal takes two seconds, so that two were never both heard.
-        try:
-            async with asyncio.timeout(4.0):
-                _, writer = await asyncio.open_connection(address, port)
-        except ConnectionRefusedError:
-            return True
-        except TimeoutError:
-            return False
-        except OSError as ex:
-            # (An address of a kind this computer has no way to, IPv6 where there is none: nothing is there for it either.)
-            return ex.errno in (errno.ENETUNREACH, errno.EADDRNOTAVAIL, errno.EAFNOSUPPORT)
-        writer.close()
-        return False
-
-    return not all(await asyncio.gather(*(refuses(address) for address in addresses))) if addresses else True
 
 
 async def jetkvm_at(address: str) -> bool:
@@ -601,7 +734,8 @@ def view(record: DeviceRecord, editing: bool = True) -> dict[str, Any]:
         "id": record.id,
         "name": record.name,
         "host": urlsplit(record.url).netloc,
-        "open_url": record.open_url or f"{record.url}/",
+        # (A guest of Proxmox: its console on Proxmox's own page, where the address the wall keeps is no page.)
+        "open_url": record.open_url or (proxmox.console_page(record.url) if record.kind == "proxmox" else f"{record.url}/"),
         "kind": record.kind,
         "picture": driver_for(record.kind).picture,  # False: its tile shows how a server is, not a screen
         "group": record.group,
@@ -617,6 +751,7 @@ def view(record: DeviceRecord, editing: bool = True) -> dict[str, Any]:
         "fingerprint": saved_fingerprint(record.cert_pem),  # (None as well where what is remembered is no certificate)
         "has_password": record.secret is not None,
         "alerts": record.alerts,
+        "fingerbot_strength": record.fingerbot_strength if record.fingerbot_strength in FINGERBOT_STRENGTHS else FINGERBOT_STRENGTHS[0],
     }
 
 
@@ -624,14 +759,17 @@ def create_app(core: Core) -> FastAPI:
     store, audit = core.store, Attributed(core.audit)
     saving = asyncio.Lock()  # settings reach the disk one write at a time, in the order they were made
 
-    async def save() -> None:
-        """Write the settings to disk without making every tile wait for the disk."""
+    async def save(leaving: frozenset[str] = frozenset()) -> None:
+        """Write the settings to disk without making every tile wait for the disk. `leaving`: devices written down as
+        gone already, which are taken off the wall once that is done (see remove_devices)."""
         async with saving:
             # Taken on the event loop, where nothing can change it halfway, and when its turn has come: taken
             # before the wait, it would still hold a change whose own write failed meanwhile and which was
             # taken back for that, and would then save it after all.
             try:
                 data = store.snapshot()
+                if leaving:
+                    data["devices"] = [device for device in data["devices"] if device["id"] not in leaving]
                 await asyncio.to_thread(store.write, data)
             except OSError:
                 raise
@@ -693,10 +831,28 @@ def create_app(core: Core) -> FastAPI:
                 await save()
             except OSError as ex:
                 log.error("%s: its new address could not be saved: %s", changed.name, ex)
-        core.audit.write("device_moved", "", device=changed.name, url=to, was=url, note="over HTTPS now")
+        core.audit.write("device_moved", "", device=changed.name, device_id=device_id, url=to, was=url, note="over HTTPS now")
         log.info("%s: offers HTTPS by now, and is talked to at %s", changed.name, to)
 
     manager.moved = moved
+
+    async def known(device_id: str, url: str, was: str, mark: str) -> None:
+        """A driver took a number its machine gives for itself (see DeviceManager._known): kept with the tile as a person's
+        change is, one change at a time and with a new record in the old one's place (so that an edit under way notices),
+        and only where what is kept is still what the driver had, at the address it was seen at. A save that fails leaves
+        it in memory, as for a first certificate, and it is written with the next change that is saved."""
+        async with one_change:
+            record = store.device(device_id)
+            if record is None or record.url != url or record.machine != was:
+                return
+            changed = dataclasses.replace(record, machine=mark)
+            store.devices[store.devices.index(record)] = changed
+            try:
+                await save()
+            except OSError as ex:
+                log.error("%s: the number its machine gives for itself could not be saved: %s", changed.name, ex)
+
+    manager.known = known
     assets = load_assets()
     served = page_mark()  # the mark of the page's files as they were read just now
     live_files = os.environ.get("QKVM_DEV") == "1"  # while developing: pick up edits without a restart
@@ -757,16 +913,18 @@ def create_app(core: Core) -> FastAPI:
         record = store.device(device_id)
         detail = str(((device._status or {}).get("error") or {}).get("message") or "")
         address = urlsplit(device.spec.base_url).netloc
-        alert = alerts.describe(device.spec.name, address, previous, state, detail, server=not device.picture)
+        atx = (device._status or {}).get("atx")
+        off = isinstance(atx, dict) and atx.get("enabled") is True and atx.get("power") is False  # (its power board says so)
+        alert = alerts.describe(device.spec.name, address, previous, state, detail, server=not device.picture, off=off)
         if not alerts.wanted(alert, store.alerts) or (record is not None and not record.alerts):
             return
         if paused:
             # Not sent, and not forgotten: when the pause is over, what is not as it was before it is told.
             held.setdefault(device_id, previous)
-            core.audit.write("alert", "", device=alert.device, state=alert.state, was=alert.previous, held=True)
+            core.audit.write("alert", "", device=alert.device, device_id=device_id, state=alert.state, was=alert.previous, held=True)
             return
         alert.link = alerts.link_for(store.alerts.link, device_id)
-        core.audit.write("alert", "", device=alert.device, state=alert.state, was=alert.previous)
+        core.audit.write("alert", "", device=alert.device, device_id=device_id, state=alert.state, was=alert.previous)
         log.info("alert: %s (%s -> %s)", alert.title, alert.previous, alert.state)
         outbox.put(alert)  # delivered from there: the watching does not wait for somebody else's server
 
@@ -815,7 +973,7 @@ def create_app(core: Core) -> FastAPI:
         """
         return store.alerts.enabled or bool(store.server.metrics_token) or core.unlock_secret is not None
 
-    background: set[asyncio.Task[None]] = set()  # things set going by a request that it does not wait for
+    background: set[asyncio.Task[Any]] = set()  # things set going by a request that it does not wait for (or that outlive it, if it is cut off)
 
     async def fit_unlock_file() -> None:
         """Make the unlock file qKVM was started with fit this data folder, now that a password has opened it."""
@@ -872,26 +1030,78 @@ def create_app(core: Core) -> FastAPI:
             except Exception:  # a failed round must not be the last one: locking up after the last sign-out depends on it
                 log.exception("housekeeping failed")
 
+    # --- history (W4): what the wall saw of each machine, kept in history.sqlite (see history.py) -----------------
+    # Every look at a device's status reaches the history through the manager (kvm.Device.on_status), whoever
+    # asked for it: a browser, the alert round, a collector. And once a minute the history looks by itself, so
+    # that a machine is watched while the wall is unlocked, with or without anybody looking, at the least cost
+    # (a glance: what the alerts ask, which takes nobody's place at a JetKVM).
+    kept = core.history
+    manager.observed = kept.observe
+
+    async def history_looks() -> None:
+        while True:
+            await asyncio.sleep(HISTORY_LOOK_EVERY)
+            try:
+                watched = list(manager.devices.items())
+                glances = await asyncio.gather(*(device.glance() for _, device in watched), return_exceptions=True)
+                for (device_id, device), glance in zip(watched, glances, strict=True):
+                    if isinstance(glance, dict) and manager.devices.get(device_id) is device:
+                        kept.observe(device_id, glance)
+                kept.sweep()  # a machine not looked at for a while (the wall locked itself, say) is unwatched from its last look on
+            except Exception:  # whatever goes wrong in one round must not end the keeping
+                log.exception("the history could not look at the machines")
+
+    def history_pressed(device_id: str, action: str, ok: bool | None, note: str = "", at: float | None = None) -> None:
+        """A power action was pressed from the wall: the history keeps that it was, and how the device took it (None: not known).
+        `at`: when it was pressed (a press that is waited for until it is seen done is written when that wait ends).
+
+        Not of a machine that is no longer on the wall: its history went with it, and a press that was still being held
+        when it was removed (seconds, for a long one) came back as a row of a machine that is gone."""
+        if action in POWER_ACTIONS and store.device(device_id) is not None:
+            kept.pressed(device_id, action, ok, note, now=at)
+
+    # Reads of the history take a thread each, for up to the few seconds a read may run: so many at once and no
+    # more, whoever asks, so that a viewer with a script cannot have the wall's threads to themselves; and of each
+    # account or token one at a time, with a pause after it, so that one of them cannot have all of them either.
+    history_reads = Reads(HISTORY_READS_AT_ONCE, HISTORY_TURN_WAIT, "the history")
+
+    # (The route that reads the history stands beside the snapshot route below, under the same mark.)
+
+    # --- the activity log's index (activity.py): made from the text files, followed as they are written ----------
+    # The text log tells it that there is more as each entry is written (it does not wait for it); reads of the log
+    # go to it where it holds what the text files hold, and to the text files where it does not. Read by the same rule
+    # as the history: an admin's script cannot have the wall's threads to itself either.
+    indexed = core.activity
+    activity_reads = Reads(ACTIVITY_READS_AT_ONCE, ACTIVITY_TURN_WAIT, "the activity log")
+    downloads = Downloads(DOWNLOADS_AT_ONCE)
+
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         manager.load()
-        tasks = [asyncio.create_task(job()) for job in (housekeeping, watch, outbox.run)]
+        kept.start()  # (once; the history outlives the listeners, as the rest of core does)
+        indexed.start()  # (once, as the history: at the first start after an upgrade it is made from the text files there)
+        tasks = [asyncio.create_task(job()) for job in (housekeeping, watch, outbox.run, history_looks)]
         yield
         for task in tasks:
             task.cancel()
         if background:
-            # What a sign-in set going is finished, within a time, and not cut off. It is the note that opens
-            # the saved passwords at the next start: made in memory, on its way to the file. A wall stopped
+            # What a request set going is finished, within a time, and not cut off. The note a sign-in makes that
+            # opens the saved passwords at the next start: made in memory, on its way to the file. A wall stopped
             # in that moment (the first sign-in, then a restart) had said that it carries on by itself, and
-            # came back locked.
+            # came back locked. And the removal of several machines whose request was cut off by the stop.
             await asyncio.wait(list(background), timeout=BACKGROUND_OWED)
         for task in list(background):
             task.cancel()
         await asyncio.gather(*tasks, *background, return_exceptions=True)
         await outbox.close()
+        await lines.close()  # (what a live line still has down on a machine is let go of before the machine's connection goes)
         await manager.close()
         await asyncio.to_thread(core.audit.flush)  # what was done last is on disk before the program ends
+        # ...and the activity log's index lets go of its file, all of it brought into the file (what it had not taken in yet,
+        # the next start takes in: the text files have it). Started again with the listeners, where they are opened anew.
+        await asyncio.to_thread(indexed.stop)
         await asyncio.to_thread(core.sessions.flush)  # ...and so is who signed out last
+        await asyncio.to_thread(kept.flush)  # ...and what the wall saw last, with when it last looked (history: W4)
 
     app = FastAPI(title="qKVM", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
     app.state.trusted_proxies = core.trusted_proxies
@@ -1995,6 +2205,12 @@ def create_app(core: Core) -> FastAPI:
 
     # --- the wall ---------------------------------------------------------------
 
+    def abilities_of(record: DeviceRecord) -> list[str]:
+        """What this tile can do (kvm.ABILITIES): as its driver last found it, or the driver's own list while nothing
+        is known of the device (the saved passwords locked, say). A client goes by this, never by the kind."""
+        device = manager.devices.get(record.id)
+        return device.abilities() if device is not None else can_do(*driver_for(record.kind).can)
+
     @app.get("/api/v1/wall")
     async def wall(request: Request) -> dict[str, Any]:
         shown = [d for d in store.devices if allowed(request, d.id)]
@@ -2012,8 +2228,9 @@ def create_app(core: Core) -> FastAPI:
             # many there are: the list of all pairs of a thousand tiles was a quarter of a gigabyte.)
             twins = [d for d in alike.get(marks[record.id] or "", []) if d is not record][:MOST_TWINS]
             same_as = [{"id": d.id, "name": d.name, "host": urlsplit(d.url).netloc} for d in twins]
-            devices.append({**view(record, editing=request.state.user.role == "admin"), "same_as": same_as})
-        return {"interval": store.server.interval, "devices": devices}
+            devices.append({**view(record, editing=request.state.user.role == "admin"), "same_as": same_as, "can": abilities_of(record)})
+        # "live": the form of the live connection this server speaks (live.py); a client that speaks another asks for none.
+        return {"interval": store.server.interval, "live": live.FORM, "devices": devices}
 
     @app.put("/api/v1/wall/order")
     async def arrange(body: OrderIn, request: Request) -> Response:
@@ -2045,42 +2262,93 @@ def create_app(core: Core) -> FastAPI:
         request: Request,
         w: int = Query(640, ge=1, le=16384),
         age: float | None = Query(None, ge=0, le=3600),
+        big: bool = Query(False),
     ) -> Response:
         """One frame, at least `w` pixels wide when the source has that many.
 
         `age`: how old, in seconds, the frame may be. A tile that refreshes once a second does not
-        need one taken for it alone when another browser got one a moment ago.
+        need one taken for it alone when another browser got one a moment ago. `big`: this is the
+        enlarged (large) view of the machine, so a PC with Intel AMT holds a session open for it (and
+        opens one before a power-on), where a tile that is only shown gets a still now and then.
         """
         device = manager.devices.get(device_id)
         if device is None or not allowed(request, device_id):
             return fail(404, "not_found", "Unknown device")
         try:
-            frame = await device.snapshot(w, age)
+            frame = await device.snapshot(w, age, big=big)
         except KvmError as ex:
             return fail(ex.status, ex.code, ex.message)
         if refused := still_shown(request, device_id):
             return refused
-        return Response(
-            frame.data,
-            media_type=frame.content_type,
-            headers={"Cache-Control": "no-store", "X-KVM-Signal": "1" if frame.signal else "0"},
-        )
+        headers = {"Cache-Control": "no-store", "X-KVM-Signal": "1" if frame.signal else "0"}
+        if frame.still:
+            # A still kept between sessions (a PC with Intel AMT whose tile is only shown): the page says its age.
+            headers["X-KVM-Still"] = "1"
+            headers["X-KVM-Age"] = str(max(0, round(time.monotonic() - frame.taken_at)))
+        return Response(frame.data, media_type=frame.content_type, headers=headers)
+
+    # --- history (W4): the one route that reads it; what feeds it stands above the lifespan ----------------------
+
+    @app.get("/api/v1/devices/{device_id}/history")
+    async def device_history(
+        device_id: str,
+        request: Request,
+        what: Literal["summary", "states", "samples", "events"] = "summary",
+        since: float | None = Query(None, ge=0, le=1e11),  # seconds since 1970; left out: a week back (samples: a day)
+        until: float | None = Query(None, ge=0, le=1e11),  # left out: now
+        limit: int = Query(1000, ge=1, le=history.MOST_ROWS),
+        every: int = Query(0, ge=0, le=86400),  # samples: averaged over spans of that many seconds; 0: as they were taken
+    ) -> Response:
+        """What the history says of one machine, for the roles that may see it (see history.py and the README).
+
+        `summary`: when it was first and last heard from, and how much of the window it was watched and online.
+        `states`, `samples`, `events`: the rows in the window, oldest first, a bounded page (`more` says if it was cut).
+        """
+        if store.device(device_id) is None or not allowed(request, device_id):
+            return fail(404, "not_found", "Unknown device")
+        now = time.time()
+        until_at = now if until is None else until
+        since_at = until_at - (history.DAY if what == "samples" else history.WEEK) if since is None else since
+        if since_at > until_at:
+            return fail(422, "invalid", "since: has to be before until")
+        # Its turn: after the read of the same account or token that is under way, and the pause after that one.
+        try:
+            found = await history_reads.run(request.state.user.id, lambda: kept.read(device_id, what, since_at, until_at, limit, every, now))
+        except TurnRefused as turned:
+            return turned.reply
+        except history.NotReadable as ex:
+            return fail(503, "history_unavailable", str(ex))
+        # The read took its time. Whoever asked may have lost the right to the machine meanwhile.
+        if refused := still_allowed(request):
+            return refused
+        if store.device(device_id) is None or not allowed(request, device_id):
+            return fail(404, "not_found", "Unknown device")
+        return JSONResponse(found)
 
     # --- devices ----------------------------------------------------------------
 
-    async def connect(record: DeviceRecord, password: str | None, force: bool) -> tuple[Device, dict[str, Any]]:
+    async def connect(record: DeviceRecord, password: str | None, force: bool, take: bool = False) -> tuple[Device, dict[str, Any]]:
         """Contact a device with these settings: (its client, what it says about itself).
 
-        Raises KvmError when the device can't be reached or logged in to, unless `force`.
+        Raises KvmError when the device can't be reached or logged in to, unless `force`. `take`: whoever typed the password
+        says "this is it", and the machine that answers now is the one the tile is for (see DeviceSpec.machine); where nothing
+        answered (saved without being checked), the machine it was for stands, and nothing is taken at a later look.
         """
+        if password:
+            vncdevice.forget_pace(record.url)  # (a console behind a door is asked for at once as well: before its client is made, which reads it)
         client = manager.client(record, password)
+        kept = record.machine
+        if take:
+            client.spec.machine = ""
         if password:
             # Typed by a person just now, for this device: tried at once, whatever was rejected there before
             # and however long that was to wait. (A save without one finds the wait standing, and offers nothing.)
             REJECTED.forget(client.spec)
         about: dict[str, Any] = {}
+        identified = False
         try:
             about = await client.identify()
+            identified = True
         except KvmError:
             if not force:
                 await client.close()
@@ -2089,10 +2357,18 @@ def create_app(core: Core) -> FastAPI:
             log.exception("%s: the device answered in a way that was not expected", record.url)
             await client.close()
             raise KvmError("bad_response", "The device answered in a way qKVM does not understand") from None
+        if take and not identified:
+            client.spec.machine = kept  # (nothing was found to take: the next machine to answer there is not taken for it)
         record.cert_pem = client.spec.cert_pem  # keep what was trusted on first contact
+        record.machine = client.spec.machine  # ...and the machine it was found to be, where its driver can tell (see DeviceSpec.machine)
         said = about.pop("ident", None)  # what it says it is: for telling it from the others, not for the page
-        if isinstance(said, str) and IDENT.fullmatch(said) and not record.ident.startswith("own:"):
-            record.ident = said
+        if not record.ident.startswith("own:"):
+            if isinstance(said, str) and IDENT.fullmatch(said):
+                record.ident = said
+            elif identified and said == "":
+                # (Its driver read it, and it says none: a number it gave before is not kept. None is "not read just now",
+                # which leaves what is kept as it is.)
+                record.ident = ""
         return client, about
 
     def twin_of(record: DeviceRecord) -> DeviceRecord | None:
@@ -2106,13 +2382,71 @@ def create_app(core: Core) -> FastAPI:
         said = f"This {'says it is' if said_so else 'is'} the same device as {twin.name}, which is on the wall already" + ("" if twin.name == host else f" ({host})")
         return JSONResponse({"code": "same_device", "message": said, "same_as": {"id": twin.id, "name": twin.name, "host": host}}, status_code=409)
 
+    def parse_vnc(body: DeviceIn, own: DeviceRecord | None) -> tuple[str, str, str] | JSONResponse:
+        """A VNC server, said so by the kind chosen or by its address (vnc://, vncs://): it speaks no HTTP, and is not asked what it is."""
+        try:
+            url, open_url = vncdevice.vnc_url(body.url), _open_url(body.open_url)
+        except ValueError as ex:
+            return fail(422, "invalid", str(ex).capitalize())
+        if any(d.url == url and d is not own for d in store.devices):
+            return fail(409, "duplicate", "This device is already on the wall")
+        return url, open_url, "vnc"
+
+    async def parse_proxmox(body: DeviceIn, own: DeviceRecord | None) -> tuple[str, str, str] | JSONResponse:
+        """A guest of Proxmox, said so by the kind chosen: the address names the guest, by its number and its node.
+        Where only its number is given, its node is asked of Proxmox with the token typed (or, at the address it was
+        saved for, the saved one: never sent anywhere else on the strength of an address typed in an edit)."""
+        try:
+            found, open_url = proxmox.address_of(body.url), _open_url(body.open_url)
+        except ValueError as ex:
+            return fail(422, "invalid", str(ex).capitalize())
+        if found.vmid is None:
+            return fail(422, "invalid", "Name the guest: the Proxmox's address with the guest's ID after it (pve.lan/100), or pick guests from its list")
+        node = found.node
+        if node is None:
+            saved_for = None  # the tile being edited, where its token was saved for this very Proxmox
+            if own is not None and own.kind == "proxmox" and own.username == body.username.strip():
+                try:
+                    saved_for = own if proxmox.address_of(own.url).origin == found.origin else None
+                except ValueError:
+                    saved_for = None
+            token = body.password or (manager.spec(saved_for).password if saved_for is not None else "")
+            if not token:
+                return fail(422, "invalid", "Name the guest's node as well (pve.lan/pve1/100), or type the token's secret, with which its node is looked up")
+            try:
+                listed, _, _ = await proxmox.guests(
+                    found.origin, body.username.strip(), token, typed=bool(body.password),
+                    tls=saved_for.tls if saved_for is not None else "pinned", cert_pem=saved_for.cert_pem if saved_for is not None else None,
+                )  # fmt: skip
+            except KvmError as ex:
+                return fail(422, ex.code, ex.message)
+            node = next((guest["node"] for guest in listed if guest["vmid"] == found.vmid), None)
+            if node is None:
+                return fail(422, "invalid", f"The token sees no virtual machine {found.vmid} on this Proxmox")
+        url = proxmox.guest_url(found.origin, node, found.vmid)
+        if any(d.url == url and d is not own for d in store.devices):
+            return fail(409, "duplicate", "This device is already on the wall")
+        return url, open_url, "proxmox"
+
     async def parse(body: DeviceIn, own: DeviceRecord | None) -> tuple[str, str, str] | JSONResponse:
         """Check what was typed: (address, console address, driver kind), or what is wrong with it."""
+        if body.kind == "vnc" or vncdevice.is_vnc(body.url) or (body.kind == "auto" and own is not None and own.kind == "vnc"):
+            return parse_vnc(body, own)
+        if body.kind == "proxmox" or (body.kind == "auto" and own is not None and own.kind == "proxmox"):
+            return await parse_proxmox(body, own)
         try:
             url, open_url = device_url(body.url), _open_url(body.open_url)
         except ValueError as ex:
             return fail(422, "invalid", str(ex).capitalize())
         kind: str = body.kind
+        try:
+            typed = urlsplit(body.url.strip() if "://" in body.url else f"https://{body.url.strip()}").port
+        except ValueError:
+            typed = None
+        if kind == "amt" and typed is None:
+            # Intel AMT answers on ports of its own: an engine's address typed without one is at its port (16993 with TLS,
+            # 16992 plain), not at 443 or 80, where its redirection port would not be known (amt.REDIRECTION_BESIDE).
+            url = device_url(amt.at_its_port(url))
         if kind == "auto" and own is not None and url == own.url:
             kind = own.kind  # same device as before: no need to ask it again
             # Every edit signs in to the device again, with the password typed or the one saved. For a JetKVM at
@@ -2123,10 +2457,6 @@ def create_app(core: Core) -> FastAPI:
             if twin is not None and twin.startswith("https://") and await jetkvm_at(twin):
                 url = twin
         if kind == "auto":
-            try:
-                typed = urlsplit(body.url.strip() if "://" in body.url else f"https://{body.url.strip()}").port
-            except ValueError:
-                typed = None
             try:
                 kind, url = await detect_kind(url, "://" in body.url, typed)
             except KvmError as ex:
@@ -2151,6 +2481,7 @@ def create_app(core: Core) -> FastAPI:
             kind=kind,
             group=" ".join(body.group.split()),
             alerts=body.alerts is not False,
+            fingerbot_strength=body.fingerbot_strength or FINGERBOT_STRENGTHS[0],
         )
         if body.tls is None and url.startswith("https") and await publicly_trusted(url):
             # Reached through somebody's front door, whose certificate changes every few weeks: not one to remember.
@@ -2191,8 +2522,9 @@ def create_app(core: Core) -> FastAPI:
             except OSError as ex:
                 store.devices.remove(record)
                 await manager.remove(record.id)
+                kept.forget(record.id)  # (looked at while the settings were being written: what the history noted of it goes too)
                 return not_saved("The new device", ex)
-        audit.write("device_added", client_ip(request), device=record.name, url=url)
+        audit.write("device_added", client_ip(request), device=record.name, device_id=record.id, url=url)
         return JSONResponse({"device": view(record), "about": about}, status_code=201)
 
     @app.put("/api/v1/devices/{device_id}")
@@ -2214,6 +2546,7 @@ def create_app(core: Core) -> FastAPI:
             kind=kind,
             group=" ".join(body.group.split()),
             alerts=record.alerts if body.alerts is None else body.alerts,
+            fingerbot_strength=body.fingerbot_strength or record.fingerbot_strength,
         )
         moved, typed = url != record.url, bool(body.password)
         # A new address, and no password typed: the saved one is about to be used somewhere it was not saved
@@ -2221,9 +2554,16 @@ def create_app(core: Core) -> FastAPI:
         # remembered for it, which is then kept and has to be shown again. Anywhere else (a device that shows
         # no certificate, a mode that remembers none) the password is typed, by whoever says "this is it".
         # (Not a server's controller: its maker may have put one certificate, and one key, on every board. Two
-        # of them are not told apart by it, and the password of one is not for the other.)
+        # of them are not told apart by it, and the password of one is not for the other. Nor a guest of Proxmox:
+        # the certificate is its Proxmox's, or a proxy's in front of it, or a wildcard shared with other hosts, and
+        # its saved API token is not for whatever else shows that one. As core.identity, which knows neither by it.)
         known_again = (
-            moved and not typed and record.tls == changed.tls == "pinned" and bool(record.cert_pem) and url.startswith("https") and "redfish" not in (record.kind, kind)
+            moved
+            and not typed
+            and record.tls == changed.tls == "pinned"
+            and bool(record.cert_pem)
+            and url.startswith("https")
+            and not {"redfish", "proxmox"} & {record.kind, kind}
         )
         # A JetKVM that was on plain HTTP and offers HTTPS now, at the same host: its saved password goes with
         # it without being typed, as it does when the tile follows by itself. It only gains by the move.
@@ -2232,12 +2572,20 @@ def create_app(core: Core) -> FastAPI:
             return fail(422, "password_needed", "There is nothing to know this device by at another address. Type its password to use it there.")
         if changed.tls != record.tls or (moved and not known_again):
             changed.cert_pem = None  # another mode, or another place that somebody vouched for: trust is established afresh
+        # Whoever types the password says "this is it": the machine that answers now is the one the tile is for (a PC whose
+        # board was changed, or the one the tile said answers there instead), where one answers (`connect`'s `take`); saved
+        # without being checked, the one remembered stands. Not typed, it has to be the one remembered.
         # "Save anyway" is for a device that is down, at the address it was vouched for. Not for a new address
         # the saved password goes along to: saved there unchecked, the tile says "another certificate", and
         # whoever then presses "Trust" (or sets it to "don't check") has sent the password to whatever is there.
         carried = moved and not typed and record.secret is not None
+        # Saved again by a person (another address, another certificate check, the password, or nothing changed but the
+        # saving): a console behind a door is asked for afresh, whatever pause it was in. Before the client is made, which
+        # reads it; and again once the client before it is gone, which may have written meanwhile.
+        for url_ in (record.url, changed.url):
+            vncdevice.forget_pace(url_)
         try:
-            client, _ = await connect(changed, body.password or None, body.force and not carried)
+            client, _ = await connect(changed, body.password or None, body.force and not carried, take=typed)
         except KvmError as ex:
             if body.force and carried:
                 return fail(422, "password_needed", f"This device could not be checked at its new address ({ex.message}). Type its password to save it there all the same.")
@@ -2259,43 +2607,127 @@ def create_app(core: Core) -> FastAPI:
             at = store.devices.index(record)
             store.devices[at] = changed
             await manager.adopt(client)
+            for url_ in (record.url, changed.url):
+                vncdevice.forget_pace(url_)
             try:
                 await save()
             except OSError as ex:
                 store.devices[at] = record
                 await manager.replace(record)
                 return not_saved("The change to this device", ex)
-        audit.write("device_changed", client_ip(request), device=changed.name, url=url)
+        audit.write("device_changed", client_ip(request), device=changed.name, device_id=changed.id, url=url)
         return JSONResponse({"device": view(changed)})
 
     @app.delete("/api/v1/devices/{device_id}")
     async def delete_device(device_id: str, request: Request) -> Response:
+        """Take one machine off the wall, the way several are taken off (take_off): the settings written without it first,
+        and only then the machine taken off the wall and its connection closed. A write that fails changes nothing, so
+        nothing is put back. (It was taken off first: a write that failed had told its live lines that it was gone, let
+        go of their keys, cut off what was being done to it and signed in to it anew, and then said that nothing was
+        changed.) Its answers are as they were: `ok`; 404 `not_found`; 507 `not_saved`."""
         record = store.device(device_id)
         if record is None:
             return fail(404, "not_found", "Unknown device")
-        at = store.devices.index(record)
-        store.devices.remove(record)
-        await manager.remove(device_id)
+        answer = await removing(frozenset({device_id}), f"Removing {record.name}", client_ip(request))
+        return JSONResponse({"ok": True}) if answer.status_code == 200 else answer
+
+    @app.post("/api/v1/devices/remove")
+    async def remove_devices(body: RemoveIn, request: Request) -> Response:
+        """Take several machines off the wall in one go: every one of them, or none.
+
+        With the settings written once for all of them, and for each what goes with one that the route above removes:
+        its saved password, its history, what alerts knew of it, its line in the activity log. An id that is not on the
+        wall (removed by somebody else a moment ago, or never there) removes nothing, and the answer names it: what was
+        asked for is not what would be done. Nor is a write that fails.
+
+        Nothing on the wall changes until the file says that they are gone: the settings are written as they will be,
+        and only then are the machines taken off and their connections closed. (Taken off first, a write that failed had
+        them to put back, and meanwhile their live lines had been told that they were gone.) The work is a task of its
+        own, which the answer waits for: should the request be cut off (qKVM stopping, its listeners opened anew), the
+        task goes on to the end the file has (within the time a stopping wall gives it: see take_off), and in a request
+        that is being stopped nothing is awaited.
+
+        What is being done to one of them at this moment does not keep it, as it does not keep a single one: the
+        admin's word is the last. An action on its way is answered as one cut off by an edit, "it may have been done"
+        (its connection is taken away under it, kvm.RETIRED), and a live line is told, and lets go of the keys it
+        holds down on the machine before the connection goes (live.Lines.retiring). Refused instead, a machine that
+        somebody held over a live line, or typed to again and again, could be kept on the wall for as long as they liked.
+        """
+        wanted = list(dict.fromkeys(body.ids))  # (an id given twice is one machine)
+        on_wall = {record.id: record for record in store.devices}
+        unknown = [device_id for device_id in wanted if device_id not in on_wall]
+        if unknown:
+            named = ", ".join(unknown[:5]) + (f" and {len(unknown) - 5} more" if len(unknown) > 5 else "")
+            said = f"{'This is' if len(unknown) == 1 else 'These are'} not on the wall: {named}. Nothing was removed."
+            return JSONResponse({"code": "not_found", "message": said, "unknown": unknown}, status_code=404)
+        what = f"Removing {on_wall[wanted[0]].name}" if len(wanted) == 1 else f"Removing {len(wanted)} KVMs"
+        return await removing(frozenset(wanted), what, client_ip(request))
+
+    async def removing(going: frozenset[str], what: str, ip: str) -> Response:
+        """take_off, as a task of its own that the request waits for: cut off, the request lets go of it and it ends as its
+        write does (see remove_devices). For one machine (delete_device) as for several."""
+        work = asyncio.ensure_future(take_off(going, what, ip))
+        background.add(work)  # (one that a stopping wall gives time to finish: see lifespan)
+        work.add_done_callback(background.discard)
         try:
-            await save()
+            return await asyncio.shield(work)
+        except asyncio.CancelledError:
+            work.add_done_callback(unheard)  # (cut off: should it fail now, nobody else would hear of it)
+            raise
+
+    def unheard(work: asyncio.Task[Response]) -> None:
+        if not work.cancelled() and (ex := work.exception()) is not None:
+            log.error("removing machines failed after its request was cut off", exc_info=ex)
+
+    async def take_off(going: frozenset[str], what: str, ip: str) -> Response:
+        """The part of removing one machine or several that waits: the file, then the wall, then the connections.
+
+        Cut off with its request, it goes on without the turn for changes, within the time a stopping wall gives it
+        (BACKGROUND_OWED; a write that takes longer still ends in its thread, and the wall is left as it was in memory).
+        A stop cuts off every request at once, so what can come between is only what the program changes by itself (a
+        JetKVM followed to HTTPS, a certificate remembered, the unlock note), none of which keeps a place in the list of
+        devices across a wait.
+        """
+        try:
+            await save(leaving=going)
         except OSError as ex:
-            # Gone from the wall and still in the file, with its password, it would be back after a restart.
-            store.devices.insert(at, record)
-            await manager.replace(record)
-            return not_saved(f"Removing {record.name}", ex)
-        watcher.forget(device_id)
-        audit.write("device_removed", client_ip(request), device=record.name, url=record.url)
-        return JSONResponse({"ok": True})
+            return not_saved(what, ex)
+        # Written down. From here to the end of what goes with them nothing is waited for: no other change sees half of it.
+        places = [record for record in store.devices if record.id in going]
+        store.devices[:] = [record for record in store.devices if record.id not in going]
+        taken = manager.take(going)
+        try:
+            together = {"note": f"one of {len(places)} removed together"} if len(places) > 1 else {}
+            for record in places:
+                watcher.forget(record.id)
+            kept.forget(*(record.id for record in places))  # their history goes with them (never dropped, however full the history's queue)
+            for record in places:
+                audit.write("device_removed", ip, device=record.name, device_id=record.id, url=record.url, **together)
+        finally:
+            # Closed side by side, whatever the above came to; every live line told first, and what it held down let go
+            # of through the machine's own connection.
+            await manager.retire_all(taken)
+        return JSONResponse({"ok": True, "removed": [record.id for record in places]})
+
+    def certificate_at(record: DeviceRecord) -> str | None:
+        """Where the certificate a tile checks is asked for: its https address, or a `vncs://` server's host and port (asked
+        at its address as an https one, it was asked at port 443, somebody else's); None for a device reached without TLS."""
+        if record.url.startswith("https"):
+            return record.url
+        if record.url.startswith("vncs://"):
+            return vncdevice.certificate_address(record.url)
+        return None
 
     @app.get("/api/v1/devices/{device_id}/certificate")
     async def certificate(device_id: str) -> Response:
         record = store.device(device_id)
         if record is None:
             return fail(404, "not_found", "Unknown device")
-        if not record.url.startswith("https"):
+        where = certificate_at(record)
+        if where is None:
             return JSONResponse({"saved": None, "presented": None})
         try:
-            presented = fingerprint(await fetch_certificate(record.url))
+            presented = fingerprint(await fetch_certificate(where))
         except KvmError as ex:
             return fail(ex.status, ex.code, ex.message)
         saved = saved_fingerprint(record.cert_pem)
@@ -2307,7 +2739,7 @@ def create_app(core: Core) -> FastAPI:
         if record is None:
             return fail(404, "not_found", "Unknown device")
         try:
-            pem = await fetch_certificate(record.url)
+            pem = await fetch_certificate(certificate_at(record) or record.url)
         except KvmError as ex:
             return fail(ex.status, ex.code, ex.message)
         # Pin only the certificate the user was shown, not whatever is there a moment later.
@@ -2323,14 +2755,16 @@ def create_app(core: Core) -> FastAPI:
             trusted = dataclasses.replace(record, cert_pem=pem, tls="pinned")
             at = store.devices.index(record)
             store.devices[at] = trusted
+            vncdevice.forget_pace(trusted.url)  # (a console behind a door that met the other certificate is asked for again at once)
             await manager.replace(trusted)
+            vncdevice.forget_pace(trusted.url)  # (and what the client before it wrote while it was retired)
             try:
                 await save()
             except OSError as ex:
                 store.devices[at] = record
                 await manager.replace(record)
                 return not_saved("Trusting this certificate", ex)
-        audit.write("certificate_trusted", client_ip(request), device=trusted.name, fingerprint=fingerprint(pem))
+        audit.write("certificate_trusted", client_ip(request), device=trusted.name, device_id=trusted.id, fingerprint=fingerprint(pem))
         return JSONResponse({"device": view(trusted)})
 
     # --- device actions ---------------------------------------------------------
@@ -2346,17 +2780,49 @@ def create_app(core: Core) -> FastAPI:
             return fail(ex.status, ex.code, ex.message)
         return still_shown(request, device_id) or JSONResponse({"targets": targets})
 
+    def waited_for(request: Request, device_id: str, device: Device, custom: tuple[ActionRecord, int, str] | None = None) -> JSONResponse | None:
+        """Asked again of an action that waited (seconds, for a last holder's letting go: Lines.handed_over) before it goes:
+        whoever asked may no longer, and the tile may have been changed or taken off meanwhile. Nothing was sent, and the
+        refusal says so; sent on, it went to a connection taken away and was answered "it may have been done". `custom`:
+        the saved action it runs, its `changed` and its name as they were when it was looked up, before the wait."""
+        if (refusal := still_allowed(request)) is not None:
+            return refusal
+        if not allowed(request, device_id):
+            return fail(404, "not_found", "Unknown device")
+        if manager.devices.get(device_id) is not device:
+            return fail(409, "conflict", f"{device.spec.name} was changed or taken off the wall while this waited. Nothing was sent: look at it again.")
+        if custom is not None and (not any(action is custom[0] for action in store.actions) or custom[0].changed != custom[1]):
+            # (Edited meanwhile, it may type where it pressed a key, and want a question it did not want; removed, it is no
+            # action of anybody's. Run as it was clicked, it was neither.)
+            return fail(409, "changed", f"\"{custom[2]}\" was changed or removed while this waited. Nothing was sent: look at it again.")
+        return None
+
+    def keyboard_held(name: str, by: str, request: Request) -> JSONResponse:
+        """What is said while somebody has a machine's keyboard and mouse over a live line: who, as the live line's own
+        refusal says it (`by`), to whoever may act on the machine, an operator as an admin. In the sentence, for the page;
+        and to an admin in person, where they can take them over (an action does not take over by itself: live_may_take)."""
+        message = f"{by} has {name}'s keyboard and mouse over a live line at this moment. Wait until they are given back."
+        user: UserRecord = request.state.user
+        if user.role == "admin" and not is_token(user):
+            message += " As an admin you can take them over in its live view."
+        return JSONResponse({"code": "busy", "message": message, "by": by}, status_code=409)
+
     @app.post("/api/v1/devices/{device_id}/actions")
     async def act(device_id: str, body: ActionIn, request: Request) -> Response:
         device = manager.devices.get(device_id)
         if device is None or not allowed(request, device_id):
             return fail(404, "not_found", "Unknown device")
         # What goes into the activity log: which action, never the text that was typed.
-        detail: dict[str, Any] = {"device": device.spec.name, "action": body.action}
+        detail: dict[str, Any] = {"device": device.spec.name, "device_id": device_id, "action": body.action}
         if body.batch:
             detail["batch"] = body.batch
         action: str = body.action
         keys, text, enter = body.keys, body.text, body.enter
+        custom: tuple[ActionRecord, int, str] | None = None  # the saved action, as it was looked up (see waited_for)
+        if action == "bios_setup" and body.batch:
+            # One machine at a time: it opens the machine's large view to show the setup screen, and leaving several
+            # halted in their firmware setup at once is rarely meant. Not offered in a bulk run (the page does not either).
+            return fail(422, "invalid", "Start into BIOS setup is for one machine at a time: it opens its large view to show the setup screen.")
         if action == "custom":
             saved = next((a for a in store.actions if a.id == body.custom_id), None)
             if saved is None:
@@ -2369,6 +2835,7 @@ def create_app(core: Core) -> FastAPI:
                 # where it used to press a key, and want a confirmation it did not want before.
                 return fail(409, "changed", f"\"{saved.name}\" was changed since you opened this list. Look at it again before running it.")
             detail["name"] = saved.name
+            custom = (saved, saved.changed, saved.name)
             action, keys, enter = saved.kind, saved.keys, saved.enter
             if saved.kind == "text":
                 # Its text is opened whatever is saved for it, nothing included: an action that types has a
@@ -2389,21 +2856,44 @@ def create_app(core: Core) -> FastAPI:
             detail["mac"] = body.mac
         elif action == "port":
             detail["port"] = body.port + 1  # as people count them
+        elif action in FINGERBOT_PRESSES:
+            detail["strength"] = device.spec.fingerbot_strength  # (how hard it was told to press: the machine's own setting)
         if device_id in acted_on:
             # The page holds a second action back while the first is out, but only the page it was sent from.
             # Another tab, somebody else, a run over many machines know nothing of it; and a power button
             # pressed twice is not pressed harder: the second press undoes the first.
             return fail(409, "busy", f"Something else is being done to {device.spec.name} at this moment. Wait for it to finish.")
+        if (by := lines.held_by(device_id)) is not None:
+            # One thing at a time per machine: somebody has its keyboard and mouse over a live line (live.py). Also for
+            # whoever holds them: a text typed by this road beside keys sent by that one would be two hands on one keyboard.
+            return keyboard_held(device.spec.name, by, request)
         acted_on.add(device_id)
+        try:
+            # Keyboard and mouse given back, or taken away, a moment ago: what the holder still had on its way, and the
+            # letting go of what they had down, goes first. (Nobody takes them meanwhile: the machine is being acted on.)
+            refusal = waited_for(request, device_id, device, custom) if await lines.handed_over(device_id) else None
+        except BaseException:
+            acted_on.discard(device_id)  # (cut off before anything was sent)
+            raise
+        if refusal is not None:
+            acted_on.discard(device_id)
+            return refusal
         note: str | None = None  # where what happened is not simply "done": "already on"
         def still_theirs() -> bool:
             """Whether whoever asked for this may still have it done (asked by what takes long: typing key by key)."""
             return still_allowed(request) is None and allowed(request, device_id)
 
+        pressed_at = time.time()  # (what the history keeps of a power button: when it was pressed)
+        answered, sent = PRESS_ANSWERED.set(False), PRESS_SENT.set(None)
+        if body.watching and not body.batch:
+            # The sender has its large or live view open (see Device.watched). Never an entry of a bulk run: that comes from
+            # the selection, and forty PCs switched on together are not forty sessions opened first.
+            device.watched()
         try:
             await device.act(action, mac=body.mac, keys=keys, text=text, port=body.port, still=still_theirs)
         except AlreadySo as so:
             note = detail["note"] = str(so)
+            history_pressed(device_id, action, True, note, pressed_at)
         except KvmError as ex:
             if ex is RETIRED:
                 # The connection it went out on was taken away meanwhile: the device was edited, or the last
@@ -2411,18 +2901,46 @@ def create_app(core: Core) -> FastAPI:
                 # as one: "Retry failed" would press a power button a second time.
                 unknown = f"{device.spec.name} was being changed while this was under way. It may have been done all the same: look at the machine before trying again."
                 audit.write("action_failed", client_ip(request), error=unknown, **detail)
+                history_pressed(device_id, action, None, "retired", pressed_at)  # (it may have been done: nobody knows)
                 return fail(504, "timeout", unknown)
             audit.write("action_failed", client_ip(request), error=ex.message, **detail)
+            # (No answer in time, or one that broke off on its way: it may have been done, as the page says, and the history
+            # keeps that nobody knows.)
+            history_pressed(device_id, action, None if ex.code in ("timeout", "dropped") else False, ex.code, pressed_at)
             return fail(ex.status, ex.code, ex.message)
         except asyncio.CancelledError:
             # qKVM is being stopped, or its listeners reopened, and this request is cut off. What was sent may
             # have been carried out: whoever reads the log is to find that it was sent.
-            audit.write("action_failed", client_ip(request), error="qKVM was stopped or restarted before the machine answered: it may have been done", **detail)
+            if PRESS_ANSWERED.get():
+                # (The KVM had answered the click, and the button was being held, or its change waited for: it was pressed.)
+                audit.write("action", client_ip(request), note="qKVM was stopped after the KVM had taken the press: it was pressed", **detail)
+                history_pressed(device_id, action, True, "stopped", pressed_at)
+            elif PRESS_SENT.get() is False:
+                # (The driver says the press had not gone out: the KVM was only being asked, whether a Fingerbot is paired, say.)
+                audit.write("action_failed", client_ip(request), error="qKVM was stopped before the press went out: nothing was pressed", **detail)
+                history_pressed(device_id, action, False, "stopped", pressed_at)
+            else:
+                audit.write("action_failed", client_ip(request), error="qKVM was stopped or restarted before the machine answered: it may have been done", **detail)
+                history_pressed(device_id, action, None, "stopped", pressed_at)
             raise
+        else:
+            history_pressed(device_id, action, True, at=pressed_at)
         finally:
+            PRESS_ANSWERED.reset(answered)
+            PRESS_SENT.reset(sent)
             acted_on.discard(device_id)
         audit.write("action", client_ip(request), **detail)
         return JSONResponse({"ok": True, "note": note})
+
+    # (Each its own: consoles not had, asked for in a loop, leave the openings' allowance as it was.)
+    console_said = {event: activity.Allowance(lambda: activity.CONSOLE_SAID_AN_HOUR) for event in ("console_opened", "console_failed")}
+
+    def console_written(event: str, request: Request, device: str, device_id: str, **detail: Any) -> None:
+        """A server's console opened or not had, into the activity log: within the account's allowance (activity.Allowance)."""
+        # (Each server opened is named once an hour whatever is left; a console not had gives nobody a way in, and is not.)
+        unsaid = console_said[event].take(request.state.user.id, device_id if event == "console_opened" else None)
+        if unsaid is not None:
+            audit.write(event, client_ip(request), device=device, device_id=device_id, **detail, **({"unsaid": unsaid} if unsaid else {}))
 
     @app.post("/api/v1/devices/{device_id}/console")
     async def open_console(device_id: str, request: Request) -> Response:
@@ -2440,16 +2958,174 @@ def create_app(core: Core) -> FastAPI:
         try:
             way_in = await device.console()
         except KvmError as ex:
+            # Asked of a server that has a console, and not had: in the log as well (somebody at a server's console, trying
+            # again and again, is worth knowing of). Not of a machine that has none to give (`no_console`): nothing was tried.
+            if ex.code != "no_console":
+                console_written("console_failed", request, device=record.name, device_id=device_id, error=ex.message)
             return fail(ex.status, ex.code, ex.message)
         # The controller took its time making the pass out. Whoever asked may have lost the right to it meanwhile.
         if refused := still_allowed(request):
             return refused
-        if not allowed(request, device_id) or store.device(device_id) is not record:
+        now = store.device(device_id)
+        # (Changed meanwhile where it matters here: its address, or the one a browser reaches it by. Not where the record was
+        # replaced for a number its machine gave, which the asking itself may have taken: see DeviceManager._known.)
+        if not allowed(request, device_id) or now is None or (now.url, now.open_url) != (record.url, record.open_url):
             return fail(404, "not_found", "Unknown device")
         # At the address a browser reaches the device by, which is not always the one this program uses.
         where = urlsplit(record.open_url or record.url)
-        audit.write("console_opened", client_ip(request), device=record.name)
+        console_written("console_opened", request, device=record.name, device_id=device_id)
         return JSONResponse({"url": f"{where.scheme}://{where.netloc}{way_in}"})
+
+    @app.post("/api/v1/devices/{device_id}/kvm")
+    async def switch_kvm(device_id: str, body: KvmSwitchIn, request: Request) -> Response:
+        """Switch a PC's Intel AMT KVM on, or off, on its management engine: a setting of the PC, which only an admin
+        changes, only by asking for it here (a look never does), and which is written down."""
+        device, record = manager.devices.get(device_id), store.device(device_id)
+        if device is None or record is None or not allowed(request, device_id):
+            return fail(404, "not_found", "Unknown device")
+        if not isinstance(device, amt.AmtDevice):
+            return fail(422, "invalid", "Only a PC with Intel AMT has a KVM to switch on from here")
+        if device_id in acted_on:
+            return fail(409, "busy", f"Something else is being done to {record.name} at this moment. Wait for it to finish.")
+        if (by := lines.held_by(device_id)) is not None:
+            return keyboard_held(record.name, by, request)
+        acted_on.add(device_id)
+        try:
+            # (As for an action: the last holder's letting go goes first.)
+            refusal = waited_for(request, device_id, device) if await lines.handed_over(device_id) else None
+        except BaseException:
+            acted_on.discard(device_id)
+            raise
+        if refusal is not None:
+            acted_on.discard(device_id)
+            return refusal
+        try:
+            await device.switch_kvm(body.on)
+        except KvmError as ex:
+            if ex is RETIRED:
+                # (As for an action: the connection it went out on was taken away meanwhile, and it may have been done.)
+                unknown = f"{record.name} was being changed while this was under way. It may have been done all the same: look at the machine before trying again."
+                audit.write("kvm_switch_failed", client_ip(request), device=record.name, device_id=device_id, on=body.on, error=unknown)
+                return fail(504, "timeout", unknown)
+            audit.write("kvm_switch_failed", client_ip(request), device=record.name, device_id=device_id, on=body.on, error=ex.message)
+            return fail(ex.status, ex.code, ex.message)
+        except asyncio.CancelledError:
+            audit.write("kvm_switch_failed", client_ip(request), device=record.name, device_id=device_id, on=body.on, error="qKVM was stopped or restarted before the machine answered: it may have been done")
+            raise
+        finally:
+            acted_on.discard(device_id)
+        audit.write("kvm_switched", client_ip(request), device=record.name, device_id=device_id, on=body.on)
+        return JSONResponse({"ok": True})
+
+    # --- the live line: one WebSocket per viewer, the picture down, keys and the mouse up (live.py) ---------------
+    # The two calls of desktop/SPEC.md section 6.2: a pass, then the line that shows it. Everything behind them is in
+    # live.py; what is here is who may ask, and what the guard above does for a request over HTTP and not for a WebSocket.
+
+    def may_see(user: UserRecord, device_id: str) -> bool:
+        """May this account see this KVM? (`allowed`, for an account that is not the one making the request in hand.)"""
+        if user.devices is None or device_id in user.devices:
+            return True
+        record = store.device(device_id) if user.groups else None
+        return record is not None and record.group.casefold() in {group.casefold() for group in user.groups}
+
+    def live_standing(holder: live.Holder, device_id: str) -> tuple[str | None, bool]:
+        """Whether whoever was given this pass may still be on a line to this machine, and whether they may act: (why not, may act).
+
+        Asked when the line is let in and every few seconds after it. The line carries no cookie, so the account the
+        pass was given to is looked at anew here: a browser's sign-in that ended (signed out, or signed out everywhere
+        by an admin) ends the line; so does an account removed, suspended or limited to other machines, a token taken
+        back or run out, and a wall that locked itself. An account given a lesser role keeps looking and loses the keys.
+        """
+        user: UserRecord | None
+        if holder.token is not None:
+            sent = next((t for t in store.tokens if t.id == holder.token and t.kind == "api"), None)
+            if sent is None or (sent.expires is not None and sent.expires <= time.time()):
+                return "signed_out", False
+            user = token_user(sent)
+        else:
+            session = core.sessions.get(holder.session)
+            if session is None:
+                return "signed_out", False
+            if holder.user_id.startswith("token:"):  # a screen on the wall, opened with its display link
+                shown = next((t for t in store.tokens if t.id == holder.user_id[6:] and t.kind == "display"), None)
+                if shown is None or (shown.expires is not None and shown.expires <= time.time()):
+                    return "signed_out", False
+                user = token_user(shown)
+            else:
+                user = store.user(holder.user_id)
+                if user is None or user.suspended:
+                    return "signed_out", False
+                if must_enroll(user) and not session.sso:
+                    return "not_allowed", False
+        if not core.vault.unlocked or device_id not in manager.devices or not may_see(user, device_id):
+            return "not_found", False
+        return None, RANK[user.role] >= RANK["operator"]
+
+    def live_may_take(holder: live.Holder, device_id: str) -> bool:
+        """Whether whoever was given this pass may take this machine's keyboard and mouse from whoever holds them over a live
+        line: an admin, in person, as the account is at this moment (asked when they ask, not when the pass was given).
+
+        Never a token, of any role (a token is never an admin, and one written as one in the settings file is not taken for
+        one here), and never a wall screen, which only looks. An admin's action without the live view does not take over
+        (it is refused 409 with the holder's name, `keyboard_held`): taking a person's keyboard away is done where it can be
+        seen, after a question that names them."""
+        if holder.token is not None or holder.user_id.startswith("token:"):
+            return False
+        why, may_act = live_standing(holder, device_id)
+        user = store.user(holder.user_id)
+        return why is None and may_act and user is not None and user.role == "admin"
+
+    lines = live.Lines(manager, standing=live_standing, busy=lambda device_id: device_id in acted_on, audit=audit.write, may_take=live_may_take)
+    manager.retiring = lines.retiring  # (keys a line has down on a device are let go of before its connection is closed)
+
+    @app.post("/api/v1/devices/{device_id}/live")
+    async def live_pass(device_id: str, request: Request) -> Response:
+        """A pass for one live line to this machine: good for half a minute, and for one use (live.py)."""
+        if not core.vault.unlocked:
+            return fail(503, "locked", "qKVM was restarted and nobody has signed in since, so it cannot reach its devices.")
+        device = manager.devices.get(device_id)
+        if device is None or not allowed(request, device_id):
+            return fail(404, "not_found", "Unknown device")
+        if not lines.offers(device):
+            return fail(404, "no_live", "This machine has no live picture")
+        user: UserRecord = request.state.user
+        _, sent = asking(request)
+        holder = live.Holder(
+            user_id=user.id,
+            name=user.name,
+            may_control=RANK[user.role] >= RANK["operator"],
+            ip=client_ip(request),
+            session=None if sent is not None else request.cookies.get(COOKIE),
+            token=None if sent is None else sent.id,
+        )
+        try:
+            ticket = lines.issue(device_id, holder)
+        except KvmError as ex:  # (as many live pictures as one account may have: busy, and a pass runs out within half a minute)
+            return fail(ex.status, ex.code, ex.message, **{"Retry-After": str(round(live.PASS_LASTS))})
+        return JSONResponse({"v": live.FORM, "ticket": ticket})
+
+    def same_host(origin: str, host: str) -> bool:
+        """Whether a page at `origin` is this wall's own page: a WebSocket cannot carry the header the guard asks for, and a browser sends where a page is from."""
+        try:
+            return urlsplit(origin).netloc == host
+        except ValueError:
+            return False
+
+    @app.websocket("/api/v1/devices/{device_id}/live")
+    async def live_line(ws: WebSocket, device_id: str) -> None:
+        """The line itself. It carries no cookie: the pass in its first message says whom it is for (live.py).
+
+        The guard above runs for a request over HTTP and not for this. What it asks of everybody before anything
+        else, whether the address and the host are ones this wall answers at all, is asked here. A page of another
+        site cannot open a line that is let in: a pass is had only through the guarded call above.
+        """
+        host, origin = ws.headers.get("host", ""), ws.headers.get("origin")
+        if not client_allowed(ws) or not host_allowed(host, store.server.allowed_hosts) or (origin is not None and not same_host(origin, host)):
+            # Closed before it is let in, which the web server answers with a bare 403. (Refused with an answer of
+            # our own, it wrote an error into the log for every one: anybody who can reach the port could fill it.)
+            await ws.close(code=1008)
+            return
+        await lines.serve(ws, device_id, client_ip(ws))
 
     # --- saved actions ----------------------------------------------------------
 
@@ -2772,7 +3448,8 @@ def create_app(core: Core) -> FastAPI:
                 else [
                     {
                         "name": device.name, "host": urlsplit(device.url).netloc, "kind": device.kind, "group": device.group, "password": bool(device.password),
-                        "tls": device.tls if device.url.startswith("https://") else "", "open_url": device.open_url, "new": device.url in new, "same_as": twins.get(device.url, ""),
+                        # (A console over vncs:// has its certificate checked as one over https:// does, and is said so.)
+                        "tls": device.tls if device.url.startswith(("https://", "vncs://")) else "", "open_url": device.open_url, "new": device.url in new, "same_as": twins.get(device.url, ""),
                     }
                     for device in content.devices
                 ],
@@ -2833,16 +3510,20 @@ def create_app(core: Core) -> FastAPI:
                     record = DeviceRecord(
                         id=new_id(), name=device.name, url=device.url, username=device.username, open_url=device.open_url, tls=device.tls,
                         cert_pem=device.cert_pem, kind=device.kind, group=device.group, ident=device.ident, alerts=device.alerts,
+                        fingerbot_strength=device.fingerbot_strength,
                     )  # fmt: skip
+                    # The machine it was added for, which its driver checks before anything is sent to it (DeviceSpec.machine). Where
+                    # the file has none, the first look takes it.
+                    record.machine = device.machine
                     if device.keep_both:
                         record.ident = f"own:{record.id}"  # as the form marks a tile that is to stay beside its twin
                     record.secret = core.vault.encrypt(device.password, record.id) if device.password else None
                     added.append(record)
                 saved_actions: list[ActionRecord] = []
                 for action in actions:
-                    kept = ActionRecord(id=new_id(), name=action.name, kind=action.kind, keys=action.keys, enter=action.enter, danger=action.danger)
-                    kept.secret = core.vault.encrypt(action.text, f"action:{kept.id}") if action.kind == "text" else None
-                    saved_actions.append(kept)
+                    made = ActionRecord(id=new_id(), name=action.name, kind=action.kind, keys=action.keys, enter=action.enter, danger=action.danger)
+                    made.secret = core.vault.encrypt(action.text, f"action:{made.id}") if action.kind == "text" else None
+                    saved_actions.append(made)
                 address = core.vault.encrypt(told["webhook"], "alerts:webhook") if told is not None and told["webhook"] else None
                 # Made before anything is touched: whatever goes wrong in the making leaves the wall as it was.
                 clients = [manager.client(record) for record in added]
@@ -2855,9 +3536,10 @@ def create_app(core: Core) -> FastAPI:
                     if record in store.devices:
                         store.devices.remove(record)
                     await manager.remove(record.id)
-                for kept in saved_actions:
-                    if kept in store.actions:
-                        store.actions.remove(kept)
+                kept.forget(*(record.id for record in added))  # (looked at while the settings were being written: what the history noted goes too)
+                for made in saved_actions:
+                    if made in store.actions:
+                        store.actions.remove(made)
                 for name, value in before[0].items():
                     setattr(store.alerts, name, value)
                 store.server.interval, store.server.update_check = before[1], before[2]
@@ -2889,7 +3571,7 @@ def create_app(core: Core) -> FastAPI:
                 alert_log["error"], not_opening[0] = None, None  # (one that still does not open is said again, at the next look)
         # Each device by name and address, as one that was typed in is written down; a file of hundreds, by their number.
         for record in added[:MOST_NAMED]:
-            audit.write("device_added", client_ip(request), device=record.name, url=record.url, note="from a file")
+            audit.write("device_added", client_ip(request), device=record.name, device_id=record.id, url=record.url, note="from a file")
         audit.write(
             "import_done", client_ip(request), devices=len(added), actions=len(saved_actions), encrypted=content.sealed,
             parts=sorted(part for part, there in (("devices", added), ("actions", saved_actions), ("alerts", told is not None), ("wall", wall is not None)) if there),
@@ -2974,6 +3656,29 @@ def create_app(core: Core) -> FastAPI:
             entry["moved_from"] = urlsplit(same.url).netloc if gone and same is not None else None
         # From inside a container the network that can be looked through is the container's: said, not left to be wondered at.
         return JSONResponse({**result, "container": core.container})
+
+    @app.post("/api/v1/proxmox/guests")
+    async def proxmox_guests(body: ProxmoxIn) -> Response:
+        """The virtual machines an API token may see on a Proxmox, to pick from for adding; and, where the address
+        named one by its number, that one's address as the wall keeps it (`named`, its node looked up)."""
+        try:
+            found = proxmox.address_of(body.url)
+        except ValueError as ex:
+            return fail(422, "invalid", str(ex).capitalize())
+        try:
+            listed, containers, _ = await proxmox.guests(found.origin, body.username.strip(), body.password, typed=True)
+        except KvmError as ex:
+            return fail(422, ex.code, ex.message)
+        on_wall = {d.url: d for d in store.devices}
+        for guest in listed:
+            there = on_wall.get(guest["url"])
+            guest["known_as"] = there.name if there is not None else None
+        named = None
+        if found.vmid is not None:
+            named = next((guest["url"] for guest in listed if guest["vmid"] == found.vmid and found.node in (None, guest["node"])), None)
+            if named is None:
+                return fail(422, "invalid", f"The token sees no virtual machine {found.vmid} on this Proxmox")
+        return JSONResponse({"guests": listed, "containers": containers, "named": named})
 
     # --- alerts -------------------------------------------------------------------
 
@@ -3062,32 +3767,159 @@ def create_app(core: Core) -> FastAPI:
         delivered(None)
         return JSONResponse(alerts_view())
 
+    def asked_of(
+        q: list[str] | None, kind: str, before: float | None, since: float | None, until: float | None, user: str | None, device: str | None
+    ) -> activity.Asked:
+        """What a request asks of the activity log. A machine by its id; and where it is on the wall, by the name it has now as
+        well, for what was written before entries gave the id (0.1.x), which named it only."""
+        record = store.device(device) if device is not None else None
+        return activity.Asked.of(q, kind, before, since, until, user, device, record.name if record is not None else None)
+
     @app.get("/api/v1/audit")
     async def audit_log(
+        request: Request,
         limit: int = 100,
         q: Annotated[list[str] | None, Query()] = None,  # words to look for, in whatever case; several: any of them
         kind: Literal["", "signin", "action", "change", "alert"] = "",
         before: float | None = None,  # only what is older than this moment: the next page of a long log
-    ) -> dict[str, Any]:
+        since: float | None = Query(None, ge=0, le=1e11),  # seconds since 1970: what was done from then on
+        until: float | None = Query(None, ge=0, le=1e11),  # ...up to then
+        user: str | None = Query(None, min_length=1, max_length=100),  # what one account (or token) did, by its name
+        device: str | None = Query(None, min_length=1, max_length=64),  # what was done to one machine, by its id
+    ) -> Response:
         limit = max(1, min(limit, 500))
-        # Read in a worker thread: the log can be megabytes, and the tiles should not wait for it.
-        found = await asyncio.to_thread(audit.tail, limit + 1, audit_filter(q or [], kind, before))
+        if since is not None and until is not None and since > until:
+            return fail(422, "invalid", "since: has to be before until")
+        asked = asked_of(q, kind, before, since, until, user, device)
+        # Read in a worker thread, in its turn: the index where it holds what the text files hold, else the files.
+        try:
+            found = await activity_reads.run(request.state.user.id, lambda: indexed.read(asked, limit))
+        except TurnRefused as turned:
+            return turned.reply
+        except activity.NotReadable as ex:
+            return fail(503, "activity_unavailable", str(ex))
+        # The read waited its turn, and for the index or the files: whoever asked may have lost the right to it meanwhile.
+        if refused := still_allowed(request):
+            return refused
         # (And whether this is all of it: entries that could not be written are counted, and that is said.)
-        return {"entries": found[:limit], "more": len(found) > limit, "missing": audit.missing}
+        return JSONResponse({"entries": found.entries, "more": found.more, "missing": audit.missing})
 
     @app.get("/api/v1/audit/export")
     async def audit_export(
+        request: Request,
         format: Literal["csv", "jsonl"] = "csv",
         q: Annotated[list[str] | None, Query()] = None,
         kind: Literal["", "signin", "action", "change", "alert"] = "",
+        since: float | None = Query(None, ge=0, le=1e11),
+        until: float | None = Query(None, ge=0, le=1e11),
+        user: str | None = Query(None, min_length=1, max_length=100),
+        device: str | None = Query(None, min_length=1, max_length=64),
     ) -> Response:
-        """The activity log as a file: all of it, or what a search finds. A table (CSV), or the entries as they are (JSON lines)."""
-        entries = await asyncio.to_thread(audit.tail, 10**9, audit_filter(q or [], kind, None))
-        if format == "csv":
-            text, media = await asyncio.to_thread(audit_table, entries), "text/csv; charset=utf-8"
-        else:
-            text, media = "".join(json.dumps(entry, ensure_ascii=False) + "\n" for entry in entries), "application/x-ndjson"
-        name = f"qkvm-activity-{time.strftime('%Y%m%d-%H%M%S', time.gmtime())}.{format}"
-        return Response(text, media_type=media, headers={"Content-Disposition": f'attachment; filename="{name}"', "Cache-Control": "no-store"})
+        """The activity log as a file: all of it, or what a search finds. A table (CSV), or the entries as they are (JSON lines).
+
+        Made a page at a time, each page a read in its turn, into a file of its own (in memory up to SPOOL_IN_MEMORY, on the
+        disk beyond that): a long log is never held in memory whole (it was, a list of every entry, and of the table made of
+        it), nor the index by one download for longer than a page. Sent once it is whole, with its length: one that cannot be
+        made whole is refused before anything is sent, and one cut off on its way falls short of its length, which whatever
+        fetched it sees. (Sent as it was read, a download cut short ended as a whole one does, a file that looked complete with
+        part of the log missing: the second reviewer of W4c. The web server's middleware ends a streamed answer whose source
+        failed as if it were done.)
+        """
+        if since is not None and until is not None and since > until:
+            return fail(422, "invalid", "since: has to be before until")
+        asked = asked_of(q, kind, None, since, until, user, device)
+        asker = request.state.user.id
+        # Made or being sent at once: DOWNLOADS_AT_ONCE from everybody together, one of each account. Each holds a file as large
+        # as what it holds until it is sent: stacked by one admin, they filled the disk (the third reviewer of W4c).
+        give_back = downloads.take(asker)
+        if give_back is None:
+            return fail(503, "busy", "Downloads of the activity log are being made or sent just now (one of each account at a time). Try again in a moment.", **{"Retry-After": "2"})
+        pager = indexed.pager(asked)
+        # (Beyond what is held in memory, in the data folder, where the record is: the room kept for the record is asked of the
+        # disk it is made on, and what the log holds is not left in the system's temporary folder, nor in memory where that is
+        # a tmpfs, nor in a container's own layer where the data folder is a volume.)
+        prefix, suffix = activity.DOWNLOAD_NAMED  # (by which a start finds one a power cut left: activity.leftover_downloads)
+        spool = tempfile.SpooledTemporaryFile(max_size=SPOOL_IN_MEMORY, dir=str(core.data_dir), prefix=prefix, suffix=suffix)
+        closing = threading.Lock()  # (taken by the first to let go of it: it is closed once)
+
+        def done() -> None:
+            give_back()
+            if not closing.acquire(blocking=False):
+                return
+            # Closed, and so gone from the disk, in a thread and not waited for: a large file takes its time to go, and nothing
+            # waits for the disk on the event loop. (Where no thread can be had any more, the program ending: here.)
+            try:
+                asyncio.get_running_loop().run_in_executor(None, spool.close)
+            except RuntimeError:
+                spool.close()
+
+        def said(page: list[dict[str, Any]], heading: bool) -> bytes:
+            if format == "csv":
+                return audit_table(page, heading).encode()
+            return "".join(json.dumps(entry, ensure_ascii=False) + "\n" for entry in page).encode()
+
+        def room_for(more: int) -> bool:
+            """Whether the disk the file is made on keeps the record's room (activity.Index._room) with `more` bytes in it. (Asks
+            the disk: in a thread.)"""
+            try:
+                free = shutil.disk_usage(core.data_dir).free
+            except OSError:
+                return True
+            return free - more >= 2 * core.audit.max_bytes + 2 * activity.WAL_MOST
+
+        handed = False  # (from there on, the file and the place go with the answer: see Handed)
+        try:
+            page, heading = await activity_reads.run(asker, pager.next), True
+            if page is None and format == "csv":
+                spool.write(said([], True))
+            while page is not None:
+                if await request.is_disconnected():
+                    # Asked for and not waited for: nothing more is made, and nothing was taken away (no entry).
+                    return fail(400, "disconnected", "The download was not waited for")
+                chunk = await asyncio.to_thread(said, page, heading)
+                if spool.tell() + len(chunk) > SPOOL_IN_MEMORY and not await asyncio.to_thread(room_for, len(chunk)):  # (in memory it takes none of the disk)
+                    return fail(507, "not_saved", "There is not room enough on the disk to make this download beside what the activity log is to keep: narrow it down, or make room")
+                await asyncio.to_thread(spool.write, chunk)
+                heading = False
+                if refused := still_allowed(request):  # (as after any read that waited: before each page, and at the end)
+                    return refused
+                page = await activity_reads.run(asker, pager.next, patient=True)
+            if refused := still_allowed(request):
+                return refused
+            # Written down before it is sent: who took the log away, and which part of it. (What it holds was read before. The
+            # words as they are looked for: twenty of a hundred characters at the most. As they came, an address long enough
+            # made an entry longer than any the log is read for.)
+            words = [text[: activity.LONGEST_WORD] for text in (q or [])[: activity.MOST_WORDS]]
+            narrowed = {key: value for key, value in (("q", words), ("kind", kind), ("since", since), ("until", until), ("user", user), ("device", device)) if value}
+            audit.write("activity_exported", client_ip(request), format=format, **({"asked": narrowed} if narrowed else {}))
+            size = spool.tell()
+
+            async def body() -> AsyncIterator[bytes]:
+                await asyncio.to_thread(spool.seek, 0)
+                # (64 kB at a time: on Windows a megabyte handed to the connection counts as one write until all of it is
+                # taken, and a client that took less than 50 kB a second was taken for one that takes nothing, and dropped.)
+                while chunk := await asyncio.to_thread(spool.read, 1 << 16):
+                    yield chunk
+
+            name = f"qkvm-activity-{time.strftime('%Y%m%d-%H%M%S', time.gmtime())}.{format}"
+            media = "text/csv; charset=utf-8" if format == "csv" else "application/x-ndjson"
+            said_how = {"Content-Disposition": f'attachment; filename="{name}"', "Cache-Control": "no-store", "Content-Length": str(size)}
+            reply = Handed(body(), done, media_type=media, headers=said_how)
+            handed = True
+            return reply
+        except TurnRefused as turned:
+            return turned.reply
+        except activity.NotReadable as ex:
+            return fail(503, "activity_unavailable", str(ex))
+        finally:
+            if not handed:
+                done()  # (refused, or cut off: what was made of it goes, and so does its place)
+            # Let go of in a thread of its own and not waited for: a download cut off is a task being stopped, and the page
+            # it was reading is done first (Pager.close waits for it). (Where no thread can be had any more, the program
+            # ending, here: it waits a page at the most.)
+            try:
+                asyncio.get_running_loop().run_in_executor(None, pager.close)
+            except RuntimeError:
+                pager.close()
 
     return app

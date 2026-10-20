@@ -13,6 +13,7 @@ import functools
 import hashlib
 import io
 import logging
+import logging.config
 import os
 import socket
 import struct
@@ -134,6 +135,7 @@ def nothing_else_listening() -> Iterator[None]:
 def a_kvm_at(port: int) -> KvmDevice:
     kvmd = KvmDevice(DeviceSpec("d", "Hostile", f"http://127.0.0.1:{port}", "admin", "secret", tls="insecure"))
     kvmd._token = "t"  # signed in already: this is about the connection that keeps the picture coming
+    kvmd._glinet = True  # ...and known for a GLKVM, as a look finds one: the family is not asked of a device that only speaks this line
     return kvmd
 
 
@@ -354,11 +356,12 @@ def test_what_a_device_said_just_before_it_reset_the_connection_is_heard(when: s
 
 
 def test_requests_from_nobody_are_a_line_of_each_kind_and_not_a_line_each(tmp_path: Path) -> None:
-    # The web server writes a warning for every request that is none, and two for every one that asks for a
-    # WebSocket, which this program does not speak. Anybody who reaches the port can send those, signed in
-    # or not: six hundred of them were nine hundred lines in two seconds, in the log (whose history is
-    # kept to a size, and was gone in minutes at that rate) and on the terminal (which is kept to none).
-    # The program itself, started as it is started.
+    # The web server writes a warning for every request that is none; and it wrote two for every one that asked
+    # for a WebSocket while this program spoke none (it speaks one now, the live line of live.py, and a request
+    # for a WebSocket anywhere else is refused by the router without a line). Anybody who reaches the port can
+    # send those, signed in or not: six hundred of them were nine hundred lines in two seconds, in the log
+    # (whose history is kept to a size, and was gone in minutes at that rate) and on the terminal (which is
+    # kept to none). The program itself, started as it is started.
     port, data = closed_port(), tmp_path / "data"
     env = {**os.environ, "PYTHONPATH": str(Path(cli.__file__).resolve().parent.parent)}
     env.pop("QKVM_CHILD", None)
@@ -394,4 +397,49 @@ def test_requests_from_nobody_are_a_line_of_each_kind_and_not_a_line_each(tmp_pa
     written = (tmp_path / "terminal.txt").read_text(encoding="utf-8", errors="replace")
     counted = {what: (log.count(what), written.count(what)) for what in ("Invalid HTTP request received", "Unsupported upgrade request", "No supported WebSocket library")}
     print(f">>> {2 * many} requests from nobody: (lines in qkvm.log, lines on the terminal) {counted}")
-    assert all(in_log == 1 and on_terminal <= 1 for in_log, on_terminal in counted.values()), counted
+    assert counted["Invalid HTTP request received"][0] == 1 and counted["Invalid HTTP request received"][1] <= 1, counted
+    assert counted["Unsupported upgrade request"] == (0, 0) and counted["No supported WebSocket library"] == (0, 0), counted
+
+
+def test_a_logging_configuration_given_later_puts_no_device_session_in_the_log() -> None:
+    # The WebSocket library writes, at its finer levels, every header it sends: a KVM's session in the cookie. Its
+    # connections to devices log through a logger that says nothing finer than a warning. A level of that logger's own did
+    # not hold: a logging configuration given later that names the library's logger (its lines at DEBUG, to look into
+    # something) sets every logger below it back to no level, and so to DEBUG.
+    from tests.fake_kvm import FakeKvm, FakeState
+
+    heard: list[str] = []
+
+    class Heard(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            heard.append(record.getMessage())
+
+    library, to_devices = logging.getLogger("websockets"), logging.getLogger("websockets.to_devices")
+    kept = [(logger, logger.level, list(logger.handlers), logger.propagate, logger.disabled) for logger in (library, to_devices)]
+    hearing = Heard(logging.DEBUG)
+    fake = FakeKvm(FakeState()).start()
+    try:
+        logging.config.dictConfig({"version": 1, "disable_existing_loggers": False, "loggers": {"websockets": {"level": "DEBUG"}}})
+        library.addHandler(hearing)
+
+        async def run() -> str:
+            device = KvmDevice(DeviceSpec(id="ab12cd34", name="One", base_url=fake.url, username="admin", password="secret"))
+            try:
+                line = await device.input_line()
+                await line.send('{"event_type": "key", "event": {"key": "KeyA", "state": false}}')
+                await line.close()
+                assert device._token
+                return device._token
+            finally:
+                await device.close()
+
+        session = asyncio.run(run())
+    finally:
+        library.removeHandler(hearing)
+        for logger, level, handlers, propagate, disabled in kept:
+            logger.setLevel(level)
+            logger.handlers[:] = handlers
+            logger.propagate, logger.disabled = propagate, disabled
+        fake.stop()
+    assert not any(session in said for said in heard), "a device's session is in the log"
+    assert not any("KeyA" in said for said in heard), "what was sent to a device is in the log"

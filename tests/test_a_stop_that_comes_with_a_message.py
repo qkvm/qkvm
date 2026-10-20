@@ -153,6 +153,7 @@ def test_a_kvm_taken_off_the_wall_while_it_keeps_sending_is_let_go_of(monkeypatc
     async def once(port: int, talking: threading.Event, enough: threading.Event, hung_up: threading.Event) -> None:
         device = KvmDevice(DeviceSpec("k", "k", f"http://127.0.0.1:{port}", "admin", "secret"))
         device._token = "token"  # signed in: what is asked here is how the stream ends, not how it begins
+        device._glinet = True  # (and known for a GLKVM: the family is not asked of a device that only speaks this line)
         device._wanted_at = time.monotonic()
         device._start_keepalive()
         reading = device._keepalive

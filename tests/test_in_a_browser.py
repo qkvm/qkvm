@@ -32,6 +32,7 @@ pytest.importorskip("playwright.sync_api", reason="the browser tests need Playwr
 from playwright.sync_api import Browser, Error, Locator, Page, Request, expect, sync_playwright
 
 from qkvm import exchange, kvm, update, vault
+from tests.fake_amt import AmtState, FakeAmt
 from tests.fake_jetkvm import FakeJetKvm, JetState
 from tests.fake_kvm import FakeKvm, FakeState
 from tests.fake_redfish import BmcState, FakeBmc
@@ -417,12 +418,15 @@ def test_a_kvm_is_added_from_the_wall(tmp_path: Path, browser: Browser, fakes: l
         form.get_by_role("button", name="Check and add").click()
         expect(form.locator("ul.results li.ok")).to_contain_text("over plain HTTP")  # said, where the password crosses unencrypted
         expect(page.locator("#wall article")).to_have_count(1)
+        # The try with the wrong password is no longer true of that address, and its line went: one line per address.
+        expect(form.locator("ul.results li")).to_have_count(1)
+        expect(form.locator("ul.results li.bad")).to_have_count(0)
 
         # One that does not answer can be added all the same, when the person says so.
         nobody = f"http://127.0.0.1:{closed_port()}"
         form.locator("textarea").fill(nobody)
         form.get_by_role("button", name="Check and add").click()
-        expect(form.locator("ul.results li.bad")).to_have_count(2)
+        expect(form.locator("ul.results li.bad")).to_have_count(1)
         assert page.locator("#wall article").count() == 1
         form.get_by_role("button", name="Add anyway").click()
         expect(form.locator("ul.results li.ok")).to_have_count(2)
@@ -978,6 +982,28 @@ def test_a_kvm_is_renamed_and_keeps_the_password_that_was_saved_for_it(tmp_path:
         assert admin.get("/api/v1/wall").json()["devices"][0]["name"] == "Web server"
 
 
+def test_a_spinner_goes_on_turning_where_the_system_asks_for_less_motion(tmp_path: Path, browser: Browser) -> None:
+    # Everything else is cut short there; a spinner that stood still said that the work had stopped, while it went on
+    # (seen on a computer with Windows' animations switched off, adding a slow server's controller).
+    with a_wall(tmp_path) as (live, _), looking(browser, live, reduced_motion="reduce") as page:
+        sign_in(page, live)
+        turning = page.evaluate(
+            """() => {
+                const button = document.createElement('button');
+                button.className = 'primary';
+                button.setAttribute('aria-busy', 'true');
+                const spinner = document.createElement('span');
+                spinner.className = 'spinner';
+                document.body.append(button, spinner);
+                const said = [getComputedStyle(button, '::after'), getComputedStyle(spinner)].map(style => [style.animationName, style.animationIterationCount]);
+                button.remove();
+                spinner.remove();
+                return said;
+            }"""
+        )
+        assert turning == [["spin", "infinite"], ["spin", "infinite"]], turning
+
+
 def test_what_is_no_kvm_is_not_added_anyway_and_a_tile_that_signs_nobody_in_is_still_renamed(tmp_path: Path, browser: Browser, fakes: list[FakeKvm]) -> None:
     # For a day the page offered "Add anyway" for whatever answers its sign-in with an error. An address that
     # is no KVM at all does that (a mistyped one, a printer, a router's page), and once added it was sent the
@@ -1115,6 +1141,117 @@ def test_several_are_ticked_and_one_action_run_on_all_of_them(tmp_path: Path, br
         page.wait_for_timeout(400)
         for fake in fakes:
             assert fake.state.actions == ["shortcut MetaLeft,KeyL"], fake.state.actions  # each of them, and each once
+
+
+def test_several_are_ticked_and_removed_at_once_after_a_question_that_names_them(tmp_path: Path, browser: Browser, fakes: list[FakeKvm]) -> None:
+    spares = [FakeKvm(FakeState(colour=(20, 120, 60), hostname="spare-a")).start(), FakeKvm(FakeState(colour=(90, 30, 120), hostname="spare-b")).start()]
+    try:
+        named = (("Build server", fakes[0]), ("Mail server", fakes[1]), ("Spare A", spares[0]), ("Spare B", spares[1]))
+        with a_wall(tmp_path, *named) as (live, admin), looking(browser, live) as page:
+            ids = {device["name"]: device["id"] for device in admin.get("/api/v1/wall").json()["devices"]}
+            sign_in(page, live)
+            expect(page.locator("#wall article")).to_have_count(4)
+            page.locator("#select-toggle").click()
+            remove = page.locator("#bulk-remove")
+            expect(remove).to_be_visible()
+            expect(remove).to_be_disabled()  # (nothing ticked yet)
+            for name in ("Build server", "Mail server", "Spare A"):
+                tile(page, name).click()
+            expect(page.locator("#bulk-count")).to_have_text("3 selected")
+
+            # The question names each of them with its address, says what goes, and wants the tick before anything is sent.
+            remove.click()
+            asking = top(page)
+            expect(asking.locator("h2")).to_have_text("Remove 3 KVMs?")
+            expect(asking.locator("ul.targets li")).to_have_count(3)
+            for name, fake in named[:3]:
+                expect(asking.locator("ul.targets li", has_text=name)).to_contain_text(fake.url.split("://", 1)[1])
+            expect(asking).to_contain_text("Their saved passwords and their history go with them, for good: this cannot be undone.")
+            expect(asking).to_contain_text("Settings > Export and import")
+            go = asking.get_by_role("button", name="Remove 3 KVMs")
+            expect(go).to_be_disabled()
+            asking.get_by_label("Yes, remove all 3 machines").check()
+            expect(go).to_be_enabled()
+            # Cancelled: nothing goes, and the selection is as it was.
+            asking.get_by_role("button", name="Cancel").click()
+            expect(page.locator("dialog[open]")).to_have_count(0)
+            remove.click()
+            page.keyboard.press("Escape")  # (and so is a question closed with Esc)
+            expect(page.locator("dialog[open]")).to_have_count(0)
+            page.wait_for_timeout(300)
+            assert len(admin.get("/api/v1/wall").json()["devices"]) == 4
+            expect(page.locator("#bulk-count")).to_have_text("3 selected")
+
+            # One of them is taken off by somebody else while the question is open: nothing goes, and that is said.
+            remove.click()
+            asking = top(page)
+            asking.get_by_label("Yes, remove all 3 machines").check()
+            assert admin.delete(f"/api/v1/devices/{ids['Spare A']}").status_code == 200
+            asking.get_by_role("button", name="Remove 3 KVMs").click()
+            expect(asking.locator("p[role=status]")).to_have_text("Spare A is no longer on the wall, so nothing was removed. Look at the selection again.")
+            expect(asking.locator("ul.progress li.bad")).to_have_text(re.compile("Spare A.*No longer on the wall"))
+            expect(asking.locator("ul.progress li.skipped")).to_have_count(2)
+            asking.locator(".actions").get_by_role("button", name="Close").click()
+            expect(page.locator("#wall article")).to_have_count(3)
+            expect(page.locator("#bulk-count")).to_have_text("2 selected")  # (what is left of the selection)
+            assert [device["name"] for device in admin.get("/api/v1/wall").json()["devices"]] == ["Build server", "Mail server", "Spare B"]
+
+            # And now for good: they go, the wall shows what is left, and select mode is left with them.
+            remove.click()
+            asking = top(page)
+            expect(asking.locator("h2")).to_have_text("Remove 2 KVMs?")
+            asking.get_by_label("Yes, remove all 2 machines").check()
+            asking.get_by_role("button", name="Remove 2 KVMs").click()
+            expect(asking.locator("p[role=status]")).to_have_text("2 KVMs removed.")
+            expect(asking.locator("h2")).to_have_text("Remove 2 KVMs")  # (a question no more)
+            expect(asking.locator("ul.progress li.ok")).to_have_count(2)
+            expect(page.locator("#wall article")).to_have_count(1)
+            expect(tile(page, "Spare B")).to_be_visible()
+            expect(page.locator("#bulkbar")).to_be_hidden()
+            expect(page.locator("#select-toggle")).to_have_attribute("aria-pressed", "false")
+            asking.locator(".actions").get_by_role("button", name="Close").click()
+            assert [device["name"] for device in admin.get("/api/v1/wall").json()["devices"]] == ["Spare B"]
+            entries = admin.get("/api/v1/audit", params={"q": "device_removed"}).json()["entries"]
+            assert sorted(entry["device"] for entry in entries if entry["event"] == "device_removed") == ["Build server", "Mail server", "Spare A"]
+
+            # An operator has select mode, and no Remove in it; asked for all the same, the wall refuses.
+            assert admin.post("/api/v1/users", json={"name": "olga", "role": "operator", "password": OTHER}).status_code == 201
+            with looking(browser, live) as hers:
+                sign_in(hers, live, OTHER, name="olga")
+                expect(hers.locator("#wall article")).to_have_count(1)
+                hers.locator("#select-toggle").click()
+                expect(hers.locator("#bulkbar")).to_be_visible()
+                expect(hers.locator("#bulk-remove")).to_be_hidden()
+                assert asks(hers, "POST", "api/v1/devices/remove", {"ids": [ids["Spare B"]]}) == 403
+            assert len(admin.get("/api/v1/wall").json()["devices"]) == 1
+
+            # One machine alone: no tick, the question in the singular.
+            page.locator("#select-toggle").click()
+            tile(page, "Spare B").click()
+            remove.click()
+            asking = top(page)
+            expect(asking.locator("h2")).to_have_text("Remove Spare B?")
+            expect(asking).to_contain_text("Its saved password and its history go with it")
+            expect(asking.get_by_role("checkbox")).to_have_count(0)
+            # Its question closed while the request is out (held here on its way): no second Remove until it is answered,
+            # and then what became of it is said where it can still be seen.
+            held: list[Any] = []
+            page.route("**/api/v1/devices/remove", lambda route: held.append(route))
+            asking.get_by_role("button", name="Remove", exact=True).click()
+            until(page, lambda: bool(held), "the request never went out")
+            page.keyboard.press("Escape")
+            expect(page.locator("dialog[open]")).to_have_count(0)
+            expect(remove).to_be_disabled()
+            expect(page.locator("#bulk-count")).to_have_text("1 selected")
+            held[0].continue_()
+            told(page, "Spare B removed.")
+            expect(page.locator("#wall article")).to_have_count(0)
+            expect(page.locator("#bulkbar")).to_be_hidden()
+            page.unroute("**/api/v1/devices/remove")
+            assert admin.get("/api/v1/wall").json()["devices"] == []
+    finally:
+        for spare in spares:
+            spare.stop()
 
 
 def test_the_search_and_the_filters_narrow_the_wall_and_typing_presses_no_shortcut(tmp_path: Path, browser: Browser, fakes: list[FakeKvm]) -> None:
@@ -1438,6 +1575,34 @@ def test_what_is_taken_in_from_a_file_is_what_its_summary_showed(tmp_path: Path,
         assert [action["name"] for action in admin.get("/api/v1/actions").json()["actions"]] == ["Another key altogether"]
 
 
+def test_a_console_over_vncs_is_said_to_be_encrypted_and_how_its_certificate_is_checked(tmp_path: Path, browser: Browser) -> None:
+    # The summary of a file said "its certificate is not checked" only of addresses with https://, and the list of KVMs
+    # called every other one "Unencrypted (http)": a console over vncs:// whose certificate is not checked was neither.
+    file = json.dumps({
+        "format": exchange.FORMAT,
+        "version": 1,
+        "devices": [
+            {"url": "vncs://unchecked.invalid:5901", "kind": "vnc", "name": "Unchecked console", "tls": "insecure"},
+            {"url": "vnc://plain.invalid:5901", "kind": "vnc", "name": "Plain console"},
+        ],
+    })  # fmt: skip
+    with a_wall(tmp_path) as (live, _), looking(browser, live) as page:
+        sign_in(page, live)
+        settings(page, "files").get_by_role("button", name="Import...", exact=True).click()
+        form = top(page)
+        form.locator("input[type=file]").set_input_files({"name": "consoles.json", "mimeType": "application/json", "buffer": file.encode()})
+        form.get_by_role("button", name="Read the file").click()
+        expect(form.locator(".picklist div", has_text="Unchecked console")).to_contain_text("its certificate is not checked")
+        expect(form.locator(".picklist div", has_text="Plain console")).not_to_contain_text("certificate")
+        form.get_by_role("button", name="Take in", exact=True).click()
+        told(page, "2 devices added")
+        top(page).locator('[role=tab][data-tab="devices"]').click()  # (Settings, which the import was opened from)
+        pane = top(page).locator("[role=tabpanel]")
+        expect(pane.locator("tr", has_text="Unchecked console")).to_contain_text("Not checked")
+        expect(pane.locator("tr", has_text="Unchecked console")).not_to_contain_text("Unencrypted")
+        expect(pane.locator("tr", has_text="Plain console")).to_contain_text("Unencrypted (vnc)")
+
+
 def test_metrics_are_switched_on_given_a_new_token_and_switched_off(tmp_path: Path, browser: Browser) -> None:
     with a_wall(tmp_path) as (live, _), looking(browser, live) as page, httpx.Client(base_url=live.url) as collector:
         sign_in(page, live)
@@ -1585,6 +1750,109 @@ def test_a_server_on_the_wall_has_a_power_button_and_no_keyboard(tmp_path: Path,
         server.stop()
 
 
+def test_a_server_is_started_into_its_bios_setup_after_a_question_that_names_it(tmp_path: Path, browser: Browser) -> None:
+    # Start into BIOS setup on the page: in the machine's own menu where its controller allows it; asked first, with the
+    # server named and that it restarts (Cancel sends nothing); a yes opens its large view and sends the press with
+    # `watching`; the controller is given the one-time override, then the restart.
+    server = FakeBmc().start()
+    try:
+        with a_wall(tmp_path, ("A server", server)) as (live, _), looking(browser, live) as page:
+            sign_in(page, live)
+            expect(tile(page, "A server")).to_have_attribute("data-state", "online", timeout=40_000)
+            deadline = time.monotonic() + 30
+            while True:  # (offered once the page's look at the server says the controller allows it: a menu shows what was known when it opened)
+                page.get_by_role("button", name="Actions for A server").click()
+                menu = top(page)
+                if menu.get_by_role("button", name="Start into BIOS setup").count():
+                    break
+                assert time.monotonic() < deadline, "Start into BIOS setup was never offered"
+                page.keyboard.press("Escape")
+                page.wait_for_timeout(500)
+            menu.get_by_role("button", name="Start into BIOS setup").click()
+            expect(top(page).locator("h2")).to_have_text("Start into BIOS setup")
+            expect(top(page)).to_contain_text("A server will restart now and start straight into its BIOS setup screen, once.")
+            top(page).get_by_role("button", name="Cancel").click()
+            page.wait_for_timeout(400)
+            assert server.state.actions == [] and not any("Boot" in change for change in server.state.changes)
+            page.get_by_role("button", name="Actions for A server").click()  # (the menu closed as the question opened)
+            top(page).get_by_role("button", name="Start into BIOS setup").click()
+            with page.expect_request(lambda request: request.method == "POST" and request.url.endswith("/actions")) as sent:
+                top(page).get_by_role("button", name="Restart into setup").click()
+            assert sent.value.post_data_json == {"action": "bios_setup", "watching": True}
+            expect(page.locator("#focus-name")).to_have_text("A server")  # its large view, to watch the setup
+            until(page, lambda: server.state.actions == ["system ForceRestart"], "the server was never restarted")
+            boots = [change["Boot"] for change in server.state.changes if "Boot" in change]
+            assert boots == [{"BootSourceOverrideEnabled": "Once", "BootSourceOverrideTarget": "BiosSetup"}]
+    finally:
+        server.stop()
+
+
+def test_a_pc_with_intel_amt_says_what_it_is_and_why_its_screen_is_not_shown_and_an_admin_switches_its_kvm_on(tmp_path: Path, browser: Browser) -> None:
+    pc = FakeAmt(AmtState(kvm="disabled", listener=False)).start()  # as an engine set up by hand comes: its KVM off on the engine
+    try:
+        with a_wall(tmp_path, ("A PC", pc)) as (live, _), looking(browser, live) as page:  # type: ignore[arg-type]
+            sign_in(page, live)
+            pc_tile = tile(page, "A PC")
+            expect(pc_tile).to_have_attribute("data-state", "online", timeout=40_000)
+            # The tile says what the machine is (not "Server"), and why its screen is not shown, on the tile itself.
+            expect(pc_tile.locator(".panel-power")).to_contain_text("PC with Intel AMT")
+            expect(pc_tile.locator(".panel-why")).to_contain_text("Its screen is not shown: Its KVM is switched off on its management engine.")
+            pc_tile.focus()
+            page.keyboard.press("Enter")
+            expect(page.locator("#focus")).to_be_visible()
+            switch = page.locator("#focus-panel").get_by_role("button", name="Switch on its KVM")
+            expect(switch).to_be_visible()
+            switch.click()
+            asked = top(page)
+            expect(asked).to_contain_text("This changes a setting of the PC")
+            assert pc.state.changes == []  # (asked first: nothing is changed before the yes)
+            asked.get_by_role("button", name="Switch on", exact=True).click()
+            told(page, "Its KVM is on")
+            until(page, lambda: pc.state.changes == [("CIM_KVMRedirectionSAP", "2"), ("AMT_RedirectionService", "ListenerEnabled=true")], f"the PC was told {pc.state.changes}")
+            page.wait_for_function("() => document.querySelector('#focus-canvas').width > 1", timeout=40_000)  # its screen, enlarged
+            page.keyboard.press("Escape")
+            expect(pc_tile).to_have_class(re.compile(r"\bhas-frame\b"), timeout=40_000)  # and on its tile
+            # The way back is an admin's too, under Actions; asked first as well.
+            page.get_by_role("button", name="Actions for A PC").click()
+            top(page).get_by_role("button", name="Switch off its KVM").click()
+            top(page).get_by_role("button", name="Switch off", exact=True).click()
+            told(page, "Its KVM is off")
+            until(page, lambda: pc.state.changes[2:] == [("CIM_KVMRedirectionSAP", "3")], f"the PC was told {pc.state.changes}")
+    finally:
+        pc.stop()
+
+
+def test_the_enlarged_view_of_a_machine_with_a_live_picture_holds_its_panel_still(tmp_path: Path, browser: Browser) -> None:
+    # (The demo found it: over the live picture of a server or a PC with Intel AMT, the panel of how it is came and went
+    # once a second, because a class was toggled with a value that could be undefined, which flips it instead of setting
+    # it. The same went for whether a tile counts as pictured before its first frame.)
+    pc = FakeAmt(AmtState(kvm="enabled")).start()
+    try:
+        with a_wall(tmp_path, ("A PC", pc)) as (live, _), looking(browser, live) as page:  # type: ignore[arg-type]
+            sign_in(page, live)
+            pc_tile = tile(page, "A PC")
+            expect(pc_tile).to_have_attribute("data-state", "online", timeout=40_000)
+            pc_tile.focus()
+            page.keyboard.press("Enter")
+            expect(page.locator("#focus")).to_be_visible()
+            page.wait_for_function("() => document.querySelector('#focus-canvas').width > 1", timeout=40_000)
+            seen = page.evaluate(
+                """async () => {
+                    const seen = [];
+                    for (let i = 0; i < 16; i++) {
+                        const focus = document.querySelector('#focus');
+                        seen.push([focus.classList.contains('has-panel'), focus.classList.contains('pictured')]);
+                        await new Promise(done => setTimeout(done, 250));
+                    }
+                    return seen;
+                }"""
+            )
+            assert all(sample == seen[0] for sample in seen), f"the panel came and went over four seconds: {seen}"
+            assert seen[0] == [False, True], seen  # the picture shown, the panel a button away
+    finally:
+        pc.stop()
+
+
 @pytest.mark.parametrize("role", ["viewer", "operator"])
 def test_an_account_limited_to_one_machine_has_that_one_and_no_way_to_the_other(tmp_path: Path, browser: Browser, fakes: list[FakeKvm], role: str) -> None:
     with a_wall(tmp_path, ("Allowed", fakes[0]), ("Kept from them", fakes[1])) as (live, admin), looking(browser, live) as page:
@@ -1609,3 +1877,116 @@ def test_an_account_limited_to_one_machine_has_that_one_and_no_way_to_the_other(
         page.reload()
         expect(page.locator("#wall article")).to_have_count(1)
         expect(page.locator("#focus")).to_be_hidden()
+
+
+def test_a_vnc_server_is_added_from_the_wall_by_choosing_the_kind(tmp_path: Path, browser: Browser) -> None:
+    from tests.fake_vnc import FakeVnc, VncState
+
+    server = FakeVnc(VncState(width=320, height=200, name="vm-one")).start()
+    try:
+        with a_wall(tmp_path) as (live, _), looking(browser, live) as page:
+            sign_in(page, live)
+            page.locator("#add-device").click()
+            form = top(page)
+            form.get_by_label("What to add").select_option("vnc")
+            expect(form.locator("label.field", has_text="Addresses")).to_contain_text("VNC server")  # the hint follows the choice
+            expect(form.get_by_role("textbox", name=re.compile(r"^User name"))).to_be_disabled()  # a VNC server has no user name
+            form.locator("textarea").fill(f"127.0.0.1:{server.port}")
+            form.locator("input[type=password]").fill("secret")
+            form.get_by_role("button", name="Check and add").click()
+            expect(form.locator("ul.results li.ok")).to_contain_text("vm-one added")  # named after what it calls itself
+            form.get_by_role("button", name="Close").click()
+            expect(tile(page, "vm-one")).to_have_attribute("data-state", "online", timeout=40_000)
+            expect(tile(page, "vm-one")).to_have_class(re.compile(r"\bhas-frame\b"))
+            # Its edit dialog says what it is and has no user name box.
+            page.get_by_role("button", name="Actions for vm-one").click()
+            top(page).get_by_role("button", name="Edit...").click()
+            expect(top(page).get_by_text("Type: VNC server")).to_be_visible()
+            assert top(page).get_by_role("textbox", name=re.compile(r"^User name")).count() == 0
+    finally:
+        server.stop()
+
+
+def test_a_vnc_server_over_tls_whose_certificate_changed_is_shown_and_trusted_again(tmp_path: Path, browser: Browser) -> None:
+    # (The final review's F3.) The dialog showed nothing for a vncs:// address (the wall answered null for both), and its
+    # Trust fetched the certificate at port 443: such a server could not be trusted again from the page.
+    from tests.fake_vnc import FakeVnc, VncState
+
+    known = FakeVnc(VncState(width=64, height=48, name="lab box"), tls_dir=tmp_path / "known").start()
+    other: FakeVnc | None = None
+    try:
+        with a_wall(tmp_path / "wall") as (live, admin), looking(browser, live) as page:
+            added = admin.post("/api/v1/devices", json={"url": known.url, "password": "secret", "name": "Lab box"})
+            assert added.status_code == 201, added.text
+            sign_in(page, live)
+            expect(tile(page, "Lab box")).to_have_class(re.compile(r"\bhas-frame\b"))
+            known.stop()
+            other = FakeVnc(VncState(width=64, height=48, name="reinstalled"), port=known.port, tls_dir=tmp_path / "other").start()
+            review = tile(page, "Lab box").get_by_role("button", name="Review certificate")
+            expect(review).to_be_visible(timeout=60_000)
+            review.click()
+            asked = top(page)
+            expect(asked.locator("h2")).to_have_text("Lab box certificate")
+            expect(asked.locator("code.fingerprint")).to_have_count(2)
+            shown = asked.locator("code.fingerprint").all_inner_texts()
+            assert len(shown) == 2 and shown[0] != shown[1] and all(len(mark) >= 40 for mark in shown), shown
+            expect(asked.locator(".note.bad")).to_contain_text("do not trust it")
+            assert other.state.password_tries == 0  # (shown, not trusted: told nothing)
+            asked.get_by_role("button", name="Trust this certificate").click()
+            told(page, "Lab box: certificate trusted")
+            expect(tile(page, "Lab box")).to_have_attribute("data-state", "online", timeout=60_000)
+            assert other.state.password_tries >= 1
+            # Its edit dialog says which certificate is remembered and offers to review it, as for an https address.
+            page.get_by_role("button", name="Actions for Lab box").click()
+            top(page).get_by_role("button", name="Edit...").click()
+            expect(top(page).get_by_text(f"Remembered SHA-256: {shown[1]}")).to_be_visible()
+            expect(top(page).get_by_role("button", name="Review certificate")).to_be_visible()
+    finally:
+        known.stop()
+        if other is not None:
+            other.stop()
+
+
+def test_virtual_machines_on_proxmox_are_picked_from_its_list_and_added(tmp_path: Path, browser: Browser) -> None:
+    from tests.fake_proxmox import SECRET, TOKEN_ID, FakeProxmox, Guest, PveState
+    from tests.fake_vnc import VncState
+
+    guests = {100: Guest(100, "web", screen=VncState(width=320, height=200)), 101: Guest(101, "db", status="stopped"), 102: Guest(102, "mail")}
+    pve = FakeProxmox(PveState(guests=guests, containers=[300]), tls_dir=tmp_path / "pve").start()
+    try:
+        with a_wall(tmp_path) as (live, _), looking(browser, live) as page:
+            sign_in(page, live)
+            page.locator("#add-device").click()
+            form = top(page)
+            form.get_by_label("What to add").select_option("proxmox")
+            expect(form.locator("label.field", has_text="Addresses")).to_contain_text("API token")  # the hint follows the choice
+            user = form.get_by_role("textbox", name=re.compile(r"^User name"))
+            expect(user).to_have_value("")  # (no "admin": a token's ID goes there)
+            user.fill(TOKEN_ID)
+            form.locator("input[type=password]").fill(SECRET)
+            # One Proxmox, no guest named: its guests are listed, nothing ticked, the container said apart.
+            form.locator("textarea").fill(f"127.0.0.1:{pve.port}")
+            form.get_by_role("button", name="Check and add").click()
+            asked = form.locator("ul.results > li.ask")
+            expect(asked).to_contain_text("3 virtual machines the token may see")
+            expect(asked).to_contain_text("1 container is not listed")
+            expect(asked.get_by_label(re.compile(r"^101 · db"))).not_to_be_checked()
+            asked.get_by_label(re.compile(r"^100 · web")).check()
+            asked.get_by_role("button", name="Add the ticked ones").click()
+            expect(asked.locator("li.ok")).to_contain_text("web added")
+            expect(asked.get_by_label(re.compile(r"^100 · web"))).to_be_disabled()  # on the wall now
+            # One guest named by its ID: added at once.
+            form.locator("textarea").fill(f"127.0.0.1:{pve.port}/102")
+            form.get_by_role("button", name="Check and add").click()
+            expect(form.locator(f'li.ok[data-url="127.0.0.1:{pve.port}/102"]')).to_contain_text("mail added")
+            assert pve.state.in_the_clear == []
+            form.get_by_role("button", name="Close").click()
+            expect(tile(page, "web")).to_have_attribute("data-state", "online", timeout=40_000)
+            expect(tile(page, "web")).to_have_class(re.compile(r"\bhas-frame\b"))
+            # Its edit dialog says what it is, and asks for the token where a login is asked for.
+            page.get_by_role("button", name="Actions for web").click()
+            top(page).get_by_role("button", name="Edit...").click()
+            expect(top(page).get_by_text("Type: Proxmox VM")).to_be_visible()
+            expect(top(page).get_by_role("textbox", name=re.compile(r"^API token ID"))).to_have_value(TOKEN_ID)
+    finally:
+        pve.stop()

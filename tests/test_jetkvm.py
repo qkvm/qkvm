@@ -592,7 +592,7 @@ def test_watching_over_a_jetkvm_for_alerts_does_not_hold_on_to_its_picture(jet: 
     # With alerts on, every device is looked at every fifteen seconds. For a JetKVM that somebody had on
     # screen once, each of those looks counted as somebody watching: the video connection, which costs a good
     # part of a processor and is the one viewer a JetKVM allows, was never given back.
-    monkeypatch.setattr(jetkvm, "KEEPALIVE_IDLE", 1.0)
+    monkeypatch.setattr(jetkvm, "UNWATCHED", 1.0)
 
     async def look(device: jetkvm.JetKvmDevice) -> None:
         assert await device.probe() == "online"
@@ -613,7 +613,7 @@ def test_what_is_told_about_a_jetkvm_does_not_change_with_whether_somebody_is_lo
     # Without a connection a JetKVM only says that it is there. Calling that "online" made the computer
     # behind it, switched off, lose its picture each time somebody opened the wall and get it back each
     # time they left: two alerts for nothing, every time.
-    monkeypatch.setattr(jetkvm, "KEEPALIVE_IDLE", 1.0)
+    monkeypatch.setattr(jetkvm, "UNWATCHED", 1.0)
     jet.state.signal = False
 
     async def look(device: jetkvm.JetKvmDevice) -> None:
@@ -644,7 +644,7 @@ def test_a_jetkvm_whose_picture_somebody_else_took_is_still_watched_over(jet: Fa
 def test_collecting_metrics_does_not_count_as_watching_either(jet: FakeJetKvm, monkeypatch: pytest.MonkeyPatch) -> None:
     # What the alerts' rounds no longer did, the collector did in their place: every look for /metrics held
     # the JetKVM's video connection, or made a new one, taking the picture from whoever had it.
-    monkeypatch.setattr(jetkvm, "KEEPALIVE_IDLE", 1.0)
+    monkeypatch.setattr(jetkvm, "UNWATCHED", 1.0)
 
     async def look(device: jetkvm.JetKvmDevice) -> None:
         assert (await device.glance())["state"] == "online"

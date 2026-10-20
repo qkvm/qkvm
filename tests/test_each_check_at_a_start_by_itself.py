@@ -70,6 +70,41 @@ def test_a_device_whose_address_has_no_port_to_speak_of_or_another_way_than_the_
     assert '"url" is not an address' in refused(tmp_path)
 
 
+@pytest.mark.parametrize(
+    ("kind", "address", "read"),
+    [
+        ("vnc", "vnc://kvm.invalid", True),  # (as vncdevice.vnc_url keeps one at the usual port, 5900)
+        ("vnc", "vnc://192.168.1.20:5901", True),
+        ("vnc", "vncs://[fd00::20]:5901", True),
+        ("vnc", "VNC://kvm.invalid", True),  # (a scheme is the same in either case, to the reader and to the driver)
+        ("vnc", "vnc://kvm.invalid:0", False),
+        ("vnc", "vnc://", False),
+        ("vnc", "ftp://kvm.invalid", False),
+        ("kvmd", "vnc://kvm.invalid", False),
+        ("jetkvm", "vncs://kvm.invalid", False),
+        ("redfish", "vnc://kvm.invalid", False),
+        ("amt", "vnc://kvm.invalid", False),
+        ("proxmox", "vncs://kvm.invalid:8006/nodes/pve1/qemu/100", False),
+    ],
+)
+def test_a_vnc_servers_address_is_read_back_where_the_tile_is_a_vnc_servers_and_only_there(tmp_path: Path, kind: str, address: str, read: bool) -> None:
+    # A VNC server is kept at vnc:// or vncs:// (the Add box, the network search, an import): taken at a start for no
+    # address, a wall with one did not start again (6d0bed7), nor did --disable-2fa or --reset-password run on it.
+    saved_with(tmp_path, lambda saved: saved["devices"][0].update(kind=kind, url=address))
+    said = refused(tmp_path)
+    assert (said == "") is read, said
+    if not read:
+        assert '"url" is not an address' in said
+
+
+def test_where_both_copies_are_refused_the_start_says_why_of_each(tmp_path: Path) -> None:
+    # It said only why the first was: a second copy refused for another reason (or missing) was not told apart.
+    saved_with(tmp_path, lambda saved: saved["devices"][0].update(url="vnc://kvm.invalid"))  # (no VNC server's tile)
+    (tmp_path / "qkvm.json").write_text("{", encoding="utf-8")
+    said = refused(tmp_path)
+    assert "qkvm.json cannot be read (Expecting" in said and 'qkvm.bak (the device' in said and '"url" is not an address' in said, said
+
+
 def test_a_token_is_never_an_admin_whatever_the_file_says(tmp_path: Path) -> None:
     # No form makes one: what manages qKVM itself takes a person. Written into the file by hand, a token
     # for a script administered: accounts, devices, other tokens, on the strength of a key and no password.

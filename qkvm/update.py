@@ -21,13 +21,14 @@ import importlib.metadata
 import io
 import json
 import logging
+import platform
 import re
 import shutil
-import sys
 import time
 import zipfile
 import zlib
 from dataclasses import dataclass
+from email.parser import Parser
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -35,6 +36,10 @@ from urllib.parse import urlsplit
 import httpx
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+from packaging.markers import UndefinedComparison
+from packaging.requirements import InvalidRequirement, Requirement
+from packaging.specifiers import InvalidSpecifier, SpecifierSet
+from packaging.version import InvalidVersion, Version
 
 from ._version import __version__
 from .kvm import public_context
@@ -112,25 +117,68 @@ def _checksum_for(sums: bytes, name: str) -> str:
 
 
 def _check_requirements(metadata: str) -> None:
-    """An update can replace the program's own files, not the libraries it needs."""
-    for line in metadata.splitlines():
-        key, _, value = line.partition(":")
-        value = value.strip()
-        if key == "Requires-Python" and value.startswith(">="):
-            wanted = tuple(int(part) for part in re.findall(r"\d+", value)[:2])
-            if sys.version_info[:2] < wanted:
-                raise UpdateError(f"This version needs Python {value[2:].strip()} or newer")
-        elif key == "Requires-Dist" and "extra ==" not in value:
-            name = re.match(r"[A-Za-z0-9._-]+", value)
-            if name is None:
+    """An update replaces only this program: the installed Python and active dependencies must already satisfy it."""
+    use_pip = "Install the new version with pip instead: pip install --upgrade qkvm"
+    headers = Parser().parsestr(metadata)
+    if headers.defects or len(headers.get_all("Requires-Python", [])) > 1:
+        raise UpdateError(f"The release has invalid dependency metadata. {use_pip}")
+    # Core metadata permits folded headers; the package description after the blank line is not metadata.
+    def unfolded(value: str) -> str:
+        return " ".join(value.splitlines()).strip()
+
+    try:
+        python_spec = SpecifierSet(unfolded(headers.get("Requires-Python", "")))
+        python_version = Version(platform.python_version())
+        if not python_spec.contains(python_version, prereleases=True):
+            raise UpdateError(f"This version needs Python {python_spec}; this copy runs {python_version}. {use_pip}")
+        for value in headers.get_all("Requires-Dist", []):
+            requirement = Requirement(unfolded(value))
+            # The app installs no optional extras. Evaluate the whole marker: a literal substring such as
+            # 'extra ==' may be only one branch of a condition that still applies to the base installation.
+            if requirement.marker is not None and not requirement.marker.evaluate({"extra": ""}):
                 continue
+            if requirement.url or requirement.extras:
+                # A name/version cannot prove the origin of a direct URL, or that an extra's dependencies
+                # are installed. Leave those installations to pip instead of accepting incomplete proof.
+                raise UpdateError(f"This version needs an installation of '{requirement.name}' that the in-app updater cannot verify. {use_pip}")
             try:
-                importlib.metadata.version(name.group())
+                installed = Version(importlib.metadata.version(requirement.name))
             except importlib.metadata.PackageNotFoundError:
-                raise UpdateError(
-                    f"This version needs the Python package '{name.group()}', which is not installed. "
-                    "Install the new version with pip instead: pip install --upgrade qkvm"
-                ) from None
+                raise UpdateError(f"This version needs the Python package '{requirement.name}', which is not installed. {use_pip}") from None
+            if not requirement.specifier.contains(installed, prereleases=True):
+                raise UpdateError(f"This version needs '{requirement.name}{requirement.specifier}'; installed is {installed}. {use_pip}")
+    except (InvalidRequirement, InvalidSpecifier, InvalidVersion, UndefinedComparison, KeyError, RecursionError):
+        raise UpdateError(f"The release's dependency requirements could not be verified. {use_pip}") from None
+
+
+def check_startup_requirements(package: Path, version: str) -> None:
+    """Check the selected package before it opens settings, including updates installed by an older updater."""
+    # An in-app update changes qkvm.__path__, not sys.path: looking up qkvm through importlib.metadata
+    # would find the original installation's requirements. Read the metadata beside the code being run.
+    # A source checkout or editable install has no metadata beside its source package and is left alone.
+    metadata_dir = package.parent / f"{PACKAGE}-{version}.dist-info"
+    try:
+        metadata = (metadata_dir / "METADATA").read_text(encoding="utf-8")
+    except FileNotFoundError:
+        if not metadata_dir.exists():
+            return
+        raise UpdateError("This copy is missing its package metadata. Reinstall it with: pip install --upgrade qkvm") from None
+    except (OSError, UnicodeError):
+        raise UpdateError("This copy's package metadata could not be read. Reinstall it with: pip install --upgrade qkvm") from None
+    headers = Parser().parsestr(metadata)
+    try:
+        valid = (
+            not headers.defects
+            and len(headers.get_all("Name", [])) == 1
+            and headers["Name"].strip().lower() == PACKAGE
+            and len(headers.get_all("Version", [])) == 1
+            and Version(headers["Version"].strip()) == Version(version)
+        )
+    except InvalidVersion:
+        valid = False
+    if not valid:
+        raise UpdateError("This copy's package metadata does not match its code. Reinstall it with: pip install --upgrade qkvm")
+    _check_requirements(metadata)
 
 
 def unpack(wheel: bytes, version: str, destination: Path) -> None:
@@ -161,9 +209,10 @@ def unpack(wheel: bytes, version: str, destination: Path) -> None:
         declared = re.search(r'__version__\s*=\s*"([^"]+)"', archive.read(f"{PACKAGE}/_version.py").decode("utf-8", "replace"))
         if declared is None or parse_version(declared.group(1)) != parse_version(version):
             raise UpdateError("The package is not the version the release says it is")
-        metadata = next((n for n in names if n.endswith(".dist-info/METADATA")), None)
-        if metadata:
-            _check_requirements(archive.read(metadata).decode("utf-8", "replace"))
+        metadata = [n for n in names if n.endswith(".dist-info/METADATA")]
+        if len(metadata) != 1:
+            raise UpdateError("The package must contain exactly one dependency metadata file")
+        _check_requirements(archive.read(metadata[0]).decode("utf-8", "replace"))
 
         staging = destination.with_name(destination.name + ".tmp")
         shutil.rmtree(staging, ignore_errors=True)

@@ -14,7 +14,7 @@ import pytest
 from qkvm import jetkvm, kvm, redfish, update, vault
 from qkvm.jetkvm import JetKvmDevice
 from qkvm.redfish import RedfishDevice
-from tests.fake_jetkvm import FakeJetKvm
+from tests.fake_jetkvm import FakeJetKvm, JetState
 from tests.fake_redfish import BmcState, FakeBmc
 from tests.test_meanwhile import in_background
 from tests.test_redfish import a_screen
@@ -160,7 +160,10 @@ def test_no_key_is_left_down_when_typing_ends_in_the_middle(tmp_path: Path, monk
 
     monkeypatch.setattr(JetKvmDevice, "_call", call)
     monkeypatch.setattr(JetKvmDevice, "_on_message", heard)
-    jet = FakeJetKvm().start()
+    # (Over JSON-RPC, the road an older JetKVM takes: it leaves hidrpc unanswered. The same over hidrpc is in
+    # test_a_jetkvm_over_hidrpc.py.)
+    monkeypatch.setattr(jetkvm, "HID_SHAKE_WITHIN", 0.3)
+    jet = FakeJetKvm(JetState(hidrpc=False)).start()
     try:
         with wall(tmp_path) as admin:
             device = add(admin, jet.url)

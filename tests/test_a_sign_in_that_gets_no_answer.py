@@ -45,8 +45,12 @@ from tests.test_wall import closed_port, fast, wall  # noqa: F401
 S = 60.0  # for the first tests here every wait of the program is a sixtieth of what it is: a minute is a second
 PASSWORD = "the-saved-password-1"
 WATCHED = 375 / S  # six minutes and a quarter
-LATE = 12 / S  # an answer after twelve seconds: later than anything else is waited for (eight), sooner than a sign-in is (twenty)
-NEVER = 60 / S  # and one after a minute: nothing is waited for that long
+# The waits for an answer, and the answers that come late, a twentieth of what they are, not a sixtieth: the device's
+# answer "at once" has to come within them, and a sixtieth of the eight seconds a look is given (0.13 s) was shorter than
+# a busy computer took for one: the tile said "offline" of a device that answers everything but its sign-in.
+A = 20.0
+LATE = 12 / A  # an answer after twelve seconds: later than anything else is waited for (eight), sooner than a sign-in is (twenty)
+NEVER = 60 / A  # and one after a minute: nothing is waited for that long
 
 
 @pytest.fixture
@@ -56,7 +60,7 @@ def sixtieth(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(driver, "LOGIN_RETRY", kvm.LOGIN_RETRY / S)
     for name in ("STATUS_TTL", "ERROR_HOLD", "BACKOFF_MAX", "STILL_THERE_EVERY", "TRANSFER_TIME", "STATUS_FIRST_WAIT", "UNANSWERED_MOST"):
         monkeypatch.setattr(kvm, name, getattr(kvm, name) / S)
-    monkeypatch.setattr(kvm, "WAITS", httpx.Timeout(8.0 / S, connect=4.0 / S))
+    monkeypatch.setattr(kvm, "WAITS", httpx.Timeout(8.0 / A, connect=4.0 / A))  # (see A)
     monkeypatch.setattr(redfish, "LOOK_EVERY", redfish.LOOK_EVERY / S)
     monkeypatch.setattr(redfish, "RETRY_LOOK", redfish.RETRY_LOOK / S)
 

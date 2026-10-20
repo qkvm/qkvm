@@ -824,6 +824,19 @@ pre.wrap { white-space: pre-wrap; word-break: break-all; margin: 0 0 14px; }
 .reading[data-tone="warn"] b, .reading[data-tone="warn"] span { color: #fbbf24; }
 .reading[data-tone="bad"] b { color: #f87171; }
 .panel-hardware { margin: 0; font-size: clamp(10px, 2.9cqw, 15px); color: #94a3b8; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* Why there is no picture: on a tile in the lines it has room for (the whole sentence on hover), enlarged all of it. */
+.panel-why {
+  margin: 0;
+  font-size: clamp(10px, 2.7cqw, 14px);
+  line-height: 1.35;
+  color: #cbd5e1;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  line-clamp: 3;
+  overflow: hidden;
+}
+.panel-actions { display: flex; justify-content: flex-start; }
 .sensors { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 6px; }
 .sensors div {
   display: flex;
@@ -842,6 +855,7 @@ pre.wrap { white-space: pre-wrap; word-break: break-all; margin: 0 0 14px; }
 /* Small tiles (a wall of many) keep the power state and the two readings that matter most. */
 @container (max-width: 250px) {
   .panel-hardware, .panel-power > span:last-child:not(.locating), .reading:nth-child(n+3) { display: none; }
+  .panel-why { -webkit-line-clamp: 2; line-clamp: 2; }
   .panel-power > span.locating { font-size: 0; gap: 0; }  /* the dot alone */
   .locating i { width: 9px; height: 9px; }
 }
@@ -901,6 +915,10 @@ pre.wrap { white-space: pre-wrap; word-break: break-all; margin: 0 0 14px; }
 .twin:hover { background: color-mix(in srgb, var(--warn) 12%, transparent); }
 .results li.ask { border-left-color: var(--warn); flex-wrap: wrap; }
 .results li.ask > span { flex: 1 1 100%; }  /* the question on a line of its own, the answers under it */
+/* A Proxmox's virtual machines, to tick and add: under the question, the whole width */
+.pick-guests { flex: 1 1 100%; display: grid; gap: 8px; }
+.pick-guests .picklist { margin-left: 0; max-height: 240px; }
+.pick-guests .results { margin: 0; }
 
 /* Multi-port KVMs: one button per input, built like the filter in the top bar. Always shown,
    because it says which computer the picture belongs to. */
@@ -1009,9 +1027,54 @@ pre.wrap { white-space: pre-wrap; word-break: break-all; margin: 0 0 14px; }
 .focus .reading b { font-size: clamp(18px, 2.6cqw, 30px); }
 .focus .reading span, .focus .panel-power > span:last-child { font-size: 12px; }
 .focus .panel-hardware { font-size: 15px; white-space: normal; }
+.focus .panel-why { font-size: 15px; display: block; overflow: visible; }
 .focus .veil-icon { width: 52px; height: 52px; }
 .focus .veil-icon .icon { width: 24px; height: 24px; }
 .focus .veil strong { font-size: 17px; }
+/* The live picture's own line in the bar: codec, size, pictures a second, what was dropped. */
+.focus-bar .live-line { font-variant-numeric: tabular-nums; }
+/* While keyboard and mouse are held: a second row of the same controls, for the keys a browser keeps to
+   itself, with what else is so said at its right end and never under a button. */
+.focus-keys {
+  position: relative;
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 6px 14px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line-strong);
+}
+.focus-keys .muted { font-size: 12px; }
+.focus-screen:focus { outline: none; }
+/* Held: the picture is the machine's screen, and the pointer over it is the machine's own. */
+.focus-screen.controlling { cursor: default; }
+.focus-screen.controlling canvas { touch-action: none; }
+
+/* --- under the enlarged picture: what the wall saw of this machine (the history) ---------------------------
+   A box of its own, the last thing in the enlarged view; the picture above it keeps the room that is left. */
+.focus-history { flex: none; padding: 8px 14px 10px; border-top: 1px solid var(--line); background: var(--bg); font-size: 12px; }
+.focus-history .history-line { margin: 0; display: flex; flex-wrap: wrap; gap: 2px 18px; align-items: baseline; font-variant-numeric: tabular-nums; }
+.focus-history .history-line b { font-weight: 600; }
+.focus-history .history-graphs { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 6px 18px; margin-top: 6px; }
+.focus-history figure { margin: 0; min-width: 0; }
+.focus-history figcaption { display: flex; justify-content: space-between; gap: 8px; margin-bottom: 2px; font-size: 11px; color: var(--muted); white-space: nowrap; }
+.focus-history figcaption span { overflow: hidden; text-overflow: ellipsis; }
+.focus-history canvas { display: block; width: 100%; height: 56px; }
+/* What was done to the machine (admins), beside its history: a column of its own at the right, under it where there is no room. */
+.focus-history:has(> .history-done) { display: grid; grid-template-columns: minmax(0, 1fr) minmax(240px, 36%); column-gap: 24px; align-items: start; }
+.focus-history > .history-done { grid-column: 2; grid-row: 1 / span 2; min-width: 0; }
+.focus-history .done-head { display: flex; align-items: baseline; gap: 10px; margin: 0 0 2px; }
+.focus-history .done-head b { font-weight: 600; }
+.focus-history .done-list { margin: 0; padding: 0; list-style: none; min-height: calc(3 * 1.5em); }
+.focus-history .done-list li { overflow: hidden; line-height: 1.5; text-overflow: ellipsis; white-space: nowrap; }
+.focus-history .done-list b { font-weight: 600; }
+.focus-history .done-when { color: var(--muted); font-variant-numeric: tabular-nums; }
+@media (max-width: 760px) {
+  .focus-history:has(> .history-done) { grid-template-columns: minmax(0, 1fr); }
+  .focus-history > .history-done { grid-column: 1; grid-row: auto; margin-top: 6px; }
+}
 
 /* --- dialogs ---------------------------------------------------------------- */
 
@@ -1150,6 +1213,16 @@ dialog.settings .dialog-body { display: grid; grid-template-columns: 212px minma
 .toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin: 0 0 14px; }
 .toolbar input[type="search"] { flex: 0 1 320px; height: 32px; padding: 0 10px; }
 .toolbar select { min-width: 190px; }
+.toolbar input.who { width: 190px; height: 32px; padding: 0 10px; }
+.toolbar .when { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); }
+.toolbar input[type="datetime-local"] { height: 32px; padding: 0 8px; }
+.toolbar input[type="datetime-local"]:focus { outline: none; border-color: var(--accent-text); box-shadow: 0 0 0 3px var(--accent-soft); }
+@media (max-width: 760px) {
+  /* One under the other, each as wide as the list: not a ragged column of boxes of their own widths. */
+  .toolbar > :is(input, select, .when) { flex: 1 1 100%; width: auto; min-width: 0; }
+  .toolbar .when > span { width: 3em; }
+  .toolbar .when > input { flex: 1; min-width: 0; }
+}
 @media (max-width: 760px) {
   /* No room for a column: the sections become one row that scrolls sideways, and never a second row. */
   dialog.settings .dialog-body { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); }
@@ -1345,5 +1418,11 @@ dialog.settings .dialog-body { display: grid; grid-template-columns: 212px minma
     animation-delay: 0s !important;
     animation-iteration-count: 1 !important;
     transition-duration: .01ms !important;
+  }
+  /* A spinner is no decoration: it says that work is still going on, and stopped it says the opposite. It
+     turns slower here, and goes on turning. */
+  .spinner, button[aria-busy="true"]::after {
+    animation-duration: 1.4s !important;
+    animation-iteration-count: infinite !important;
   }
 }

@@ -151,10 +151,12 @@ class Watcher:
         return stable, state
 
 
-def describe(name: str, address: str, previous: str, state: str, detail: str = "", server: bool = False) -> Alert:
+def describe(name: str, address: str, previous: str, state: str, detail: str = "", server: bool = False, off: bool = False) -> Alert:
     """What to say about a KVM going from `previous` to `state`.
 
     `server`: it is a server seen through its management controller, where "no signal" means switched off.
+    `off`: the KVM's power board says the computer behind it is off: its light is out, which it is too where a computer
+    asleep puts it out (without a board, a KVM cannot tell either from a computer that is unplugged).
     """
     box = "Its management controller" if server else "The KVM"
     if state == "offline":
@@ -162,6 +164,8 @@ def describe(name: str, address: str, previous: str, state: str, detail: str = "
     if state == "no_signal":
         if server:
             return Alert("no_signal", name, address, state, previous, f"{name} is powered off", "The server was switched off or shut down.")
+        if off:
+            return Alert("no_signal", name, address, state, previous, f"{name} is off or asleep", "The KVM's power board shows the computer's power light out.")
         text = "The computer is off, asleep or no longer plugged into the KVM."
         return Alert("no_signal", name, address, state, previous, f"{name} has no video signal", text)
     if state == "auth":

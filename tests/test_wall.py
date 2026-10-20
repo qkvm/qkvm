@@ -111,7 +111,7 @@ def test_first_run_setup_then_login(tmp_path: Path) -> None:
             "unlocks_at_start": True,
         }  # fmt: skip
         assert (account["name"], account["role"]) == ("admin", "admin")  # the first account runs everything
-        assert client.get("/api/v1/wall").json() == {"interval": 1.0, "devices": []}
+        assert client.get("/api/v1/wall").json() == {"interval": 1.0, "live": 2, "devices": []}
         assert client.post("/api/v1/setup", json={"password": PASSWORD}).status_code == 409
 
     with wall(tmp_path, sign_in=False) as client:  # the wall was restarted
@@ -260,7 +260,7 @@ def test_oversized_and_unsized_requests_are_refused(tmp_path: Path) -> None:
 
 def test_a_bug_in_a_handler_is_contained(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     with wall(tmp_path) as client:
-        monkeypatch.setattr(client.core.audit, "tail", lambda limit: 1 / 0)  # type: ignore[attr-defined]
+        monkeypatch.setattr(client.core.activity, "read", lambda asked, limit: 1 / 0)  # type: ignore[attr-defined]
         broken = client.get("/api/v1/audit")
         assert broken.status_code == 500
         assert broken.json() == {"code": "internal", "message": "Something went wrong inside qKVM. The details are in its log."}
@@ -468,8 +468,10 @@ def test_status_never_waits_for_a_dead_device(tmp_path: Path, monkeypatch: pytes
         assert time.monotonic() - began < 1.0
         # What is known by then depends on the system underneath: Windows keeps trying a closed port for two
         # seconds, so the answer is "connecting"; Linux is refused at once, and may know already.
-        nobody_there = {"state": "offline", "error": {"code": "unreachable", "message": "Device is unreachable"}, "last_seen_ago": None}
-        assert first in ({"state": "connecting", "error": None, "last_seen_ago": None}, nobody_there)
+        # (What it can be asked is the driver's list, there being no look at the device yet that could add to it.)
+        can = kvm.can_do(*kvm.KvmDevice.can)
+        nobody_there = {"can": can, "state": "offline", "error": {"code": "unreachable", "message": "Device is unreachable"}, "last_seen_ago": None}
+        assert first in ({"can": can, "state": "connecting", "error": None, "last_seen_ago": None}, nobody_there)
         wait_until(lambda: client.get("/api/v1/status").json()[device]["state"] == "offline", "never reported offline")
 
 
@@ -1058,7 +1060,10 @@ def test_the_activity_log_can_be_searched_and_taken_away(tmp_path: Path, fake: F
         # A name that begins like a formula is not one in the file: whoever opens it runs nothing.
         assert rows[1][4] == "'=HYPERLINK(1)"
         lines = client.get("/api/v1/audit/export?format=jsonl").text.splitlines()
-        assert [json_lines.loads(line)["event"] for line in lines] == ["login_failed", "user_added", "action", "device_added", "setup"]
+        # (The download of a moment ago is in the log itself, with what it was of: the activity log taken away is something done.)
+        exported, *rest = [json_lines.loads(line) for line in lines]
+        assert [entry["event"] for entry in rest] == ["login_failed", "user_added", "action", "device_added", "setup"]
+        assert (exported["event"], exported["format"], exported["asked"], exported["user"]) == ("activity_exported", "csv", {"kind": "action"}, "admin")
         assert client.get("/api/v1/audit/export?format=pdf").status_code == 422
 
         olga = TestClient(client.app, headers=CSRF, client=("127.0.0.1", 50041))

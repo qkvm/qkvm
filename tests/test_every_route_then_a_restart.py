@@ -1,9 +1,14 @@
 """Nothing the program itself saves is refused by the check a start makes.
 
 Every route that changes what is saved is driven, with ordinary values and with the odd ones a form or a
-script may send (a whole number where a time is declared, a number written as a text, a port with ".0").
-After every single change the settings file as it then lies on disk is read by `Store` by itself, with no
-second copy beside it: a refusal there is a wall that does not start after a restart.
+script may send (a whole number where a time is declared, a number written as a text, a port with ".0"),
+for every kind of machine the wall takes (a KVM of each family, a server's controller, a VNC server over
+vnc:// and vncs://, a PC with Intel AMT, a guest of Proxmox), and every field a tile keeps (how hard a
+Fingerbot presses, the number its machine gave for itself). After every single change the settings file as
+it then lies on disk is read by `Store` by itself, with no second copy beside it, and so is the second copy
+(qkvm.bak) by itself, as a start reads it where the file is damaged: a refusal there is a wall that does not
+start after a restart. (The VNC server's address, vnc://, was refused so on 6d0bed7: a wall with one did not
+start again, nor did `--disable-2fa` or `--reset-password` run on its folder.)
 """
 
 from __future__ import annotations
@@ -21,9 +26,12 @@ from qkvm import discover, exchange, jetkvm, kvm, server, totp, update, vault
 from qkvm.cli import main as run_cli
 from qkvm.core import Core
 from qkvm.store import Store, StoreError
+from tests.fake_amt import FakeAmt
 from tests.fake_jetkvm import FakeJetKvm, JetState
 from tests.fake_kvm import FakeKvm, FakeState
+from tests.fake_proxmox import SECRET, TOKEN_ID, FakeProxmox, Guest, PveState
 from tests.fake_redfish import FakeBmc
+from tests.fake_vnc import FakeVnc, VncState
 from tests.test_totp import code_for, switch_on
 from tests.test_users import account, browser, visitor
 from tests.test_wall import PASSWORD, add, closed_port, wait_until, wall
@@ -44,23 +52,25 @@ def fast(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 class Reads:
-    """Reads the settings file as a start would, by itself, after every change; keeps what was refused."""
+    """Reads the settings file as a start would, by itself, after every change, and its second copy by itself as a start
+    reads it where the file is damaged; keeps what was refused."""
 
     def __init__(self, folder: Path, scratch: Path) -> None:
         self.folder, self.scratch, self.refused, self.asked = folder, scratch, [], 0
 
     def __call__(self, after: str) -> None:
         self.asked += 1
-        alone = self.scratch / f"read{self.asked}"
-        alone.mkdir()
-        shutil.copy2(self.folder / "qkvm.json", alone / "qkvm.json")
-        try:
-            store = Store(alone / "qkvm.json")
-            assert store.restored is False
-        except StoreError as ex:
-            said = str(ex)
-            self.refused.append(f"after {after}: {said[said.index('cannot be read'):][:160]}")
-        shutil.rmtree(alone, ignore_errors=True)
+        for copy in ("qkvm.json", "qkvm.bak"):
+            alone = self.scratch / f"read{self.asked}{copy[-4:]}"
+            alone.mkdir()
+            shutil.copy2(self.folder / copy, alone / copy)
+            try:
+                store = Store(alone / "qkvm.json")
+                assert store.restored is (copy == "qkvm.bak")
+            except StoreError as ex:
+                said = str(ex)
+                self.refused.append(f"after {after} ({copy}): {said[said.index('cannot be read'):][:160]}")
+            shutil.rmtree(alone, ignore_errors=True)
 
 
 def ok(reply: Any, *codes: int) -> Any:
@@ -79,6 +89,15 @@ def test_every_changing_route_leaves_a_file_that_a_start_reads(tmp_path: Path, m
     jet_state = JetState()
     jet_plain = FakeJetKvm(jet_state).start()
     jet_secure: FakeJetKvm | None = None
+    vnc_plain = FakeVnc(VncState(width=160, height=100)).start()
+    vnc_bare = FakeVnc(VncState(width=64, height=48, seed=2)).start()
+    vnc_tls = FakeVnc(VncState(width=64, height=48, seed=3), tls_dir=tmp_path / "vnc").start()
+    amt_pc = FakeAmt().start()
+    pve = FakeProxmox(PveState(guests={
+        100: Guest(100, "web", screen=VncState(width=320, height=200, name="QEMU (web)")),
+        101: Guest(101, "db", status="stopped", screen=VncState(width=64, height=48, name="QEMU (db)", seed=4)),
+    }), tls_dir=tmp_path / "pve").start()  # fmt: skip
+    proxmox_token = {"username": TOKEN_ID, "password": SECRET, "kind": "proxmox"}
     monkeypatch.setattr(jetkvm, "WAY_EVERY", 0.2)
     try:
         with wall(folder) as admin:
@@ -99,6 +118,45 @@ def test_every_changing_route_leaves_a_file_that_a_start_reads(tmp_path: Path, m
             reads("a server's controller (says what it is: ident)")
             jet = add(admin, jet_plain.url, password=jet_state.password)
             reads("a JetKVM on plain HTTP")
+
+            # --- the kinds 0.2.0 adds, and the fields of a tile it keeps ------------------------------------------------
+            vnc_one = add(admin, vnc_plain.url, name="A VNC server")  # (kept as vnc://host:port)
+            assert store.device(vnc_one).url.startswith("vnc://")
+            reads("a VNC server added by its address (vnc://)")
+            add(admin, f"127.0.0.1:{vnc_bare.port}", kind="vnc")  # (named by its address; as the network search's result is added)
+            reads("a VNC server added by the kind chosen")
+            vnc_secure = add(admin, vnc_tls.url, name="Over vncs")  # (TLS from the first byte: its certificate remembered)
+            assert store.device(vnc_secure).url.startswith("vncs://") and store.device(vnc_secure).cert_pem
+            reads("a VNC server over vncs:// (certificate remembered)")
+            add(admin, f"vnc://[::1]:{closed_port()}", force=True)
+            reads("a VNC server at an IPv6 address that does not answer, saved anyway")
+            for body in (
+                {"url": vnc_plain.url, "name": "Renamed VNC", "group": "Rack 2", "alerts": False, "fingerbot_strength": "light"},
+                {"url": f"VNC://127.0.0.1:{vnc_plain.port}/", "kind": "auto", "password": "secret", "open_url": "https://console.invalid/vnc"},
+            ):
+                ok(admin.put(f"/api/v1/devices/{vnc_one}", json=body))
+                reads(f"an edit of a VNC server ({sorted(body)})")
+            ok(admin.put(f"/api/v1/devices/{vnc_secure}", json={"url": vnc_tls.url, "name": "Over vncs", "tls": "insecure"}))
+            reads("a VNC server over vncs:// not to have its certificate checked")
+            pc = add(admin, amt_pc.url, name="Desk 7")
+            assert store.device(pc).kind == "amt" and store.device(pc).machine.startswith("amt:"), store.device(pc)
+            reads("a PC with Intel AMT (the number its machine gives for itself kept)")
+            ok(admin.put(f"/api/v1/devices/{pc}", json={"url": amt_pc.url, "name": "Desk 7", "password": "secret", "fingerbot_strength": "light"}))
+            reads("a PC with Intel AMT, its password typed again (its machine taken as it answers)")
+            guest = add(admin, pve.guest_url(100), **proxmox_token)
+            reads("a guest of Proxmox")
+            stopped_guest = add(admin, f"127.0.0.1:{pve.port}/101", **proxmox_token)  # (its node looked up with the token)
+            reads("a guest of Proxmox named by its number alone")
+            ok(admin.put(f"/api/v1/devices/{guest}", json={"url": pve.guest_url(100), "name": "web server", "kind": "auto", "username": TOKEN_ID}))
+            reads("an edit of a guest of Proxmox")
+            for strength in ("light", None, "firm"):
+                ok(admin.put(f"/api/v1/devices/{one}", json={"url": plain_kvm.url, "name": "", "fingerbot_strength": strength}))
+                reads(f"how hard a Fingerbot presses: {strength}")
+            light = add(admin, f"http://127.0.0.1:{closed_port()}", force=True, kind="kvmd", fingerbot_strength="light")
+            reads("a KVM added with its Fingerbot set to press lightly")
+            spare_vnc = add(admin, f"vncs://127.0.0.1:{closed_port()}", force=True, name="Spare VNC")
+            ok(admin.post("/api/v1/devices/remove", json={"ids": [spare_vnc, stopped_guest, light]}))
+            reads("a VNC server, a guest of Proxmox and a KVM removed at once")
             for body in (
                 {"url": tls_kvm.url, "name": "Renamed", "group": "", "tls": "pinned", "alerts": True, "username": "root"},
                 {"url": tls_kvm.url, "name": "", "group": "g" * 40, "alerts": None, "tls": None, "open_url": ""},
@@ -114,6 +172,13 @@ def test_every_changing_route_leaves_a_file_that_a_start_reads(tmp_path: Path, m
             reads("the tiles put in an order")
             ok(admin.delete(f"/api/v1/devices/{gone}"))
             reads("a device removed")
+            several = [add(admin, f"http://127.0.0.1:{closed_port()}", force=True, kind="kvmd", name=f"Spare {n}") for n in (1, 2, 3)]
+            ok(admin.post("/api/v1/devices/remove", json={"ids": [several[2], several[0], several[2]]}))
+            reads("several devices removed at once")
+            ok(admin.post("/api/v1/devices/remove", json={"ids": [several[1], "nobody"]}), 404)
+            reads("several devices not removed: one of them is not on the wall")
+            ok(admin.post("/api/v1/devices/remove", json={"ids": [several[1]]}))
+            reads("the last of them removed the same way")
             for target in (one, two, server_id):
                 admin.get(f"/api/v1/devices/{target}/snapshot")
             admin.get("/api/v1/status")
@@ -256,22 +321,36 @@ def test_every_changing_route_leaves_a_file_that_a_start_reads(tmp_path: Path, m
                     {"url": f"https://127.0.0.1:{closed_port()}", "name": "", "kind": "kvmd", "group": "", "tls": "pinned", "alerts": False, "password": "from the file", "ident": "sn:" + "ab" * 16},
                     {"url": "http://kvm-" + "a" * 200 + ".invalid", "kind": "jetkvm", "username": ""},  # (named by its address, which is long)
                     {"url": f"https://127.0.0.1:{closed_port()}", "kind": "redfish", "name": "A server\n", "keep_both": True, "open_url": "https://console.invalid/"},
+                    {"url": "VNC://vnc-of-a-file.invalid", "kind": "vnc", "name": "VNC of a file", "password": "from the file"},  # (5900: no port kept)
+                    {"url": f"vncs://[::1]:{closed_port()}", "kind": "vnc", "tls": "insecure"},
+                    {"url": f"https://127.0.0.1:{closed_port()}/nodes/pve1/qemu/100", "kind": "proxmox", "username": TOKEN_ID, "password": SECRET},
+                    {"url": f"http://127.0.0.1:{closed_port()}", "kind": "amt", "machine": "amt:" + "0123456789abcdef" * 2, "fingerbot_strength": "light"},
                 ],
                 "actions": [{"name": "From a file", "kind": "text", "text": "typed", "enter": True, "danger": True}, {"name": "Keys of a file", "kind": "keys", "keys": "F1"}],
                 "alerts": {"enabled": False, "format": "slack", "offline": False, "webhook": "https://hooks.invalid/x"},
                 "wall": {"interval": 3, "update_check": False},  # (3, not 3.0)
             }
-            ok(admin.post("/api/v1/import/read", json={"file": json.dumps(file)}))
+            said = ok(admin.post("/api/v1/import/read", json={"file": json.dumps(file)})).json()
+            assert len(said["devices"]) == len(file["devices"]), said  # (every one of them taken: none left out as no address)
             ok(admin.post("/api/v1/import", json={"file": json.dumps(file), "take": list(exchange.PARTS)}))
             reads("a plain file taken in, all four parts")
             whole = ok(admin.post("/api/v1/export", json={"password": PASSWORD, "passphrase": PASSPHRASE, "parts": list(exchange.PARTS)})).text
+            said = ok(admin.post("/api/v1/import/read", json={"file": whole, "passphrase": PASSPHRASE})).json()
+            # (What the wall writes into its own file it reads back, every tile of every kind: none left out.)
+            assert len(said["devices"]) == len(store.devices) and not said["left_out"], said["left_out"]
             ok(admin.post("/api/v1/import", json={"file": whole, "passphrase": PASSPHRASE, "take": list(exchange.PARTS)}))
             reads("the wall's own sealed file taken in again")
             mine = mine  # (kept: the admin's second step stays on over the restart below)
 
         # --- from the command line, and starts of other kinds -------------------------------------------------------
         reads("the wall stopped")
-        assert run_cli(["--data-dir", str(folder), "--disable-2fa", "admin"]) == 0
+        # How large the activity log and the history grow is said in the file, by hand (no form sets it): every start
+        # and save after this one reads it and keeps it.
+        settings = json.loads((folder / "qkvm.json").read_text(encoding="utf-8"))
+        settings["server"].update(activity_mb=12, history_days=30, history_mb=50)
+        (folder / "qkvm.json").write_text(json.dumps(settings, indent=2), encoding="utf-8")
+        reads("the sizes of the activity log and the history set by hand")
+        assert run_cli(["--data-dir", str(folder), "--disable-2fa", "admin"]) == 0, f"qkvm --disable-2fa did not run; refused so far: {reads.refused}"
         reads("qkvm --disable-2fa")
         with wall(folder, sign_in=False, locked_start=True) as admin:  # (takes what the key in the folder fitted out of the file)
             assert admin.core.store.restored is False  # type: ignore[attr-defined]
@@ -283,18 +362,72 @@ def test_every_changing_route_leaves_a_file_that_a_start_reads(tmp_path: Path, m
             ok(admin.post("/api/v1/login", json={"name": "admin", "password": PASSWORD}))
             wait_until(lambda: admin.core.store.unlock is not None, "the key of its own was never fitted again")  # type: ignore[attr-defined]
             reads("a start that keeps a key again")
-        assert run_cli(["--data-dir", str(folder), "--reset-password"]) == 0
+        assert run_cli(["--data-dir", str(folder), "--reset-password"]) == 0, f"qkvm --reset-password did not run; refused so far: {reads.refused}"
         reads("qkvm --reset-password")
         with wall(folder) as admin:  # (sets the wall up again)
             assert admin.core.store.restored is False  # type: ignore[attr-defined]
             reads("set up again after the reset")
     finally:
-        for stand_in in (plain_kvm, tls_kvm, second_tls, bmc, jet_plain, jet_secure):
+        for stand_in in (plain_kvm, tls_kvm, second_tls, bmc, jet_plain, jet_secure, vnc_plain, vnc_bare, vnc_tls, amt_pc, pve):
             if stand_in is not None:
                 stand_in.stop()
-    print(f">>> the file was read {reads.asked} times, after as many changes; refused: {reads.refused or 'never'}")
+    print(f">>> the file and its copy were read {reads.asked} times, after as many changes; refused: {reads.refused or 'never'}")
     assert not reads.refused, "\n".join(reads.refused)
     assert not list(folder.glob("qkvm.damaged-*")), "a start of this run set the settings file aside"
+    # ...and what was set is what is there, after every start and the reset: each kind, vnc:// and vncs:// both, the
+    # Fingerbot's strength, the machine's number, and the sizes set by hand.
+    final = json.loads((folder / "qkvm.json").read_text(encoding="utf-8"))
+    devices = final["devices"]
+    assert {"kvmd", "jetkvm", "redfish", "vnc", "amt", "proxmox"} <= {device["kind"] for device in devices}, devices
+    assert {"vnc", "vncs"} <= {device["url"].split("://")[0] for device in devices}, devices
+    assert any(device["fingerbot_strength"] == "light" for device in devices) and any(device["machine"] for device in devices)
+    assert (final["server"]["activity_mb"], final["server"]["history_days"], final["server"]["history_mb"]) == (12, 30, 50)
+
+
+@pytest.mark.filterwarnings(r"ignore:connect\(\) must be used as a context manager:DeprecationWarning")  # (as in test_live.py)
+def test_a_take_over_and_the_live_views_leave_files_that_a_start_reads(tmp_path: Path) -> None:
+    # What a live view and a take-over of keyboard and mouse write (the activity log, with the machine's id, who took them
+    # from whom; nothing in the settings) is read back by the next start, and found there by the machine.
+    from tests.test_live import Wall, a_jpeg
+
+    folder, scratch = tmp_path / "data", tmp_path / "scratch"
+    scratch.mkdir()
+    reads = Reads(folder, scratch)
+    comet = FakeKvm(FakeState(picture=a_jpeg((32, 74, 135)), picture_type="image/jpeg")).start()
+    try:
+        with Wall(folder) as first:
+            admin = first.browser()
+            device = first.add(admin, comet.url, fingerbot_strength="light")
+            ok(admin.post("/api/v1/users", json={"name": "olga", "role": "operator", "password": "olga may act here"}), 201)
+            reads("a KVM and an account")
+            hers = first.line(first.browser("olga", "olga may act here"), device)
+            hers.say(t="control", on=True)
+            assert hers.word("control")["on"] is True
+            mine = first.line(admin, device)
+            mine.say(t="control", on=True, take=True, **{"from": "olga"})
+            assert mine.word("control") == {"t": "control", "on": True}
+            assert hers.word("control")["code"] == "taken"
+            hers.close()
+            mine.close()
+            wait_until(lambda: len(first.audit(admin, "live_closed")) == 2, "the live views' ends were not written down")
+            reads("a take-over, and two live views ended")
+        with Wall(folder) as again:
+            admin = again.browser("admin")
+            reads("a start after a take-over")
+            for asked in ({"q": "live_control"}, {"device": device, "kind": "action"}):
+                found: list[Any] = []
+
+                def answered(asked: dict[str, Any] = asked, found: list[Any] = found) -> bool:
+                    reply = admin.get("/api/v1/audit", params=asked)
+                    found[:] = reply.json()["entries"] if reply.status_code == 200 else [reply.status_code, reply.text[:200]]
+                    said = {(e["user"], e["on"], e.get("by"), e.get("from"), e["device_id"]) for e in found if isinstance(e, dict) and e["event"] == "live_control"}
+                    # (her keyboard taken, taken from her by the admin, and taken by him from her: each of this machine)
+                    return {("olga", True, None, None, device), ("olga", False, "admin", None, device), ("admin", True, None, "olga", device)} <= said
+
+                wait_until(answered, f"the take-over is not found again after a restart ({asked}): {found}", timeout=20)
+    finally:
+        comet.stop()
+    assert not reads.refused, "\n".join(reads.refused)
 
 
 def test_a_field_that_holds_what_the_program_gives_it_is_what_it_is_declared_as(tmp_path: Path) -> None:

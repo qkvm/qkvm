@@ -17,8 +17,9 @@ from typing import Any
 
 import pytest
 
-from qkvm import jetkvm, kvm, redfish
+from qkvm import amt, jetkvm, kvm, redfish
 from qkvm.kvm import Device, DeviceSpec, KvmError
+from tests.fake_amt import FakeAmt
 from tests.fake_jetkvm import FakeJetKvm
 from tests.fake_kvm import FakeKvm
 from tests.fake_redfish import FakeBmc
@@ -72,10 +73,18 @@ def a_jetkvm(server: Any) -> Made:
     return device, lambda: server.state.logins, lambda password: setattr(server.state, "password", password)
 
 
+def an_amt_pc(server: Any) -> Made:
+    # (Digest signs every request: a "login" is the first that carries the password, and the count at the
+    # stand-in is of requests that carried one. While the password is wrong, those are the sign-ins.)
+    device = amt.AmtDevice(DeviceSpec(id="ab12", name="PC", base_url=server.url, username="admin", password="secret", kind="amt"))
+    return device, lambda: server.state.logins, lambda password: setattr(server.state, "password", password)
+
+
 KINDS: dict[str, tuple[Callable[[], Any], Callable[[Any], Made]]] = {
     "a KVM": (FakeKvm, a_kvm),
     "a server's controller": (FakeBmc, a_controller),
     "a JetKVM": (FakeJetKvm, a_jetkvm),
+    "an Intel AMT PC": (FakeAmt, an_amt_pc),
 }
 
 

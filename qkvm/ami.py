@@ -16,9 +16,10 @@ How a console session goes:
   pieces (`Frames` puts them together). Now and then it asks whether anybody is still there, and is
   told so.
 
-Only looking is done here. The same connection carries keys, the mouse and the power buttons; nothing
-in this file sends any of them. A session is ended by saying so (`goodbye`), as the controller's own
-page does when its window is closed: a console that just goes away leaves the controller waiting for it.
+The same connection carries keys and the mouse, as USB HID reports the controller hands to the server
+(`keyboard`, `mouse_abs`, `mouse_rel`), and the power buttons, which nothing here sends (the wall's power
+buttons are Redfish's). A session is ended by saying so (`goodbye`), as the controller's own page does when
+its window is closed: a console that just goes away leaves the controller waiting for it.
 
 A console is shared. Whoever opened it first holds it; when another comes, the controller asks the
 holder whether they may have it (keys and all, the picture only, or not at all), tells the newcomer
@@ -39,8 +40,10 @@ from .aspeed import FrameHeader, Garbled
 _HEAD = struct.Struct("<HIH")
 
 # The kinds of message that matter for looking (the numbers are the protocol's).
+HID = 1  # a keyboard or mouse report, going up to the controller (CMD_SEND_HID_PACKET)
 RESUME = 6  # "send the picture"
 STOP = 8  # the controller ends the session (its status says why)
+MOUSE_MODE = 10  # the controller says which mouse the server shows: absolute or relative
 FULL_SCREEN = 11  # "send the whole screen, not only what changes"
 PASS = 18  # the console pass, shown to the controller
 PASS_SEEN = 19  # ...and what it makes of it
@@ -81,6 +84,18 @@ TURNED_AWAY = 1
 PICTURE_ONLY = 2
 HOLDER_RETURNING = 7  # nobody answered: the holder's console dropped, and they may come back
 SHUT_OUT = 8  # the holder has set that nobody else comes in
+# The number a PASS_SEEN comes with where this is the first console session there is: the controller attaches its
+# virtual keyboard and mouse to the server only now (where it is set to save power), and they take moments to appear.
+FIRST_SESSION = 2
+
+# The low byte of a sharing message that says this console is now the one that holds the keyboard and mouse
+# ("the console is yours"): a lone session is greeted with it (NEXT_HOLDER, status 6).
+BECAME_MASTER = 6
+
+# Which mouse the server shows, as the controller names it (the body of a MOUSE_MODE message; the viewer's own
+# word). Absolute is what AMI's own web viewer uses and most boards default to; relative is the other.
+ABSOLUTE = 2
+RELATIVE = 1
 
 LONGEST = _FRAME_LONGEST  # no message is longer than a frame may be, and a controller that says one is, is not believed
 # ...nor do more than this many arrive in one go. The smallest is eight bytes: megabytes of those, every one made
@@ -138,6 +153,61 @@ def let_in(who: bytes) -> bytes:
 def goodbye() -> bytes:
     """What ends a session, said before the connection is closed."""
     return message(STOP)
+
+
+# --- keys and the mouse, as HID reports the controller passes to the server's USB ------------------------
+# A keyboard or mouse report goes up in a HID message (CMD_SEND_HID_PACKET). Its body is an "IUSB" packet: a
+# 32-byte header that names which virtual USB device it is for and carries a checksum, then one byte saying how
+# long the report is, then the report itself. The header's layout, the field values and the checksum are the
+# controller's (read from AMI's own web viewer, which is how the real boards are driven); the report bodies are
+# the USB HID boot keyboard and mouse reports of the USB HID standard. Nothing here touches the network.
+_IUSB = b"IUSB    "  # the eight bytes an IUSB packet begins with
+_IUSB_HDR = 32  # the header's length
+_MAJOR, _MINOR = 1, 0
+_FROM_REMOTE = 0x80  # the report is going to the server, not coming from it
+_DEV_KEYBD, _DEV_MOUSE = 0x30, 0x31  # which virtual USB device the report is for
+_PROTO_KEYBD, _PROTO_MOUSE = 0x10, 0x20
+_KEYBD_DEVNUM, _KEYBD_IFNUM = 2, 0
+_MOUSE_DEVNUM, _MOUSE_IFNUM = 2, 1
+MOST_KEYS = 6  # keys one keyboard report holds, beside the modifiers (a USB boot keyboard's own limit)
+
+
+def _iusb_packet(dev_type: int, proto: int, dev_num: int, if_num: int, seq: int, report: bytes) -> bytes:
+    """One HID message: the IUSB header (with its checksum) that names the virtual USB device, then `report`."""
+    header = bytearray(_IUSB)
+    header += bytes((_MAJOR, _MINOR, _IUSB_HDR, 0))  # ...major, minor, header length, and a space for the checksum
+    header += struct.pack("<i", len(report) + 1)  # the report and its one length byte
+    header += bytes((0, dev_type, proto, _FROM_REMOTE, dev_num, if_num, 0, 0))
+    header += struct.pack("<i", seq & 0x7FFFFFFF)
+    header += bytes(4)  # (the header is thirty-two bytes to here)
+    header[11] = (-sum(header)) & 0xFF  # so the thirty-two bytes sum to zero, as the controller checks
+    return message(HID, 0, bytes(header) + bytes((len(report),)) + report)
+
+
+def keyboard(modifiers: int, keys: list[int], seq: int = 0) -> bytes:
+    """A keyboard report: the modifier bits held (USB HID: bit 0 left Ctrl ... bit 7 right Meta) and up to six keys
+    down, by their USB HID usage. The whole state of the keyboard, as a USB boot keyboard reports it; a key no
+    longer in it is let go of. The second byte is reserved (held at zero: the auto-release the viewer puts there is
+    not used, so that a key stays down until a report without it, which is what holding a combination needs)."""
+    held = [usage & 0xFF for usage in keys[:MOST_KEYS]]
+    report = bytes((modifiers & 0xFF, 0)) + bytes(held).ljust(MOST_KEYS, b"\0")
+    return _iusb_packet(_DEV_KEYBD, _PROTO_KEYBD, _KEYBD_DEVNUM, _KEYBD_IFNUM, seq, report)
+
+
+def mouse_abs(buttons: int, x: int, y: int, wheel: int = 0, seq: int = 0) -> bytes:
+    """An absolute mouse report: the buttons held (bit 0 left, bit 1 right, bit 2 middle), where the pointer is
+    (0 to 32767 across the screen and down it), and a turn of the wheel (a signed step). This is what AMI's own
+    viewer sends, and what a board set to an absolute mouse takes."""
+    place = max(0, min(0x7FFF, x)), max(0, min(0x7FFF, y))
+    report = struct.pack("<BHHb", buttons & 0xFF, place[0], place[1], max(-127, min(127, wheel)))
+    return _iusb_packet(_DEV_MOUSE, _PROTO_MOUSE, _MOUSE_DEVNUM, _MOUSE_IFNUM, seq, report)
+
+
+def mouse_rel(buttons: int, dx: int, dy: int, wheel: int = 0, seq: int = 0) -> bytes:
+    """A relative mouse report: the buttons held and how far the pointer moved (a signed step each way), for a board
+    set to a relative mouse. (AMI's own viewer sends only absolute; this is the other way, for a board that asks for it.)"""
+    report = struct.pack("<Bbbb", buttons & 0xFF, max(-127, min(127, dx)), max(-127, min(127, dy)), max(-127, min(127, wheel)))
+    return _iusb_packet(_DEV_MOUSE, _PROTO_MOUSE, _MOUSE_DEVNUM, _MOUSE_IFNUM, seq, report)
 
 
 class Messages:

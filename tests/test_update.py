@@ -145,6 +145,165 @@ def test_signed_releases(github: FakeGitHub, tmp_path: Path) -> None:
     assert run(update.install()) == "9.9.9"
 
 
+def test_signed_update_requires_compatible_installed_dependencies(
+    github: FakeGitHub, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A correct publisher signature and checksum do not make an old dependency compatible. The old
+    # updater accepted this exact 0.1.1 -> 0.2.0 floor change, and marked the package ready to run.
+    key_file = tmp_path / "signing.key"
+    public = release.keygen(key_file)
+    github.publish("0.2.0", make_wheel("0.2.0", requires=("uvicorn>=0.54",)), signed_by=key_file.read_text())
+    update = updater(github, tmp_path / "data", keys=(public,), current="0.1.1", allow_unsigned=False)
+    installed = {"uvicorn": "0.46.0"}
+    monkeypatch.setattr(update_module.importlib.metadata, "version", installed.__getitem__)
+    run(update.check())
+    with pytest.raises(UpdateError, match=r"uvicorn.*pip install --upgrade qkvm"):
+        run(update.install())
+    assert update.state == "failed" and update.installed is None
+    assert not (tmp_path / "data" / "updates" / "current.json").exists()
+    assert not (tmp_path / "data" / "updates" / "0.2.0").exists()
+    # After the operator upgrades the library, the same signed package is accepted.
+    installed["uvicorn"] = "0.54.0"
+    assert run(update.install()) == "0.2.0"
+    assert json.loads((tmp_path / "data" / "updates" / "current.json").read_text())["version"] == "0.2.0"
+
+
+def test_deeply_nested_signed_dependency_marker_fails_without_leaving_update_busy(
+    github: FakeGitHub, tmp_path: Path
+) -> None:
+    key_file = tmp_path / "signing.key"
+    public = release.keygen(key_file)
+    requirement = "fastapi; " + "(" * 500 + 'python_version >= "3"' + ")" * 500
+    github.publish("9.9.9", make_wheel("9.9.9", requires=(requirement,)), signed_by=key_file.read_text())
+    update = updater(github, tmp_path / "data", keys=(public,), allow_unsigned=False)
+    run(update.check())
+    with pytest.raises(UpdateError, match="requirements could not be verified"):
+        run(update.install())
+    assert update.state == "failed" and update.installed is None
+    assert not (tmp_path / "data" / "updates" / "current.json").exists()
+    assert not (tmp_path / "data" / "updates" / "9.9.9").exists()
+    # A failed parser cannot leave "installing" latched or prevent a later valid package.
+    github.publish("9.9.9", make_wheel("9.9.9"), signed_by=key_file.read_text())
+    assert run(update.install()) == "9.9.9"
+
+
+@pytest.mark.parametrize(
+    ("specifier", "installed", "accepted"),
+    [
+        (">=1.2,<2", "1.2.0", True),
+        (">=1.2,<2", "2.0.0", False),
+        ("~=1.4.2", "1.4.9", True),
+        ("~=1.4.2", "1.5.0", False),
+        (">=1,!=1.2.3", "1.2.3", False),
+        ("==1.2.*", "1.2.9", True),
+        (">=1.2", "1.2rc1", False),
+        (">=1.2rc1", "1.2rc1", True),
+        (">=1", "not-a-version", False),
+    ],
+)
+def test_update_checks_dependency_version_specifiers(
+    monkeypatch: pytest.MonkeyPatch, specifier: str, installed: str, accepted: bool
+) -> None:
+    monkeypatch.setattr(update_module.importlib.metadata, "version", lambda name: installed)
+    metadata = f"Requires-Dist: some-package{specifier}\n"
+    if accepted:
+        update_module._check_requirements(metadata)
+    else:
+        with pytest.raises(UpdateError, match="pip install --upgrade qkvm"):
+            update_module._check_requirements(metadata)
+
+
+@pytest.mark.parametrize(
+    ("requirement", "active"),
+    [
+        ('absent-package; python_version < "0"', False),
+        ('absent-package; sys_platform == "no-such-platform"', False),
+        ('absent-package; extra == "video"', False),
+        ('absent-package[video] @ https://example.invalid/a.whl ; extra == "video"', False),
+        ('absent-package; extra == "video" or python_version >= "3"', True),
+        ('absent-package; extra != "video"', True),
+        ('absent-package; extra == ""', True),
+    ],
+)
+def test_update_evaluates_environment_and_optional_extra_markers(
+    monkeypatch: pytest.MonkeyPatch, requirement: str, active: bool
+) -> None:
+    looked_up = []
+
+    def absent(name: str) -> str:
+        looked_up.append(name)
+        raise update_module.importlib.metadata.PackageNotFoundError(name)
+
+    monkeypatch.setattr(update_module.importlib.metadata, "version", absent)
+    metadata = f"Requires-Dist: {requirement}\n"
+    if active:
+        with pytest.raises(UpdateError, match="not installed"):
+            update_module._check_requirements(metadata)
+        assert looked_up == ["absent-package"]
+    else:
+        update_module._check_requirements(metadata)
+        assert looked_up == []
+
+
+@pytest.mark.parametrize(
+    ("specifier", "accepted"),
+    [(">=3.11", True), (">=3.13.2", False), (">=3.11,<3.13", False), ("!=3.13.1", False), ("~=3.13.0", True)],
+)
+def test_update_checks_the_complete_python_requirement(monkeypatch: pytest.MonkeyPatch, specifier: str, accepted: bool) -> None:
+    monkeypatch.setattr(update_module.platform, "python_version", lambda: "3.13.1")
+    metadata = f"Requires-Python: {specifier}\n"
+    if accepted:
+        update_module._check_requirements(metadata)
+    else:
+        with pytest.raises(UpdateError, match="needs Python"):
+            update_module._check_requirements(metadata)
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        "Requires-Dist: not a requirement\n",
+        "Requires-Dist: some-package>=no-version\n",
+        "Requires-Dist: some-package; unknown_marker == 'x'\n",
+        "Requires-Python: not a specifier\n",
+        "Requires-Python: >=3.11\nRequires-Python: <3.0\n",
+        "Requires-Dist: some-package[video]>=1\n",
+        "Requires-Dist: some-package @ https://example.invalid/a.whl\n",
+    ],
+)
+def test_update_refuses_requirements_it_cannot_verify(metadata: str) -> None:
+    with pytest.raises(UpdateError, match="pip install --upgrade qkvm"):
+        update_module._check_requirements(metadata)
+
+
+def test_update_reads_folded_metadata_but_not_requirements_in_the_description(monkeypatch: pytest.MonkeyPatch) -> None:
+    looked_up = []
+
+    def installed(name: str) -> str:
+        looked_up.append(name)
+        return "1.5"
+
+    monkeypatch.setattr(update_module.importlib.metadata, "version", installed)
+    update_module._check_requirements("Requires-Dist: some-package>=1,\n <2\n\nRequires-Dist: absent-package>=999\n")
+    assert looked_up == ["some-package"]
+
+
+def test_update_requires_one_unambiguous_metadata_file(tmp_path: Path) -> None:
+    wheel = make_wheel("9.9.9")
+    with zipfile.ZipFile(update_module.io.BytesIO(wheel)) as original:
+        for duplicate in (False, True):
+            buffer = update_module.io.BytesIO()
+            with zipfile.ZipFile(buffer, "w") as changed:
+                for member in original.infolist():
+                    if duplicate or not member.filename.endswith(".dist-info/METADATA"):
+                        changed.writestr(member, original.read(member))
+                if duplicate:
+                    changed.writestr("other-1.0.dist-info/METADATA", "Name: other\nVersion: 1.0\n")
+            with pytest.raises(UpdateError, match="exactly one dependency metadata"):
+                update_module.unpack(buffer.getvalue(), "9.9.9", tmp_path / "new-version")
+            assert not (tmp_path / "new-version").exists()
+
+
 @pytest.mark.parametrize(
     ("wheel", "problem"),
     [

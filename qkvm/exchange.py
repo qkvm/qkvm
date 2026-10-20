@@ -36,8 +36,11 @@ from cryptography.hazmat.primitives import serialization
 
 from . import alerts
 from .kvm import KEYS, MAX_TEXT
-from .store import Store, as_a_line, device_url
+from .store import FINGERBOT_STRENGTHS, Store, as_a_line, device_url, machine_from_before
 from .vault import Vault, VaultLocked
+from .proxmox import address_of as proxmox_address
+from .proxmox import guest_url
+from .vncdevice import is_vnc, vnc_url
 
 FORMAT = "qkvm-export"
 VERSION = 1  # of the file: a later version of this program reads every earlier one
@@ -50,7 +53,7 @@ MOST_DEVICES = 2000
 MOST_ACTIONS = 500
 MIN_PASSPHRASE = 10  # as for an account's password
 SEALED_FOR = f"export {VERSION}"  # what the content is sealed for: it is not a device's password, and opens as nothing else
-KINDS = ("kvmd", "jetkvm", "redfish")
+KINDS = ("kvmd", "jetkvm", "redfish", "amt", "vnc", "proxmox")
 TLS = ("pinned", "system", "insecure")
 PARTS = ("devices", "actions", "alerts", "wall")
 # What a device says it is (server.IDENT), as a driver gives it. Not the marks this program makes itself:
@@ -82,6 +85,8 @@ class Device:
     alerts: bool
     ident: str
     keep_both: bool = False  # on the wall it comes from, somebody said it is to have a tile of its own though another tile is the same device
+    machine: str = ""  # the machine its tile was added for, by the number it gives for itself (store.DeviceRecord.machine)
+    fingerbot_strength: str = "firm"  # how hard a Fingerbot paired with it presses: "firm" | "light"
 
 
 @dataclass(frozen=True)
@@ -168,8 +173,13 @@ def gather(store: Store, vault: Vault, what: set[str], secrets: bool, not_opened
                 "cert_pem": device.cert_pem,
                 "open_url": device.open_url,
                 "alerts": device.alerts,
+                "fingerbot_strength": device.fingerbot_strength if device.fingerbot_strength in FINGERBOT_STRENGTHS else FINGERBOT_STRENGTHS[0],
                 "ident": device.ident if _IDENT.fullmatch(device.ident) else "",
                 **({"keep_both": True} if device.ident.startswith("own:") else {}),
+                # (Apart from `ident`, which a tile kept beside its twin does not carry: it is checked before anything is sent.)
+                # (Written also where none is known, "": a file without the field is one of 0.1.x, whose server's number is
+                # taken from what it kept as the server's, see store.machine_from_before.)
+                "machine": device.machine if _IDENT.fullmatch(device.machine) else "",
             }
             for device in store.devices
         ]
@@ -437,7 +447,14 @@ def _devices(said: Any, left_out: list[str]) -> list[Device]:
             address = entry.get("url")
             if not isinstance(address, str) or len(address) > 255 or "://" not in address:
                 raise ValueError("it has no address")
-            url = device_url(address)
+            if entry.get("kind") == "proxmox":
+                # (A guest's address goes on past the host: the guest, by its node and number, which it must name.)
+                where = proxmox_address(address)
+                if where.node is None or where.vmid is None:
+                    raise ValueError("it does not name a guest of Proxmox")
+                url = guest_url(where.origin, where.node, where.vmid)
+            else:
+                url = vnc_url(address) if is_vnc(address) else device_url(address)  # (a VNC server's address says so by itself)
             name = _short(entry.get("name", ""), 80)
             username = _short(entry.get("username", "admin"), 64)
             group = _short(entry.get("group", ""), 200)
@@ -447,7 +464,7 @@ def _devices(said: Any, left_out: list[str]) -> list[Device]:
                 raise ValueError("its name, user name or group is not a short line of text")
             if not isinstance(password, str) or len(password) > 256:
                 raise ValueError("its password is not one")
-            if kind not in KINDS:
+            if kind not in KINDS or (kind == "vnc") != is_vnc(address):
                 raise ValueError("it is not a kind of device this version knows")
             if tls not in TLS:
                 raise ValueError("how its certificate is checked is not said in a way this version knows")
@@ -457,7 +474,18 @@ def _devices(said: Any, left_out: list[str]) -> list[Device]:
             link = entry.get("open_url", "")
             if not isinstance(link, str) or len(link) > 255:
                 raise ValueError("its console link is not one")
-            ident = entry.get("ident", "")
+            strength = entry.get("fingerbot_strength")
+            strength = FINGERBOT_STRENGTHS[0] if strength is None else strength  # (null: not said, as the form has it)
+            if strength not in FINGERBOT_STRENGTHS:
+                raise ValueError("how hard its Fingerbot presses is not said in a way this version knows")
+            ident, machine = entry.get("ident", ""), entry.get("machine", "")
+            if not (isinstance(machine, str) and (machine == "" or _IDENT.fullmatch(machine))):
+                # (What its tile checks before anything is sent to the machine: one that is no such number is not "none",
+                # which would have the tile take whatever answers first.)
+                raise ValueError("the number its machine gave for itself is not one")
+            if "machine" not in entry:
+                # (A server's, from a file of 0.1.x, which kept it as what the server is: taken as its machine, as at an upgrade.)
+                machine = machine_from_before(kind, ident, machine)
             device = Device(
                 name=name or urlsplit(url).netloc[:80],  # (no longer than a name may be, as the form names one that is added without a name)
                 url=url,
@@ -465,12 +493,14 @@ def _devices(said: Any, left_out: list[str]) -> list[Device]:
                 password=password,
                 kind=kind,
                 group=group,
-                tls=tls if url.startswith("https://") else "pinned",
-                cert_pem=_certificate(entry.get("cert_pem"), odd) if url.startswith("https://") and tls == "pinned" else None,
+                tls=tls if url.startswith(("https://", "vncs://")) else "pinned",
+                cert_pem=_certificate(entry.get("cert_pem"), odd) if url.startswith(("https://", "vncs://")) and tls == "pinned" else None,
                 open_url=console_link(link),
                 alerts=_flag(entry.get("alerts"), True),
                 ident=ident if isinstance(ident, str) and _IDENT.fullmatch(ident) else "",
                 keep_both=entry.get("keep_both") is True,
+                machine=machine,
+                fingerbot_strength=strength,
             )
         except ValueError as ex:
             left_out.append(f"Device {number}: {ex}")

@@ -390,9 +390,9 @@ def test_an_action_that_was_carried_out_is_not_called_failed_because_its_device_
 
 
 def test_a_long_text_is_typed_to_the_end_on_a_jetkvm_nobody_is_looking_at(tmp_path: Path) -> None:
-    from tests.fake_jetkvm import FakeJetKvm
+    from tests.fake_jetkvm import FakeJetKvm, JetState
 
-    jet = FakeJetKvm().start()
+    jet = FakeJetKvm(JetState(together=0)).start()  # (each key is waited for: what arrives together is no question here)
     try:
         with wall(tmp_path) as admin:
             device = add(admin, jet.url)

@@ -7,6 +7,7 @@ import errno
 import ipaddress
 import json
 import logging
+import math
 import os
 import queue
 import re
@@ -16,10 +17,10 @@ import sys
 import unicodedata
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Generator, Iterator
 from dataclasses import MISSING, asdict, dataclass, field, fields
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 from urllib.parse import urlsplit
 
 log = logging.getLogger("qkvm")
@@ -59,6 +60,14 @@ class ServerSettings:
     # Who has to have two-factor sign-in: "" nobody, or a role, meaning accounts of that role and above
     # ("operator": operators and admins). One of them without it can sign in to set it up, and to nothing else.
     require_totp: str = ""
+    # How long what the wall saw of the machines is kept (history.sqlite; see history.py), and how large that
+    # file may grow, in millions of bytes. Outside what makes sense, the nearest that does is taken.
+    history_days: int = 90
+    history_mb: int = 200
+    # How large the activity log may grow, in millions of bytes: its text files together (ten of them, each a tenth of
+    # this), which are the record; its index (audit.sqlite) holds what they hold, and takes about two and a half times
+    # that. Read at the start. Outside what makes sense, the nearest that does is taken (activity_file_bytes).
+    activity_mb: int = 100
 
 
 @dataclass
@@ -86,12 +95,35 @@ class DeviceRecord:
     tls: str = "pinned"  # "pinned" | "system" | "insecure"
     cert_pem: str | None = None  # the certificate trusted in "pinned" mode
     secret: dict[str, str] | None = None  # the device password, encrypted by the vault
-    kind: str = "kvmd"  # which driver talks to it: "kvmd" (GLKVM, PiKVM) | "jetkvm" | "redfish" (a server's BMC)
+    kind: str = "kvmd"  # which driver talks to it: "kvmd" (GLKVM, PiKVM) | "jetkvm" | "redfish" (a server's BMC) | "amt" (a PC with Intel AMT) | "vnc" (a VNC server) | "proxmox" (a virtual machine on Proxmox VE)
     group: str = ""  # a label to show KVMs together by: a rack, a room, a customer
     # What the device says it is, where it has a say (a server's own number), or "own:..." once somebody
     # decided that it is to have a tile of its own whatever it looks like. See core.identity.
     ident: str = ""
     alerts: bool = True  # False: nobody is told when this one changes (a test bench, a machine that sleeps)
+    # The machine behind the address, by the number it gave for itself when it was added ("amt:..." for a PC with Intel
+    # AMT, from its PlatformGUID): its driver checks it before anything is sent to the machine, and the tile says so where
+    # another one answers there. Apart from `ident`, which a tile kept beside its twin gives up ("own:..."). "": none yet;
+    # the first one seen is taken (DeviceManager._known). A person who types the password in an edit takes what answers.
+    machine: str = ""
+    fingerbot_strength: str = "firm"  # how hard a Fingerbot paired with the KVM presses its power button: "firm" | "light"
+
+
+FINGERBOT_STRENGTHS = ("firm", "light")  # (what fingerbot_strength may be; anything else in a file is taken as the first)
+
+# What a server's tile of 0.1.x kept as what the server is: the number its computer gives for itself (redfish.own_number).
+_SERVER_BEFORE = re.compile(r"server:[0-9a-f]{32}")
+
+
+def machine_from_before(kind: Any, ident: Any, machine: Any) -> Any:
+    """The machine a tile was added for, where it was written by a version that had no `machine` (asked only where the
+    field is not there at all: a file of 0.1.x): a server's tile of 0.1.x kept the number its computer gives for itself as
+    what the server is (`ident`), unless it was kept beside its twin ("own:..."). That number is the server's from then on,
+    so that an upgrade never trusts whatever answers first at its address (see redfish.RedfishDevice._judge). Anything else
+    is handed back as it was."""
+    if machine == "" and kind == "redfish" and isinstance(ident, str) and _SERVER_BEFORE.fullmatch(ident):
+        return ident
+    return machine
 
 
 ROLES = ("admin", "operator", "viewer")  # most to least: everything / watch and act / watch only
@@ -445,9 +477,12 @@ class Store:
                 # the file by hand administered (accounts, devices, other tokens) on the strength of a key.
                 raise ValueError(f"{what}: \"role\" has to be viewer or operator (no token does what an admin does)")
             if isinstance(record, DeviceRecord):
+                # A VNC server is where vncdevice.vnc_url wrote it, vnc:// or vncs:// (as the Add box, the network
+                # search and an import keep it), and only a VNC server is: every other kind talks HTTP.
+                schemes = ("http", "https", "vnc", "vncs") if record.kind == "vnc" else ("http", "https")
                 try:
                     where = urlsplit(record.url)
-                    usable = bool(where.hostname) and where.scheme in ("http", "https") and where.port != 0
+                    usable = bool(where.hostname) and where.scheme in schemes and where.port != 0
                 except ValueError:
                     usable = False
                 if not usable:
@@ -459,6 +494,11 @@ class Store:
             # editor's choosing.
             if not (isinstance(record.id, str) and _ID.fullmatch(record.id)):
                 raise ValueError("a record's id is not one this program gives")
+        # A server's tile written by 0.1.x, which had no `machine` (every later write has the field): known by the number it
+        # kept as what the server is. Only there: a tile whose machine was found to be none since keeps that.
+        for record, written in zip(self.devices, data.get("devices", []), strict=True):
+            if "machine" not in written:
+                record.machine = machine_from_before(record.kind, record.ident, record.machine)
 
     def _load(self) -> None:
         failures = (OSError, ValueError, TypeError, AttributeError, RecursionError, OverflowError)
@@ -471,10 +511,11 @@ class Store:
         # copy, which is of what was saved last, and keep a damaged file next to it for inspection.
         try:
             self._read(self.backup)
-        except failures:
-            # Never start from scratch over a file that might still be recoverable.
+        except failures as second:
+            # Never start from scratch over a file that might still be recoverable. (What was wrong with each: with the first
+            # only, a second copy refused for another reason said that the first was missing.)
             raise StoreError(
-                f"{self.path} cannot be read ({damage}), and neither can its second copy, {self.backup.name}; "
+                f"{self.path} cannot be read ({damage}), and neither can its second copy, {self.backup.name} ({second}); "
                 "fix one of them, or move both aside to start over"
             ) from damage
         self.restored = True
@@ -761,23 +802,175 @@ class InstanceLock:
             self._said = {}
 
 
+LONGEST_LINE = 65_536  # bytes of a line of the activity log that is read as an entry, at the most: qKVM writes a few hundred
+
+
+def _no_number(name: str) -> Any:
+    raise ValueError(f"{name} is no number")
+
+
+def _finite(text: str) -> float:
+    number = float(text)
+    if not math.isfinite(number):  # (1e400: written as a number, read as none)
+        raise ValueError(f"{text[:20]} is no number")
+    return number
+
+
+_DECODERS = threading.local()  # one reader of entries a thread, made once: json.loads with these hooks made one a line
+
+
+def _decoder() -> json.JSONDecoder:
+    decoder: json.JSONDecoder | None = getattr(_DECODERS, "decoder", None)
+    if decoder is None:
+        decoder = _DECODERS.decoder = json.JSONDecoder(parse_constant=_no_number, parse_float=_finite)
+    return decoder
+
+
+def entry_of(line: bytes) -> dict[str, Any] | None:
+    """The entry one line of the activity log holds, or None where it holds none.
+
+    An entry is what this program writes: a record of plain things, whose event is a text and whose time is a
+    moment. A line that is something else (damaged, cut off, written by hand, longer than any entry) is no entry.
+    Handed on, a list where the event belongs or a value nested a few hundred deep made the whole log an error for
+    whoever opened it. Read here and nowhere else, by the index (activity.py) as by `tail`, so that the two agree.
+    """
+    if len(line) > LONGEST_LINE:
+        return None
+    try:
+        # (NaN and Infinity are no numbers a reader of JSON takes, nor any qKVM writes: a line with one in it handed on
+        # made the answer that held it fail.)
+        entry = _decoder().decode(line.decode("utf-8", errors="replace"))
+    except (ValueError, RecursionError):
+        return None
+    if not (isinstance(entry, dict) and isinstance(entry.get("event"), str) and _shallow(entry, 3)):
+        return None
+    at = entry.get("time")
+    if not (isinstance(at, (int, float)) and not isinstance(at, bool) and 0 <= at < 1e11):
+        return None
+    if b"\\ud" in line.lower():
+        # Half of a character named in an escape (a lone surrogate), which no text in UTF-8 can carry: handed on, the answer
+        # that held it failed, and a download stopped there. (A pair of halves is one character, and is read as such.)
+        try:
+            json.dumps(entry, ensure_ascii=False).encode("utf-8")
+        except UnicodeEncodeError:
+            return None
+    return entry
+
+
+def read_only_uri(path: Path) -> str:
+    """The URI that opens an existing SQLite file to be read (`mode=rw`: never made where there is none), for any path.
+
+    A path on a share (\\\\server\\share\\...) is `file://server/share/...` to Python, and SQLite refuses a URI that names a
+    host ("invalid uri authority"): every read of the history and of the activity log's index was refused there, and the
+    activity log was read from its files for as long as qKVM ran. SQLite takes the share as a path with an empty host.
+    """
+    uri = path.resolve().as_uri()
+    if uri.startswith("file://") and not uri.startswith("file:///"):
+        uri = "file:////" + uri[len("file://") :]
+    return f"{uri}?mode=rw"
+
+
+def open_shared(path: Path) -> BinaryIO:
+    """Open a file of the activity log to be read, without standing in the way of its writer.
+
+    The writer moves its files on (the full one becomes the newest of the old ones) while they are read: by the index,
+    by a read of the page, by a download. On Windows a file that is open cannot be moved or removed, unless whoever
+    opened it said that it may be (FILE_SHARE_DELETE), which Python's own open does not say: a read in that moment
+    made the writer write on into the full file, to move it another time. Elsewhere it never could stand in the way.
+    """
+    if sys.platform != "win32":
+        return path.open("rb")
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    where = os.path.abspath(path)
+    if len(where) >= 250 and not where.startswith("\\\\"):
+        where = "\\\\?\\" + where  # (a long path, as Windows takes one)
+    # GENERIC_READ; FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE; OPEN_EXISTING; FILE_ATTRIBUTE_NORMAL
+    handle = kernel32.CreateFileW(where, 0x80000000, 0x7, None, 3, 0x80, None)
+    if handle is None or handle == wintypes.HANDLE(-1).value:
+        code = ctypes.get_last_error()
+        raise OSError(None, ctypes.FormatError(code).strip(), str(path), code)  # (2 and 3 come out as FileNotFoundError)
+    try:
+        number = msvcrt.open_osfhandle(handle, os.O_RDONLY | os.O_BINARY)
+    except OSError:
+        kernel32.CloseHandle(handle)
+        raise
+    return os.fdopen(number, "rb")
+
+
+def lines_backwards(file: Any, end: int, block: int = 1 << 16) -> Iterator[bytes]:
+    """The lines of an open file of the activity log up to byte `end`, the last first: what lies between two line
+    feeds (b"\\n"), and before the first and after the last. Read from the end a block at a time, so that a long log
+    is read only as far as it is wanted. A line whose beginning lies further back than LONGEST_LINE from where a block
+    cuts it is handed on as b"", its bytes not kept while its beginning is looked for; one shorter than that and yet
+    longer than LONGEST_LINE whole (entry_of takes neither for an entry). Memory: a block and LONGEST_LINE at the most."""
+    at, pending, too_long = end, b"", False
+    while at > 0:
+        start = max(0, at - block)
+        file.seek(start)
+        data = file.read(at - start) + pending
+        at = start
+        if at > 0:
+            first = data.find(b"\n")
+            if first < 0:  # (all of it is the end of one line that began further back)
+                too_long = too_long or len(data) > LONGEST_LINE
+                pending = b"" if too_long else data
+                continue
+            pending, data = data[:first], data[first + 1 :]
+        else:
+            pending = b""
+        lines = data.split(b"\n")
+        if too_long:
+            lines[-1], too_long = b"", False
+        if at > 0:
+            too_long = len(pending) > LONGEST_LINE
+            if too_long:
+                pending = b""
+        yield from reversed(lines)
+
+
+DEFAULT_ACTIVITY_MB, LEAST_ACTIVITY_MB, MOST_ACTIVITY_MB = 100, 10, 100_000
+
+
+def activity_file_bytes(megabytes: Any) -> int:
+    """Bytes each file of the activity log may grow to, for `activity_mb` as the settings file says it: held to what makes
+    sense (nothing, 0, or less than that is the default; a text, a list or a fraction where a number belongs, too)."""
+    wanted = megabytes if isinstance(megabytes, int) and not isinstance(megabytes, bool) else 0
+    wanted = DEFAULT_ACTIVITY_MB if wanted <= 0 else min(MOST_ACTIVITY_MB, max(LEAST_ACTIVITY_MB, wanted))
+    return wanted * 1_000_000 // (AuditLog.OLD_FILES + 1)
+
+
 class AuditLog:
     """Append-only record of logins, changes and device actions (JSON lines).
 
     Entries are written by a thread of its own, in the order they were made: whoever makes one is in the
     middle of answering a request, on the one thread that serves everybody, and does not wait for a disk.
+    These files are the record. What is sent on to a collector is a copy of each line as it is written, and the
+    index the page searches (activity.py) is made from these files and from nothing else; neither is waited for.
 
-    Kept: the file being written, and OLD_FILES before it, of max_bytes each. That is years of an
-    ordinary wall, and enough that what somebody did cannot be pushed out of the log by doing something
-    harmless a few thousand times afterwards.
+    Kept: the file being written, and OLD_FILES before it, of max_bytes each (a tenth of `activity_mb`: 10 MB as it
+    comes, which is more than a year of a busy wall; the README has the numbers). Enough that what somebody did cannot
+    be pushed out of the log by doing something harmless a few thousand times afterwards.
     """
 
     OLD_FILES = 9
 
-    def __init__(self, path: Path, max_bytes: int = 2_000_000, forward: Callable[[str], None] | None = None) -> None:
+    def __init__(self, path: Path, max_bytes: int | None = None, forward: Callable[[str], None] | None = None) -> None:
         self.path = path
-        self.max_bytes = max_bytes
+        self.max_bytes = activity_file_bytes(DEFAULT_ACTIVITY_MB) if max_bytes is None else max_bytes
         self.forward = forward  # given each entry once it is written, for sending on (it must not wait for anything)
+        self.on_written: Callable[[], None] | None = None  # told that the file has more in it (it must not wait for anything)
+        # How often the files were moved on, twice a time: one more as it begins and one more as it ends, odd in between. Whoever
+        # looks at several of the files one after the other (the index's round, a reading of them) can tell by it that they were
+        # moved on meanwhile, and that what it found at one name may be at the next by now.
+        self.rotations = 0
+        self._ends = False  # the writer's: the file being written was seen to end where a line ends (see _append)
         # Entries that could not be written since the program started: how many, since when, and why the last time.
         self.missing: dict[str, Any] | None = None
         self._unsaid = 0  # ...and how many of them the log itself does not yet say are missing
@@ -800,6 +993,8 @@ class AuditLog:
             line = self._waiting.get()
             try:
                 self._append(line)
+                if self.on_written is not None:
+                    self.on_written()
                 if self.forward is not None:
                     self.forward(line)
             except Exception:  # whatever goes wrong with one entry, the ones after it are written
@@ -810,19 +1005,61 @@ class AuditLog:
     def _old(self, number: int) -> Path:
         return self.path.with_name(f"{self.path.name}.{number}")
 
+    def files(self) -> list[Path]:
+        """Where the log is, the newest first: the file being written, then the old ones, whether they are there or not."""
+        return [self.path, *(self._old(number) for number in range(1, self.OLD_FILES + 1))]
+
+    def _rotate(self) -> None:
+        """The full file becomes the newest of the old ones, each of the others one older, and the oldest goes.
+
+        From the first old one that is not there, if one is not: a step that failed (a file held open by something else
+        just now, on Windows) left one out, and the next try moved the ones above it on all the same, so that a file
+        went for every step that had failed. Now the files above a gap stay as they are, and nothing goes but the oldest.
+        That one is removed first, and not replaced by the next: a file being read (opened to be shared, open_shared)
+        can be removed and renamed on Windows, and not replaced.
+        """
+        self.rotations += 1  # (odd while the files are being moved on: see `rotations`)
+        try:
+            free = next((number for number in range(1, self.OLD_FILES + 1) if not self._old(number).exists()), None)
+            if free is None:
+                self._old(self.OLD_FILES).unlink()
+                free = self.OLD_FILES
+            for number in range(free, 0, -1):
+                newer = self.path if number == 1 else self._old(number - 1)
+                if newer.exists():
+                    os.replace(newer, self._old(number))
+        finally:
+            self.rotations += 1
+        self._ends = True  # (the next line begins a file of its own)
+
+    def _ended(self) -> bool:
+        """Whether the file being written ends where a line ends: it is empty, not there, or its last byte is a line feed."""
+        try:
+            with self.path.open("rb") as file:
+                if file.seek(0, os.SEEK_END) == 0:
+                    return True
+                file.seek(-1, os.SEEK_END)
+                return file.read(1) == b"\n"
+        except OSError:
+            return True  # (not there; or not to be read just now, and then whatever is written is written as it was)
+
     def _append(self, line: str) -> None:
         try:
             if self.path.stat().st_size > self.max_bytes:
-                # The oldest goes, each of the others becomes one older, and the full one the newest of them.
-                for number in range(self.OLD_FILES, 0, -1):
-                    newer = self.path if number == 1 else self._old(number - 1)
-                    if newer.exists():
-                        os.replace(newer, self._old(number))
+                self._rotate()
         except OSError:
             pass  # not there yet, or held open by something else just now: written on, and moved aside another time
         told = bool(self._unsaid and self.missing is not None)
+        # A line the last run did not end (it was cut off in the middle of a write) is ended first. Written on, the next entry
+        # was part of that line, and read as one with it it was no entry: the first thing done after a restart was missing
+        # from the log as it is read. Looked at once, at the first entry, and again after a write the disk refused (not at
+        # every entry: a second opening of the file for each slowed the writer, and under load what was asked to be read a
+        # moment later was not written yet). A line feed is added; nothing that is there is changed.
+        mended = "" if self._ends or self._ended() else "\n"
         try:
             with self.path.open("a", encoding="utf-8") as fh:
+                if mended:
+                    fh.write(mended)
                 if told and self.missing is not None:
                     # It can be written again. The hole is written into it first: what is known of it here
                     # is gone with the next restart, and the log would then read as if nothing were missing.
@@ -830,6 +1067,7 @@ class AuditLog:
                     fh.write(json.dumps(gap) + "\n")
                 fh.write(line)
             # (Only now is it on its way to the disk: a full one refuses at the end, when the file is closed.)
+            self._ends = True
             if told:
                 self._unsaid, self._unsaid_since = 0, None
         except OSError as ex:
@@ -838,6 +1076,7 @@ class AuditLog:
             # own log, and to whoever opens the activity log (see `missing`).
             now = time.time()
             why = ex.strerror or type(ex).__name__
+            self._ends = False  # (a write the disk refused may have left part of a line: looked at before the next)
             self.missing = {"count": (self.missing or {}).get("count", 0) + 1, "since": (self.missing or {}).get("since", now), "why": why}
             self._unsaid += 1
             self._unsaid_since = self._unsaid_since or now
@@ -854,30 +1093,52 @@ class AuditLog:
     def tail(self, limit: int, wanted: Callable[[dict[str, Any]], bool] | None = None) -> list[dict[str, Any]]:
         """The newest `limit` entries, newest first. `wanted`: only those it says yes to."""
         self.flush()  # what was done a moment ago is in what is read
-        entries: list[dict[str, Any]] = []
-        for path in (self.path, *(self._old(number) for number in range(1, self.OLD_FILES + 1))):
-            if len(entries) >= limit:
+        found: list[dict[str, Any]] = []
+        for entry in self.entries():
+            if len(found) >= limit:
                 break
-            try:
-                lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-            except OSError:
-                continue
-            for line in reversed(lines):
-                if len(entries) >= limit:
+            if wanted is None or wanted(entry):
+                found.append(entry)
+        return found
+
+    def entries(self) -> Generator[dict[str, Any], None, None]:
+        """Every entry of the files, the newest first, read from their ends as far as they are wanted (entry_of).
+
+        The files as they are when this begins: all of them are opened at once (to be shared, open_shared), so that the
+        writer moving them on meanwhile neither reads one of them twice nor leaves the oldest out. Of the file being written,
+        only lines that have ended: its last one without its line feed is still being written (or was written so by hand, and
+        the writer's next entry then runs into it), as the index takes it (activity.py).
+        """
+        opened: list[tuple[Path, BinaryIO]] = []
+        try:
+            # Where the files were moved on while they were being opened, one of them was opened under two names (the second
+            # reviewer of W4c): opened again, a few times at the most. (A writer that moves them on at every look leaves it as
+            # it is: what is read is then the files as they were opened, one of them perhaps twice, as before W4c.)
+            for attempt in range(5):
+                began = self.rotations
+                for path in self.files():
+                    try:
+                        opened.append((path, open_shared(path)))
+                    except OSError:
+                        continue
+                if (began % 2 == 0 and self.rotations == began) or attempt == 4:
                     break
+                for _, file in opened:
+                    file.close()
+                opened = []
+                time.sleep(0.01)
+            for path, file in opened:
                 try:
-                    entry = json.loads(line)
-                except (ValueError, RecursionError):
-                    continue
-                # An entry is what this program writes: a record of plain things, whose event is a text and
-                # whose time is a moment. A line that is something else (damaged, or written by hand) is no
-                # entry. Handed on, a list where the event belongs or a value nested a few hundred deep
-                # made the whole log an error for whoever opened it.
-                if not (isinstance(entry, dict) and isinstance(entry.get("event"), str) and _shallow(entry, 3)):
-                    continue
-                at = entry.get("time")
-                if not (isinstance(at, (int, float)) and not isinstance(at, bool) and 0 <= at < 1e11):
-                    continue
-                if wanted is None or wanted(entry):
-                    entries.append(entry)
-        return entries
+                    end = file.seek(0, os.SEEK_END)
+                    lines = lines_backwards(file, end)
+                    if path == self.path:
+                        next(lines, None)  # (what follows its last line feed: nothing, or a line not yet ended)
+                    for line in lines:
+                        entry = entry_of(line)
+                        if entry is not None:
+                            yield entry
+                except OSError:
+                    continue  # (gone bad while it was read: what is after it is read all the same)
+        finally:
+            for _, file in opened:
+                file.close()

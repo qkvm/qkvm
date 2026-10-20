@@ -22,14 +22,19 @@ from urllib.parse import urlsplit
 
 import uvicorn
 from uvicorn.protocols.http.h11_impl import H11Protocol
+from uvicorn.protocols.websockets.websockets_sansio_impl import WebSocketsSansIOProtocol
+from websockets.exceptions import InvalidState
+from websockets.frames import Frame
 
-from . import unlock
+from . import activity, history, live, unlock
 from ._version import __version__
 from ._where import default_data_dir
 from .core import Core
+from .kvm import WarningsOnly
 from .netbind import BindError, normalize, open_sockets, resolve
 from .server import create_app
 from .store import InstanceLock, ServerSettings, StoreError
+from .update import UpdateError, check_startup_requirements
 
 log = logging.getLogger("qkvm")
 MAX_CRASHES = 5  # restarts allowed within CRASH_WINDOW before giving up
@@ -107,6 +112,12 @@ class Http(H11Protocol):
 
     def data_received(self, data: bytes) -> None:
         super().data_received(data)
+        if self.transport.get_protocol() is not self:
+            # The request was for the live line, and the connection is the WebSocket's now (`Line`, which keeps time of
+            # its own). Left running, these clocks closed every line twenty seconds after it opened.
+            self._stop_the_clock()
+            self._taken()
+            return
         if self.cycle is not None and not self.cycle.response_complete:
             self._stop_the_clock()  # a whole request is here and being answered (its body has a clock of its own)
         else:
@@ -172,10 +183,165 @@ class Http(H11Protocol):
             self.transport.close()
 
 
+# What the WebSocket library logs of a connection at its finer levels is every frame: the pass in a live line's first
+# message, and every key after it. A live line's connection logs through a logger that says nothing finer than a warning,
+# whatever any level says (`--log-level debug` included: kvm.WarningsOnly); to the web server's logger, so that what it
+# does say goes where its other lines go.
+_LINE_FRAMES = WarningsOnly(logging.getLogger("uvicorn.error"), {})
+
+
 # How the web server is run, whatever it listens on.
+class Line(WebSocketsSansIOProtocol):
+    """The web server's WebSocket, for the live line (live.py), with what it does not do by itself: hang up on a viewer that stops taking what is sent.
+
+    As it comes, it answers every ping straight into what waits to be sent, without a bound, and it keeps a
+    connection whose viewer takes nothing off it for as long as the viewer keeps it: a viewer that sent pings by
+    the million and read nothing had the answers held for it without end, and one that read nothing at all kept
+    a machine's keyboard and mouse, the keys it had down with them, for as long as its connection lived. So the
+    pings are counted, what waits to be sent is looked at, and a connection that has not drained for a while is
+    dropped: the program is told that the line is gone, as it is, and lets go of what it held.
+
+    And it reads, before any pass was shown, every frame anybody who reaches the port sends: a pong nobody asked for,
+    a piece of a message that never ends (kept, every one, for the message: two million pieces of no bytes in four
+    seconds, eighty megabytes in twenty, the program's loop at a sixth of its pace meanwhile). The program counts the
+    messages it is handed (live.MOST_A_SECOND); every other frame is counted here, and so are the pieces of a message.
+    """
+
+    _second = 0.0  # the second being counted in, and the pings and other frames that came in it
+    _pings = 0
+    _frames = 0
+    _pieces = 0  # of the message that is coming
+    _paused_since: float | None = None  # since when more waits to be sent than is kept ready, and the viewer has taken none of it
+    _hung_up = False
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        # The connection the web server made, logging through the logger above: whatever it asks to say finer than a warning
+        # is dropped there, unformatted, whether or not it found out at its making that the web server's logger is finer.
+        self.conn.logger = _LINE_FRAMES
+        self.conn.debug = False
+
+    def data_received(self, data: bytes) -> None:
+        if self._hung_up:
+            return
+        super().data_received(data)
+        if not self._hung_up and self.transport.get_write_buffer_size() > live.MOST_UNSENT_TO_VIEWER:
+            self._hang_up()
+
+    def _counted(self) -> bool:
+        """One more frame of those the program does not count itself: False, and hung up on, where that is more in a second than a viewer has reason to send."""
+        if self._hung_up:
+            return False
+        now = time.monotonic()
+        if now - self._second >= 1.0:
+            self._second, self._pings, self._frames = now, 0, 0
+        self._frames += 1
+        if self._frames > live.MOST_FRAMES_A_SECOND:
+            self._hang_up()
+            return False
+        return True
+
+    def handle_ping(self) -> None:
+        if not self._counted():
+            return
+        self._pings += 1
+        if self._pings > live.MOST_PINGS_A_SECOND or self.transport.get_write_buffer_size() > live.MOST_UNSENT_TO_VIEWER:
+            self._hang_up()
+            return
+        super().handle_ping()
+
+    def handle_pong(self, event: Frame) -> None:
+        if self._counted():
+            super().handle_pong(event)
+
+    def handle_text(self, event: Frame) -> None:
+        # A whole message the program is handed, it counts; the first piece of one in pieces, or one that comes after the
+        # line was closed (thrown away unread, and read on all the same), is counted here.
+        if self._hung_up:
+            return  # (the rest of what came in one read, after the hang-up: nobody's)
+        if (event.fin and not self.close_sent) or self._counted():
+            self._pieces = 1
+            super().handle_text(event)
+
+    def handle_bytes(self, event: Frame) -> None:
+        if self._hung_up:
+            return
+        if (event.fin and not self.close_sent) or self._counted():
+            self._pieces = 1
+            super().handle_bytes(event)
+
+    def handle_cont(self, event: Frame) -> None:
+        if not self._counted():
+            return
+        self._pieces += 1
+        if self._pieces > live.MOST_PIECES:
+            self._hang_up()  # (a message in more pieces than any client sends one: the web server keeps what came, piece by piece)
+            return
+        super().handle_cont(event)
+
+    def shutdown(self) -> None:
+        # The web server is stopping, and says goodbye on every connection. On one that is closing already (its viewer said
+        # goodbye, or the line did, and the answer still waits to be taken) the library refuses to say it twice, and the
+        # web server's stop went no further: not to the connections after this one, and not to the program's own stop
+        # (every line letting go of what it held, every device's connection closed). Dropped as it stands instead; and so is
+        # one where anything else goes wrong in that goodbye, for the same reason.
+        try:
+            super().shutdown()
+        except InvalidState:
+            self.transport.abort()
+        except Exception:
+            log.debug("saying goodbye on a live line as the web server stopped failed", exc_info=True)
+            self.transport.abort()
+
+    def keepalive_timeout(self) -> None:
+        # The viewer answered none of the pings: it is gone. Dropped as the connection stands, and not closed: closing waits
+        # for what is still to be sent to be taken, which is what a viewer that is gone never does, and the program would
+        # hear of the end only then (minutes on, for a computer that vanished with something unsent), keeping the
+        # machine's keyboard and mouse for it meanwhile, and the keys it had down.
+        self.pong_timer = None
+        self.pending_ping_payload = None
+        if not self._hung_up:
+            self._hang_up()
+
+    # What is sent waits while more waits to be sent than is kept ready (`writable`), so that a viewer that falls behind is
+    # brought forward to the next key frame, and one that is not read at all ends (`slow`), instead of everything sent to it
+    # piling up in this program's memory. The web server does this itself from some version after 0.46, which this
+    # program still runs on (pyproject.toml), and which does not: so it is done here as well, in the same three places.
+    def pause_writing(self) -> None:
+        super().pause_writing()
+        self.writable.clear()
+        since = self._paused_since = time.monotonic()
+        self.loop.call_later(live.STUCK_AFTER, self._still_stuck, since)
+
+    def resume_writing(self) -> None:
+        self._paused_since = None
+        super().resume_writing()
+        self.writable.set()
+
+    def connection_lost(self, exc: Exception | None) -> None:
+        super().connection_lost(exc)
+        self.writable.set()  # (a send that waits is let go, and finds the line gone: a lost connection is never resumed)
+
+    def _still_stuck(self, since: float) -> None:
+        if self._paused_since == since and not self._hung_up:
+            self._hang_up()
+
+    def _hang_up(self) -> None:
+        self._hung_up = True
+        self.transport.abort()  # the connection is lost, and the program is told so (a disconnect), as for a viewer that went away
+
+
 SERVER_OPTIONS: dict[str, Any] = {
     "http": Http,
-    "ws": "none",  # nothing in qKVM is talked to over a websocket: there is no way in for one
+    # The live line (live.py) is the one thing in qKVM that is talked to over a WebSocket: let in by a pass of its own,
+    # every message from it bounded, asked by the web server every few seconds whether it is there (a line that has
+    # answered none of three such askings is gone, and what it held down on a machine is let go of), and hung up on
+    # when it stops taking what is sent (`Line` above).
+    "ws": Line,
+    "ws_max_size": live.MOST_WORD,
+    "ws_ping_interval": live.ASK_EVERY,
+    "ws_ping_timeout": live.ASK_EVERY * 3,
+    "ws_per_message_deflate": False,  # pictures do not pack; and what a client sent packed would be unpacked before it is counted
     "log_config": None,  # keep the handlers set up in setup_logging
     "log_level": "warning",
     "access_log": False,  # tiles poll for a frame every second; an access log would be nothing but noise
@@ -687,12 +853,29 @@ def by_hand(holder: dict[str, Any] | None) -> str:
     return f"Ctrl+C in the window it runs in, or: {'taskkill /F /T /PID' if sys.platform == 'win32' else 'kill'} {pid}"
 
 
+def history_said(folder: Path) -> None:
+    """What `qkvm status` says of the history kept in `folder` (what the wall saw of its machines): how large it is. Only looks."""
+    size = history.size_of(folder)
+    if size:
+        say(f"  the history takes {history.said_size(size)} ({history.FILE})")
+    count, aside = history.aside_in(folder)
+    if count:
+        # Left for somebody to look at, and gone by themselves once older than the history is kept.
+        say(f"  and {count} {'copy' if count == 1 else 'copies'} of it that could not be read {'takes' if count == 1 else 'take'} {history.said_size(aside)} (history.damaged-*.sqlite)")
+    # ...and so does the activity log: its files (the record), and its index beside them.
+    text, files, index = activity.size_of(folder)
+    if files:
+        made = f", and its index {history.said_size(index)} ({activity.FILE})" if index else ""
+        say(f"  the activity log takes {history.said_size(text)} in {files} {'file' if files == 1 else 'files'} (audit.log){made}")
+
+
 def describe(where: Path, holder: dict[str, Any] | None) -> None:
     """What `qkvm status` says of one running copy."""
     version = holder.get("version") if holder else None
     say(f"qKVM{f' {version}' if isinstance(version, str) else ''} is running with {where}{who(holder)}")
     for url in (holder.get("listening") if holder else None) or []:
         say(f"  {url}")
+    history_said(where)
 
 
 def ask(command: str, data_dir: Path, folder_said: bool) -> int:
@@ -729,6 +912,8 @@ def ask(command: str, data_dir: Path, folder_said: bool) -> int:
             say(f"qkvm: qKVM is not running with {where}{hint}: there is nothing to restart", error=True)
             return 1
         say(f"qKVM is not running with {where}{hint}")
+        if command == "status":
+            history_said(data_dir)
         return 3 if command == "status" else 0  # 3: what a service manager expects of "not running"
     holder = lock.holder()
     if command == "status":
@@ -884,9 +1069,16 @@ def main(argv: list[str] | None = None) -> int:
         # else and is open to more: the settings with the accounts in them, the logs, the activity log.
         os.umask(0o077)
     data_dir = Path(args.data_dir) if args.data_dir else default_data_dir()
-    lock = InstanceLock(data_dir)
     if command != "start":
         return ask(command, data_dir, bool(args.data_dir))
+    try:
+        check_startup_requirements(Path(__file__).resolve().parent, __version__)
+    except UpdateError as ex:
+        say(f"qkvm: {ex}", error=True)
+        # A trial update installed by an older updater must fail before any settings migration. Status 1
+        # lets even the original supervisor roll it back; status 2 is reserved for configuration errors.
+        return 1
+    lock = InstanceLock(data_dir)
     try:
         # A folder made here is its owner's alone: what is in it is not for the others who use this computer.
         data_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -989,6 +1181,10 @@ def main(argv: list[str] | None = None) -> int:
                 say(f"qkvm: the data folder {data_dir} could not be written ({ex.strerror or ex}); nothing was changed", error=True)
                 return 2
             log.warning("two-factor sign-in switched off for %s from the command line", account.name)
+            # ...and in the activity log, where whoever looks into what happened looks: an account's second step taken away is
+            # one of the first things asked after an incident. (Written before the program ends: the log's writer is a thread.)
+            core.audit.write("totp_disabled", "", account=account.name, note="from the command line where qKVM runs")
+            core.audit.flush()
             say(f"Two-factor sign-in is off for {account.name}. Their password is unchanged.")
             return 0
         if args.reset_password:
@@ -998,6 +1194,8 @@ def main(argv: list[str] | None = None) -> int:
                 say(f"qkvm: the data folder {data_dir} could not be written ({ex.strerror or ex}); nothing was changed", error=True)
                 return 2
             log.warning("accounts reset from the command line")
+            core.audit.write("accounts_reset", "", note="from the command line where qKVM runs: every account and every saved password erased")
+            core.audit.flush()
             say("Accounts cleared. Start qKVM and open it to create the first one again, then re-enter the KVM passwords.")
             if left:
                 names = ", ".join(left)

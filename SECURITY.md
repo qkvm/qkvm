@@ -63,6 +63,10 @@ and its files readable by their owner only.
 | `sessions.json` | the browsers that asked to be kept signed in over a restart: a SHA-256 of each one's cookie, its account and date | yes; it cannot be replayed as a sign-in |
 | `watch.json` | what each machine was last seen as (on, off, not answering), for alerts after a restart | yes |
 | `audit.log`, `audit.log.1` ... | the activity log: who did what, when, from which address. At a failed sign-in, the name that was typed only where it is an account's | yes |
+| `audit.sqlite`, `audit.sqlite-wal`, `audit.sqlite-shm` | the activity log's searchable index, including copies of its entries; rebuilt from the text logs if missing or damaged. The companion files hold pending writes and SQLite's shared-memory index | yes |
+| `history.sqlite`, `history.sqlite-wal`, `history.sqlite-shm` | machine states, sensor readings, power events and when a machine was first and last heard from, identified by device id; no stored passwords. The companion files hold pending writes and SQLite's shared-memory index | yes |
+| `history.damaged-*.sqlite` and its `-wal` and `-shm` companions | history files set aside after damage was detected; retained for the configured history period | yes |
+| `qkvm-download-*.tmp` | a temporary copy of an activity-log download that outgrew the memory buffer; removed when the download closes, or at the next start if a crash left it behind | yes |
 | `qkvm.log` | starts, device outages, errors; until setup is done, the setup code (sign-ins, refused ones too, are in `audit.log`) | yes |
 | `tls/key.pem`, `tls/cert.pem` | the key and certificate of qKVM's own HTTPS, when it made them | yes: whoever has the key can pass for this qKVM to a browser that has accepted its certificate |
 | `updates/` | versions installed from inside the app | yes (program files) |

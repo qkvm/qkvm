@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from starlette.requests import Request
+from starlette.requests import HTTPConnection, Request
 
 log = logging.getLogger("qkvm")
 
@@ -101,7 +101,7 @@ def same_text(a: str, b: str) -> bool:
     return hmac.compare_digest(a.encode("utf-8"), b.encode("utf-8"))
 
 
-def _proxied(request: Request) -> bool:
+def _proxied(request: HTTPConnection) -> bool:
     return any(h in request.headers for h in ("x-forwarded-for", "forwarded", "x-real-ip"))
 
 
@@ -128,7 +128,7 @@ def _address(text: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
     return address
 
 
-def _believed(request: Request, address: ipaddress.IPv4Address | ipaddress.IPv6Address | None) -> bool:
+def _believed(request: HTTPConnection, address: ipaddress.IPv4Address | ipaddress.IPv6Address | None) -> bool:
     """Whether what this address says about who is calling is believed: a proxy that qKVM was told
     about when it was started; or, where it was told of none, one on this machine (`tailscale serve`).
 
@@ -159,13 +159,13 @@ def sso_name(request: Request, header: str) -> str | None:
     return said[0].strip() or None if len(said) == 1 else None
 
 
-def is_local(request: Request) -> bool:
+def is_local(request: HTTPConnection) -> bool:
     """True for a browser on this machine talking to the wall directly (not through a proxy)."""
     address = _address(request.client.host) if request.client else None
     return address is not None and address.is_loopback and not _proxied(request)
 
 
-def client_allowed(request: Request) -> bool:
+def client_allowed(request: HTTPConnection) -> bool:
     """Whether the caller is one of those qKVM was told to answer (--allow-from). Without that option: anybody.
 
     This computer itself is always answered, as long as nobody is being passed on through it: the
@@ -178,7 +178,7 @@ def client_allowed(request: Request) -> bool:
     return address is not None and any(address in network for network in networks)
 
 
-def client_ip(request: Request) -> str:
+def client_ip(request: HTTPConnection) -> str:
     """Who is calling: the address the connection comes from, or, where that is a proxy that is believed,
     the address the proxy says it is passing on."""
     host = request.client.host if request.client else "unknown"

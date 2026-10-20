@@ -92,6 +92,7 @@ def test_half_a_character_sent_to_every_text_a_changing_route_takes(tmp_path: Pa
                 ("the alert address", "PUT", "/api/v1/alerts", f'{{"enabled": true, "webhook": "http://127.0.0.1:9/{HALF}"}}'),
                 ("the link in alerts", "PUT", "/api/v1/alerts", f'{{"enabled": true, "link": "http://127.0.0.1:9/{HALF}"}}'),
                 ("the order of the tiles", "PUT", "/api/v1/wall/order", f'{{"ids": ["{HALF}", "{device}"]}}'),
+                ("the machines to remove at once", "POST", "/api/v1/devices/remove", f'{{"ids": ["{HALF}", "{other}"]}}'),
                 ("where the wall listens: a name", "PUT", "/api/v1/settings", f'{{"bind": ["lo{HALF}cal"], "port": {port}, "https": false, "interval": 1}}'),
                 ("where the wall listens: an address with a zone", "PUT", "/api/v1/settings", f'{{"bind": ["fe80::1%{HALF}"], "port": {port}, "https": false, "interval": 1}}'),
                 ("who has to have a second step", "PUT", "/api/v1/security", f'{{"require_totp": "{HALF}"}}'),
