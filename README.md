@@ -2181,7 +2181,9 @@ HTTP request of their own, with a session; that door is not built.
   at start, so a browser always gets the page that matches the running server. (Updates
   installed from inside the app restart it for you.)
 - **Start it with the system (Linux):** a systemd unit does it. With qKVM installed in an
-  environment of its own (`python3 -m venv /opt/qkvm`, then `/opt/qkvm/bin/pip install qkvm`),
+  environment of its own (`python3 -m venv /opt/qkvm`, then
+  `/opt/qkvm/bin/python -m pip install --upgrade pip` and
+  `/opt/qkvm/bin/python -m pip install qkvm`),
   this as `/etc/systemd/system/qkvm.service`:
 
   ```
@@ -2191,9 +2193,17 @@ HTTP request of their own, with a session; that door is not built.
   Wants=network-online.target
 
   [Service]
-  ExecStart=/opt/qkvm/bin/qkvm --data-dir /var/lib/qkvm
+  ExecStart=/opt/qkvm/bin/qkvm --data-dir /var/lib/qkvm --https --setup-code
   DynamicUser=yes
+  User=qkvm-web
+  Group=qkvm-web
   StateDirectory=qkvm
+  StateDirectoryMode=0700
+  UMask=0077
+  CapabilityBoundingSet=
+  ProtectKernelTunables=yes
+  ProtectKernelModules=yes
+  ProtectControlGroups=yes
   Restart=on-failure
 
   [Install]
@@ -2201,8 +2211,15 @@ HTTP request of their own, with a session; that door is not built.
   ```
 
   and `systemctl enable --now qkvm`. It runs as a user of its own that can write to
-  `/var/lib/qkvm` and nowhere else. (With `--setup-code` on the `ExecStart` line, the code
-  asked for at the first-run setup is in `journalctl -u qkvm`.)
+  its private state directory at `/var/lib/qkvm` and private temporary files. The code
+  asked for at the first-run setup is in `journalctl -u qkvm`. Use a service identity
+  that is not an existing login account: `DynamicUser=yes` reuses an account if its
+  name already exists, including that account's supplementary groups. Do not use an
+  administrator or an account in `sudo`, `docker` or `lxd` for the web service.
+  The unit above uses `qkvm-web`; choose another unused name if that is already an account.
+  These restrictions allow ordinary outbound device connections and application updates;
+  they do not provide access to host administration tools. An explicit TLS proxy setup
+  may replace `--https`, while retaining the protected first-run setup.
 
   It carries on by itself after a restart. To keep the key that makes that possible out of
   the data folder and its backups, make one that only root can read and hand it to the

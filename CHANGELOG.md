@@ -2,6 +2,8 @@
 
 ## 0.2.0
 
+- Harden the documented Linux service with a separate identity, private file modes, no Linux capabilities, and protected kernel settings; enable HTTPS and a setup code by default.
+
 - Require a current certificate trust bundle so existing installations cannot retain the compromised emSign trust chain.
 
 - Further reduce the immutable container runtime by removing unused package, account and PAM administration tools; retain package inventory and native runtime dependencies.
