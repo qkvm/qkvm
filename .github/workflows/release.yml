@@ -19,6 +19,7 @@
 #                PyPI is told by GitHub which repository and workflow is asking.
 #   Docker Hub   The repository variable DOCKERHUB_IMAGE (for example qkvm/qkvm) and the secrets
 #                DOCKERHUB_USERNAME and DOCKERHUB_TOKEN (an access token that may write to it).
+#                Store both secrets in the protected release environment, not at repository scope.
 #                Without the variable the image goes to ghcr.io only.
 #   Signing      The secret RELEASE_SIGNING_KEY of the environment "release" (Settings, Environments), and
 #                not of the repository: a repository's secrets can be read by any workflow on any branch
@@ -214,6 +215,7 @@ jobs:
   image:
     needs: [build, images, attach]
     runs-on: ubuntu-latest
+    environment: release  # approval and environment-scoped registry credentials
     permissions:
       contents: read
       packages: write
