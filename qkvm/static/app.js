@@ -3859,6 +3859,7 @@ let period = 1000;  // ms between tile refreshes, 0 = paused
 let wallDown = false;
 let wallRun = 0;    // bumped whenever the wall is torn down, so old loops notice and stop
 let focus = null;   // { id, feed, view } while a tile is enlarged
+let focusRequest = 0, focusOpening = null;  // newest requested view, including one waiting for a transition
 let filter = 'all'; // which group of tiles is shown
 let query = '';     // text typed into the search box
 let selecting = false;       // picking KVMs for a bulk action
@@ -5663,7 +5664,13 @@ function zoom(from, to, update) {
 function openFocus(id) {
   const tile = tiles.get(id);
   if (!tile) return;
+  const request = ++focusRequest;
+  focusOpening = id;
   const show = () => {
+    // A later open, Escape, sign-out or removed tile cancels this queued opening.
+    if (request !== focusRequest) return;
+    focusOpening = null;
+    if (tiles.get(id) !== tile || $('#shell').hidden) return;
     stopLive();
     focus?.feed.stop();
     const canvas = $('#focus-canvas');
@@ -5707,6 +5714,8 @@ function behindFocus(covered) {
 }
 
 function closeFocus(instant = false) {
+  const request = ++focusRequest;
+  focusOpening = null;
   if (!focus) return;
   const tile = tiles.get(focus.id);
   // What is closed is this view. Closed with a movement, the hiding runs a frame later; by then the view may
@@ -5714,7 +5723,7 @@ function closeFocus(instant = false) {
   // view, or none, is not this one's to do.
   const closing = focus;
   const hide = () => {
-    if (focus !== closing) return;
+    if (request !== focusRequest || focus !== closing) return;
     stopLive();
     focus?.feed.stop();
     focus = null;
@@ -6301,7 +6310,7 @@ let arranging = null;  // while it is being done: how to leave it
 
 function arrangeTiles() {
   if (arranging || !tiles.size) return;
-  if (focus) closeFocus(true);
+  if (focus || focusOpening) closeFocus(true);
   setSelecting(false);
   // All of them, in the wall's own order: nobody arranges what is hidden by a search, or sorted some other way.
   const was = { order, filter, query, group };
@@ -6416,7 +6425,7 @@ function buildTiles(devices) {
   devices = inOrder(devices);
   const wall = $('#wall');
   const wanted = new Set(devices.map(device => device.id));
-  if (focus && !wanted.has(focus.id)) closeFocus(true);
+  if ((focus && !wanted.has(focus.id)) || (focusOpening && !wanted.has(focusOpening))) closeFocus(true);
   for (const tile of [...tiles.values()]) {
     if (!wanted.has(tile.device.id)) dropTile(tile);
   }
@@ -6939,12 +6948,13 @@ async function boot() {
       setSelecting(!selecting);
     } else if ((event.key === 'd' || event.key === 'D') && !focus) {
       setDisplay(!displayMode);
+    } else if (event.key === 'Escape' && (focus || focusOpening)) {
+      closeFocus();
     } else if (event.key === 'Escape' && !focus && selecting) {
       setSelecting(false);
     } else if (event.key === 'Escape' && !focus && displayMode) {
       setDisplay(false);
-    } else if (focus && event.key === 'Escape') {
-      closeFocus();
+
     } else if (focus && (event.key === 'c' || event.key === 'C') && !$('#focus-control').hidden) {
       controlClicked();
     } else if (focus && event.key === 'ArrowLeft') {

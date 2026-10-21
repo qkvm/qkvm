@@ -2,6 +2,8 @@
 
 ## 0.2.0
 
+- Cancel queued screen enlargements when Escape, sign-out or a newer view request supersedes them; late animation callbacks cannot restore a closed view.
+
 - Create in-app update files and directories with private permissions even when the parent process allows group or world writes.
 
 - Harden the documented Linux service with a separate identity, private file modes, no Linux capabilities, and protected kernel settings; enable HTTPS and a setup code by default.

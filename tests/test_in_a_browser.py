@@ -1432,16 +1432,55 @@ def test_nothing_is_typed_into_a_machine_by_keys_meant_for_the_page(tmp_path: Pa
         expect(tile(page, "Build server")).to_have_attribute("data-state", "online")
         tile(page, "Build server").focus()
         page.keyboard.type("rm -rf /")
+        # The space opens the enlarged view through an asynchronous transition.
+        # Settle that change before closing it and trying to focus the inert wall.
+        expect(page.locator("#focus")).to_be_visible()
         page.keyboard.press("Control+Alt+Delete")
         page.keyboard.press("Escape")  # whatever the letters opened
         page.keyboard.press("Escape")
+        expect(page.locator("#focus")).to_be_hidden()
         tile(page, "Build server").focus()
+        expect(tile(page, "Build server")).to_be_focused()
         page.keyboard.press("Enter")
         expect(page.locator("#focus")).to_be_visible()
         page.keyboard.type("shutdown now")
         page.keyboard.press("Delete")
         page.wait_for_timeout(500)
         assert fake.state.actions == []
+
+
+def test_escape_cancels_queued_enlargements_and_older_openings_do_not_return(tmp_path: Path, browser: Browser, fakes: list[FakeKvm]) -> None:
+    with a_wall(tmp_path, ("Build server", fakes[0])) as (live, _), looking(browser, live) as page:
+        sign_in(page, live)
+        expect(tile(page, "Build server")).to_have_attribute("data-state", "online")
+        # Control transition callback delivery rather than depending on the runner's
+        # animation speed. The normal keyboard handlers still receive every key.
+        page.evaluate("""() => {
+          window.openings = [];
+          document.startViewTransition = update => {
+            window.openings.push(update);
+            return { ready: Promise.resolve(), finished: Promise.resolve() };
+          };
+        }""")
+        tile(page, "Build server").focus()
+        page.keyboard.press("Enter")
+        assert page.evaluate("window.openings.length") == 1
+        page.keyboard.press("Escape")
+        page.evaluate("window.openings.shift()()")
+        expect(page.locator("#focus")).to_be_hidden()
+        expect(tile(page, "Build server")).to_be_focused()
+
+        page.keyboard.press("Enter")
+        page.keyboard.press("Enter")
+        assert page.evaluate("window.openings.length") == 2
+        page.evaluate("window.openings.pop()()")  # newest opening delivered first
+        expect(page.locator("#focus")).to_be_visible()
+        page.keyboard.press("Escape")  # queue its closing
+        page.evaluate("window.openings.shift()()")  # stale opening must do nothing
+        page.evaluate("window.openings.shift()()")  # close the requested view
+        expect(page.locator("#focus")).to_be_hidden()
+        expect(tile(page, "Build server")).to_be_focused()
+        assert fakes[0].state.actions == []
 
 
 # --- what an outside reviewer walked through, and what it found on the way ------------------------------------
