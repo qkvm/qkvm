@@ -39,6 +39,8 @@ dependencies = [
     # Used through the libraries above; listed to keep out versions with known vulnerabilities.
     "anyio>=4.14.2",
     "idna>=3.15",
+    "certifi>=2026.10.19",  # excludes the compromised emSign intermediates from outbound TLS trust
+
     "h11>=0.16",  # reads every request that comes in; older ones could be made to see two requests where a proxy in front saw one
 ]
 

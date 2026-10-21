@@ -2,6 +2,8 @@
 
 ## 0.2.0
 
+- Require a current certificate trust bundle so existing installations cannot retain the compromised emSign trust chain.
+
 - Further reduce the immutable container runtime by removing unused package, account and PAM administration tools; retain package inventory and native runtime dependencies.
 
 - Remove unused mounting, namespace, terminal-inspection and Perl packages from the container; enforce their absence in image scans and verify retained Python/video/TLS dependencies.
