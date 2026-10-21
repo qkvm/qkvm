@@ -30,7 +30,7 @@ Unfixed LOW, MEDIUM and UNKNOWN OS findings remain disclosed in the report as re
 - The systemd advisory affects `systemd-homed`/`systemd-homework`, which are absent.
 - The Perl advisory affects `Archive::Tar`, which is absent from the installed `perl-base` subset.
 
-`check-image-runtime.py` runs against each architecture and verifies UID 10001, empty fstab, and absence of the installer tooling and affected subcomponents above. Source reachability remains a review obligation; this runtime check does not prove that future application changes cannot invoke installed utilities. Privileged containers, arbitrary shell/tool execution inside the image, and modified entrypoints are outside these dispositions.
+`check-image-runtime.py` runs against each architecture and verifies UID 10001, absence of setuid/setgid files, empty fstab, and absence of the installer tooling and affected subcomponents above. Source reachability remains a review obligation; this runtime check does not prove that future application changes cannot invoke installed utilities. Privileged containers, arbitrary shell/tool execution inside the image, and modified entrypoints are outside these dispositions.
 
 Do not renew dates automatically. Recheck upstream fixes, the final image package versions, each exception's trigger and runtime conditions. Remove exceptions when the package is fixed or absent. Keep any new exception equally specific and time-limited. `test-container-policy.py` tests malformed reports and attempted policy bypasses, including changed versions, fix availability, expiry and severity escalation.
 

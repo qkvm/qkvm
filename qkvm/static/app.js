@@ -5471,8 +5471,10 @@ class Control {
     if (this.relative) {
       // (A second button pressed or let go while one is held comes as a move here too: see below. The button of the click
       // that handed the pointer over, granted while it was held, is not one of them.)
-      if (this.handing && !event.buttons) this.handing = false;
-      if (!this.handing && this.buttonsDiffer(event)) this.syncButtons(event, null);
+      // Pointer-lock cursor warps can report buttons=0 on ordinary movement even while a button is
+      // held. Only a button transition (button != -1) changes the held set; primary transitions go
+      // through pointerDown/pointerUp. A movement cannot finish the click that requested the lock.
+      if (!this.handing && event.button !== -1 && this.buttonsDiffer(event)) this.syncButtons(event, null);
       this.moved.dx += event.movementX || 0;
       this.moved.dy += event.movementY || 0;
       this.sayMoveSoon();

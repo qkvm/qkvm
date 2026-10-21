@@ -36,7 +36,10 @@ and what happened. A way to reproduce it helps most.
   The network between a browser and qKVM should be trusted, or HTTPS switched on.
 - An admin is trusted with everything, including where alerts are sent.
 - A new qKVM belongs to whoever opens it first, until a password is chosen. Where others can
-  reach its port before you do, start it with `--setup-code`.
+  reach its port before you do, start it with `--setup-code`. The container image and
+  supplied Compose deployment enable `--https --setup-code` by default. An explicit
+  container command replaces these defaults; retain them unless using an isolated
+  backend behind a trusted TLS proxy.
 - qKVM has a host name (or an address) of its own. A browser keeps what signs it in by host
   name and not by port: a device whose own page is on another port of the name qKVM is
   looked at under (a router that forwards two ports, a tunnel to localhost) would be handed
@@ -162,3 +165,16 @@ Nothing else: no telemetry, no licence check, nothing that reports use.
 
 The newest release is the one that gets fixes. There is no promise of a response time; a
 report is answered as soon as it has been read and understood.
+
+## Live access revocation
+
+Live connections recheck current session, account, token and device access before
+sending each screen frame, granting control, or dispatching input. Queued pointer
+updates and individual steps of a relative mouse movement are checked again when
+they dispatch. A device status request cannot delay the independent periodic check
+that closes idle revoked connections and releases their held keys.
+
+Data already sent to a client cannot be recalled. A device operation already in flight
+may finish after revocation; qKVM releases keys and buttons it put down, including
+late deliveries, and waits for cleanup during controller handover. Cleanup releases
+are allowed after revocation so a machine is not left with keys held down.

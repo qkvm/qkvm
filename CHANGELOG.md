@@ -2,6 +2,11 @@
 
 ## 0.2.0
 
+- Relative mouse movement no longer fabricates button changes during pointer-lock cursor warps; the capture click cannot become a remote click. CI now runs all eight browser suites.
+
+- Recheck live-view access before every screen delivery and input dispatch, including input waiting for controller handover. A stalled device-status request no longer delays revocation.
+- Enable HTTPS and protected first-run setup in the supplied Docker deployment, and remove unnecessary setuid/setgid permissions from the runtime image.
+
 - **Settings saves tolerate brief Windows file locks.** Atomic replacement of the settings
   and their backup retries temporary access and sharing errors for a bounded time. A reader
   briefly holding the file no longer loses a newly learned server identity; persistent

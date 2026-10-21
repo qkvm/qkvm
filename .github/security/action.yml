@@ -51,7 +51,8 @@ runs:
           sleep 2
         done
         test "$(docker inspect -f '{{.State.Health.Status}}' qkvm-security)" = healthy
-        curl --fail --silent --show-error http://127.0.0.1:8787/healthz
+        docker cp qkvm-security:/data/tls/cert.pem "$RUNNER_TEMP/qkvm-security-cert.pem"
+        curl --fail --silent --show-error --cacert "$RUNNER_TEMP/qkvm-security-cert.pem" https://127.0.0.1:8787/healthz
     - name: Fresh vulnerability scan of the archive that will be published
       shell: bash
       env:

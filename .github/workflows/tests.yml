@@ -73,7 +73,7 @@ jobs:
           python -m pip install . pytest playwright==1.63.0
           python -m playwright install --with-deps chromium
       - name: The page, in a browser
-        run: python -m pytest -q tests/test_in_a_browser.py tests/test_in_a_browser_with_the_program_itself.py
+        run: python -m pytest -q tests/*browser*.py
 
   # The RFB reader against real VNC servers: TigerVNC's Xvnc with a terminal in it (what is typed is read back
   # from a file, the pointer's place is asked of the X server), and QEMU's own server showing its firmware's

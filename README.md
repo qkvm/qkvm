@@ -85,14 +85,14 @@ Ubuntu and others do), `pipx install qkvm` does the same and makes that environm
 **As a container:**
 
 ```
-docker run -d --name qkvm --restart unless-stopped -p 8787:8787 -v qkvm-data:/data qkvm/qkvm
+docker run -d --name qkvm --restart unless-stopped --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges:true -p 8787:8787 -v qkvm-data:/data qkvm/qkvm --https --setup-code
 ```
 
-Then open `http://<this machine>:8787/` and choose a password. Do that right away: until a
-password is chosen, a new qKVM belongs to whoever opens it first. Where others can reach
-the port before you do (a server on the internet, a network that is not yours alone), add
-`--setup-code` to the end of the command: qKVM then asks for a code that only its log shows
-(`docker logs qkvm`).
+Then open `https://<this machine>:8787/` and choose a password using the setup code
+shown by `docker logs qkvm`. Verify the generated certificate on the host before trusting
+it in the browser, or install a certificate trusted by your clients. These instructions
+and the supplied Compose file enable HTTPS and protect remote first-account creation
+with a setup code from the first request. Existing accounts are preserved.
 
 The image is there for amd64 and arm64 (the same
 one is at `ghcr.io/qkvm/qkvm`) and runs as an unprivileged user; settings live in the
@@ -112,12 +112,11 @@ backups, give the container a key file of your own as a secret and say where it 
 on the `docker run` line, or the lines that are commented out in the compose file. The file
 needs 32 characters or more, and has to be readable by the container's user (uid 10001).
 
-The line above serves plain HTTP on every address of that machine, which is fine for a first
-look and not for a network other people are on: the first password would cross it in clear.
-Put `--https` at the end of the `docker run` line (or `command: ["--https"]` in the compose
-file) and qKVM serves HTTPS from the first request, with a certificate it makes itself; or
-publish the port to that machine only (`-p 127.0.0.1:8787:8787`) and put a reverse proxy in
-front. Both are described under [How it is protected](#how-it-is-protected).
+For a reverse proxy that terminates HTTPS, publish the backend only on loopback
+(`-p 127.0.0.1:8787:8787`) or an isolated private container network. Only then omit
+`--https` from the backend command; retain `--setup-code`. Do not expose the HTTP
+backend to untrusted clients. See [How it is protected](#how-it-is-protected) for proxy
+trust and certificate configuration.
 
 **From the source:**
 

@@ -3031,7 +3031,7 @@ def create_app(core: Core) -> FastAPI:
     def live_standing(holder: live.Holder, device_id: str) -> tuple[str | None, bool]:
         """Whether whoever was given this pass may still be on a line to this machine, and whether they may act: (why not, may act).
 
-        Asked when the line is let in and every few seconds after it. The line carries no cookie, so the account the
+        Asked at admission, before input and frame delivery, and periodically for idle lines. The account the
         pass was given to is looked at anew here: a browser's sign-in that ended (signed out, or signed out everywhere
         by an admin) ends the line; so does an account removed, suspended or limited to other machines, a token taken
         back or run out, and a wall that locked itself. An account given a lesser role keeps looking and loses the keys.

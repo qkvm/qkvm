@@ -308,6 +308,7 @@ class Hid:
     """
 
     def __init__(self) -> None:
+        self.authorized: Callable[[], bool] | None = None  # checked again when delayed input actually dispatches
         self.keys_down: set[int] = set()  # keys that may be down on the machine: put here before they are sent
         self.buttons_down: set[int] = set()
         self._place: tuple[int, int] | None = None  # where the pointer is to be put, not yet sent
@@ -374,6 +375,8 @@ class Hid:
         by the line itself, whose letting go of a button went to the session that was open while this word waited for
         the next (the pointer's place sent by `_placing`, in a task of its own, with the button of a drag in it). What it
         carried and is not held now is let go of again once it is through, in a task of its own."""
+        if self.authorized is not None and not self.authorized():
+            return
         carried = set(buttons)
         telling = _CARRIED.set(carried)  # (and what a pointer event of this word carries as it goes, it adds: RfbHid._pointer)
         try:
@@ -1392,6 +1395,10 @@ class Line:
                     if self.words:
                         await self.ws.send_text(self.words.popleft())
                     else:
+                        # A queued screen may outlive the account's access while the socket waits.
+                        self.machine._stands(self)
+                        if self.leaving is not None:
+                            continue
                         await self.ws.send_bytes(self.pictures.popleft().message)
                 if self.leaving is not None:
                     await self.ws.close()
@@ -1424,6 +1431,9 @@ class Machine:
             await self._look()  # how the machine is, and how large its picture, before the line is told either
         if line.leaving is not None or line not in self.viewers:
             return  # (told goodbye while the machine was looked at: the tile edited, the wall stopping. Nothing to join.)
+        self._stands(line)
+        if line.leaving is not None:
+            return
         self._source_for(line).add(line)
         line.say(self._state_word())
         if self.watching is None or self.watching.done():
@@ -1524,29 +1534,37 @@ class Machine:
         if source is not None and video is not None and type(video.get("width")) is int and type(video.get("height")) is int:
             source.resize((video["width"], video["height"]))
 
-    async def _watch(self) -> None:
-        """Say how the machine is as that changes, and look now and then whether each line may still be there.
-
-        Nothing that goes wrong in one round stops the next: this is what ends a line whose account was signed out, and
-        takes the keyboard from one lowered to a viewer, for every line to this machine. A line whose standing cannot be
-        found out is not kept on the strength of that: it ends."""
-        checked_at = time.monotonic()
+    async def _watch_status(self) -> None:
+        """Device I/O has its own task: a stalled status request must not postpone revocation."""
         while self.viewers:
-            if self.lines.manager.devices.get(self.device_id) is not self.device:
-                # Edited, or taken off the wall, or the wall locked itself: what a pass was given for is gone.
-                for line in list(self.viewers):
-                    line.end("gone", "This machine was changed or taken off the wall. Open it again.")
-                return
             try:
-                self._idle()
                 await self._look()
-                if time.monotonic() - checked_at >= STANDING_EVERY:
-                    checked_at = time.monotonic()
-                    for line in list(self.viewers):
-                        self._stands(line)
-            except Exception as ex:  # (a bug: said, and the next round goes on)
-                self.device._unexpected("looking at the live lines failed", ex)
+            except Exception as ex:
+                self.device._unexpected("looking at the live status failed", ex)
             await asyncio.sleep(STATE_EVERY)
+
+    async def _watch(self) -> None:
+        """Revoke idle or unauthorized control independently of device network requests."""
+        checking = asyncio.create_task(self._watch_status())
+        checked_at = time.monotonic()
+        try:
+            while self.viewers:
+                if self.lines.manager.devices.get(self.device_id) is not self.device:
+                    for line in list(self.viewers):
+                        line.end("gone", "This machine was changed or taken off the wall. Open it again.")
+                    return
+                try:
+                    self._idle()
+                    if time.monotonic() - checked_at >= STANDING_EVERY:
+                        checked_at = time.monotonic()
+                        for line in list(self.viewers):
+                            self._stands(line)
+                except Exception as ex:
+                    self.device._unexpected("looking at the live lines failed", ex)
+                await asyncio.sleep(STATE_EVERY)
+        finally:
+            checking.cancel()
+            await asyncio.gather(checking, return_exceptions=True)
 
     def _stands(self, line: Line) -> None:
         """Whether this line may still be here, and still act: ended, or its keyboard taken away, where not."""
@@ -1603,6 +1621,9 @@ class Machine:
             if self.holder is line:
                 self._let_go(line, None, None)
             return {"t": "control", "on": False}
+        self._stands(line)
+        if line.leaving is not None or line not in self.viewers:
+            return refused("not_allowed", "This line may no longer act on this machine")
         if self.holder is line:
             return {"t": "control", "on": True}
         if not line.may_control:
@@ -1651,6 +1672,7 @@ class Machine:
         if taken_from is not None:
             self._let_go(taken_from, "taken", f"{line.holder.name} took over this machine's keyboard and mouse", by=line.holder.name)
         self.holder, self.hid, line.control = line, hid, True
+        hid.authorized = lambda: self._input_allowed(line, hid)
         self.input_at = time.monotonic()
         detail: dict[str, Any] = {"user": line.holder.name, "device": self.device.spec.name, "device_id": self.device_id, "on": True}
         if taken_from is not None:
@@ -1744,8 +1766,18 @@ class Machine:
         except Exception:
             log.debug("letting go of keys and buttons failed", exc_info=True)
 
+    def _input_allowed(self, line: Line, hid: Hid) -> bool:
+        """Recheck delayed input at dispatch. Cleanup releases never depend on continued access."""
+        if self.holder is not line or self.hid is not hid:
+            return False
+        self._stands(line)
+        return self.holder is line and self.hid is hid and not hid.ended
+
     async def input(self, line: Line, word: dict[str, Any]) -> None:
         """A key, the pointer, a button or the wheel from the line that holds them. From any other line: nothing."""
+        if self.holder is not line or self.hid is None:
+            return
+        self._stands(line)
         if self.holder is not line or self.hid is None:
             return
         hid, kind = self.hid, word.get("t")
@@ -1753,6 +1785,7 @@ class Machine:
             self.input_at = time.monotonic()
         if self.lines.handing.get(self.device_id):
             await handed_over(self.lines.handing, self.device_id)
+            self._stands(line)
             if self.holder is not line or self.hid is not hid:
                 return  # (taken from this line while it waited)
         with hid.sending():

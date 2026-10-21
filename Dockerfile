@@ -22,7 +22,8 @@ RUN apt-get update \
     && pip install . \
     && python -m pip uninstall --yes pip \
     && useradd --uid 10001 --home-dir /data --no-create-home --shell /usr/sbin/nologin qkvm \
-    && mkdir /data && chown qkvm:qkvm /data
+    && mkdir /data && chown qkvm:qkvm /data \
+    && find /usr -xdev -type f \( -perm -4000 -o -perm -2000 \) -exec chmod a-s {} +
 
 # Settings, the encrypted KVM passwords and the log live here: mount a volume to keep them.
 VOLUME /data
@@ -35,3 +36,6 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
 # reaches it is decided by the port mapping.
 # (-P: the program as it was installed above, and nothing that happens to lie in the current folder.)
 ENTRYPOINT ["python", "-P", "-m", "qkvm", "--data-dir", "/data", "--bind", "all"]
+
+# Secure first-run defaults; an explicit command may configure a trusted TLS proxy instead.
+CMD ["--https", "--setup-code"]
