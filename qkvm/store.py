@@ -252,6 +252,27 @@ def device_url(text: str) -> str:
     return written
 
 
+def _replace_settings(source: Path, destination: Path) -> None:
+    """Replace atomically, allowing a brief Windows reader to finish first.
+
+    Windows readers and scanners can deny replacement while a file is open. Retry only those errors,
+    with at most 0.4 seconds of waiting per copy; persistent failures still reach the caller. Never
+    remove the destination first: the previous complete settings must survive a failed replacement.
+    """
+    deadline = time.monotonic() + 0.4
+    for delay in (0.01, 0.02, 0.04, 0.08, 0.10, 0.15, 0.0):
+        try:
+            os.replace(source, destination)
+            return
+        except OSError as ex:
+            if sys.platform != "win32" or getattr(ex, "winerror", None) not in (5, 32, 33) or not delay:
+                raise
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise
+            time.sleep(min(delay, remaining))
+
+
 def _settle(folder: Path) -> None:
     """Have the folder itself written out, so that a file just put in place is still there after a power cut.
 
@@ -571,12 +592,12 @@ class Store:
                 json.dump(data, fh, indent=2)
                 fh.flush()
                 os.fsync(fh.fileno())
-            os.replace(tmp, self.path)
+            _replace_settings(tmp, self.path)
             _settle(self.path.parent)
             again = self.backup.with_name(self.backup.name + ".new")
             try:
                 shutil.copy2(self.path, again)
-                os.replace(again, self.backup)
+                _replace_settings(again, self.backup)
                 self.backup_is_old = False
             except OSError as ex:
                 try:

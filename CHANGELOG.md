@@ -2,6 +2,10 @@
 
 ## 0.2.0
 
+- **Settings saves tolerate brief Windows file locks.** Atomic replacement of the settings
+  and their backup retries temporary access and sharing errors for a bounded time. A reader
+  briefly holding the file no longer loses a newly learned server identity; persistent
+  failures still report that the save failed, and stale backups are handled as before.
 - **Live control ends when access is revoked.** A request that waited for a device to open its
   keyboard and mouse checks the account's or token's access again before granting control;
   an existing holder who is no longer allowed to control the machine is released.
