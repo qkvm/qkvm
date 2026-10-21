@@ -3899,6 +3899,10 @@ def create_app(core: Core) -> FastAPI:
                 # (64 kB at a time: on Windows a megabyte handed to the connection counts as one write until all of it is
                 # taken, and a client that took less than 50 kB a second was taken for one that takes nothing, and dropped.)
                 while chunk := await asyncio.to_thread(spool.read, 1 << 16):
+                    # A slow receiver can outlive its session or admin role. Keep the original
+                    # Content-Length so a stopped download is recognized as incomplete.
+                    if still_allowed(request) is not None:
+                        return
                     yield chunk
 
             name = f"qkvm-activity-{time.strftime('%Y%m%d-%H%M%S', time.gmtime())}.{format}"

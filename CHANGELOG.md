@@ -2,6 +2,8 @@
 
 ## 0.2.0
 
+- Audit-log downloads stop before sending another chunk when their session or administrator access is revoked.
+
 - Relative mouse movement no longer fabricates button changes during pointer-lock cursor warps; the capture click cannot become a remote click. CI now runs all eight browser suites.
 
 - Recheck live-view access before every screen delivery and input dispatch, including input waiting for controller handover. A stalled device-status request no longer delays revocation.

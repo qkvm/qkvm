@@ -1373,3 +1373,34 @@ if sys.platform == "win32":
             assert kept.read("dev", "states", 0, 1e11)["rows"][0]["state"] == "online"
         finally:
             kept.stop()
+
+
+@pytest.mark.parametrize("revocation", ["signed_out", "role"])
+def test_export_stops_streaming_when_authority_is_revoked(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, revocation: str) -> None:
+    from qkvm.server import Handed
+
+    written(tmp_path, old_entries(1_760_000_000.0, ["rack-1"], 2000), 2)
+    real_init = Handed.__init__
+    delivered: list[bytes] = []
+    with wall(tmp_path) as admin:
+        core = admin.core  # type: ignore[attr-defined]
+        caught_up(core.activity)
+
+        def intercepted(self: Handed, content: Any, done: Any, **how: Any) -> None:
+            async def stream() -> Any:
+                async for chunk in content:
+                    delivered.append(chunk)
+                    yield chunk
+                    if len(delivered) == 1:
+                        user = core.store.users[0]
+                        if revocation == "signed_out":
+                            core.sessions.drop_user(user.id)
+                        else:
+                            user.role = "viewer"
+            real_init(self, stream(), done, **how)
+
+        monkeypatch.setattr(Handed, "__init__", intercepted)
+        reply = admin.get("/api/v1/audit/export", params={"format": "jsonl"})
+        assert int(reply.headers["content-length"]) > 1 << 16
+        assert len(delivered) == 1, "export delivered more sensitive data after revocation"
+        assert len(reply.content) < int(reply.headers["content-length"])
