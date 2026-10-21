@@ -48,22 +48,35 @@ jobs:
   # A release cannot bypass browser, lint/type, platform-matrix and required integration CI.
   tested_commit:
     runs-on: ubuntu-latest
-    timeout-minutes: 46
+    timeout-minutes: 100
     permissions:
       actions: read
+      contents: read
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Require successful Tests for this exact commit
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          for attempt in $(seq 1 180); do
+          for attempt in $(seq 1 380); do
             runs=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow tests.yml \
               --commit "$GITHUB_SHA" --limit 100 --json databaseId,createdAt,headSha,status,conclusion,event)
             latest=$(jq --arg sha "$GITHUB_SHA" \
               '[.[] | select(.headSha == $sha and (.event == "push" or .event == "workflow_dispatch"))] | sort_by(.createdAt, .databaseId) | last' <<< "$runs")
             if jq --exit-status '.status == "completed" and .conclusion == "success"' <<< "$latest" > /dev/null; then
-              echo "Required CI passed for $GITHUB_SHA"
+              run_id=$(jq --raw-output '.databaseId' <<< "$latest")
+              gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id" > "$RUNNER_TEMP/required-ci-before.json"
+              gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/jobs?filter=latest&per_page=100" \
+                --paginate --slurp > "$RUNNER_TEMP/required-ci-jobs.json"
+              # Read the run again after its jobs: a concurrent rerun must not reuse a stale success.
+              gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id" > "$RUNNER_TEMP/required-ci-run.json"
+              jq --exit-status --slurp '.[0].run_attempt == .[1].run_attempt' \
+                "$RUNNER_TEMP/required-ci-before.json" "$RUNNER_TEMP/required-ci-run.json" > /dev/null
+              python3 .github/security/check-required-ci.py \
+                "$RUNNER_TEMP/required-ci-run.json" "$RUNNER_TEMP/required-ci-jobs.json" "$GITHUB_SHA"
               exit 0
             fi
             if [ "$attempt" -gt 4 ] && ! jq --exit-status '. != null and .status != "completed"' <<< "$latest" > /dev/null; then

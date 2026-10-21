@@ -54,6 +54,8 @@ jobs:
         run: python -m mypy
       - name: Container policy regression tests
         run: python .github/security/test-container-policy.py
+      - name: Release CI policy regression tests
+        run: python .github/security/test-required-ci.py
 
   # The page itself, run in a real browser against stand-in KVMs: what a person presses, and what they
   # then see; and, in a second file, against the program as it is started (an update, a restart onto HTTPS). Playwright and its browser are for this job only and nothing a wall is installed with; in
