@@ -9,10 +9,11 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import Callable, Iterator
+from types import SimpleNamespace
 
 import pytest
 
-from qkvm import amtserial
+from qkvm import amtserial, rfb
 from qkvm.amtserial import Kept, SerialConsole
 from qkvm.kvm import REJECTED, DeviceSpec, KvmError
 from tests.fake_amt import AmtState, FakeAmt
@@ -77,15 +78,61 @@ def test_a_console_that_stays_open_is_kept_alive_by_pings(pc: FakeAmt) -> None:
 
     async def run() -> None:
         stop = asyncio.Event()
-        running = asyncio.create_task(console.run(stop, quiet_within=0.5))
-        await asyncio.sleep(1.5)  # (three times as long as the console waits for a word of the engine's: the pongs are those)
-        assert not running.done()
-        stop.set()
-        await running
+        # Use the real idle allowance on a real socket: the stand-in runs on another thread, and a busy Windows
+        # runner can leave it unscheduled for the old half-second allowance. Wait for actual pings, not a fixed sleep;
+        # the reader's renewal of its idle allowance is checked with a controlled clock below.
+        running = asyncio.create_task(console.run(stop))
+        try:
+            async with asyncio.timeout(5):
+                while pc.state.sol_pings < 5:
+                    if running.done():
+                        await running  # report a real connection failure rather than waiting out the test's deadline
+                    await asyncio.sleep(0.01)
+            assert not running.done()
+        finally:
+            stop.set()
+            await running
 
     asyncio.run(run())
     assert pc.state.sol_pings >= 5
     soon(lambda: pc.state.sol_ended == 1, "the console's end, then the session's, reached the engine")
+
+
+def test_each_pong_renews_the_idle_allowance_and_silence_still_times_out(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Five pongs arrive four tenths of a second apart: the connection lasts longer than its half-second idle
+    # allowance, but no individual gap exceeds it. Advance a controlled clock so CPU scheduling cannot make
+    # a healthy peer appear silent. The sixth gap really exceeds the allowance and must propagate the timeout.
+    elapsed = 0.0
+    calls: list[tuple[int, float | None]] = []
+    timed_out = rfb.RfbError(rfb.TIMEOUT, "the server did not send the next piece in time")
+
+    class Replies(rfb.Stream):
+        pongs = 0
+
+        async def read(self, size: int, within: float | None) -> bytes:
+            nonlocal elapsed
+            calls.append((size, within))
+            if size == 7:
+                return bytes(7)
+            assert size == 1
+            gap = 0.4 if self.pongs < 5 else 0.6
+            if within is not None and gap > within:
+                elapsed += within
+                raise timed_out
+            elapsed += gap
+            self.pongs += 1
+            assert self.pongs <= 5, "silence must end the connection"
+            return bytes((amtserial.PONG,))
+
+    replies = Replies()
+    kept = Kept()
+    monkeypatch.setattr(amtserial, "time", SimpleNamespace(monotonic=lambda: elapsed))
+    with pytest.raises(rfb.RfbError) as ended:
+        asyncio.run(amtserial.read_console(replies, kept, quiet_within=0.5))
+    assert ended.value is timed_out
+    assert replies.pongs == 5 and elapsed == 2.5
+    assert calls == [(1, 0.5), (7, amtserial.STEP)] * 5 + [(1, 0.5)]
+    assert kept.total == 0  # pongs keep the connection alive without inventing serial text
 
 
 def test_only_the_newest_is_kept_and_each_byte_is_moved_once_at_the_most() -> None:
