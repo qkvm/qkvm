@@ -2095,7 +2095,8 @@ HTTP request of their own, with a session; that door is not built.
   Started with `--audit-syslog collector.example` (or `host:port`, or `tcp://host:port`),
   qKVM also sends each entry to a syslog collector as it is written (RFC 5424, the entry as
   JSON in the message), so that what was done is known somewhere whoever did it cannot
-  reach. The file stays the record: an entry the collector was not there for is not sent
+  reach. This transport is unencrypted UDP or TCP; use a protected local relay for TLS
+  forwarding, or a protected management network. The file stays the record: an entry the collector was not there for is not sent
   again, and nothing in qKVM waits for the collector. The page searches it, narrows it to a
   machine, an account, a kind and a time, and downloads it; in the table, a name that begins
   like a spreadsheet formula is written as text. The chapter [Activity log](#activity-log) has
@@ -2136,12 +2137,14 @@ HTTP request of their own, with a session; that door is not built.
   has every saved device password. The two other ways:
 
   - `--unlock-file FILE` keeps the key in a file of your choosing, where the folder and its
-    backups do not go: a systemd credential, a Docker secret, another disk. Each is then
-    useless without the other. qKVM makes the file if it is not there, refuses one that lies
+    backups do not go: a systemd credential, a Docker secret, another disk. A copy of the
+    data folder then lacks the automatic-unlock key, but an account password or recovery
+    key can still decrypt its vault. qKVM makes the file if it is not there, refuses one that lies
     in the data folder, and says so when other users of the computer can read it (on Windows
     it cannot tell: keep the file in a folder that is yours alone).
-  - `--locked-start` keeps no key. A copy of the data folder is then worth nothing without
-    an account's password. After every restart nothing is watched, no alert is sent and
+  - `--locked-start` keeps no automatic-unlock key. The vault still opens with an account
+    password or recovery key; metadata and logs remain readable without either.
+    After every restart nothing is watched, no alert is sent and
     every browser signs in again, until a person has been by; a power cut is when that matters.
 
   Going from one way to another takes one start and one sign-in. What the key before opened

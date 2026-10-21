@@ -28,8 +28,9 @@ and what happened. A way to reproduce it helps most.
   comes, a copy of the data folder is a copy of everything saved in it**: so that qKVM
   carries on by itself after a restart, the key that opens the saved passwords lies in that
   folder (`unlock.key`). Keep the folder, and every backup of it, as you would keep those
-  passwords. Started with `--unlock-file`, the folder opens nothing without that file;
-  started with `--locked-start`, nothing without an account's password (see below).
+  passwords. `--unlock-file` moves the automatic-unlock key out of the folder;
+  `--locked-start` removes automatic unlocking. In either mode, an account password or
+  recovery key can still decrypt a copied vault (see below).
 - Whoever can write to the data folder can stop qKVM, and can put there what it runs after an
   update: that folder is the program's, as much as its settings'.
 - The network between qKVM and a KVM may be hostile; that is why certificates are remembered.
@@ -79,7 +80,10 @@ qKVM keeps to carry on after a restart each unlock a copy of it; it is never wri
 unlocked. It follows that **any account's password, with a copy of the folder, opens the
 device passwords in that copy**, a viewer's included, and that removing an account does not
 make an old copy of the folder safe. When somebody who had an account leaves, change the
-passwords of the devices.
+passwords of the devices. Account roles and two-factor sign-in protect online access;
+they do not create separate encryption keys for each role or add a second factor to
+offline vault decryption. Device names, addresses, audit logs and history are also
+readable in the data folder without decrypting the vault.
 
 **Tokens and display links** (*Settings > Tokens*) are credentials of their own: whoever has
 one can do what it was made for (look, or look and act, on the machines it is for) until it
@@ -115,10 +119,12 @@ without anybody signing in. There are three ways, chosen when qKVM is started:
   and a copy of the folder opens everything in it.
 - *`--unlock-file FILE`:* the key is in a file you name, outside the data folder (qKVM
   refuses one inside it): a systemd credential, a Docker secret, another disk. `qkvm.json`
-  holds a copy of the data key locked with it, and neither is of use without the other.
-  Keeping the two apart (other disk, other backup) is up to whoever runs it.
-- *`--locked-start`:* no key. A copy of the folder opens nothing without an account's
-  password, and after every restart nothing is watched until somebody signs in.
+  holds a copy of the data key locked with it. Keep the file separate from the data folder
+  and its backups. This removes automatic unlocking from a stolen data-folder copy;
+  account passwords and the recovery key remain alternative ways to decrypt that copy.
+- *`--locked-start`:* no automatic-unlock key. An account password or recovery key is
+  still able to decrypt a copy of the vault. After every restart nothing is watched
+  until somebody signs in.
 
 Going from one way to another takes the key that was in use out of `qkvm.json`, out of
 `qkvm.bak` and out of the folder at that start, after which a copy of that key opens nothing:

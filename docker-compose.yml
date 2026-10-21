@@ -29,7 +29,8 @@ services:
     #     head -c 32 /dev/urandom | base64 > qkvm-unlock.key
     #     sudo chown 10001 qkvm-unlock.key && sudo chmod 600 qkvm-unlock.key
     # and take the "#" off the next four lines and off the "secrets:" block at the end. The volume and
-    # that file are then each useless without the other: keep them apart.
+    # that file must be kept apart. An account password or recovery key can also decrypt
+    # a copied vault; device metadata and logs are not encrypted.
     # environment:
     #   QKVM_UNLOCK_FILE: /run/secrets/qkvm_unlock
     # secrets:

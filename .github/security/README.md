@@ -45,3 +45,16 @@ bash .github/security/audit-wheel.sh dist/qkvm-0.2.0-py3-none-any.whl dependency
 ```
 
 The composite action in this directory also tests the archived image's health under the Compose security settings. It is shared by scheduled/push/pull-request CI and release builds so newly disclosed vulnerabilities surface before the next release attempt.
+
+
+## Required release CI
+
+`check-required-ci.py` requires the exact set of 18 Tests jobs to succeed for the
+release commit, including integrations that the Tests workflow otherwise allows
+to fail. Missing jobs, failed steps, mismatched commits and run identifiers are
+rejected. The release workflow also rejects evidence collected across different
+run attempts and waits up to 95 minutes within a 100-minute job timeout.
+
+Run `python .github/security/test-required-ci.py` to check these decisions.
+When intentionally changing the Tests matrix or job names, update the required
+set and its tests in the same change. Do not remove a required job to pass a release.
