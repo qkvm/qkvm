@@ -17,6 +17,7 @@ permissions:
 jobs:
   tests:
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -32,7 +33,7 @@ jobs:
       - name: Install
         run: python -m pip install . pytest
       - name: Test
-        run: python -m pytest -q
+        run: python -m pytest -v --full-trace
 
   # The checks a developer runs, in the versions named here: a new release of a checker that finds
   # fault where the one before did not is taken up on purpose, and not met as a red run.

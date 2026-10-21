@@ -44,6 +44,7 @@ class Way(live.Hid):
         super().__init__()
         self.name, self.said = name, said
         self.waits: dict[str, asyncio.Future[str]] = {}
+        self.waiting: dict[str, asyncio.Event] = {}
         self.closed = False
         self.releases = 0
         self.slow_up = 0.0  # seconds a key let go of takes to be taken (a device slow to take what is sent)
@@ -55,6 +56,10 @@ class Way(live.Hid):
     def hold(self, kind: str) -> None:
         """The next word of this kind ("key", "place", "button") waits for `through`."""
         self.waits[kind] = asyncio.get_running_loop().create_future()
+        self.waiting[kind] = asyncio.Event()
+
+    async def wait_until_waiting(self, kind: str) -> None:
+        await asyncio.wait_for(self.waiting[kind].wait(), timeout=5)
 
     def through(self, kind: str, how: str = "lands") -> None:
         self.waits.pop(kind).set_result(how)
@@ -63,6 +68,7 @@ class Way(live.Hid):
         gate = self.waits.get(kind)
         if gate is not None:
             self.said.append((self.name, "waiting", kind))
+            self.waiting[kind].set()
             if await gate == "fails":
                 raise KvmError("dropped", "the way to the machine ended")
 
@@ -190,9 +196,18 @@ class Scene:
 
 def played(scene: Any) -> Any:
     def run() -> None:
-        asyncio.run(scene())
+        asyncio.run(asyncio.wait_for(scene(), timeout=30))
 
     return run
+
+
+@pytest.fixture
+def pointer_clock(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
+    # Freeze only live.py's clock, not asyncio's: selecting the paced path must not depend on two calls
+    # landing within ten real milliseconds. The delayed task and timeout guards still use real time.
+    clock = SimpleNamespace(now=0.0)
+    monkeypatch.setattr(live, "time", SimpleNamespace(monotonic=lambda: clock.now, monotonic_ns=time.monotonic_ns))
+    return clock
 
 
 @pytest.mark.parametrize("checked_while_opening", [False, True])
@@ -329,7 +344,7 @@ def test_a_key_that_fails_after_its_line_lost_the_keyboard_takes_nothing_from_wh
     played(scene)()
 
 
-def test_a_key_behind_a_place_that_was_on_its_way_is_not_sent_after_the_end() -> None:
+def test_a_key_behind_a_place_that_was_on_its_way_is_not_sent_after_the_end(pointer_clock: SimpleNamespace) -> None:
     async def scene() -> None:
         s = Scene()
         await s.take(s.a)
@@ -338,7 +353,7 @@ def test_a_key_behind_a_place_that_was_on_its_way_is_not_sent_after_the_end() ->
         await s.machine.input(s.a, {"t": "m", "x": 20, "y": 20})
         way_a.hold("place")
         typing = asyncio.create_task(s.machine.input(s.a, {"t": "k", "u": 0xE2, "d": True}))  # Alt, behind the place that waits
-        await asyncio.sleep(0.01)
+        await way_a.wait_until_waiting("place")
         s.lose(s.a)
         await asyncio.sleep(0.01)
         way_a.through("place")
@@ -397,7 +412,7 @@ def test_a_button_pressed_on_its_way_at_the_end_is_let_go_of_again_and_nothing_m
     played(scene)()
 
 
-def test_a_place_the_pacing_sent_with_a_drags_button_lands_after_the_button_was_let_go_of_and_lets_it_go_again() -> None:
+def test_a_place_the_pacing_sent_with_a_drags_button_lands_after_the_button_was_let_go_of_and_lets_it_go_again(pointer_clock: SimpleNamespace) -> None:
     # A drag on a PC whose engine just ended its session: the last place of the drag is sent by the pointer's pacing, in a
     # task of its own, with the button in it (RFB says the buttons with every pointer event), and waits for the next
     # session. Meanwhile the person lets go of the button: that goes to the session that is open, none, and the place
@@ -410,8 +425,8 @@ def test_a_place_the_pacing_sent_with_a_drags_button_lands_after_the_button_was_
         await s.machine.input(s.a, {"t": "m", "x": 10, "y": 10})  # (sent at once)
         way_a.hold("place")
         await s.machine.input(s.a, {"t": "m", "x": 20, "y": 20})  # (within ten milliseconds: sent by the pacing, a moment later)
-        await asyncio.sleep(0.05)
-        assert ("way A", "waiting", "place") in s.said, "the pacing did not send the place"
+        await way_a.wait_until_waiting("place")
+        assert way_a._placing is not None and not way_a._placing.done(), "the pacing did not send the place"
         await s.machine.input(s.a, {"t": "mb", "b": 1, "d": False})  # let go of, while the place waits
         way_a.through("place")
         await s.settled()
@@ -453,7 +468,8 @@ def test_a_way_in_made_for_a_line_that_is_stopped_meanwhile_is_closed_all_the_sa
     played(scene)()
 
 
-def test_a_late_letting_go_of_two_buttons_leaves_one_pressed_again_meanwhile_down() -> None:
+@pytest.mark.parametrize("paced", [True, False], ids=["paced", "immediate"])
+def test_a_late_letting_go_of_two_buttons_leaves_one_pressed_again_meanwhile_down(pointer_clock: SimpleNamespace, paced: bool) -> None:
     # A late letting go owes two buttons; while the first goes (a device slow to take it), the holder presses the second
     # again. It was asked once, at the start, whether each was held again: the second went up on the machine, and the
     # program went on believing it down.
@@ -461,18 +477,32 @@ def test_a_late_letting_go_of_two_buttons_leaves_one_pressed_again_meanwhile_dow
         s = Scene()
         await s.take(s.a)
         way_a = s.ways[0]
-        way_a.slow_button_up = 0.05
         await s.machine.input(s.a, {"t": "mb", "b": 1, "d": True})
         await s.machine.input(s.a, {"t": "mb", "b": 3, "d": True})
         await s.machine.input(s.a, {"t": "m", "x": 10, "y": 10})
         way_a.hold("place")
-        await s.machine.input(s.a, {"t": "m", "x": 20, "y": 20})  # (sent by the pacing, with both buttons in it)
-        await asyncio.sleep(0.05)
+        if not paced:
+            pointer_clock.now += live.POINTER_EVERY * 2
+        placing = asyncio.create_task(s.machine.input(s.a, {"t": "m", "x": 20, "y": 20}))
+        await way_a.wait_until_waiting("place")
+        assert (way_a._placing is not None) is paced
         await s.machine.input(s.a, {"t": "mb", "b": 1, "d": False})
         await s.machine.input(s.a, {"t": "mb", "b": 3, "d": False})
+        first_up_started, first_up_allowed = asyncio.Event(), asyncio.Event()
+        say_button = way_a._say_button
+
+        async def hold_first_up(button: int, down: bool) -> None:
+            if button == 1 and not down:
+                first_up_started.set()
+                await first_up_allowed.wait()
+            await say_button(button, down)
+
+        way_a._say_button = hold_first_up  # type: ignore[method-assign]
         way_a.through("place")  # lands with both: both are owed a letting go again
-        await asyncio.sleep(0.02)  # (the first of them is on its way)
+        await asyncio.wait_for(first_up_started.wait(), timeout=5)
         await s.machine.input(s.a, {"t": "mb", "b": 3, "d": True})  # the middle button pressed again
+        first_up_allowed.set()
+        await placing
         await s.settled()
         assert held_down(s.said)[1] == way_a.buttons_down == {3}, f"the machine and the program disagree about the middle button: {s.said}"
 
@@ -489,9 +519,12 @@ class Pc:
         self.spec = SimpleNamespace(name="PC", id="d1")
         self.session = asyncio.Event()
         self.session.set()
+        self.waiting_for_session = asyncio.Event()
         self.pointers: list[tuple[int, int, int, bool]] = []  # x, y, buttons, a letting go
 
     async def input_ready(self) -> None:
+        if not self.session.is_set():
+            self.waiting_for_session.set()
         await self.session.wait()
 
     def screen_size(self) -> tuple[int, int] | None:
@@ -517,7 +550,7 @@ def a_pc_held() -> tuple[Pc, live.Machine, live.Line, Owed]:
     return pc, machine, line, lines
 
 
-def test_a_click_after_a_place_that_waited_for_the_next_session_lands_at_that_place() -> None:
+def test_a_click_after_a_place_that_waited_for_the_next_session_lands_at_that_place(pointer_clock: SimpleNamespace) -> None:
     # The last place before a click waits for the next session (the pacing sent it in the gap); the click comes meanwhile,
     # and waits too. Worked out as it was asked for, the click went to where the pointer had been before the gap, or a
     # press there and a drag to the place.
@@ -526,8 +559,8 @@ def test_a_click_after_a_place_that_waited_for_the_next_session_lands_at_that_pl
         assert (await machine.control(line, True))["on"] is True
         await machine.input(line, {"t": "m", "x": 8192, "y": 8192})  # (80, 50)
         pc.session.clear()  # the engine ends its session
-        await machine.input(line, {"t": "m", "x": 24576, "y": 24576})  # (240, 150), within ten milliseconds: the pacing sends it
-        await asyncio.sleep(0.05)
+        await machine.input(line, {"t": "m", "x": 24576, "y": 24576})  # (240, 150), within the controlled pacing interval
+        await asyncio.wait_for(pc.waiting_for_session.wait(), timeout=5)
         clicking = asyncio.create_task(machine.input(line, {"t": "mb", "b": 1, "d": True}))
         await asyncio.sleep(0.05)
         pc.session.set()  # the next session
