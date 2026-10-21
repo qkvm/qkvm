@@ -94,6 +94,30 @@ def test_install_puts_the_new_version_in_front_and_can_go_back(github: FakeGitHu
     assert starter.roll_back(tmp_path) is False
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX file permission regression")
+@pytest.mark.parametrize("mask", [0o000, 0o002])
+@pytest.mark.parametrize("existing", [False, True])
+def test_installation_is_private_under_a_permissive_umask(github: FakeGitHub, tmp_path: Path, mask: int, existing: bool) -> None:
+    github.publish("9.9.9", make_wheel("9.9.9"))
+    update = updater(github, tmp_path)
+    run(update.check())
+    if existing:
+        update.directory.mkdir()
+        update.directory.chmod(0o777)
+        pointer = update.directory / "current.json"
+        pointer.write_text("{}", encoding="utf-8")
+        pointer.chmod(0o666)
+    before = os.umask(mask)
+    try:
+        assert run(update.install()) == "9.9.9"
+    finally:
+        os.umask(before)
+    assert starter.active_update(tmp_path) == tmp_path / "updates" / "9.9.9" / "qkvm"
+    directory = tmp_path / "updates"
+    for path in (directory, *directory.rglob("*")):
+        assert stat.S_IMODE(path.stat().st_mode) == (0o700 if path.is_dir() else 0o600), path
+
+
 def test_an_update_older_than_the_program_is_ignored(tmp_path: Path) -> None:
     older = "0.0.1"
     package = tmp_path / "updates" / older / "qkvm"

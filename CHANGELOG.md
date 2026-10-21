@@ -2,6 +2,8 @@
 
 ## 0.2.0
 
+- Create in-app update files and directories with private permissions even when the parent process allows group or world writes.
+
 - Harden the documented Linux service with a separate identity, private file modes, no Linux capabilities, and protected kernel settings; enable HTTPS and a setup code by default.
 
 - Require a current certificate trust bundle so existing installations cannot retain the compromised emSign trust chain.

@@ -21,9 +21,11 @@ import importlib.metadata
 import io
 import json
 import logging
+import os
 import platform
 import re
 import shutil
+import tempfile
 import time
 import zipfile
 import zlib
@@ -181,6 +183,18 @@ def check_startup_requirements(package: Path, version: str) -> None:
     _check_requirements(metadata)
 
 
+def _write_private(path: Path, data: bytes) -> None:
+    """Replace an update file atomically with an owner-only file, regardless of the caller's umask."""
+    descriptor, name = tempfile.mkstemp(prefix=".qkvm-update-", dir=path.parent)
+    temporary = Path(name)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(data)
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def unpack(wheel: bytes, version: str, destination: Path) -> None:
     """Unpack a release wheel into `destination`, refusing anything that is not what a release looks like."""
     try:
@@ -216,10 +230,14 @@ def unpack(wheel: bytes, version: str, destination: Path) -> None:
 
         staging = destination.with_name(destination.name + ".tmp")
         shutil.rmtree(staging, ignore_errors=True)
+        staging.mkdir(mode=0o700)
         for member in members:
-            target = staging.joinpath(*member.filename.split("/"))
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(archive.read(member))
+            parts = member.filename.split("/")
+            parent = staging
+            for part in parts[:-1]:
+                parent = parent / part
+                parent.mkdir(mode=0o700, exist_ok=True)
+            _write_private(parent / parts[-1], archive.read(member))
     shutil.rmtree(destination, ignore_errors=True)
     staging.rename(destination)
 
@@ -433,7 +451,9 @@ class Updater:
         return release.version
 
     def _activate(self, version: str, wheel: bytes) -> None:
-        self.directory.mkdir(parents=True, exist_ok=True)
+        self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if os.name == "posix":
+            self.directory.chmod(0o700)
         unpack(wheel, version, self.directory / version)
         pointer = self.directory / "current.json"
         try:
@@ -443,11 +463,9 @@ class Updater:
             previous, ran = None, False
         if not isinstance(previous, str):
             previous, ran = None, False  # (what is written below is a version's name or nothing: never whatever stood there)
-        tmp = pointer.with_suffix(".tmp")
         # (Whether the one before got through its first half minute is kept with it: the starter goes back to
         # it as a version that ran, or as one that is still on trial. See __main__.roll_back.)
-        tmp.write_text(json.dumps({"version": version, "previous": previous, "previous_proven": ran}), encoding="utf-8")
-        tmp.replace(pointer)
+        _write_private(pointer, json.dumps({"version": version, "previous": previous, "previous_proven": ran}).encode("utf-8"))
         # Keep the new version and the one to fall back to; older ones only take up space.
         for entry in self.directory.iterdir():
             if entry.is_dir() and entry.name not in (version, previous):

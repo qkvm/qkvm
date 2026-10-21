@@ -1408,10 +1408,22 @@ def test_an_amt_pcs_screen_live_with_its_keys_and_pointer(tmp_path: Path, monkey
 
 def test_a_pcs_key_waiting_for_its_next_session_when_the_account_is_signed_out_is_let_go_of_when_it_lands(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     # An operator holds a PC with Intel AMT. Its engine ends the session at its own time, and Ctrl, pressed just then, waits
-    # for the next one, which is slow to open. Meanwhile she is signed out everywhere: the line ends, and what it had down
+    # for the next one, held at transmission until the test releases it. Meanwhile she is signed out everywhere: the line ends, and what it had down
     # is let go of, into no session. Then Ctrl lands in the next session, and nothing of the line's is there to let it go.
     monkeypatch.setattr(amt.AmtScreen, "LIVE_PACE", 0.02)
     monkeypatch.setattr(amt, "TIMEOUT_SLACK", 59.0)
+    pending, deliver = threading.Event(), threading.Event()
+    say_key = live.RfbHid._say_key
+
+    async def held_key(self: live.RfbHid, usage: int, down: bool) -> None:
+        if usage == 0xE0 and down:
+            pending.set()
+            async with asyncio.timeout(20):
+                while not deliver.is_set():
+                    await asyncio.sleep(0.01)
+        await say_key(self, usage, down)
+
+    monkeypatch.setattr(live.RfbHid, "_say_key", held_key)
     pc = FakeAmt(AmtState(session_timeout=1, session_lasts=2.5)).start()
     screen = pc.state.screen
     try:
@@ -1425,16 +1437,18 @@ def test_a_pcs_key_waiting_for_its_next_session_when_the_account_is_signed_out_i
             assert line.picture(timeout=20).kind == 2
             line.say(t="control", on=True)
             assert line.word("control") == {"t": "control", "on": True}
-            pc.state.challenge_takes = 4.0  # (the sessions after this one are slow to open)
+            pc.state.session_lasts = 0.0  # only the first session expires; the pending key is gated explicitly
             wait_until(lambda: pc.state.kvm_open == 0, "the engine never ended its session", timeout=10)
             line.say(t="k", u=0xE0, d=True)  # ControlLeft: waits for the next session
-            time.sleep(0.2)
+            assert pending.wait(5), "the key did not enter transmission before sign-out"
             assert admin.post(f"/api/v1/users/{olga_id}/logout").status_code == 200
             assert line.word("bye", timeout=10)["code"] == "signed_out"
             assert (0xFFE3, True) not in screen.keys, "Ctrl landed before the line ended: this is not the case this test is for"
+            deliver.set()
             wait_until(lambda: (0xFFE3, True) in screen.keys, f"Ctrl never landed: {screen.keys}", timeout=15)
             wait_until(lambda: screen.keys[-1] == (0xFFE3, False), f"Ctrl stayed down on the PC: {screen.keys}", timeout=5)
     finally:
+        deliver.set()
         pc.stop()
 
 
