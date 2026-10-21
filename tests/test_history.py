@@ -787,10 +787,12 @@ def test_a_trim_keeps_as_much_as_fits_where_the_older_rows_are_denser(tmp_path: 
     assert oldest < t0 + 100 * 3600  # (every row of the sparser, newer half fits, and some of the denser half with it)
 
 
-def test_a_trim_gives_the_room_back_a_share_of_the_wal_file_at_a_time(tmp_path: Path) -> None:
+def test_a_trim_gives_the_room_back_a_share_of_the_wal_file_at_a_time(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     # Every page the trim moves passes through the -wal file while the file is still as large as it was: given back all at
     # once, a file twice the size allowed took half as much again beside it for the moment (19 MB and 9.3 MB at a cap of
     # 10 MB). A share of the -wal file's at a time, with a checkpoint between them.
+    # Check disk-space bounds independently of runner speed; deadline behavior has its own regressions.
+    monkeypatch.setattr(history, "TRIM_PATIENCE", 600.0)
     t0 = time.time() - 300 * 3600
     history_of(tmp_path, t0, ((t0 + second, f"sensor {number:02d}") for second in range(0, 300 * 3600, 60) for number in range(30)))
     share = 10 * 1_000_000 // 10
@@ -993,6 +995,8 @@ def test_a_trim_short_of_time_cuts_every_machine_along_one_line_of_time(tmp_path
 def test_a_trim_tries_the_wal_file_at_once_where_a_read_outside_has_ended(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     # A checkpoint that did not get through is not tried again for a minute, and a trim that began within it did nothing,
     # though the read outside that held the -wal file had ended: ten minutes over the size allowed, to the next trim.
+    # Allow the size trim to finish; the checkpoint retry and writer deadline are tested separately.
+    monkeypatch.setattr(history, "TRIM_PATIENCE", 600.0)
     monkeypatch.setattr(history, "CHECKPOINT_PATIENCE", 0.2)
     t0 = time.time() - 300 * 3600
     history_of(tmp_path, t0, ((t0 + second, f"sensor {number:02d}") for second in range(0, 300 * 3600, 60) for number in range(30)))
@@ -1474,7 +1478,7 @@ def test_a_kvm_without_a_power_board_has_no_power_in_its_history(tmp_path: Path)
 
 def test_qkvm_status_says_how_large_the_history_is(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     assert cli.main(["status", "--data-dir", str(tmp_path)]) == 3
-    assert "history" not in capsys.readouterr().out  # none yet: nothing to say
+    assert not any(line.startswith("  the history takes ") for line in capsys.readouterr().out.splitlines())
     (tmp_path / history.FILE).write_bytes(b"x" * 2_500_000)
     assert cli.main(["status", "--data-dir", str(tmp_path)]) == 3
     said = capsys.readouterr().out

@@ -331,11 +331,11 @@ def test_update_requires_one_unambiguous_metadata_file(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("wheel", "problem"),
     [
-        (make_wheel("9.9.9", extra={"../outside.py": b""}), "should not"),
-        (make_wheel("9.9.9", extra={"other_package/__init__.py": b""}), "should not"),
-        (make_wheel("9.9.9", declared="9.9.8"), "not the version"),
-        (make_wheel("9.9.9", requires=("surely-not-installed-anywhere>=1",)), "not installed"),
-        (b"this is not a zip file", "not a valid package"),
+        pytest.param(make_wheel("9.9.9", extra={"../outside.py": b""}), "should not", id="path traversal"),
+        pytest.param(make_wheel("9.9.9", extra={"other_package/__init__.py": b""}), "should not", id="unexpected package"),
+        pytest.param(make_wheel("9.9.9", declared="9.9.8"), "not the version", id="version mismatch"),
+        pytest.param(make_wheel("9.9.9", requires=("surely-not-installed-anywhere>=1",)), "not installed", id="missing dependency"),
+        pytest.param(b"this is not a zip file", "not a valid package", id="invalid archive"),
         # Names that Windows takes for another file's, written after the one that was checked:
         pytest.param(make_wheel("9.9.9", extra={"qkvm/cli.py.": b"REPLACED = 1\n"}), "should not", id="a name that ends in a dot"),
         pytest.param(make_wheel("9.9.9", extra={"qkvm/_VERSION.PY": b'__version__ = "1234.0.0"\n'}), "should not", id="a name twice but for its capitals"),
