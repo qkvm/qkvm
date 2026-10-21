@@ -1,0 +1,30 @@
+# Container HIGH advisory assessment — 21 October 2026
+
+The original 44 HIGH package/advisory rows per architecture represented eight distinct CVEs, not 44 independent defects. Four util-linux CVEs were each attributed to nine binary packages from the same source. This assessment concerns the supplied qKVM container, not the Docker host or an independently managed Python installation.
+
+The container now removes `bsdutils`, `login`, `mount`, `util-linux`, `ncurses-bin`, `perl-base`, `libblkid1`, `liblastlog2-2`, `libmount1` and `libsmartcols1`. Removing packages also removes their executables/libraries through the package manager; package records are not hidden or rewritten. Python-linked libraries remain. This is an immutable application image: Debian's general-purpose essential-package assumption is deliberately narrowed, after installation and user creation. Upgrade by rebuilding/replacing the image.
+
+## Disposition of each original HIGH advisory
+
+| Advisory | Original rows | Retained scope | qKVM exposure and action |
+|---|---:|---|---|
+| [CVE-2026-76642](https://security-tracker.debian.org/tracker/CVE-2026-76642) | 9 | `libuuid1` | Failed mount helpers could still trigger privileged post-mount operations. Removed `mount` and `libmount1`; qKVM does not perform OS mount operations. The retained UUID library does not contain that implementation. |
+| [CVE-2026-78408](https://security-tracker.debian.org/tracker/CVE-2026-78408) | 9 | `libuuid1` | A privileged operator using `nsenter --join-cgroup` could pass a privileged descriptor to an untrusted target. Removed `nsenter` with util-linux. The retained UUID library does not implement namespace entry. |
+| [CVE-2026-78409](https://security-tracker.debian.org/tracker/CVE-2026-78409) | 9 | `libuuid1` | Privileged `X-mount.subdir` resolution could escape through intermediate symlinks. Removed mount/libmount. The default fstab is unconfigured; the UUID library has no mount-path resolution code. |
+| [CVE-2026-78410](https://security-tracker.debian.org/tracker/CVE-2026-78410) | 9 | `libuuid1` | Restricted privileged bind mounts could redirect ownership/mode changes. Removed mount/libmount. qKVM does not invoke this functionality. |
+| [CVE-2026-54369](https://security-tracker.debian.org/tracker/CVE-2026-54369) | 1 | `libacl1` | Pathname ACL operations can follow attacker-controlled symlinks. The library remains because core base utilities depend on it. No qKVM use of its ACL APIs was identified; `setfacl` is absent. This is conditional residual risk, not a patched-library claim. Root execution of ACL-aware tools on attacker-controlled paths would invalidate the deployment assumptions. |
+| [CVE-2025-69720](https://security-tracker.debian.org/tracker/CVE-2025-69720) | 4 | ncurses libraries/data | The overflow is in `infocmp`'s `analyze_string`, not the retained shared-library implementation. Removed `infocmp` with ncurses-bin; qKVM does not accept terminfo input. Libraries remain to preserve Python curses and shell compatibility. |
+| [CVE-2026-16742](https://github.com/systemd/systemd/security/advisories/GHSA-jm29-p7hh-vjhv) | 2 | `libsystemd0`, `libudev1` | The affected homed/homework authentication components are absent. Their shared source package also produces these libraries; library presence does not install the vulnerable service. The runtime check rejects both executables. |
+| [CVE-2026-9538](https://security-tracker.debian.org/tracker/CVE-2026-9538) | 1 | None | Perl Archive::Tar can allocate excessive memory from a crafted header. That module was absent already; perl-base is now also removed and its exception deleted. qKVM does not use Perl to unpack archives. |
+
+## Remaining risks and how to reduce them
+
+No remotely reachable qKVM exploit for these eight CVEs was established. Component absence provides stronger evidence than an unused-feature assumption, but this review does not prove absence of every exploit chain or unknown vulnerability. The ACL library remains a conditional exposure; runtime nonroot identity, no setuid/setgid executables, dropped capabilities, no-new-privileges and a read-only root constrain its privileged trigger. Do not run the container privileged, as root, with host namespaces, or with the Docker socket mounted.
+
+The Debian stable tracker still lists the relevant source versions as vulnerable/deferred. Upstream fixes and newer Debian unstable/testing packages exist, but mixing unstable system libraries into the stable image would add ABI and maintenance risk. Continue rebuilding for stable security updates. When stable fixes arrive, the policy blocks old exceptions from accepting a finding that has an available fix. If a retained library becomes necessary on an untrusted or privileged path, address that path immediately rather than renewing an exception.
+
+The expected remaining scanner attribution is ten HIGH rows: four for libuuid1, three for ncurses libraries/data, two for systemd libraries and one for libacl1. These are retained in raw scan evidence and are not filtered with ignore files or VEX. Confirm counts against each build's fresh scan. Exceptions retain their original expiry: **November 19, 2026, 00:00 UTC**, with no automatic renewal.
+
+The scan gate rejects all ten removed package names even without a vulnerability finding. Runtime checks reject the affected executable/module paths and libmount, preserve package inventory, check nonroot identity and filesystem privilege bits, and import Python native extensions plus video/TLS dependencies. Both architectures must pass these checks and certificate-verified HTTPS startup before publication.
+
+A future smaller runtime base could eliminate more source-package attributions, but it must preserve Python native extensions, codec dependencies, CA certificates, timezone data and a verifiable SBOM. Removing package metadata or suppressing advisories is not remediation. Native decoder hardening, host patching, restricted controller networks and secure storage remain separate security obligations.

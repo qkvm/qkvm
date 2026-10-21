@@ -15,12 +15,11 @@
       "packages": {
         "libncursesw6": "6.5+20250216-2",
         "libtinfo6": "6.5+20250216-2",
-        "ncurses-base": "6.5+20250216-2",
-        "ncurses-bin": "6.5+20250216-2"
+        "ncurses-base": "6.5+20250216-2"
       },
-      "reviewed": "2026-10-20",
+      "reviewed": "2026-10-21",
       "expires": "2026-11-19",
-      "reason": "Requires infocmp -i on a crafted terminfo database. The utility is present, but qKVM does not invoke it or accept terminfo uploads. This is a reviewed absent execution path, not a claim that the installed ncurses package is fixed.",
+      "reason": "The vulnerable analyze_string code is in the infocmp executable, removed with ncurses-bin. Retained ncurses libraries/data support Python curses and the base shell; qKVM does not process terminfo input. The runtime check rejects infocmp and the inventory gate rejects ncurses-bin. Retained source-version findings are not represented as patched.",
       "references": [
         "https://security-tracker.debian.org/tracker/CVE-2025-69720",
         "https://invisible-island.net/ncurses/NEWS.html#index-t20251213"
@@ -37,7 +36,7 @@
         "libsystemd0": "257.13-1~deb13u1",
         "libudev1": "257.13-1~deb13u1"
       },
-      "reviewed": "2026-10-20",
+      "reviewed": "2026-10-21",
       "expires": "2026-11-19",
       "reason": "Affects systemd-homed authentication of a forged embedded home record. Only shared libraries are installed; the runtime precondition check rejects systemd-homed and systemd-homework executables on each architecture.",
       "references": [
@@ -55,7 +54,7 @@
       "packages": {
         "libacl1": "2.3.2-2+b1"
       },
-      "reviewed": "2026-10-20",
+      "reviewed": "2026-10-21",
       "expires": "2026-11-19",
       "reason": "Requires privileged pathname ACL operations following attacker-controlled symlinks. qKVM does not call ACL APIs, runs as UID 10001, and the runtime precondition check rejects setfacl. Library presence alone does not establish the trigger.",
       "references": [
@@ -71,19 +70,11 @@
         "arm64"
       ],
       "packages": {
-        "bsdutils": "1:2.41.5-0+deb13u1",
-        "libblkid1": "2.41.5-0+deb13u1",
-        "liblastlog2-2": "2.41.5-0+deb13u1",
-        "libmount1": "2.41.5-0+deb13u1",
-        "libsmartcols1": "2.41.5-0+deb13u1",
-        "libuuid1": "2.41.5-0+deb13u1",
-        "login": "1:4.16.0-2+really2.41.5-0+deb13u1",
-        "mount": "2.41.5-0+deb13u1",
-        "util-linux": "2.41.5-0+deb13u1"
+        "libuuid1": "2.41.5-0+deb13u1"
       },
-      "reviewed": "2026-10-20",
+      "reviewed": "2026-10-21",
       "expires": "2026-11-19",
-      "reason": "Privileged mount with attacker-controlled filesystem and configured fstab X-mount options. qKVM never invokes mount; fstab is empty and the image runs as UID 10001. Deploy with all capabilities dropped and no-new-privileges.",
+      "reason": "Only libuuid1 remains from the util-linux source package, retained for Python _uuid. This advisory concerns mount/libmount or nsenter, not UUID generation. Those executables and libmount are removed; the scanner inventory and runtime check reject their return. Package-source attribution remains visible; the source version is not represented as patched.",
       "references": [
         "https://security-tracker.debian.org/tracker/CVE-2026-76642",
         "https://github.com/util-linux/util-linux/security/advisories/GHSA-m25x-3hj9-m26f"
@@ -97,19 +88,11 @@
         "arm64"
       ],
       "packages": {
-        "bsdutils": "1:2.41.5-0+deb13u1",
-        "libblkid1": "2.41.5-0+deb13u1",
-        "liblastlog2-2": "2.41.5-0+deb13u1",
-        "libmount1": "2.41.5-0+deb13u1",
-        "libsmartcols1": "2.41.5-0+deb13u1",
-        "libuuid1": "2.41.5-0+deb13u1",
-        "login": "1:4.16.0-2+really2.41.5-0+deb13u1",
-        "mount": "2.41.5-0+deb13u1",
-        "util-linux": "2.41.5-0+deb13u1"
+        "libuuid1": "2.41.5-0+deb13u1"
       },
-      "reviewed": "2026-10-20",
+      "reviewed": "2026-10-21",
       "expires": "2026-11-19",
-      "reason": "Requires a privileged operator to invoke nsenter --join-cgroup against an attacker-controlled target. qKVM does not invoke nsenter and runs as UID 10001. Deploy with all capabilities dropped and no-new-privileges; privileged deployments are outside this disposition.",
+      "reason": "Only libuuid1 remains from the util-linux source package, retained for Python _uuid. This advisory concerns mount/libmount or nsenter, not UUID generation. Those executables and libmount are removed; the scanner inventory and runtime check reject their return. Package-source attribution remains visible; the source version is not represented as patched.",
       "references": [
         "https://security-tracker.debian.org/tracker/CVE-2026-78408",
         "https://github.com/util-linux/util-linux/security/advisories/GHSA-55fx-f4gg-cfhj"
@@ -123,19 +106,11 @@
         "arm64"
       ],
       "packages": {
-        "bsdutils": "1:2.41.5-0+deb13u1",
-        "libblkid1": "2.41.5-0+deb13u1",
-        "liblastlog2-2": "2.41.5-0+deb13u1",
-        "libmount1": "2.41.5-0+deb13u1",
-        "libsmartcols1": "2.41.5-0+deb13u1",
-        "libuuid1": "2.41.5-0+deb13u1",
-        "login": "1:4.16.0-2+really2.41.5-0+deb13u1",
-        "mount": "2.41.5-0+deb13u1",
-        "util-linux": "2.41.5-0+deb13u1"
+        "libuuid1": "2.41.5-0+deb13u1"
       },
-      "reviewed": "2026-10-20",
+      "reviewed": "2026-10-21",
       "expires": "2026-11-19",
-      "reason": "Privileged mount and administrator-configured fstab X-mount options are required. qKVM never invokes mount; empty fstab and UID 10001 are checked per architecture. Upstream version-range disagreement is not the basis for this disposition. Deploy with all capabilities dropped and no-new-privileges.",
+      "reason": "Only libuuid1 remains from the util-linux source package, retained for Python _uuid. This advisory concerns mount/libmount or nsenter, not UUID generation. Those executables and libmount are removed; the scanner inventory and runtime check reject their return. Package-source attribution remains visible; the source version is not represented as patched.",
       "references": [
         "https://security-tracker.debian.org/tracker/CVE-2026-78409",
         "https://github.com/util-linux/util-linux/security/advisories/GHSA-8f2p-47x3-43mv"
@@ -149,40 +124,14 @@
         "arm64"
       ],
       "packages": {
-        "bsdutils": "1:2.41.5-0+deb13u1",
-        "libblkid1": "2.41.5-0+deb13u1",
-        "liblastlog2-2": "2.41.5-0+deb13u1",
-        "libmount1": "2.41.5-0+deb13u1",
-        "libsmartcols1": "2.41.5-0+deb13u1",
-        "libuuid1": "2.41.5-0+deb13u1",
-        "login": "1:4.16.0-2+really2.41.5-0+deb13u1",
-        "mount": "2.41.5-0+deb13u1",
-        "util-linux": "2.41.5-0+deb13u1"
+        "libuuid1": "2.41.5-0+deb13u1"
       },
-      "reviewed": "2026-10-20",
+      "reviewed": "2026-10-21",
       "expires": "2026-11-19",
-      "reason": "Privileged mount with attacker-controlled filesystem and configured fstab X-mount options. qKVM never invokes mount; fstab is empty and the image runs as UID 10001. Deploy with all capabilities dropped and no-new-privileges.",
+      "reason": "Only libuuid1 remains from the util-linux source package, retained for Python _uuid. This advisory concerns mount/libmount or nsenter, not UUID generation. Those executables and libmount are removed; the scanner inventory and runtime check reject their return. Package-source attribution remains visible; the source version is not represented as patched.",
       "references": [
         "https://security-tracker.debian.org/tracker/CVE-2026-78410",
         "https://github.com/util-linux/util-linux/security/advisories/GHSA-rh77-686x-2f2m"
-      ]
-    },
-    {
-      "id": "CVE-2026-9538",
-      "severity": "HIGH",
-      "architectures": [
-        "amd64",
-        "arm64"
-      ],
-      "packages": {
-        "perl-base": "5.40.1-6+deb13u1"
-      },
-      "reviewed": "2026-10-20",
-      "expires": "2026-11-19",
-      "reason": "Affects Perl Archive::Tar parsing a malicious tar header. Only perl-base is installed; Archive/Tar.pm is absent and its absence is checked on each architecture. qKVM does not use Perl.",
-      "references": [
-        "https://security-tracker.debian.org/tracker/CVE-2026-9538",
-        "https://www.openwall.com/lists/oss-security/2026/05/26/4"
       ]
     }
   ]

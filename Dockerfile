@@ -16,6 +16,9 @@ COPY pyproject.toml LICENSE README.md ./
 COPY qkvm ./qkvm
 # The base may precede a Debian security update. Install available fixes, and remove pip after
 # installing the app: container updates replace the image, so its bundled HTTP clients are not needed.
+# Remove unused OS administration tools only in this immutable application image,
+# after installation/user creation. Debian marks several as general-purpose OS essentials;
+# qKVM needs none of them. Retain package metadata and Python-linked libraries.
 RUN apt-get update \
     && apt-get upgrade --yes \
     && rm -rf /var/lib/apt/lists/* \
@@ -23,6 +26,11 @@ RUN apt-get update \
     && python -m pip uninstall --yes pip \
     && useradd --uid 10001 --home-dir /data --no-create-home --shell /usr/sbin/nologin qkvm \
     && mkdir /data && chown qkvm:qkvm /data \
+    && apt-get purge --yes --allow-remove-essential \
+        bsdutils login mount util-linux ncurses-bin \
+        libblkid1 liblastlog2-2 libmount1 libsmartcols1 \
+    && apt-get purge --yes --allow-remove-essential perl-base \
+    && test -z "$(dpkg --audit)" \
     && find /usr -xdev -type f \( -perm -4000 -o -perm -2000 \) -exec chmod a-s {} +
 
 # Settings, the encrypted KVM passwords and the log live here: mount a volume to keep them.

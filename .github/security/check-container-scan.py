@@ -19,6 +19,11 @@ from urllib.parse import urlsplit
 
 ARCHITECTURES = {"amd64", "arm64"}
 SEVERITIES = {"UNKNOWN", "LOW", "MEDIUM", "HIGH", "CRITICAL"}
+REMOVED_RUNTIME_PACKAGES = {
+    "bsdutils", "login", "mount", "util-linux", "ncurses-bin", "perl-base",
+    "libblkid1", "liblastlog2-2", "libmount1", "libsmartcols1",
+}
+
 
 
 class InvalidInput(ValueError):
@@ -204,6 +209,11 @@ def evaluate(report, document, arch, today=None):
             raise InvalidInput(f"{label}: unsupported result class/type {result_class!r}/{result_type!r}")
         inventory = package_inventory(result, result_type, label)
         inventory_counts[result_type] += len(inventory)
+        if result_type == "debian":
+            for name, _ in sorted(inventory):
+                if name in REMOVED_RUNTIME_PACKAGES:
+                    violations.append(f"removed runtime package must not return: {name}")
+
         if result_type == "python-pkg":
             python_names.update(name.lower().replace("_", "-") for name, _ in inventory)
         # Trivy legitimately omits this field when there are no findings.

@@ -82,6 +82,13 @@ class ContainerPolicyTests(unittest.TestCase):
         violations, _, _, _ = self.evaluate(**kwargs)
         self.assertTrue(any(text in item for item in violations), violations)
 
+    def test_removed_runtime_packages_are_rejected_even_without_a_finding(self):
+        for name in sorted(POLICY.REMOVED_RUNTIME_PACKAGES):
+            with self.subTest(package=name):
+                self.report = clean_report()
+                self.report["Results"][0]["Packages"].append({"Name": name, "Version": "1.0"})
+                self.assertBlocked(f"removed runtime package must not return: {name}")
+
     def test_clean_inventory_without_vulnerabilities_field_passes(self):
         violations, accepted, residual, inventory = self.evaluate()
         self.assertEqual((violations, accepted, residual), ([], [], {}))

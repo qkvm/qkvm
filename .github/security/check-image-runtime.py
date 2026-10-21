@@ -13,7 +13,7 @@ for module in ("pip", "setuptools"):
     if importlib.util.find_spec(module) is not None:
         raise SystemExit(f"Installer tooling must not remain in the runtime: {module}")
 # Source-package CVEs do not apply when the affected executable/module is absent.
-for pattern in ("**/systemd-homed", "**/systemd-homework", "**/Archive/Tar.pm", "**/setfacl"):
+for pattern in ("**/systemd-homed", "**/systemd-homework", "**/Archive/Tar.pm", "**/setfacl", "**/mount", "**/umount", "**/nsenter", "**/infocmp", "**/perl", "**/libmount.so*"):
     for root in (Path("/usr"), Path("/bin"), Path("/sbin")):
         if next(root.glob(pattern), None) is not None:
             raise SystemExit(f"Exception precondition changed: found {pattern}")
@@ -21,4 +21,7 @@ for pattern in ("**/systemd-homed", "**/systemd-homework", "**/Archive/Tar.pm", 
 for path in Path("/usr").rglob("*"):
     if path.is_file() and path.stat().st_mode & (stat.S_ISUID | stat.S_ISGID):
         raise SystemExit(f"Privileged executable must not remain in the runtime: {path}")
+# Package trimming must preserve Python's native extensions and the video/TLS stack.
+for module in ("_ctypes", "_ssl", "_uuid", "_curses", "aiortc", "av", "cryptography"):
+    __import__(module)
 print("Nonroot identity, absence of setuid/setgid files, and container exception preconditions verified")
