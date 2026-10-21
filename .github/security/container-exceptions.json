@@ -33,12 +33,11 @@
         "arm64"
       ],
       "packages": {
-        "libsystemd0": "257.13-1~deb13u1",
-        "libudev1": "257.13-1~deb13u1"
+        "libsystemd0": "257.13-1~deb13u1"
       },
       "reviewed": "2026-10-21",
       "expires": "2026-11-19",
-      "reason": "Affects systemd-homed authentication of a forged embedded home record. Only shared libraries are installed; the runtime precondition check rejects systemd-homed and systemd-homework executables on each architecture.",
+      "reason": "Affects systemd-homed authentication of a forged embedded home record. Only libsystemd0 remains, required by coreutils; libudev1 is removed. The runtime precondition check rejects systemd-homed and systemd-homework executables on each architecture.",
       "references": [
         "https://security-tracker.debian.org/tracker/CVE-2026-16742",
         "https://github.com/systemd/systemd/security/advisories/GHSA-jm29-p7hh-vjhv"

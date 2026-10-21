@@ -2,6 +2,8 @@
 
 ## 0.2.0
 
+- Further reduce the immutable container runtime by removing unused package, account and PAM administration tools; retain package inventory and native runtime dependencies.
+
 - Remove unused mounting, namespace, terminal-inspection and Perl packages from the container; enforce their absence in image scans and verify retained Python/video/TLS dependencies.
 
 - Discard a JetKVM frame receive that overlaps a returning video signal instead of marking its potentially old picture as current.

@@ -22,6 +22,9 @@ SEVERITIES = {"UNKNOWN", "LOW", "MEDIUM", "HIGH", "CRITICAL"}
 REMOVED_RUNTIME_PACKAGES = {
     "bsdutils", "login", "mount", "util-linux", "ncurses-bin", "perl-base",
     "libblkid1", "liblastlog2-2", "libmount1", "libsmartcols1",
+    "apt", "libapt-pkg7.0", "adduser", "passwd", "login.defs",
+    "libpam-modules", "libpam-modules-bin", "libpam-runtime", "libpam0g",
+    "sysvinit-utils", "libudev1",
 }
 
 

@@ -29,7 +29,10 @@ RUN apt-get update \
     && apt-get purge --yes --allow-remove-essential \
         bsdutils login mount util-linux ncurses-bin \
         libblkid1 liblastlog2-2 libmount1 libsmartcols1 \
-    && apt-get purge --yes --allow-remove-essential perl-base \
+        apt libapt-pkg7.0 adduser passwd login.defs \
+        libpam-modules libpam-modules-bin libpam-runtime libpam0g \
+        sysvinit-utils libudev1 \
+    && dpkg --purge --force-remove-essential perl-base \
     && test -z "$(dpkg --audit)" \
     && find /usr -xdev -type f \( -perm -4000 -o -perm -2000 \) -exec chmod a-s {} +
 
