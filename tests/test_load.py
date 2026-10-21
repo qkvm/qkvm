@@ -422,7 +422,8 @@ def test_a_kvm_that_is_slow_with_its_picture_keeps_no_tile_waiting(
                 task.get_coro().__qualname__ == "KvmDevice._fetch" for task in call.args[0]
             )]
             assert len(picture_waits) == 1
-            assert 0 < picture_waits[0].kwargs["timeout"] <= 0.3
+            # Subtracting monotonic timestamps can round just above the budget.
+            assert 0 < picture_waits[0].kwargs["timeout"] <= kvm.PICTURE_PATIENCE + 1e-6
             assert len(fetching) == 1
             machine = fetching[0]
             pending = next(iter(machine._fetching.values()))
