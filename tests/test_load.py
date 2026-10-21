@@ -10,6 +10,7 @@ import time
 from collections.abc import AsyncIterator, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -407,9 +408,17 @@ def test_a_kvm_that_is_slow_with_its_picture_keeps_no_tile_waiting(
         assert (reply.status_code, reply.json()["code"]) == (503, "no_stream")  # the tile shows "connecting"
         assert time.monotonic() - began < 0.9  # ...and its place in the browser's queue is free again
         # While that request is with the KVM, nobody else waits for it either.
-        began = time.monotonic()
-        assert client.get(snap(device)).status_code == 503
-        assert time.monotonic() - began < 0.2
+        # Check the wait itself: scheduling and HTTP overhead on a busy runner can
+        # exceed 200 ms even when no second picture wait occurs.
+        waiting = AsyncMock(wraps=asyncio.wait)
+        with monkeypatch.context() as patch:
+            patch.setattr(asyncio, "wait", waiting)
+            assert client.get(snap(device)).status_code == 503
+        assert not any(
+            task.get_coro().__qualname__ == "KvmDevice._fetch"
+            for call in waiting.await_args_list
+            for task in call.args[0]
+        )
         # It carried on by itself, and what it brought goes to whoever asks next: the KVM is asked once.
         time.sleep(1.3)
         assert client.get(snap(device)).status_code == 200
