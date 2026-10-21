@@ -44,7 +44,7 @@ CRASH_WINDOW = 60.0
 # Libraries this program runs on, and the first version of each without a publicly known
 # vulnerability that matters here. The same floors are in pyproject.toml; this is for a copy
 # started in an environment that was put together some other way.
-SAFE_FROM = {"starlette": (1, 3, 1), "cryptography": (50, 0, 0), "anyio": (4, 14, 2), "idna": (3, 15, 0), "h11": (0, 16, 0)}
+SAFE_FROM = {"starlette": (1, 3, 1), "cryptography": (50, 0, 0), "anyio": (4, 14, 2), "idna": (3, 15, 0), "certifi": (2026, 10, 19), "h11": (0, 16, 0)}
 
 
 def outdated_libraries() -> dict[str, str]:
