@@ -2,6 +2,8 @@
 
 ## 0.2.0
 
+- Treat unreadable activity responses beside device history as unavailable and recover on the next usable response without an unhandled page error.
+
 - Cancel queued screen enlargements when Escape, sign-out or a newer view request supersedes them; late animation callbacks cannot restore a closed view.
 
 - Create in-app update files and directories with private permissions even when the parent process allows group or world writes.

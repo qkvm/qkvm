@@ -105,3 +105,45 @@ def test_a_history_that_cannot_be_read_is_asked_for_less_and_less_often(tmp_path
             assert 2 <= again <= 3, f"asked {again} times in a minute after the first refusal"
     finally:
         fake.stop()
+
+
+@pytest.mark.parametrize("body", ["", "null", '{"entries":null}', '{"entries":[null]}'])
+def test_unreadable_activity_beside_busy_history_is_unavailable_and_recovers(tmp_path: Path, browser: Browser, body: str) -> None:  # noqa: F811
+    fake = FakeKvm(FakeState()).start()
+    try:
+        with a_wall(tmp_path, ("Build server", fake)) as (live, _), looking(browser, live) as page:
+            sign_in(page, live)
+            audit = "**/api/v1/audit?*"
+            history = "**/api/v1/devices/*/history*"
+            page.route(audit, lambda route: route.fulfill(status=200, content_type="application/json", body=body))
+            page.route(history, lambda route: route.fulfill(status=503, json={"code": "busy", "message": "History busy"}))
+            tile(page, "Build server").focus()
+            with page.expect_response(audit):
+                page.keyboard.press("Enter")
+            expect(page.locator("#focus-history .history-line")).to_contain_text("could not be read")
+            expect(page.locator("#focus-history .history-done")).to_have_count(0)
+            # A later usable answer is still shown; a failed optional activity
+            # request neither breaks the page nor poisons subsequent views.
+            page.keyboard.press("Escape")
+            expect(page.locator("#focus")).to_be_hidden()
+            page.unroute(audit)
+            page.unroute(history)
+            tile(page, "Build server").focus()
+            page.keyboard.press("Enter")
+            expect(page.locator("#focus-history .history-line")).to_contain_text("Last seen")
+            expect(page.locator("#focus-history .history-done")).to_be_visible()
+    finally:
+        fake.stop()
+
+
+def test_an_incomplete_successful_history_response_is_reported_as_unreadable(tmp_path: Path, browser: Browser) -> None:  # noqa: F811
+    fake = FakeKvm(FakeState()).start()
+    try:
+        with a_wall(tmp_path, ("Build server", fake)) as (live, _), looking(browser, live) as page:
+            sign_in(page, live)
+            page.route("**/api/v1/devices/*/history*", lambda route: route.fulfill(status=200, content_type="application/json", body=""))
+            tile(page, "Build server").focus()
+            page.keyboard.press("Enter")
+            expect(page.locator("#focus-history .history-line")).to_contain_text("qKVM returned an unreadable response")
+    finally:
+        fake.stop()

@@ -186,7 +186,11 @@ async function api(method, path, body, patience = 30000) {
     throw new ApiError('qKVM is not responding', 'network', 0);
   }
   let data = null;
-  try { data = await res.json(); } catch { /* empty or not JSON */ }
+  try { data = await res.json(); } catch {
+    // A successful status does not make an interrupted or malformed body a usable answer.
+    // 204 is the API's intentional empty response; other successes must contain JSON.
+    if (res.ok && res.status !== 204) throw new ApiError('qKVM returned an unreadable response', 'invalid_response', res.status);
+  }
   if (!res.ok) {
     if (res.status === 401 && data?.code === 'unauthorized') sessionExpired();
     if (res.status === 403 && data?.code === 'totp_required') mustEnroll();
@@ -6058,10 +6062,13 @@ async function refreshHistory(id, run) {
   // of its own), and drawn when it comes: the history does not wait for it. (Live views left out: whoever has it enlarged
   // has one open, and the three lines would soon be nothing but looks.)
   const doing = can('admin')
-    ? api('GET', `api/v1/audit?device=${encodeURIComponent(id)}&limit=${DONE_ASKED}`).then(found => ({
-      entries: found.entries.filter(entry => entry.event !== 'live_opened' && entry.event !== 'live_closed').slice(0, DONE_SHOWN),
-      looked: found.entries.length,
-    }), () => null)
+    ? api('GET', `api/v1/audit?device=${encodeURIComponent(id)}&limit=${DONE_ASKED}`).then(found => {
+      if (!Array.isArray(found?.entries)) return null;
+      return {
+        entries: found.entries.filter(entry => entry.event !== 'live_opened' && entry.event !== 'live_closed').slice(0, DONE_SHOWN),
+        looked: found.entries.length,
+      };
+    }).catch(() => null)  // includes an unreadable answer, before waiting for the history alongside it
     : Promise.resolve(null);
   try {
     summary = await api('GET', `api/v1/devices/${id}/history`);
