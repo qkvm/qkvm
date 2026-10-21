@@ -309,40 +309,47 @@ def test_the_stand_in_terminal_counts_what_it_says() -> None:
 
 
 @pytest.mark.parametrize("when", ["in answer to something the wall said", "together with its answer to the handshake"])
-def test_what_a_device_said_just_before_it_reset_the_connection_is_heard(when: str) -> None:
-    # A device that says something and hangs up the hard way in the same breath. On Windows the reset is known
-    # of before what came just ahead of it is handed over; for a while "is the connection closing?" was asked
-    # before anything was worked through, and what such a device had said was thrown away, its answer to the
-    # handshake among it.
-    # (What Windows itself throws away is another matter, and not the program's: words that arrived while
-    # nobody was reading are gone once a reset comes in behind them, where Linux hands them over. A wall that
-    # is late to look, as on a loaded machine, has lost them before it sees anything. This test once let the
-    # words come while the wall was between two reads, and heard them 39 times in 40 on an idle machine and 18
-    # on a loaded one. Here the wall is reading when they come, and then does not look until the device has
-    # hung up, as a loaded machine would not have: the reset is known of before the words are handed over,
-    # the moment they used to be thrown away. Forty in forty.)
+def test_what_a_device_said_just_before_it_reset_the_connection_is_heard(when: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    # A TCP reset may discard bytes that Windows has not delivered yet. First
+    # establish that the message reached the parser, then reset before recv().
+    # The separate closing-transport regression in test_beside_the_fix covers
+    # data_received after transport shutdown, without relying on OS ordering.
     said = b'{"the last": "words"}'
     tries = 40
-    hung_up = threading.Event()  # set by the device once it has said its words and reset the connection
+    delivered, hung_up = threading.Event(), threading.Event()
+    original = kvm._ToADevice.process_event
 
-    def answers_and_resets(conn: socket.socket) -> None:
-        conn.recv(4096)  # whatever the wall said
-        conn.sendall(frame(0x1, said))
+    def received(connection: kvm._ToADevice, event: object) -> None:
+        original(connection, event)
+        if getattr(event, "opcode", None) == 1 and getattr(event, "data", None) == said:
+            delivered.set()
+
+    monkeypatch.setattr(kvm._ToADevice, "process_event", received)
+
+    def reset_after_delivery(conn: socket.socket) -> None:
+        delivered.wait(5)
         reset(conn)
         hung_up.set()
 
+    def answers_and_resets(conn: socket.socket) -> None:
+        conn.recv(4096)
+        conn.sendall(frame(0x1, said))
+        reset_after_delivery(conn)
+
     asked = when == "in answer to something the wall said"
-    device = OddDevice(answers_and_resets) if asked else InOneBreath(frame(0x1, said), then=reset)
+    device = OddDevice(answers_and_resets) if asked else InOneBreath(frame(0x1, said), then=reset_after_delivery)
 
     async def run() -> list[str]:
         heard = []
         for _ in range(tries):
+            delivered.clear()
+            hung_up.clear()
             try:
                 async with kvm.ws_connect(f"ws://127.0.0.1:{device.port}/", open_timeout=5, close_timeout=1) as ws:
                     if asked:
-                        hung_up.clear()
                         await ws.send("say it")
-                        hung_up.wait(5)  # the loop held, on purpose, until the words and the reset have both landed
+                    assert await asyncio.to_thread(hung_up.wait, 5), "device did not reset"
+                    assert delivered.is_set(), "message did not reach the parser"
                     heard.append(str(await asyncio.wait_for(ws.recv(), 5)))
             except Exception as ex:
                 heard.append(type(ex).__name__)

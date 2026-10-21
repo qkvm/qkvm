@@ -398,35 +398,57 @@ def test_a_viewer_on_a_slow_link_is_not_handed_its_own_last_picture(tmp_path: Pa
 def test_a_kvm_that_is_slow_with_its_picture_keeps_no_tile_waiting(
     tmp_path: Path, fake: FakeKvm, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    release = threading.Event()
+    fetching: list[KvmDevice] = []
+    original = KvmDevice._fetch_snapshot
+
+    async def held(device: KvmDevice, size: str, asked: float) -> kvm.Snapshot:
+        fetching.append(device)
+        assert await asyncio.to_thread(release.wait, 20), "picture was never released"
+        return await original(device, size, asked)
+
+    monkeypatch.setattr(KvmDevice, "_fetch_snapshot", held)
     with wall(tmp_path) as client:
-        device = add(client, fake.url)
-        assert client.get("/api/v1/status").json()[device]["state"] == "online"
-        monkeypatch.setattr(kvm, "PICTURE_PATIENCE", 0.3)
-        fake.state.slow_snapshot = 1.2
-        began = time.monotonic()
-        reply = client.get(snap(device))
-        assert (reply.status_code, reply.json()["code"]) == (503, "no_stream")  # the tile shows "connecting"
-        assert time.monotonic() - began < 0.9  # ...and its place in the browser's queue is free again
-        # While that request is with the KVM, nobody else waits for it either.
-        # Check the wait itself: scheduling and HTTP overhead on a busy runner can
-        # exceed 200 ms even when no second picture wait occurs.
-        waiting = AsyncMock(wraps=asyncio.wait)
-        with monkeypatch.context() as patch:
-            patch.setattr(asyncio, "wait", waiting)
-            assert client.get(snap(device)).status_code == 503
-        assert not any(
-            task.get_coro().__qualname__ == "KvmDevice._fetch"
-            for call in waiting.await_args_list
-            for task in call.args[0]
-        )
-        # It carried on by itself, and what it brought goes to whoever asks next: the KVM is asked once.
-        time.sleep(1.3)
-        assert client.get(snap(device)).status_code == 200
-        assert len(fake.state.snapshot_queries) == 1
-        # That picture has been handed out now. The next request is for a new one.
-        fake.state.slow_snapshot = 0
-        assert client.get(snap(device)).status_code == 200
-        assert len(fake.state.snapshot_queries) == 2
+        try:
+            device = add(client, fake.url)
+            assert client.get("/api/v1/status").json()[device]["state"] == "online"
+            monkeypatch.setattr(kvm, "PICTURE_PATIENCE", 0.3)
+            waiting = AsyncMock(wraps=asyncio.wait)
+            with monkeypatch.context() as patch:
+                patch.setattr(asyncio, "wait", waiting)
+                reply = client.get(snap(device))
+            assert (reply.status_code, reply.json()["code"]) == (503, "no_stream")
+            picture_waits = [call for call in waiting.await_args_list if any(
+                task.get_coro().__qualname__ == "KvmDevice._fetch" for task in call.args[0]
+            )]
+            assert len(picture_waits) == 1
+            assert 0 < picture_waits[0].kwargs["timeout"] <= 0.3
+            assert len(fetching) == 1
+            machine = fetching[0]
+            pending = next(iter(machine._fetching.values()))
+            assert not pending.done()
+            # Windows timers may wake just before the monotonic deadline. Ensure
+            # it has expired before checking that later callers do not wait again.
+            deadline = next(iter(machine._fetching_since.values())) + kvm.PICTURE_PATIENCE
+            wait_until(lambda: time.monotonic() >= deadline, "picture budget did not expire")
+            waiting.reset_mock()
+            with monkeypatch.context() as patch:
+                patch.setattr(asyncio, "wait", waiting)
+                assert client.get(snap(device)).status_code == 503
+            assert not any(
+                task.get_coro().__qualname__ == "KvmDevice._fetch"
+                for call in waiting.await_args_list for task in call.args[0]
+            )
+            assert not pending.done()
+            assert len(fetching) == 1
+            release.set()
+            wait_until(pending.done, "released picture did not finish")
+            assert client.get(snap(device)).status_code == 200
+            assert len(fake.state.snapshot_queries) == 1
+            assert client.get(snap(device)).status_code == 200
+            assert len(fake.state.snapshot_queries) == 2
+        finally:
+            release.set()
 
 
 def test_a_tile_whose_turn_came_late_is_not_handed_its_own_last_picture(fake: FakeKvm) -> None:

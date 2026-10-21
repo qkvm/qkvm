@@ -626,7 +626,11 @@ def test_a_download_that_cannot_be_made_whole_is_refused_and_not_sent_in_part(tm
     # Sent as it was read, a download whose second page could not be read in time (or whose asker was signed out meanwhile)
     # ended as a whole one does: a file that looked complete, with part of the log missing (the second reviewer of W4c). It is
     # made whole before anything is sent now, and sent with its length; one that cannot be made whole is refused.
-    written(tmp_path, old_entries(1_760_000_000.0, ["rack-1"], 2 * activity.PAGE + 50), 2)
+    entries = old_entries(1_760_000_000.0, ["rack-1"], 2 * activity.PAGE + 50)
+    written(tmp_path, entries, 2)
+    # Startup can append its unlock event while a snapshot is being prepared. Check every
+    # historical record, rather than comparing the snapshot with a log that keeps growing.
+    params = {"format": "jsonl", "until": entries[-1]["time"]}
     real = activity.Pager.next
     pages = {"read": 0}
 
@@ -639,13 +643,13 @@ def test_a_download_that_cannot_be_made_whole_is_refused_and_not_sent_in_part(tm
     with wall(tmp_path) as admin:
         caught_up(admin.core.activity)  # type: ignore[attr-defined]
         monkeypatch.setattr(activity.Pager, "next", next_page)
-        refused = admin.get("/api/v1/audit/export", params={"format": "jsonl"})
+        refused = admin.get("/api/v1/audit/export", params=params)
         assert (refused.status_code, refused.json()["code"]) == (503, "activity_unavailable")
         monkeypatch.undo()
         assert not [entry for entry in admin.core.audit.tail(10) if entry["event"] == "activity_exported"]  # type: ignore[attr-defined]  # (nothing was taken)
-        whole = admin.get("/api/v1/audit/export", params={"format": "jsonl"})
+        whole = admin.get("/api/v1/audit/export", params=params)
         assert whole.status_code == 200 and int(whole.headers["content-length"]) == len(whole.content)
-        assert len(whole.text.splitlines()) == len(admin.core.audit.tail(10**6)) - 1  # type: ignore[attr-defined]  # (all but its own entry)
+        assert [json.loads(line) for line in whole.text.splitlines()] == list(reversed(entries))
 
 
 def test_an_index_whose_stop_took_longer_than_was_waited_for_is_started_again_all_the_same(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
