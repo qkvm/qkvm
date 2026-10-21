@@ -970,7 +970,14 @@ class JetKvmDevice(Device):
 
         try:
             while True:
-                session.frame = await track.recv()
+                signal_at = session.signal_at
+                frame = await track.recv()
+                if signal_at != session.signal_at:
+                    # This receive began before the screen returned. Its decoded
+                    # frame may still belong to the previous signal; wait for the
+                    # next receive instead of marking that picture as current.
+                    continue
+                session.frame = frame
                 session.frame_at = time.monotonic()
         except MediaStreamError:
             pass

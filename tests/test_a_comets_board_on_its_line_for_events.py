@@ -454,8 +454,13 @@ def test_once_nobody_watches_the_picture_the_board_is_asked_again(tmp_path: Path
             wait_until(lambda: bool(board_of(client, device)) and fake.state.streams == 0, "the line was held while nobody watched the picture")
             before = asked(fake)
             fake.state.computer_on = False
-            wait_until(lambda: board_of(client, device)["power"] is False, "the board was not asked once nobody watched")
-            assert asked(fake) > before
+            # Closing the event line and refreshing the status happen in separate
+            # tasks. A final event can report the power change before the first
+            # fallback poll completes; require both observations within the bound.
+            wait_until(
+                lambda: board_of(client, device)["power"] is False and asked(fake) > before,
+                "the board was not asked once nobody watched",
+            )
             heard_on_its_line(client, fake, device)
             assert client.delete(f"/api/v1/devices/{device}").status_code == 200
             wait_until(lambda: fake.state.viewers == 0, "the line outlived its tile")

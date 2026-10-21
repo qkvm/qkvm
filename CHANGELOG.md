@@ -2,6 +2,8 @@
 
 ## 0.2.0
 
+- Discard a JetKVM frame receive that overlaps a returning video signal instead of marking its potentially old picture as current.
+
 - Audit-log downloads stop before sending another chunk when their session or administrator access is revoked.
 
 - Relative mouse movement no longer fabricates button changes during pointer-lock cursor warps; the capture click cannot become a remote click. CI now runs all eight browser suites.

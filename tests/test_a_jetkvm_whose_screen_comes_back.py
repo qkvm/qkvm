@@ -22,6 +22,7 @@ still taken for one that stopped, after FRAME_STALE, as before.
 
 from __future__ import annotations
 
+import asyncio
 import threading
 import time
 from pathlib import Path
@@ -29,6 +30,7 @@ from pathlib import Path
 import pytest
 
 from qkvm import jetkvm
+from qkvm.kvm import DeviceSpec
 from tests.fake_jetkvm import FakeJetKvm, JetState
 from tests.test_jetkvm import fast, picture  # noqa: F401  (the fixture)
 from tests.test_live import Picture, Wall
@@ -208,3 +210,41 @@ def test_an_answer_about_the_screen_asked_before_it_went_to_sleep_does_not_wake_
             assert look["state"] == "no_signal", look  # the event is newer than the answer
     finally:
         jet.stop()
+
+
+def test_a_frame_read_across_a_signal_change_is_not_marked_as_a_new_picture() -> None:
+    from aiortc.mediastreams import MediaStreamError
+
+    async def run() -> None:
+        device = jetkvm.JetKvmDevice(DeviceSpec("jet", "A JetKVM", "http://127.0.0.1:18901", "", "", kind="jetkvm"))
+        session = jetkvm._Session()
+        previous, delayed, fresh = object(), object(), object()
+        session.frame = previous
+        session.frame_at = 1.0
+        session.ready_said = True
+
+        class Track:
+            calls = 0
+
+            async def recv(self) -> object:
+                self.calls += 1
+                if self.calls == 1:
+                    # A decode already in flight when the screen goes and returns
+                    # cannot establish that its result belongs to the new signal.
+                    jetkvm._video_said(session, {"ready": False})
+                    jetkvm._video_said(session, {"ready": True})
+                    await asyncio.sleep(0)
+                    return delayed
+                if self.calls == 2:
+                    assert session.frame is previous
+                    assert session.frame_at == 1.0
+                    return fresh
+                assert session.frame is fresh
+                assert session.frame_at >= session.signal_at
+                raise MediaStreamError
+
+        track = Track()
+        await device._watch(session, track)
+        assert track.calls == 3
+
+    asyncio.run(run())
