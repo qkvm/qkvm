@@ -521,7 +521,7 @@ def test_a_shown_tile_takes_a_still_now_and_then_and_a_live_view_holds_a_session
     # only shown on the wall gets a still every STILL_EVERY, each a short session that closes (Intel's border on the PC's
     # monitor only for that); between them the cached still is handed out. A live view (enlarged, or its live line) holds a
     # session open and draws at a viewer's pace.
-    monkeypatch.setattr(amt.AmtScreen, "STILL_EVERY", 1.0)
+    monkeypatch.setattr(amt.AmtScreen, "STILL_EVERY", 3600.0)
 
     async def run() -> None:
         device = a_pc(pc)
@@ -534,12 +534,14 @@ def test_a_shown_tile_takes_a_still_now_and_then_and_a_live_view_holds_a_session
             while pc.state.redirection_open:
                 assert time.monotonic() < deadline, "the still session was held open"
                 await asyncio.sleep(0.02)
-            for _ in range(10):  # a tile shown for half a second: the cached still, no new session
+            for _ in range(10):  # repeated looks within the cache interval: no new session
                 assert (await device.snapshot(640)).still is True
                 await asyncio.sleep(0.05)
             assert pc.state.kvm_sessions == 1 and device._screen._failures == 0
             # STILL_EVERY on: the next look takes a fresh still, another short session, and closes it again.
-            await asyncio.sleep(1.0)
+            # Age the cached frame explicitly: wall-clock scheduling on loaded
+            # Windows runners must not expire it during the cached-frame checks.
+            device._screen._still_at -= device._screen.STILL_EVERY
             await device.snapshot(640)  # (due: kicks a fresh still in the background, the cached one shown meanwhile)
             deadline = time.monotonic() + 5
             while pc.state.kvm_sessions < 2 or pc.state.redirection_open:

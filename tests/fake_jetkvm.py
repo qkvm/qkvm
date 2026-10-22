@@ -34,6 +34,8 @@ Uses the aiortc package, like the driver it tests.
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
+
 import asyncio
 import base64
 import json
@@ -182,7 +184,29 @@ class FakeScreen(MediaStreamTrack):
 
 
 def make_fake_jetkvm(state: JetState) -> FastAPI:
-    app = FastAPI()
+    peers: set[Any] = set()
+    closing: dict[Any, asyncio.Future[Any]] = {}
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        try:
+            yield
+        finally:
+            # Finish peer teardown before uvicorn closes its event loop. A peer
+            # replaced by a new viewer can still have ICE/DTLS cleanup pending.
+            if current["pc"] is not None:
+                peers.add(current["pc"])
+            for peer in tuple(peers):
+                close_connection(peer)
+            tasks = tuple(closing.values())
+            if tasks:
+                _, pending = await asyncio.wait(tasks, timeout=5)
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+            peers.clear()
+
+    app = FastAPI(lifespan=lifespan)
     # The viewer's connection, its `rpc` and `hidrpc` channels, and whether it did the hidrpc handshake.
     current: dict[str, Any] = {"pc": None, "rpc": None, "hid": None, "shaken": False}
 
@@ -500,14 +524,19 @@ def make_fake_jetkvm(state: JetState) -> FastAPI:
         let_go_of_the_keyboard()  # (a real one let go of a key the previous viewer held, as the next one came; said to it)
         current.update(pc=None, rpc=None, hid=None, shaken=False)  # (somebody else's now)
 
-    closing: set[asyncio.Future[Any]] = set()  # (connections being closed, held until they are)
-
     def close_connection(pc: RTCPeerConnection) -> None:
-        # The loop holds only weak references to tasks. Keep delayed hand-over
-        # cleanup alive too, including when close waits on another close's future.
+        # Own both explicit and library-initiated cleanup until it finishes.
+        # asyncio itself only keeps weak references to pending tasks.
+        if pc in closing:
+            return
         task = asyncio.ensure_future(pc.close())
-        closing.add(task)
-        task.add_done_callback(closing.discard)
+        closing[pc] = task
+
+        def finished(task: asyncio.Future[Any]) -> None:
+            closing.pop(pc, None)
+            peers.discard(pc)
+
+        task.add_done_callback(finished)
 
     def drop() -> None:
         """The device ends the viewer's connection without a word of its own (a restart of its program, the network)."""
@@ -581,6 +610,7 @@ def make_fake_jetkvm(state: JetState) -> FastAPI:
             do_hid_batch()
         if current["pc"] is pc:
             let_go_of_the_keyboard()
+        close_connection(pc)
 
     @app.websocket("/webrtc/signaling/client")
     async def signalling(websocket: WebSocket) -> None:
@@ -606,6 +636,7 @@ def make_fake_jetkvm(state: JetState) -> FastAPI:
                 hand_over()
 
                 pc = RTCPeerConnection(RTCConfiguration(iceServers=[]))
+                peers.add(pc)
                 current.update(pc=pc, rpc=None, hid=None, shaken=False)
                 state.sessions += 1
                 pc.addTrack(FakeScreen(state))

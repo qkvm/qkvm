@@ -875,3 +875,23 @@ def test_fake_handover_keeps_pending_connection_cleanup_alive() -> None:
             loop.set_exception_handler(previous)
 
     asyncio.run(main())
+
+
+def test_fake_shutdown_finishes_connection_cleanup() -> None:
+    """Stopping the simulator must finish its peer before closing the event loop."""
+    from tests.fake_jetkvm import make_fake_jetkvm
+
+    async def main() -> None:
+        closed = asyncio.Event()
+
+        class Peer:
+            async def close(self) -> None:
+                await asyncio.sleep(0)
+                closed.set()
+
+        app = make_fake_jetkvm(JetState())
+        async with app.router.lifespan_context(app):
+            app.state.current.update(pc=Peer(), rpc=None, hid=None)
+        assert closed.is_set(), "simulator stopped without awaiting its peer close"
+
+    asyncio.run(main())
