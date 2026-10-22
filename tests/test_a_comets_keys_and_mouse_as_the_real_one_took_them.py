@@ -60,14 +60,28 @@ def test_the_line_says_how_a_kvms_pointer_is_moved_and_says_it_again_when_that_c
         comet.stop()
 
 
-def test_a_jetkvms_pointer_is_moved_both_ways(tmp_path: Path) -> None:
+@pytest.mark.parametrize("startup_delay", [0.0, 11.0])
+def test_a_jetkvms_pointer_is_moved_both_ways(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, startup_delay: float) -> None:
     # A JetKVM takes places and steps (its absolute and relative reports): both.
+    import asyncio
+    from qkvm import jetkvm
+
+    hold = jetkvm.JetKvmDevice._hold
+
+    async def delayed(self, session):
+        await asyncio.sleep(startup_delay)
+        await hold(self, session)
+
+    monkeypatch.setattr(jetkvm.JetKvmDevice, "_hold", delayed)
     jet = FakeJetKvm(JetState(width=640, height=360)).start()
     try:
         with Wall(tmp_path) as wall:
             admin = wall.browser()
             device = wall.add(admin, jet.url)
             viewer = wall.line(admin, device)
+            # Pointer capability is checked after connection setup. Cold isolated
+            # video startup is not part of the ten-second state-message budget.
+            assert viewer.picture(timeout=20).kind == 2
             said = viewer.word("state", timeout=10)
             while said.get("pointer") is None:
                 said = viewer.word("state", timeout=10)

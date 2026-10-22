@@ -83,6 +83,7 @@ class AmtState:
     listener: bool = True  # AMT_RedirectionService.ListenerEnabled: the redirection port takes connections only while it is on
     session_timeout: int = 0  # IPS_KVMRedirectionSettingData.SessionTimeout, minutes (0: none)
     session_lasts: float = 0.0  # seconds after which the stand-in ends a KVM session itself (its "minutes"); 0: never
+    next_session_ends_when: threading.Event | None = None  # consumed by the next KVM session; explicit test-controlled expiry
     # The first session ends as the viewer's first request for the screen comes: its handshake is done, and a viewer that
     # is to send keys is waiting INPUT_AFTER (an end at the engine's own time that falls into that wait).
     first_session_ends_at_request: bool = False
@@ -638,11 +639,15 @@ class FakeRedirection(FakeVnc):
         state.kvm_sessions += 1
         state.kvm_open += 1
         try:
+            ending = state.next_session_ends_when
+            state.next_session_ends_when = None
             first = state.kvm_sessions == 1 and (state.first_session_ends_at_request or state.first_session_ends_after_keys)
-            if first or state.sessions_end_after_requests:
+            if ending is not None or first or state.sessions_end_after_requests:
                 asked, keyed = len(state.screen.requests), len(state.screen.keys)
 
                 def going_on() -> bool:
+                    if ending is not None:
+                        return not ending.is_set()
                     if not first:
                         return len(state.screen.requests) < asked + state.sessions_end_after_requests
                     if state.first_session_ends_at_request:
