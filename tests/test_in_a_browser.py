@@ -2014,11 +2014,11 @@ def test_virtual_machines_on_proxmox_are_picked_from_its_list_and_added(tmp_path
             asked = form.locator("ul.results > li.ask")
             expect(asked).to_contain_text("3 virtual machines the token may see")
             expect(asked).to_contain_text("1 container is not listed")
-            expect(asked.get_by_label(re.compile(r"^101 Â· db"))).not_to_be_checked()
-            asked.get_by_label(re.compile(r"^100 Â· web")).check()
+            expect(asked.get_by_label(re.compile(r"^101 · db"))).not_to_be_checked()
+            asked.get_by_label(re.compile(r"^100 · web")).check()
             asked.get_by_role("button", name="Add the ticked ones").click()
             expect(asked.locator("li.ok")).to_contain_text("web added")
-            expect(asked.get_by_label(re.compile(r"^100 Â· web"))).to_be_disabled()  # on the wall now
+            expect(asked.get_by_label(re.compile(r"^100 · web"))).to_be_disabled()  # on the wall now
             # One guest named by its ID: added at once.
             form.locator("textarea").fill(f"127.0.0.1:{pve.port}/102")
             form.get_by_role("button", name="Check and add").click()
