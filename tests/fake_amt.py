@@ -84,6 +84,7 @@ class AmtState:
     session_timeout: int = 0  # IPS_KVMRedirectionSettingData.SessionTimeout, minutes (0: none)
     session_lasts: float = 0.0  # seconds after which the stand-in ends a KVM session itself (its "minutes"); 0: never
     next_session_ends_when: threading.Event | None = None  # consumed by the next KVM session; explicit test-controlled expiry
+    next_session_starts_when: threading.Event | None = None  # consumed by the next KVM handshake; holds reconnect until released
     # The first session ends as the viewer's first request for the screen comes: its handshake is done, and a viewer that
     # is to send keys is waiting INPUT_AFTER (an end at the engine's own time that falls into that wait).
     first_session_ends_at_request: bool = False
@@ -631,6 +632,11 @@ class FakeRedirection(FakeVnc):
         if odd == "wrong_end":
             await wire.write(bytes((0x42, 0, 0, 0, 0, 0, 0, 0)))
             return
+        opening = state.next_session_starts_when
+        state.next_session_starts_when = None
+        if opening is not None:
+            while not opening.is_set():
+                await asyncio.sleep(0.005)
         await wire.write((bytes((amt.RECORDED,)) if odd == "recorded" else b"") + bytes((amt.KVM_GOING, 0, 0, 0, 0, 0, 0, 0)))
         if odd == "not_rfb":
             await wire.write(b"<html><body>no screen here</body></html>")

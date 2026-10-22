@@ -1437,12 +1437,14 @@ def test_a_pcs_key_waiting_for_its_next_session_when_the_account_is_signed_out_i
             # End the established session on purpose, after startup/control. A
             # short timer could expire before startup or between polling turns.
             ended_at, sessions = pc.state.session_ended_at, pc.state.kvm_sessions
+            pc.state.next_session_starts_when = deliver
             expire.set()
             wait_until(lambda: pc.state.session_ended_at > ended_at, "the engine never ended its session", timeout=10)
             line.say(t="k", u=0xE0, d=True)  # ControlLeft: waits for the next session
             assert pending.wait(5), "the key did not enter transmission before sign-out"
             assert admin.post(f"/api/v1/users/{olga_id}/logout").status_code == 200
             assert line.word("bye", timeout=10)["code"] == "signed_out"
+            assert pc.state.kvm_open == 0, "the replacement session opened before sign-out cleanup"
             assert (0xFFE3, True) not in screen.keys, "Ctrl landed before the line ended: this is not the case this test is for"
             deliver.set()
             wait_until(lambda: (0xFFE3, True) in screen.keys, f"Ctrl never landed: {screen.keys}", timeout=15)
