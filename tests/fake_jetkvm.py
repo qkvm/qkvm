@@ -496,18 +496,23 @@ def make_fake_jetkvm(state: JetState) -> FastAPI:
         handed_over.append((old_rpc, old_hid))
         if old_rpc is not None and old_rpc.readyState == "open":
             old_rpc.send(json.dumps({"jsonrpc": "2.0", "method": "otherSessionConnected", "params": None}))
-        asyncio.get_running_loop().call_later(state.hand_over_close, lambda pc=old_pc: asyncio.ensure_future(pc.close()))
+        asyncio.get_running_loop().call_later(state.hand_over_close, close_connection, old_pc)
         let_go_of_the_keyboard()  # (a real one let go of a key the previous viewer held, as the next one came; said to it)
         current.update(pc=None, rpc=None, hid=None, shaken=False)  # (somebody else's now)
 
     closing: set[asyncio.Future[Any]] = set()  # (connections being closed, held until they are)
 
+    def close_connection(pc: RTCPeerConnection) -> None:
+        # The loop holds only weak references to tasks. Keep delayed hand-over
+        # cleanup alive too, including when close waits on another close's future.
+        task = asyncio.ensure_future(pc.close())
+        closing.add(task)
+        task.add_done_callback(closing.discard)
+
     def drop() -> None:
         """The device ends the viewer's connection without a word of its own (a restart of its program, the network)."""
         if current["pc"] is not None:
-            task = asyncio.ensure_future(current["pc"].close())
-            closing.add(task)
-            task.add_done_callback(closing.discard)
+            close_connection(current["pc"])
 
     def close_hid() -> None:
         """The device closes the viewer's hidrpc channel and keeps the rest of the connection."""

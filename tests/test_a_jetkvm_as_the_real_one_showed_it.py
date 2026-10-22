@@ -835,3 +835,43 @@ def test_a_connection_made_anew_by_the_wall_is_not_the_jetkvm_going_offline(tmp_
             line.close()
     finally:
         jet.stop()
+
+
+def test_fake_handover_keeps_pending_connection_cleanup_alive() -> None:
+    """A delayed close must remain owned even while its only wait is internal."""
+    import gc
+    from tests.fake_jetkvm import make_fake_jetkvm
+
+    async def main() -> None:
+        loop = asyncio.get_running_loop()
+        errors = []
+        previous = loop.get_exception_handler()
+        loop.set_exception_handler(lambda loop, context: errors.append(context))
+        started, finished = asyncio.Event(), asyncio.Event()
+
+        class Peer:
+            async def close(self) -> None:
+                started.set()
+                try:
+                    await loop.create_future()
+                finally:
+                    finished.set()
+
+        app = make_fake_jetkvm(JetState(hand_over_close=0))
+        app.state.current.update(pc=Peer(), rpc=None, hid=None)
+        before = asyncio.all_tasks()
+        try:
+            app.state.hand_over()
+            await asyncio.wait_for(started.wait(), 1)
+            gc.collect()
+            await asyncio.sleep(0)
+            assert not errors, [item.get("message") for item in errors]
+            assert not finished.is_set(), "pending close was garbage collected"
+        finally:
+            pending = asyncio.all_tasks() - before
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            loop.set_exception_handler(previous)
+
+    asyncio.run(main())
