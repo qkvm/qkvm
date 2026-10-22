@@ -10,6 +10,7 @@ import time
 from collections.abc import AsyncIterator, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import httpx
@@ -383,15 +384,28 @@ def test_viewers_that_refresh_slowly_share_a_picture(tmp_path: Path, fake: FakeK
         assert kvm.share_window(3600) == kvm.MAX_SHARED_AGE  # however long is asked for, a picture is never that stale
 
 
-def test_a_viewer_on_a_slow_link_is_not_handed_its_own_last_picture(tmp_path: Path, fake: FakeKvm) -> None:
+def test_a_viewer_on_a_slow_link_is_not_handed_its_own_last_picture(
+    tmp_path: Path, fake: FakeKvm, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Control only the device clock: HTTP scheduling before snapshot() starts must
+    # not consume the 0.1-second margin between the cache age and the next turn.
+    clock = [time.monotonic()]
+    monkeypatch.setattr(kvm, "time", SimpleNamespace(monotonic=lambda: clock[0], time=time.time))
+    original = KvmDevice._fetch_snapshot
+
+    async def delayed(device: KvmDevice, size: str, asked: float) -> kvm.Snapshot:
+        clock[0] += 0.3  # delivery takes time; the frame must retain its request time
+        return await original(device, size, asked)
+
+    monkeypatch.setattr(KvmDevice, "_fetch_snapshot", delayed)
     with wall(tmp_path) as client:
         device = add(client, fake.url)
-        fake.state.slow_snapshot = 0.3  # the KVM is far away
-        began = time.monotonic()
+        began = clock[0]
         assert client.get(snap(device), params={"age": 0.4}).status_code == 200
-        time.sleep(max(0.0, began + 0.5 - time.monotonic()))  # the tile's next turn, half a second after the first
+        assert len(fake.state.snapshot_queries) == 1
+        clock[0] = began + 0.5
         assert client.get(snap(device), params={"age": 0.4}).status_code == 200
-        # The first picture arrived 0.2 s ago but was asked for 0.5 s ago: too old to pass off as a new one.
+        # Delivered 0.2 s ago, requested 0.5 s ago: the next turn needs a new frame.
         assert len(fake.state.snapshot_queries) == 2
 
 
