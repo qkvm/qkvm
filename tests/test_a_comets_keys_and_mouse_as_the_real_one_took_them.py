@@ -64,7 +64,7 @@ def test_the_line_says_how_a_kvms_pointer_is_moved_and_says_it_again_when_that_c
 def test_a_jetkvms_pointer_is_moved_both_ways(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, startup_delay: float) -> None:
     # A JetKVM takes places and steps (its absolute and relative reports): both.
     import asyncio
-    from qkvm import jetkvm
+    from qkvm import jetkvm, video
 
     hold = jetkvm.JetKvmDevice._hold
 
@@ -81,7 +81,8 @@ def test_a_jetkvms_pointer_is_moved_both_ways(tmp_path: Path, monkeypatch: pytes
             viewer = wall.line(admin, device)
             # Pointer capability is checked after connection setup. Cold isolated
             # video startup is not part of the ten-second state-message budget.
-            assert viewer.picture(timeout=20).kind == 2
+            setup_budget = startup_delay + video.START_WITHIN + jetkvm.CONNECT_TIMEOUT + video.WORK_WITHIN
+            assert viewer.picture(timeout=setup_budget).kind == 2
             said = viewer.word("state", timeout=10)
             while said.get("pointer") is None:
                 said = viewer.word("state", timeout=10)

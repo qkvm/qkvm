@@ -15,7 +15,10 @@ from __future__ import annotations
 
 import json
 import shutil
+import socket
 import time
+from collections.abc import Iterator
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
 
@@ -49,6 +52,20 @@ def fast(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(kvm, "FIRST_CONTACT_WAIT", 5)
     monkeypatch.setattr(kvm, "PICTURE_PATIENCE", 5)
     monkeypatch.setattr(update, "DEFAULT_REPO", "")
+
+
+@pytest.fixture(autouse=True)
+def distinct_closed_ports(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    # Keep these addresses unavailable to other sockets until the test ends.
+    # Closing immediately lets the OS hand the same port to a later spare device.
+    with ExitStack() as sockets:
+        def reserved() -> int:
+            sock = sockets.enter_context(socket.socket())
+            sock.bind(("127.0.0.1", 0))
+            return int(sock.getsockname()[1])  # bound, not listening: still unreachable
+
+        monkeypatch.setitem(globals(), "closed_port", reserved)
+        yield
 
 
 class Reads:

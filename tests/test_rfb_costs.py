@@ -259,6 +259,11 @@ def test_a_server_whose_pictures_cost_much_to_draw_gets_its_share_of_the_drawing
 
     async def go() -> None:
         await client.handshake()
+        if kind == "small jpegs":
+            # Measure steady-state drawing, not the one-time OS sandbox launch.
+            # Startup has its own deadline; drawing share is unchanged afterward.
+            sample = fake_vnc.jpeg_of(fake_vnc.known_picture(16, 16, 3), 16, 16, 8)
+            await asyncio.to_thread(rfb.decode_jpeg, sample, 16, 16, client._video_decoder)
         began = time.monotonic()
         serving = asyncio.create_task(client.serve())
         await asyncio.sleep(window)
@@ -393,3 +398,32 @@ async def served_from(client: Client) -> RfbError:
     except RfbError as ex:
         return ex
     raise AssertionError("it did not end")
+
+
+def test_an_expensive_first_drawing_slice_is_paid_before_more_work(monkeypatch: pytest.MonkeyPatch) -> None:
+    from types import SimpleNamespace
+
+    clock = [1.0]
+    calls: list[float] = []
+    waits: list[float] = []
+    monkeypatch.setattr(rfb, "time", SimpleNamespace(monotonic=lambda: clock[0], perf_counter=time.perf_counter))
+    monkeypatch.setattr(rfb, "DRAWING_SHARE", 0.2)
+    monkeypatch.setattr(rfb, "DRAWING_BURST", 0.1)
+    monkeypatch.setattr(rfb, "DRAWING_ALL", 10.0)
+    monkeypatch.setattr(rfb, "_ALL", [0.1, clock[0]])
+
+    async def sleep(seconds: float) -> None:
+        waits.append(seconds)
+        clock[0] += seconds
+
+    client = Client(Scripted(b""), None)
+    monkeypatch.setattr(rfb, "asyncio", SimpleNamespace(get_running_loop=asyncio.get_running_loop, sleep=sleep))
+
+    def advance(steps: object, most: float) -> tuple[bool, float]:
+        calls.append(clock[0])
+        return (False, 0.8) if len(calls) == 1 else (True, 0.01)
+
+    monkeypatch.setattr(rfb, "_advance", advance)
+    run(client._drawn(iter(())))
+    assert len(calls) == 2 and waits
+    assert calls[1] - calls[0] == pytest.approx((0.8 - 0.1) / 0.2)
