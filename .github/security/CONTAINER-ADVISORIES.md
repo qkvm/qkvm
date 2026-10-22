@@ -10,6 +10,12 @@ The build verifies native dependency provenance. Runtime checks verify nonroot e
 
 Remaining MEDIUM/LOW library findings stay visible and require evaluation and upstream updates. A clean HIGH count does not resolve codec risk or prove absence of unknown vulnerabilities. Keep the existing decoder isolation and deployment restrictions.
 
+## Scan evidence for the application-only candidate
+
+Local Trivy 0.76.0 scans on 22 October 2026, using the database updated at 13:15 UTC, report the same results for AMD64 and ARM64: 19 OS packages, 33 Python packages, zero CRITICAL, zero HIGH, 24 MEDIUM and 10 LOW rows, with no fixable OS findings or reported Python vulnerabilities. The previous image had 66 OS packages, nine HIGH, 44 MEDIUM and 37 LOW rows. Hosted CI rebuilds and rescans both architectures independently; its exact-commit artifacts are the release evidence.
+
+Remaining rows are attributed to libc6 (21), SQLite (4), GCC runtime/source packages (six rows across gcc-14-base, libgcc-s1 and libstdc++6), zlib (2), and bzip2 (1). Those runtime dependencies remain for application compatibility; their retained findings are not suppressed. The previous detailed register below and the residual-advisory document explain their conditions, with current package presence/counts taken from the fresh reports.
+
 ## Historical assessment of the previous image
 
 The following records why the earlier image had nine HIGH rows. Its exceptions are superseded by package removal above and must not be renewed for the new image.

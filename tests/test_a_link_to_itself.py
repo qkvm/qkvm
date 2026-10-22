@@ -20,10 +20,12 @@ import qkvm.__main__ as starter
 pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="a link needs a right most accounts on Windows have not got")
 
 
-def typed(folder: Path, shell: str, *words: str, **more: str) -> subprocess.CompletedProcess[str]:
+def typed(folder: Path, setup: str, *words: str, **more: str) -> subprocess.CompletedProcess[str]:
     env = {**os.environ, "PYTHONPATH": str(Path(starter.__file__).resolve().parent.parent), "HOME": str(folder / "home"), **more}
     env.pop(starter.CHILD, None)
-    return subprocess.run(["sh", "-c", shell, "sh", str(folder / "here"), sys.executable, *words], env=env, capture_output=True, text=True, timeout=120)
+    # Prepare the same filesystem state without requiring a shell in the image.
+    script = "import os, sys; os.chdir(sys.argv[1]); " + setup + "; os.execv(sys.executable, [sys.executable, *sys.argv[2:]])"
+    return subprocess.run([sys.executable, "-P", "-c", script, str(folder / "here"), *words], env=env, capture_output=True, text=True, timeout=120)
 
 
 @pytest.mark.parametrize("how", ["--unlock-file", "QKVM_UNLOCK_FILE"])
@@ -31,9 +33,9 @@ def test_started_with_an_unlock_file_behind_a_link_to_itself_it_says_so(tmp_path
     (tmp_path / "here").mkdir()
     words = ["-P", "-m", "qkvm", "--data-dir", "data", "--port", "1", "--bind", "local"]
     if how == "--unlock-file":
-        done = typed(tmp_path, 'cd "$1" && ln -s loop loop && shift && exec "$@"', *words, "--unlock-file", "loop/key")
+        done = typed(tmp_path, 'os.symlink("loop", "loop")', *words, "--unlock-file", "loop/key")
     else:
-        done = typed(tmp_path, 'cd "$1" && ln -s loop loop && shift && exec "$@"', *words, QKVM_UNLOCK_FILE="loop/key")
+        done = typed(tmp_path, 'os.symlink("loop", "loop")', *words, QKVM_UNLOCK_FILE="loop/key")
     print(f">>> qkvm {how} loop/key on Python {sys.version_info.major}.{sys.version_info.minor}: status {done.returncode}; {done.stderr.strip().splitlines()[-1:]}")
     assert "Traceback" not in done.stderr, done.stderr[-600:]
     assert done.returncode == 2, "not 'could not start' to the starter, which takes any other status for a version that does not work"

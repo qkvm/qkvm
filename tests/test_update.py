@@ -954,7 +954,7 @@ def test_started_in_a_folder_that_is_gone_with_a_data_folder_given_from_there_it
     gone.mkdir()
     env = {**os.environ, "PYTHONPATH": str(Path(starter.__file__).resolve().parent.parent)}
     env.pop(starter.CHILD, None)
-    typed = 'cd "$1" && rmdir "$1" && exec "$2" -P -m qkvm --data-dir data --port 1 --bind local'
-    done = subprocess.run(["sh", "-c", typed, "sh", str(gone), sys.executable], env=env, capture_output=True, text=True, timeout=120)
+    typed = "import os, sys; os.chdir(sys.argv[1]); os.rmdir(sys.argv[1]); os.execv(sys.executable, [sys.executable, '-P', '-m', 'qkvm', '--data-dir', 'data', '--port', '1', '--bind', 'local'])"
+    done = subprocess.run([sys.executable, "-P", "-c", typed, str(gone)], env=env, capture_output=True, text=True, timeout=120)
     assert done.returncode == 2, (done.returncode, done.stderr)
     assert "cannot keep settings in data" in done.stderr and "Traceback" not in done.stderr, done.stderr
