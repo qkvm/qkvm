@@ -342,14 +342,22 @@ def test_one_long_step_of_a_costly_server_does_not_hold_up_every_other_server(mo
         try:
             async with asyncio.timeout(30):
                 ended = await served_from(cheap)
+            took = time.monotonic() - began
         finally:
             busy.cancel()
             await asyncio.gather(busy, return_exceptions=True)
+            await costly.close()
+            await cheap.close()
         assert ended.code == rfb.CLOSED and cheap.frames == 20, ended.message
         assert costly.frames >= 2  # (it was drawn, as often as its share lets it)
-        return time.monotonic() - began
+        return took
 
-    assert run(go()) < 3.0
+    # Canceling an asyncio future cannot stop an already running drawing thread.
+    # Own and drain this test's pool so its large JPEG cannot be allocated during
+    # the next test's process-wide memory measurement.
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        monkeypatch.setattr(rfb, "_DRAWERS", pool)
+        assert run(go()) < 3.0
 
 
 def test_a_copy_and_a_change_of_size_of_a_large_screen_are_drawn_in_steps(monkeypatch: pytest.MonkeyPatch) -> None:

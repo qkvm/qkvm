@@ -1294,13 +1294,16 @@ def test_a_controller_whose_own_resource_cannot_be_read_still_shows_its_screen_w
 
 def test_the_console_is_given_back_when_nobody_looks(tmp_path: Path, with_screen: FakeBmc, monkeypatch: pytest.MonkeyPatch) -> None:
     # A controller has two console seats. The wall takes one while somebody looks at it, and not for good.
-    monkeypatch.setattr(redfish, "CONSOLE_IDLE", 0.4)
+    normal_idle = redfish.CONSOLE_IDLE
     bmc = with_screen
     with wall(tmp_path) as client:
         device = add(client, bmc.url)
         picture_of(client, device)
         assert bmc.state.watching == 1
+        # Shorten only the idle phase; isolated encoder startup is not inactivity.
+        monkeypatch.setattr(redfish, "CONSOLE_IDLE", 0.4)
         wait_until(lambda: (bmc.state.watching, bmc.state.web_sessions) == (0, {}), "the console stayed open with nobody looking")
+        monkeypatch.setattr(redfish, "CONSOLE_IDLE", normal_idle)
         # ...and whoever looks again gets it again. (Looked at until it is open: a look in the moment the old one
         # is still being put away is answered with the picture that is kept, and the look after it opens the
         # console. A wall looks every second; this looked once, and on a slow machine once was that moment.)
