@@ -248,3 +248,37 @@ def test_a_frame_read_across_a_signal_change_is_not_marked_as_a_new_picture() ->
         assert track.calls == 3
 
     asyncio.run(run())
+
+
+def test_frames_queued_before_the_signal_returns_are_not_new_pictures() -> None:
+    from types import SimpleNamespace
+    from aiortc.mediastreams import MediaStreamError
+
+    async def run() -> None:
+        device = jetkvm.JetKvmDevice(DeviceSpec("jet", "A JetKVM", "http://127.0.0.1:18901", "", "", kind="jetkvm"))
+        session = jetkvm._Session()
+        previous = object()
+        delayed = SimpleNamespace(received_at=10.0)
+        fresh = SimpleNamespace(received_at=12.0)
+        session.frame, session.frame_at = previous, 9.0
+        session.ready_said, session.signal_at = True, 11.0
+
+        class Track:
+            calls = 0
+
+            async def recv(self) -> object:
+                self.calls += 1
+                if self.calls <= 2:
+                    assert session.frame is previous and session.frame_at == 9.0
+                    return delayed  # even several old decodes must be discarded
+                if self.calls == 3:
+                    assert session.frame is previous
+                    return fresh
+                assert session.frame is fresh and session.frame_at == 12.0
+                raise MediaStreamError
+
+        track = Track()
+        await device._watch(session, track)
+        assert track.calls == 4
+
+    asyncio.run(run())

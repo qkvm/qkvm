@@ -308,3 +308,35 @@ def test_jpeg_path_never_invokes_native_decoder_in_parent(monkeypatch: pytest.Mo
 
     monkeypatch.setattr(av, "CodecContext", SimpleNamespace(create=forbidden))
     assert len(rfb.decode_jpeg(jpeg, 16, 16)) == 16 * 16 * 3
+
+
+def test_decoder_preserves_parent_queue_time_through_slow_decoding(monkeypatch: pytest.MonkeyPatch) -> None:
+    import queue
+
+    clock = [10.0]
+    monkeypatch.setattr(video, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    pending = video.BoundedDecoderQueue()
+    codec = SimpleNamespace(mimeType="video/H264")
+    pending.put((codec, SimpleNamespace(data=b"encoded", timestamp=7)))
+    queued = pending.get_nowait()
+    clock[0] = 20.0  # screen returned while the encoded frame waited
+    inputs = queue.Queue()
+    inputs.put(queued)
+    inputs.put(None)
+    delivered = []
+    worker = SimpleNamespace(close=lambda: None)
+
+    class Decoder:
+        def __init__(self, unused: object) -> None:
+            self.worker = worker
+
+        def decode(self, encoded: object) -> list[video.VideoFrame]:
+            clock[0] = 30.0  # isolated decoding took more time
+            return [video.VideoFrame(16, 16, worker, 1)]
+
+    monkeypatch.setattr(video, "H264Decoder", Decoder)
+    loop = SimpleNamespace(call_soon_threadsafe=lambda callback, frame: callback(frame))
+    output = SimpleNamespace(empty=lambda: True, put_nowait=delivered.append)
+    video.decoder_worker(loop, inputs, output)
+    assert len(delivered) == 2 and delivered[-1] is None
+    assert delivered[0].received_at == 10.0

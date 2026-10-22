@@ -11,6 +11,7 @@ import struct
 import subprocess
 import sys
 import threading
+import time
 import weakref
 from dataclasses import dataclass
 from typing import Any
@@ -44,6 +45,7 @@ class VideoFrame:
     height: int
     worker: Worker
     ident: int
+    received_at: float = 0.0  # parent clock, before waiting for isolated decoding
 
 
 _workers: weakref.WeakSet[Worker] = weakref.WeakSet()
@@ -279,6 +281,8 @@ class BoundedDecoderQueue(queue.Queue[Any]):
                 self.stopped = True
                 self.queue.clear()
                 item = None
+            else:
+                item = (*item, time.monotonic())
             self._put(item)
             self.unfinished_tasks += 1
             self.not_empty.notify()
@@ -298,13 +302,14 @@ def decoder_worker(loop: asyncio.AbstractEventLoop, input_q: Any, output_q: Any)
             task = input_q.get()
             if task is None:
                 break
-            codec, encoded = task
+            codec, encoded, received_at = task
             if codec.mimeType.lower() != "video/h264":
                 raise VideoError("video codec is not permitted")
             if decoder is None:
                 decoder = H264Decoder(getattr(input_q, "worker", None))
             for frame in decoder.decode(encoded):
-                loop.call_soon_threadsafe(deliver, frame)
+                stamped = VideoFrame(frame.width, frame.height, frame.worker, frame.ident, received_at)
+                loop.call_soon_threadsafe(deliver, stamped)
     except (VideoError, OSError, RuntimeError):
         pass  # fail closed and tell the track it ended; no alternate native decoder
     finally:

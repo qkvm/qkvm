@@ -996,8 +996,14 @@ class JetKvmDevice(Device):
                     # frame may still belong to the previous signal; wait for the
                     # next receive instead of marking that picture as current.
                     continue
+                received_at = getattr(frame, "received_at", time.monotonic())
+                if received_at < session.signal_at:
+                    # Decoding can finish after a signal change even when this
+                    # receive starts after it. Queue time belongs to the parent,
+                    # so the worker cannot make an old frame look current.
+                    continue
                 session.frame = frame
-                session.frame_at = time.monotonic()
+                session.frame_at = received_at
         except MediaStreamError:
             if not session.done.is_set() and not session.taken:
                 session.lost = KvmError("no_stream", "Secure video processing stopped", 503)
