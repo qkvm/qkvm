@@ -1,4 +1,20 @@
-# Container HIGH advisory assessment — 21 October 2026
+# Application-only container remediation — 22 October 2026
+
+The application-only candidate replaces the earlier trimmed general-purpose image. All nine HIGH-associated packages are excluded from the final runtime, and `container-exceptions.json` now contains no exceptions. The release scan must therefore report zero HIGH and CRITICAL findings. Both architectures must pass fresh scans and the full application suite inside the final image before release.
+
+The build stage installs the unchanged qKVM package on the same pinned Debian-based Python image and applies stable updates. The final stage copies Python/application files, the vendor-owned libraries required by their native objects, certificate and timezone data, and original package records/license files. It excludes shell/package-management tools and their ACL/systemd dependencies. Original package names, versions and source attribution are retained for shipped packages; no scanner ignore filter or VEX suppression is used.
+
+Optional CPython curses/readline/Tk/native UUID extensions are excluded. These are terminal/desktop interfaces and native UUID1 support, not qKVM web features. qKVM's UUID4 generation retains Python's OS-randomness implementation. No controller, discovery, account, storage, browser, video, or keyboard/mouse feature is removed. The container is an application appliance, not a general-purpose Python development environment; use Docker logs and the Python health check instead of an interactive shell. Native/PyPI installations are unchanged.
+
+The build verifies native dependency provenance. Runtime checks verify nonroot execution, privilege bits, absence of the removed components, TLS trust, UUIDs, timezones and isolated JPEG roundtrips. CI additionally runs the complete application test suite against the installed package inside each final image, with test tooling mounted separately. The ordinary Windows/Linux, browser and controller CI jobs remain required.
+
+Remaining MEDIUM/LOW library findings stay visible and require evaluation and upstream updates. A clean HIGH count does not resolve codec risk or prove absence of unknown vulnerabilities. Keep the existing decoder isolation and deployment restrictions.
+
+## Historical assessment of the previous image
+
+The following records why the earlier image had nine HIGH rows. Its exceptions are superseded by package removal above and must not be renewed for the new image.
+
+### Container HIGH advisory assessment — 21 October 2026
 
 The original 44 HIGH package/advisory rows per architecture represented eight distinct CVEs, not 44 independent defects. Four util-linux CVEs were each attributed to nine binary packages from the same source. This assessment concerns the supplied qKVM container, not the Docker host or an independently managed Python installation.
 

@@ -5,3 +5,7 @@
 !README.md
 !qkvm
 qkvm/**/__pycache__
+
+!.github
+!.github/security
+!.github/security/assemble-runtime.py

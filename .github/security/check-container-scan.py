@@ -25,6 +25,8 @@ REMOVED_RUNTIME_PACKAGES = {
     "apt", "libapt-pkg7.0", "adduser", "passwd", "login.defs",
     "libpam-modules", "libpam-modules-bin", "libpam-runtime", "libpam0g",
     "sysvinit-utils", "libudev1",
+    "libacl1", "libsystemd0", "libuuid1", "libncursesw6", "libtinfo6",
+    "ncurses-base", "bash", "dash", "coreutils", "dpkg", "tar",
 }
 
 

@@ -57,6 +57,17 @@ runs:
       env:
         ARCH: ${{ inputs.arch }}
       run: bash .github/security/scan-image.sh "image-$ARCH/image.tar" "$ARCH" "image-$ARCH/evidence"
+    - name: Run the application suite inside the final runtime
+      shell: bash
+      run: |
+        # Test tooling is mounted read-only; it is never installed in the image.
+        python3 -m pip install --target "$RUNNER_TEMP/qkvm-image-test-deps" pytest
+        docker run --rm --pull=never --read-only --tmpfs /tmp \
+          --tmpfs /data:uid=10001,gid=10001 --cap-drop ALL --security-opt no-new-privileges:true \
+          -v "$GITHUB_WORKSPACE:/work:ro" \
+          -v "$RUNNER_TEMP/qkvm-image-test-deps:/testdeps:ro" \
+          -e PYTHONPATH=/testdeps -e CI=true -w /tmp \
+          --entrypoint python qkvm:security -P -c 'import qkvm, pytest; assert qkvm.__file__.startswith("/usr/local/"); raise SystemExit(pytest.main(["--import-mode=importlib", "-q", "-p", "no:cacheprovider", "/work/tests"]))'
     - name: Record the immutable archive checksum
       shell: bash
       env:

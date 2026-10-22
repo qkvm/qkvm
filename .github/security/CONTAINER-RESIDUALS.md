@@ -1,4 +1,8 @@
-# Remaining container OS advisory assessment
+# Residual advisory history and application-only runtime
+
+The register below describes the earlier image and its 44 MEDIUM/37 LOW findings. The application-only candidate removes further packages and all nine HIGH attributions; use each architecture's fresh scan artifact for current counts. Retained library assessments still apply where the corresponding package is present. Package removal is not a patch to remaining libraries. See [the current container assessment](CONTAINER-ADVISORIES.md) for the new packaging and validation requirements.
+
+## Previous container OS advisory assessment
 
 Reviewed 21 October 2026. The preceding image had 49 MEDIUM and 51 LOW rows, covering 60 distinct CVE/temporary identifiers. This follow-up reviews every identifier and removes eleven additional administration packages. Fresh scans of both architectures confirm 44 MEDIUM and 37 LOW rows. Nine HIGH rows remain separately assessed in [CONTAINER-ADVISORIES.md](CONTAINER-ADVISORIES.md).
 
