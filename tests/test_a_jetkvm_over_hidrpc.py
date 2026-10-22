@@ -1234,3 +1234,36 @@ def test_r5_a_text_whose_layout_or_road_could_not_be_found_out_was_not_typed_and
         assert jet.state.reports == []
 
     run(jet, test)
+
+
+def test_reconnect_waits_for_an_ended_sessions_decoder_cleanup(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def exercise() -> None:
+        device = jetkvm.JetKvmDevice(kvm.DeviceSpec("w", "test wall", "http://127.0.0.1:18901", "", "", kind="jetkvm"))
+        previous = jetkvm._Session()
+        previous.done.set()
+        previous.lost = kvm.KvmError("no_stream", "Secure video processing stopped", 503)
+        cleanup = asyncio.Event()
+        ending = asyncio.create_task(cleanup.wait())
+        device._session, device._task = previous, ending
+
+        async def next_session(session: jetkvm._Session) -> None:
+            session.ready.set()
+            await session.done.wait()
+
+        monkeypatch.setattr(device, "_run", next_session)
+        connecting = asyncio.create_task(device._connected(urgent=True))
+        try:
+            done, _ = await asyncio.wait({connecting}, timeout=0.05)
+            assert not done, "reconnection returned the ended session before decoder cleanup finished"
+            cleanup.set()
+            current = await asyncio.wait_for(connecting, 2)
+            assert current is not previous and current.live
+        finally:
+            cleanup.set()
+            connecting.cancel()
+            if device._task is not None:
+                device._task.cancel()
+            await asyncio.gather(connecting, ending, *([device._task] if device._task is not None else []), return_exceptions=True)
+            await device.close()
+
+    asyncio.run(exercise())

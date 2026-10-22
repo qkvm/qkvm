@@ -85,7 +85,8 @@ def windows_lockdown() -> None:
         raise RuntimeError("AppContainer verification is Windows-only")
     from ctypes import wintypes as wt
     # This entry point is imported for Linux checks too; WinDLL exists only on Windows.
-    windows_dll = getattr(ctypes, "WinDLL")
+    windows_ctypes: Any = ctypes
+    windows_dll = windows_ctypes.WinDLL
     kernel = windows_dll("kernel32", use_last_error=True)
     advapi = windows_dll("advapi32", use_last_error=True)
     kernel.GetCurrentProcess.restype = ctypes.c_void_p

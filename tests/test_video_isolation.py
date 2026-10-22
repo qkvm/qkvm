@@ -220,3 +220,55 @@ def test_unreviewed_receiver_version_is_refused(monkeypatch: pytest.MonkeyPatch)
     monkeypatch.setattr(video.importlib.metadata, "version", lambda name: "99.0.0")
     with pytest.raises(video.VideoError, match="not been verified"):
         video.install_aiortc_boundary()
+
+def test_production_worker_has_kernel_restrictions() -> None:
+    """Check the production launch itself, not just the standalone boundary probe."""
+    worker = video.Worker()
+    try:
+        if sys.platform == "linux":
+            def status(pid: str) -> dict[str, str]:
+                return dict(line.split(":", 1) for line in Path(f"/proc/{pid}/status").read_text().splitlines() if ":" in line)
+
+            parent = status("self")
+            child = status(str(worker._process.pid))
+            assert int(child["NoNewPrivs"]) == 1
+            assert int(child["Seccomp"]) == 2
+            assert int(child["Seccomp_filters"]) > int(parent["Seccomp_filters"])
+            assert int(child["Threads"]) == 1
+        elif sys.platform == "win32":
+            from qkvm import _video_windows as windows
+
+            token = windows.P()
+            windows.checked(windows.api(windows.advapi, "OpenProcessToken", [windows.P, windows.wt.DWORD, ctypes.POINTER(windows.P)])(worker._process._handle, 8, ctypes.byref(token)))
+            try:
+                value, size = windows.wt.DWORD(), windows.wt.DWORD()
+                info = windows.api(windows.advapi, "GetTokenInformation", [windows.P, ctypes.c_int, windows.P, windows.wt.DWORD, ctypes.POINTER(windows.wt.DWORD)])
+                windows.checked(info(token, 29, ctypes.byref(value), 4, ctypes.byref(size)))
+                assert value.value == 1
+                info(token, 30, None, 0, ctypes.byref(size))
+                groups = ctypes.create_string_buffer(size.value)
+                windows.checked(info(token, 30, groups, size.value, ctypes.byref(size)))
+                assert ctypes.cast(groups, ctypes.POINTER(windows.wt.DWORD))[0] == 0
+                limits = windows.ExtendedLimits()
+                query = windows.api(windows.kernel, "QueryInformationJobObject", [windows.P, ctypes.c_int, windows.P, windows.wt.DWORD, windows.P])
+                windows.checked(query(worker._process._job, 9, ctypes.byref(limits), ctypes.sizeof(limits), None))
+                assert limits.basic.active_processes == 1
+                assert limits.process_memory == 1024**3
+                assert limits.basic.flags & 0x2108 == 0x2108
+            finally:
+                windows.close_handle(token)
+    finally:
+        worker.close()
+
+
+def test_jpeg_path_never_invokes_native_decoder_in_parent(monkeypatch: pytest.MonkeyPatch) -> None:
+    import av
+    from qkvm import rfb
+
+    jpeg = video.encode_jpeg(video.RGBFrame(16, 16, bytes(16 * 16 * 3)), None, 2)
+
+    def forbidden(*args: object) -> None:
+        raise AssertionError("native decoding attempted in credential-holding parent")
+
+    monkeypatch.setattr(av, "CodecContext", SimpleNamespace(create=forbidden))
+    assert len(rfb.decode_jpeg(jpeg, 16, 16)) == 16 * 16 * 3

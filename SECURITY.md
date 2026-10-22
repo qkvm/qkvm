@@ -212,8 +212,9 @@ Windows installations need permission to create an AppContainer profile and a
 writable temporary directory for the public runtime bundle.
 
 Other operating systems and Linux architectures currently fail closed for these
-native-video paths. Device control and video paths forwarded without native
-processing are separate. The aiortc version is pinned because its receiver hook
+native-video paths. Connections that require a worker cannot start; this includes
+JetKVM's shared video/control connection. Other device types' control and video
+paths forwarded without native processing are separate. The aiortc version is pinned because its receiver hook
 is an internal interface; upgrading it requires reviewing and testing the boundary.
 
 Isolation limits the consequences of a native-library exploit; it does not fix

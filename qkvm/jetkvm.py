@@ -728,7 +728,9 @@ class JetKvmDevice(Device):
             if refused is not None:
                 raise refused.with_traceback(None)
         ending = self._task
-        if session is not None and (session.anew is not None or session.taken) and ending is not None and not ending.done():
+        if session is not None and (session.done.is_set() or session.anew is not None or session.taken) and ending is not None and not ending.done():
+            # An ended decoder can still be cleaning up its process. Wait before
+            # _start(), which must not reuse that ended session during teardown.
             # Being ended by the wall (to be made anew, or because its own page took the viewer, as when "Show here"
             # comes a moment after that): once it is closed (HAND_OVER_GRACE and six seconds at the most here; beyond
             # that it is said to be taking too long, and asked again it is made).
