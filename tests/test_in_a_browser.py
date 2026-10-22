@@ -1423,18 +1423,23 @@ def test_the_page_is_served_with_its_rules_and_keeps_to_them(tmp_path: Path, bro
             context.close()
 
 
-def test_nothing_is_typed_into_a_machine_by_keys_meant_for_the_page(tmp_path: Path, browser: Browser, fakes: list[FakeKvm]) -> None:
+@pytest.mark.parametrize("motion", ["reduce", "no-preference"])
+def test_nothing_is_typed_into_a_machine_by_keys_meant_for_the_page(tmp_path: Path, browser: Browser, fakes: list[FakeKvm], motion: str) -> None:
     # The wall looks; it is no console. Whatever is typed while a tile has the focus, or while one is
     # enlarged, stays with the page: the machine behind it gets none of it.
     fake = fakes[0]
     with a_wall(tmp_path, ("Build server", fake)) as (live, _), looking(browser, live) as page:
+        page.emulate_media(reduced_motion=motion)
         sign_in(page, live)
         expect(tile(page, "Build server")).to_have_attribute("data-state", "online")
         tile(page, "Build server").focus()
-        page.keyboard.type("rm -rf /")
-        # The space opens the enlarged view through an asynchronous transition.
-        # Settle that change before closing it and trying to focus the inert wall.
+        page.keyboard.type("rm")
+        page.keyboard.press("Space")
+        # The first space opens the view and focuses its Close button. A later
+        # space can activate that button, so settle the opening before typing
+        # the rest; do not assume the whole string leaves the view open.
         expect(page.locator("#focus")).to_be_visible()
+        page.keyboard.type("-rf /")
         page.keyboard.press("Control+Alt+Delete")
         page.keyboard.press("Escape")  # whatever the letters opened
         page.keyboard.press("Escape")
@@ -2009,11 +2014,11 @@ def test_virtual_machines_on_proxmox_are_picked_from_its_list_and_added(tmp_path
             asked = form.locator("ul.results > li.ask")
             expect(asked).to_contain_text("3 virtual machines the token may see")
             expect(asked).to_contain_text("1 container is not listed")
-            expect(asked.get_by_label(re.compile(r"^101 · db"))).not_to_be_checked()
-            asked.get_by_label(re.compile(r"^100 · web")).check()
+            expect(asked.get_by_label(re.compile(r"^101 Â· db"))).not_to_be_checked()
+            asked.get_by_label(re.compile(r"^100 Â· web")).check()
             asked.get_by_role("button", name="Add the ticked ones").click()
             expect(asked.locator("li.ok")).to_contain_text("web added")
-            expect(asked.get_by_label(re.compile(r"^100 · web"))).to_be_disabled()  # on the wall now
+            expect(asked.get_by_label(re.compile(r"^100 Â· web"))).to_be_disabled()  # on the wall now
             # One guest named by its ID: added at once.
             form.locator("textarea").fill(f"127.0.0.1:{pve.port}/102")
             form.get_by_role("button", name="Check and add").click()
