@@ -51,9 +51,6 @@ def linux_lockdown() -> None:
         raise RuntimeError("video worker must enter its sandbox before creating threads")
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     resource.setrlimit(resource.RLIMIT_AS, (1024**3, 1024**3))
-    # Imported libraries must not leave a file, socket, or directory handle behind.
-    os.closerange(3, 1_048_576)
-    resource.setrlimit(resource.RLIMIT_NOFILE, (3, 3))
     libc = ctypes.CDLL(None, use_errno=True)
     if libc.prctl(4, 0, 0, 0, 0) != 0:  # PR_SET_DUMPABLE
         raise OSError(ctypes.get_errno(), "cannot disable worker dumps")
@@ -75,6 +72,10 @@ def linux_lockdown() -> None:
     rules.append((0x06, 0, 0, 0x00050001))
     array = (Filter * len(rules))(*(Filter(*r) for r in rules))
     program = Program(len(rules), array)
+    # ctypes structure setup lazily imports support code on Python 3.14. Finish
+    # trusted setup before closing handles and forbidding further file opens.
+    os.closerange(3, 1_048_576)
+    resource.setrlimit(resource.RLIMIT_NOFILE, (3, 3))
     if libc.prctl(22, 2, ctypes.byref(program), 0, 0) != 0:  # PR_SET_SECCOMP
         raise OSError(ctypes.get_errno(), "cannot install worker syscall filter")
 
