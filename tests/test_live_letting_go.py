@@ -1253,6 +1253,12 @@ def test_a_pcs_key_that_waited_for_the_next_session_and_landed_after_the_end_is_
             await asyncio.sleep(0.1)
             await pressing  # it lands in the next session
             await lines.settled()
+            # The sender's drain is not the stand-in's acknowledgement. Keep the connection
+            # alive until the receiver has processed the release, even on a busy test host.
+            deadline = time.monotonic() + 5
+            while (0xFFE3, False) not in screen.keys:
+                assert time.monotonic() < deadline, f"Ctrl's release never reached the PC: {screen.keys}"
+                await asyncio.sleep(0.01)
         finally:
             await device.close()
 
