@@ -14,6 +14,7 @@ import contextlib
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -57,14 +58,17 @@ def a_board(**how: Any) -> FakeKvm:
 
 
 @pytest.mark.parametrize("status", [500, 502, 503, 504])
-def test_a_press_answered_with_a_5xx_may_have_pressed_and_is_not_pressed_again_until_it_cannot_be_pressing(tmp_path: Path, quick: dict[str, float], status: int) -> None:
+def test_a_press_answered_with_a_5xx_may_have_pressed_and_is_not_pressed_again_until_it_cannot_be_pressing(tmp_path: Path, quick: dict[str, float], status: int, monkeypatch: pytest.MonkeyPatch) -> None:
     fake = a_board(atx_reply=(status, f"<html><body>{status} Bad Gateway</body></html>"))
     try:
         with wall(tmp_path) as client:
             device = add(client, fake.url)
             wait_until(lambda: client.get("/api/v1/status").json()[device]["atx"]["enabled"] is True, "the board was never seen")
+            # Keep the short cooldown open while HTTP/history work is scheduled. A slow runner
+            # must not turn a correctly expired cooldown into a failed safety assertion.
+            now = time.monotonic()
+            monkeypatch.setattr(kvm, "time", SimpleNamespace(monotonic=lambda: now, time=time.time))
             _, first = press(client, device, "atx_power")
-            answered = time.monotonic()
             assert fake.state.actions == ["atx power"], fake.state.actions  # (the board pressed)
             said = first.json()
             # The page takes `timeout` as no answer ("It may have been done"), and offers no retry of it.
@@ -76,11 +80,13 @@ def test_a_press_answered_with_a_5xx_may_have_pressed_and_is_not_pressed_again_u
             fake.state.atx_reply = None
             for action in ("atx_power", "atx_reset", "fingerbot_power"):
                 _, again = press(client, device, action)
-                assert (again.status_code, again.json()["code"]) == (409, "busy"), (action, again.text)
+                assert (again.status_code, again.json().get("code")) == (409, "busy"), (action, again.text)
                 assert "may still be pressing" in again.json()["message"], again.text
             assert fake.state.actions == ["atx power"] and fake.state.presses == [], (fake.state.actions, fake.state.presses)
-            # Not for ever: the answer's time and the button's hold, from the answer.
-            time.sleep(max(0.0, answered + 0.5 + quick["power"] + 0.2 - time.monotonic()))
+            # Advance beyond the answer's time plus the button hold, then let the device clock
+            # progress normally again for the successful press and its status polling.
+            offset = now + 0.5 + quick["power"] + 0.2 - time.monotonic()
+            monkeypatch.setattr(kvm, "time", SimpleNamespace(monotonic=lambda: time.monotonic() + offset, time=time.time))
             _, after = press(client, device, "atx_power")
             assert (after.status_code, after.json()) == (200, {"ok": True, "note": None}), after.text
             assert fake.state.actions == ["atx power", "atx power"]

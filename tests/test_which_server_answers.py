@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -236,7 +237,16 @@ def test_a_command_goes_only_under_the_session_the_server_was_asked_under(tmp_pa
 
 
 def settings_of(data: Path) -> dict[str, Any]:
-    return json.loads((data / "qkvm.json").read_text(encoding="utf-8"))
+    # The background save replaces this file atomically. Windows can briefly deny an open
+    # while the old file is being replaced; a permanent permission problem must still fail.
+    deadline = time.monotonic() + 1.0
+    while True:
+        try:
+            return json.loads((data / "qkvm.json").read_text(encoding="utf-8"))
+        except PermissionError as ex:
+            if sys.platform != "win32" or getattr(ex, "winerror", None) not in (5, 32, 33) or time.monotonic() >= deadline:
+                raise
+            time.sleep(0.01)
 
 
 def as_written_by_0_1(data: Path, ident: str | None = None) -> None:
