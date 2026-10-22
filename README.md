@@ -67,6 +67,12 @@ qKVM is an independent project. It is not affiliated with GL.iNet, PiKVM or JetK
 
 ## Run it
 
+Native video processing requires Linux x86-64/ARM64 or Windows with the video
+sandbox available. macOS and other unverified platforms currently refuse these
+video paths, including JetKVM's combined video/control connection; they do not
+fall back to an unsandboxed decoder. See [Native video isolation](SECURITY.md#native-video-isolation)
+for platform requirements and limitations.
+
 **As a program** (Python 3.11 or newer):
 
 ```
@@ -2665,8 +2671,9 @@ or from published source, and tried on a stand-in laid out like it.
 - KVMs with two-factor login enabled are not supported.
 - qKVM itself has been run on Windows 11 and on Linux (Debian 13 and Ubuntu 24.04, as a
   service and in a container; amd64, and arm64 in a container), with Python 3.11 to 3.14.
-  It has not been tried on macOS: nothing in it is known to stand in the way, and nobody
-  has seen it run there.
+  macOS has no verified native-video sandbox in this candidate. Native-video paths
+  fail closed there, including JetKVM's combined video/control connection; full
+  macOS support is not claimed.
 - The page is run by its tests in Chromium, which is what Chrome and Edge are. Most of those
   tests were run once in Firefox as well, and passed. Safari, and the browsers of phones and
   tablets, have not been tried.
