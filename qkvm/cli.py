@@ -1205,9 +1205,9 @@ def main(argv: list[str] | None = None) -> int:
         log.info("qkvm %s starting, data in %s", __version__, _in_full(data_dir))
         outdated = outdated_libraries()
         if outdated:
-            log.warning("libraries with known vulnerabilities: %s", "; ".join(outdated.values()), extra=SAID)
+            log.warning("libraries below the required minimum versions: %s", "; ".join(outdated.values()), extra=SAID)
             # By name: upgrading qKVM itself leaves a library alone that still meets what an older qKVM asked for.
-            say(f"qkvm: these libraries have known vulnerabilities - update them with: pip install --upgrade {' '.join(outdated)}", error=True)
+            say(f"qkvm: these libraries are below the required minimum versions - update them with: pip install --upgrade {' '.join(outdated)}", error=True)
             for line in outdated.values():
                 say(f"  {line}", error=True)
         raise_file_limit()
