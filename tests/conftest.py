@@ -27,6 +27,17 @@ def home(tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPat
 
 
 @pytest.fixture(autouse=True)
+def deployment_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Tests select their deployment mode explicitly, independent of their host.
+
+    Native update tests exercise native installs even when pytest runs in an
+    image. Container-specific tests set this flag themselves; image startup and
+    runtime checks separately verify the actual image's container default.
+    """
+    monkeypatch.delenv("QKVM_CONTAINER", raising=False)
+
+
+@pytest.fixture(autouse=True)
 def nobody_asked_about_releases(monkeypatch: pytest.MonkeyPatch) -> None:
     """Where a wall of a test looks for a newer version, nothing is listening: never the real place.
 

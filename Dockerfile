@@ -26,7 +26,7 @@ RUN python /assemble-runtime.py /runtime
 
 FROM scratch
 COPY --from=build /runtime/ /
-ENV PATH=/usr/local/bin \
+ENV PATH=/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin \
     LANG=C.UTF-8 \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \

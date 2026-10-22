@@ -12,6 +12,8 @@ from pathlib import Path
 
 from qkvm.video import RGBFrame, decode_jpeg, encode_jpeg, shutdown
 
+if os.environ.get("QKVM_CONTAINER") != "1":
+    raise SystemExit("Image must retain container update restrictions")
 if os.getuid() != 10001:
     raise SystemExit("The image must run as qkvm UID 10001")
 if any(line.strip() and not line.lstrip().startswith("#") for line in Path("/etc/fstab").read_text().splitlines()):
