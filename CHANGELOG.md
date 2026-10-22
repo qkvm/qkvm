@@ -2,6 +2,8 @@
 
 ## 0.2.0
 
+- Bound native JPEG decoding to the expected rectangle plus buffer alignment, and reject inconsistent decoded dimensions before RGB conversion.
+
 - Treat unreadable activity responses beside device history as unavailable and recover on the next usable response without an unhandled page error.
 
 - Cancel queued screen enlargements when Escape, sign-out or a newer view request supersedes them; late animation callbacks cannot restore a closed view.

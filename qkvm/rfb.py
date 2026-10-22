@@ -567,10 +567,19 @@ def decode_jpeg(data: bytes, width: int, height: int) -> bytes:
 
     try:
         codec: Any = av.CodecContext.create("mjpeg", "r")
+        # A later JPEG frame header can override the size read above. Bound native
+        # allocation too, before decoding or reformatting an untrusted picture.
+        # FFmpeg also checks padded buffers: allow SIMD/chroma alignment, not
+        # arbitrary dimensions from a second frame header.
+        padded_pixels = ((width + 255) // 256 * 256) * ((height + 63) // 64 * 64)
+        codec.options = {"max_pixels": str(padded_pixels)}
         frames = codec.decode(av.Packet(data)) + codec.decode(None)
         if not frames:
             raise ValueError("no frame in it")
-        frame = frames[0].reformat(format="rgb24")
+        frame = frames[0]
+        if (frame.width, frame.height) != (width, height):
+            raise ValueError("decoded dimensions differ from the rectangle")
+        frame = frame.reformat(format="rgb24")
     except Exception as ex:  # whatever the library says of a picture it cannot read
         raise RfbError(PROTOCOL, f"a JPEG that cannot be read ({type(ex).__name__})") from None
     if (frame.width, frame.height) != (width, height):

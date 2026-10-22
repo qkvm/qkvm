@@ -565,3 +565,50 @@ def test_tile_bytes_changed_before_compression_reach_the_decoders_and_end_with_a
         if ended.code == rfb.CLOSED or (ended.code == rfb.PROTOCOL and any(word in ended.message for word in DECODED)):
             reached += 1
     assert reached >= 40, reached
+
+
+@pytest.mark.parametrize("width,height", [(16, 16), (32, 8)])
+def test_jpeg_native_decoder_cannot_exceed_the_rectangle(width: int, height: int, monkeypatch: pytest.MonkeyPatch) -> None:
+    import av
+    from types import SimpleNamespace
+
+    create = av.CodecContext.create
+    decoded: list[tuple[int, int]] = []
+
+    class ObservedDecoder:
+        def __init__(self, *args: Any) -> None:
+            self.native = create(*args)
+
+        @property
+        def options(self) -> Any:
+            return self.native.options
+
+        @options.setter
+        def options(self, value: Any) -> None:
+            self.native.options = value
+
+        def decode(self, packet: Any) -> Any:
+            frames = self.native.decode(packet)
+            decoded.extend((frame.width, frame.height) for frame in frames)
+            return frames
+
+    # The header reader sees the first SOF; FFmpeg accepts a later SOF. A post-decode
+    # size check is too late to prevent allocation for that larger native frame.
+    small = fake_vnc.jpeg_of(known_picture(width, height), width, height, 8)
+    large = fake_vnc.jpeg_of(known_picture(256, 256), 256, 256, 8)
+    start = small.index(b"\xff\xc0")
+    length = int.from_bytes(small[start + 2 : start + 4], "big")
+    data = large[:2] + small[start : start + 2 + length] + large[2:]
+    assert rfb.picture_size(data) == (width, height)
+    monkeypatch.setattr(av, "CodecContext", SimpleNamespace(create=ObservedDecoder))
+    # The native decoder must refuse, rather than returning a larger frame that
+    # qKVM reformats and only then rejects as the wrong rectangle size.
+    with pytest.raises(RfbError, match="a JPEG that cannot be read"):
+        rfb.decode_jpeg(data, width, height)
+    assert decoded == []  # no oversized native frame was returned, even before RGB conversion
+
+
+@pytest.mark.parametrize("width,height", [(1, 1), (17, 33), (160, 96), (257, 65)])
+def test_jpeg_pixel_limit_allows_native_buffer_padding(width: int, height: int) -> None:
+    picture = fake_vnc.jpeg_of(known_picture(width, height), width, height, 8)
+    assert len(rfb.decode_jpeg(picture, width, height)) == 3 * width * height
