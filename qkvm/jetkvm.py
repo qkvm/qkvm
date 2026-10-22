@@ -819,7 +819,7 @@ class JetKvmDevice(Device):
     async def _hold(self, session: _Session) -> None:
         """Connect as the JetKVM's own page would, then stay for as long as the wall is watched."""
         try:
-            from aiortc import RTCConfiguration, RTCPeerConnection, RTCSessionDescription
+            from aiortc import RTCConfiguration, RTCPeerConnection, RTCRtpReceiver, RTCSessionDescription
             from aiortc.sdp import candidate_from_sdp
         except ImportError:
             raise MISSING_DRIVER from None
@@ -831,7 +831,16 @@ class JetKvmDevice(Device):
         try:
             # No STUN or TURN servers: the wall and the KVM talk directly, and nobody else needs to know.
             pc = session.pc = RTCPeerConnection(RTCConfiguration(iceServers=[]))
-            pc.addTransceiver("video", direction="recvonly")
+            video = pc.addTransceiver("video", direction="recvonly")
+            # JetKVM sends H.264. Do not negotiate unused native video decoders;
+            # RTX retransmits the selected codec and does not add another decoder.
+            capabilities = RTCRtpReceiver.getCapabilities("video")
+            if capabilities is None:
+                raise MISSING_DRIVER
+            codecs = [codec for codec in capabilities.codecs if codec.mimeType.lower() in {"video/h264", "video/rtx"}]
+            if not any(codec.mimeType.lower() == "video/h264" for codec in codecs):
+                raise MISSING_DRIVER
+            video.setCodecPreferences(codecs)
             rpc = session.rpc = pc.createDataChannel("rpc")  # the device only answers on channels the viewer opens
             rpc.on("open", lambda: self._opened(session))
             rpc.on("message", lambda message: self._on_message(session, message))

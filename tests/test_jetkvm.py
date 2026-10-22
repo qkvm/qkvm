@@ -55,6 +55,10 @@ def test_jetkvm_is_recognised_and_shows_its_screen(tmp_path: Path, jet: FakeJetK
 
         frame = picture(client, device)
         assert frame.content[:3] == b"\xff\xd8\xff" and frame.headers["x-kvm-signal"] == "1"  # type: ignore[attr-defined]
+        assert jet.state.video_offers
+        for offer in jet.state.video_offers:
+            codecs = {line.split()[1].split("/")[0].lower() for line in offer.splitlines() if line.startswith("a=rtpmap:")}
+            assert "h264" in codecs and codecs <= {"h264", "rtx"}
         status = client.get("/api/v1/status").json()[device]
         assert status["state"] == "online" and status["kind"] == "jetkvm"
         assert status["video"] == {"signal": True, "width": 640, "height": 360, "fps": 60}
@@ -661,3 +665,27 @@ def test_collecting_metrics_does_not_count_as_watching_either(jet: FakeJetKvm, m
 
     watched_by_the_alerts(jet, look)
     assert jetkvm._parse("[" * 60_000) == {}  # (a message nested too deep to read is no message, and no error)
+
+
+@pytest.mark.parametrize("missing", [True, False])
+def test_jetkvm_does_not_fall_back_to_other_decoders(tmp_path: Path, jet: FakeJetKvm, monkeypatch: pytest.MonkeyPatch, missing: bool) -> None:
+    from aiortc import RTCRtpReceiver
+    from aiortc.rtcrtpparameters import RTCRtpCapabilities, RTCRtpCodecCapability
+
+    capabilities = None if missing else RTCRtpCapabilities(codecs=[RTCRtpCodecCapability(mimeType="video/VP8", clockRate=90000)])
+    monkeypatch.setattr(RTCRtpReceiver, "getCapabilities", staticmethod(lambda kind: capabilities))
+
+    async def go() -> None:
+        device = jetkvm.JetKvmDevice(DeviceSpec("x", "console", jet.url, "", "secret", kind="jetkvm"))
+        session = jetkvm._Session()
+        try:
+            with pytest.raises(KvmError) as ended:
+                await device._hold(session)
+            assert ended.value.code == jetkvm.MISSING_DRIVER.code
+            assert jet.state.video_offers == []
+        finally:
+            if session.pc is not None:
+                await session.pc.close()
+            await device.close()
+
+    asyncio.run(go())

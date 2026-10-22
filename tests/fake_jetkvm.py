@@ -124,6 +124,7 @@ class JetState:
     token: str | None = None
     logins: int = 0
     passwords_over: list[str] = field(default_factory=list)  # how each password shown to it travelled: "http" or "https"
+    video_offers: list[str] = field(default_factory=list)  # codec negotiation sent by the viewer
     sessions: int = 0  # video connections made so far
     actions: list[str] = field(default_factory=list)
     typed: list[tuple[int, list[int]]] = field(default_factory=list)  # every keyboard state with keys down that a message made
@@ -593,6 +594,7 @@ def make_fake_jetkvm(state: JetState) -> FastAPI:
                 if message.get("type") != "offer":
                     continue
                 offer = json.loads(base64.b64decode(message["data"]["sd"]))
+                state.video_offers.append(offer["sdp"])
 
                 # One viewer at a time: tell the previous one, then drop it.
                 current["loop"] = asyncio.get_running_loop()

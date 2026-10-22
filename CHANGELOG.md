@@ -2,6 +2,8 @@
 
 ## 0.2.0
 
+- Negotiate only H.264 video and retransmission with JetKVM, avoiding unused native video decoders and refusing unsupported codec fallback.
+
 - Bound native JPEG decoding to the expected rectangle plus buffer alignment, and reject inconsistent decoded dimensions before RGB conversion.
 
 - Treat unreadable activity responses beside device history as unavailable and recover on the next usable response without an unhandled page error.
