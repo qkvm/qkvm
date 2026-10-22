@@ -572,6 +572,8 @@ def test_jpeg_native_decoder_cannot_exceed_the_rectangle(width: int, height: int
     import av
     from types import SimpleNamespace
 
+    from qkvm import _video_worker
+
     create = av.CodecContext.create
     decoded: list[tuple[int, int]] = []
 
@@ -586,6 +588,14 @@ def test_jpeg_native_decoder_cannot_exceed_the_rectangle(width: int, height: int
         @options.setter
         def options(self, value: Any) -> None:
             self.native.options = value
+
+        @property
+        def thread_count(self) -> int:
+            return self.native.thread_count
+
+        @thread_count.setter
+        def thread_count(self, value: int) -> None:
+            self.native.thread_count = value
 
         def decode(self, packet: Any) -> Any:
             frames = self.native.decode(packet)
@@ -605,7 +615,9 @@ def test_jpeg_native_decoder_cannot_exceed_the_rectangle(width: int, height: int
     # qKVM reformats and only then rejects as the wrong rectangle size.
     with pytest.raises(RfbError, match="a JPEG that cannot be read"):
         rfb.decode_jpeg(data, width, height)
-    assert decoded == []  # no oversized native frame was returned, even before RGB conversion
+    with pytest.raises((av.FFmpegError, ValueError)):
+        _video_worker.decode_jpeg(av, data, width, height)
+    assert decoded == []  # the worker itself rejects before any oversized native frame is returned
 
 
 @pytest.mark.parametrize("width,height", [(1, 1), (17, 33), (160, 96), (257, 65)])

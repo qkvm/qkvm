@@ -155,7 +155,8 @@ jobs:
   # The resulting OCI archives (including SBOM/provenance) are the only images allowed to publish.
   images:
     needs: build
-    runs-on: ubuntu-latest
+    # Kernel sandbox checks must execute natively, not through syscall emulation.
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
     strategy:
       fail-fast: false
       matrix:

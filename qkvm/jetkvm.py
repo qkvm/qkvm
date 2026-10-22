@@ -39,7 +39,6 @@ import time
 import zlib
 from collections import deque
 from collections.abc import Callable
-from fractions import Fraction
 from typing import Any
 
 import httpx
@@ -315,20 +314,14 @@ def with_candidates(sdp: str, candidates: list[str]) -> str:
 
 def encode_jpeg(frame: Any, width: int | None, quantizer: int) -> bytes:
     """A decoded video frame as a JPEG, shrunk to `width` when that is smaller."""
-    import av
+    from .video import encode_jpeg as isolated_jpeg
 
-    if width and width < frame.width:
-        height = max(2, round(frame.height * width / frame.width / 2) * 2)
-        frame = frame.reformat(width=width, height=height, format="yuvj420p", interpolation="LANCZOS")
-    else:
-        frame = frame.reformat(format="yuvj420p")
-    codec: Any = av.CodecContext.create("mjpeg", "w")
-    codec.width, codec.height, codec.pix_fmt = frame.width, frame.height, "yuvj420p"
-    codec.time_base = Fraction(1, 30)
-    codec.options = {"qmin": str(quantizer), "qmax": str(quantizer)}
-    frame.pts = 0
-    packets = codec.encode(frame) + codec.encode(None)
-    return bytes(packets[0])
+    from .video import VideoError
+
+    try:
+        return isolated_jpeg(frame, width, quantizer)
+    except VideoError:
+        raise KvmError("no_stream", "Secure video processing stopped; waiting for a new picture", 503) from None
 
 
 class _Leftover:
@@ -343,6 +336,7 @@ class _Session:
     """One WebRTC connection to the device and what has arrived over it."""
 
     def __init__(self) -> None:
+        self.video_worker: Any = None
         self.pc: Any = None
         self.rpc: Any = None
         self.ready = asyncio.Event()  # the data channel is open: the device can be talked to
@@ -807,6 +801,9 @@ class JetKvmDevice(Device):
             # The last picture (decoded, so megabytes of it) is not kept beyond the connection it came over.
             session.frame = None
             session.encoded.clear()
+            if session.video_worker is not None:
+                await asyncio.to_thread(session.video_worker.close)
+                session.video_worker = None
             if session.pc is not None:
                 # Given a few seconds, and then left to finish by itself: whoever waits for this is holding
                 # up a change to the wall, or the program's way out.
@@ -827,11 +824,22 @@ class JetKvmDevice(Device):
         # and the library warns about every one of them. That is how video starts, not something to report.
         logging.getLogger("aiortc.codecs.h264").setLevel(logging.ERROR)
 
+        from .video import BoundedDecoderQueue, VideoError, Worker, install_aiortc_boundary
+
+        try:
+            install_aiortc_boundary()
+            # Establish isolation before negotiating video, so startup cannot fill
+            # the bounded decoder queue while the first frames arrive.
+            session.video_worker = await asyncio.to_thread(Worker)
+        except (VideoError, OSError):
+            raise KvmError("no_stream", "Secure video processing is unavailable", 503) from None
         ws = await self._signalling()
         try:
             # No STUN or TURN servers: the wall and the KVM talk directly, and nobody else needs to know.
             pc = session.pc = RTCPeerConnection(RTCConfiguration(iceServers=[]))
             video = pc.addTransceiver("video", direction="recvonly")
+            receiver: Any = video.receiver
+            receiver._RTCRtpReceiver__decoder_queue = BoundedDecoderQueue(session.video_worker)
             # JetKVM sends H.264. Do not negotiate unused native video decoders;
             # RTX retransmits the selected codec and does not add another decoder.
             capabilities = RTCRtpReceiver.getCapabilities("video")
@@ -989,7 +997,9 @@ class JetKvmDevice(Device):
                 session.frame = frame
                 session.frame_at = time.monotonic()
         except MediaStreamError:
-            pass
+            if not session.done.is_set() and not session.taken:
+                session.lost = KvmError("no_stream", "Secure video processing stopped", 503)
+                session.done.set()
 
     def _on_message(self, session: _Session, message: Any) -> None:
         if not isinstance(message, str):

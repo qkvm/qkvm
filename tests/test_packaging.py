@@ -44,7 +44,10 @@ def test_the_packages_asked_for_are_the_few_that_are_needed() -> None:
 
 def test_each_package_has_a_lowest_version_it_is_known_to_work_with() -> None:
     for requirement in PROJECT["dependencies"]:
-        assert ">=" in requirement, f"{requirement}: say from which version on"
+        if requirement.startswith("aiortc"):
+            assert requirement == "aiortc==1.15.0", "review the decoder boundary before changing its receiver"
+        else:
+            assert ">=" in requirement, f"{requirement}: say from which version on"
 
 
 def test_the_page_brings_everything_it_needs() -> None:
@@ -61,7 +64,7 @@ def test_the_versions_looked_for_at_start_are_the_ones_asked_for_on_installing()
     # together some other way, or grown old, is told so. Two lists that say the same thing have to.
     from qkvm.cli import SAFE_FROM
 
-    asked = {re.split(r"[\s<>=!~\[;]", requirement, maxsplit=1)[0].lower(): requirement.split(">=", 1)[1] for requirement in PROJECT["dependencies"]}
+    asked = {re.split(r"[\s<>=!~\[;]", requirement, maxsplit=1)[0].lower(): re.split(r">=|==", requirement, maxsplit=1)[1] for requirement in PROJECT["dependencies"]}
     for name, minimum in SAFE_FROM.items():
         numbers = tuple(int(part) for part in asked[name].split("."))
         assert numbers + (0,) * (3 - len(numbers)) == minimum, name

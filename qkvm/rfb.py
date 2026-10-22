@@ -563,33 +563,12 @@ def decode_jpeg(data: bytes, width: int, height: int) -> bytes:
     """A JPEG as three bytes a pixel. RfbError where it is not a picture of that size, or none at all."""
     if picture_size(data) != (width, height):
         raise RfbError(PROTOCOL, "a JPEG that is not of its rectangle's size")
-    import av
+    from .video import decode_jpeg as isolated_jpeg
 
     try:
-        codec: Any = av.CodecContext.create("mjpeg", "r")
-        # A later JPEG frame header can override the size read above. Bound native
-        # allocation too, before decoding or reformatting an untrusted picture.
-        # FFmpeg also checks padded buffers: allow SIMD/chroma alignment, not
-        # arbitrary dimensions from a second frame header.
-        padded_pixels = ((width + 255) // 256 * 256) * ((height + 63) // 64 * 64)
-        codec.options = {"max_pixels": str(padded_pixels)}
-        frames = codec.decode(av.Packet(data)) + codec.decode(None)
-        if not frames:
-            raise ValueError("no frame in it")
-        frame = frames[0]
-        if (frame.width, frame.height) != (width, height):
-            raise ValueError("decoded dimensions differ from the rectangle")
-        frame = frame.reformat(format="rgb24")
-    except Exception as ex:  # whatever the library says of a picture it cannot read
+        return isolated_jpeg(data, width, height)
+    except Exception as ex:
         raise RfbError(PROTOCOL, f"a JPEG that cannot be read ({type(ex).__name__})") from None
-    if (frame.width, frame.height) != (width, height):
-        raise RfbError(PROTOCOL, "a JPEG that is not of its rectangle's size")
-    plane = frame.planes[0]
-    raw = bytes(plane)
-    row = 3 * width
-    if plane.line_size == row:
-        return raw[: row * height]
-    return b"".join(raw[y * plane.line_size : y * plane.line_size + row] for y in range(height))
 
 
 class Client:

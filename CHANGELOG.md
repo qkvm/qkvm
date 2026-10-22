@@ -2,6 +2,8 @@
 
 ## 0.2.0
 
+- Isolate native JPEG/H.264 processing from KVM credentials using Linux seccomp or Windows AppContainer workers, with bounded messages, resource limits, deadlines and no unsandboxed fallback. Pin the reviewed WebRTC receiver interface and test the OS boundary and container compatibility.
+
 - Require the audited aiortc and PyAV minimums during installation and warn about older manually maintained video libraries.
 
 - Negotiate only H.264 video and retransmission with JetKVM, avoiding unused native video decoders and refusing unsupported codec fallback.

@@ -209,24 +209,13 @@ def screen_jpeg(width: int, height: int, screen: bytearray, target: int | None, 
     `screen` is the one frames are being read into: it is copied here, in the thread this runs in (megabytes,
     and not on the thread that serves every browser). ValueError: it is not a screen of that size.
     """
-    import av
+    from .video import RGBFrame, dimensions, encode_jpeg
 
-    from .jetkvm import encode_jpeg
-
+    dimensions(width, height)
     rgb = bytes(screen)
     if len(rgb) != 3 * width * height:
         raise ValueError("not a screen of that size")
-    frame = av.VideoFrame(width, height, "rgb24")
-    plane = frame.planes[0]
-    row = 3 * width
-    if plane.line_size == row:
-        plane.update(rgb)
-    else:  # the library keeps each row a little longer than it is
-        padded = bytearray(plane.line_size * height)
-        for y in range(height):
-            padded[y * plane.line_size : y * plane.line_size + row] = rgb[y * row : (y + 1) * row]
-        plane.update(bytes(padded))
-    return encode_jpeg(frame, target, quantizer)
+    return encode_jpeg(RGBFrame(width, height, rgb), target, quantizer)
 
 
 class _Console:

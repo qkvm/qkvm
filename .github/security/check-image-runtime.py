@@ -6,6 +6,8 @@ import pwd
 import stat
 from pathlib import Path
 
+from qkvm.video import RGBFrame, decode_jpeg, encode_jpeg, shutdown
+
 if os.getuid() != 10001:
     raise SystemExit("The image must run as qkvm UID 10001")
 if any(line.strip() and not line.lstrip().startswith("#") for line in Path("/etc/fstab").read_text().splitlines()):
@@ -28,3 +30,11 @@ for path in Path("/usr").rglob("*"):
 for module in ("_ctypes", "_ssl", "_uuid", "_curses", "_sqlite3", "_bz2", "_lzma", "aiortc", "av", "cryptography"):
     __import__(module)
 print("Nonroot identity, absence of setuid/setgid files, and container exception preconditions verified")
+
+# Nested seccomp must work under the ordinary nonroot container policy on each CPU.
+
+picture = encode_jpeg(RGBFrame(17, 33, bytes([31, 64, 127]) * 17 * 33), None, 2)
+if len(decode_jpeg(picture, 17, 33)) != 17 * 33 * 3:
+    raise SystemExit("Isolated video processing failed in the runtime image")
+shutdown()
+print("Native video sandbox and bounded JPEG roundtrip verified")

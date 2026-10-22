@@ -316,7 +316,8 @@ jobs:
 
   # The same archive build, runtime checks and security policy that gate every release.
   image:
-    runs-on: ubuntu-latest
+    # Kernel sandbox checks must execute natively, not through syscall emulation.
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
     strategy:
       fail-fast: false
       matrix:

@@ -35,7 +35,7 @@ dependencies = [
     "cryptography>=50",
     # A JetKVM sends its picture as WebRTC video only: a WebRTC client and, with it, a video decoder.
     # The largest thing here by far, and loaded only once there is a JetKVM on the wall.
-    "aiortc>=1.15",
+    "aiortc==1.15.0",  # decoder isolation uses this reviewed receiver interface
     "av>=17.1.0",  # keep upgrades on at least the audited native-video baseline; aiortc supplies the upper bound
     # Used through the libraries above; listed to keep out versions with known vulnerabilities.
     "anyio>=4.14.2",

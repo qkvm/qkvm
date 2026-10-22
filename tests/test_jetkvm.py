@@ -65,7 +65,14 @@ def test_jetkvm_is_recognised_and_shows_its_screen(tmp_path: Path, jet: FakeJetK
         assert status["about"] == {"model": "JetKVM", "version": "0.5.9"}
         assert status["usb"] == {"keyboard": True, "mouse": True}
         small = client.get(snap(device), params={"w": 300})
-        assert small.status_code == 200 and len(small.content) < len(frame.content)  # type: ignore[attr-defined]
+        from qkvm.rfb import picture_size
+
+        assert small.status_code == 200
+        full_size = picture_size(frame.content)  # type: ignore[attr-defined]
+        small_size = picture_size(small.content)
+        assert full_size is not None and small_size is not None
+        # Different live frames have different compressibility; check actual resizing.
+        assert small_size[0] < full_size[0] and small_size[1] < full_size[1]
     assert jet.state.logins == 1 and jet.state.sessions == 1  # one login, one connection, however many requests
 
 

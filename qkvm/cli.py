@@ -58,7 +58,9 @@ def outdated_libraries() -> dict[str, str]:
         except PackageNotFoundError:
             continue
         numbers = tuple(int(part) for part in re.findall(r"[0-9]+", installed)[:3])
-        if numbers < minimum:
+        if name == "aiortc" and installed != "1.15.0":
+            found[name] = f"{name} {installed} (video isolation requires reviewed version 1.15.0)"
+        elif numbers < minimum:
             found[name] = f"{name} {installed} (required minimum {'.'.join(str(part) for part in minimum)})"
     return found
 

@@ -184,3 +184,41 @@ Data already sent to a client cannot be recalled. A device operation already in 
 may finish after revocation; qKVM releases keys and buttons it put down, including
 late deliveries, and waits for cleanup during controller handover. Cleanup releases
 are allowed after revocation so a machine is not left with keys held down.
+
+
+## Native video isolation
+
+JPEG decoding, H.264 decoding, resizing and JPEG encoding run in a fresh worker
+process. The application sends bounded video data over pipes; it does not send
+KVM addresses, passwords, session cookies, unlock keys or its environment. Native
+frames remain in the worker. Replies use a fixed binary format with dimensions,
+operation and size checks before payload allocation; Python object deserialization
+is not used. A failed, overloaded or timed-out worker stops video without falling
+back to native decoding in the credential-holding application.
+
+On Linux x86-64 and ARM64, the worker loads trusted runtime code before applying a
+seccomp syscall allowlist. It then cannot open files, create sockets or processes,
+inspect other processes or change its sandbox. It retains only the three standard
+pipe/null descriptors, cannot dump core, and has a 1 GiB address-space limit.
+
+On Windows, each worker has a separate capability-free AppContainer identity. A
+read-only copy of public Python and video runtime files is made available to it;
+application data is not copied. A job limits the worker to one process and 1 GiB
+of committed memory and restricts UI access. Only the explicit input, output and
+null-error handles are inherited. The worker verifies its AppContainer token and
+absence of capabilities before reading video. It may access its own empty profile
+and system resources permitted to AppContainers; it is not a no-filesystem sandbox.
+Windows installations need permission to create an AppContainer profile and a
+writable temporary directory for the public runtime bundle.
+
+Other operating systems and Linux architectures currently fail closed for these
+native-video paths. Device control and video paths forwarded without native
+processing are separate. The aiortc version is pinned because its receiver hook
+is an internal interface; upgrading it requires reviewing and testing the boundary.
+
+Isolation limits the consequences of a native-library exploit; it does not fix
+vulnerabilities in bundled libraries. A compromised worker can see video supplied
+to it, corrupt or stop its output, and attack the operating-system sandbox. Shared
+JPEG processing can include screens from multiple devices. Keep video libraries
+and the host operating system updated. Browser-side decoding, network protocol
+libraries, administrator access and a compromised host remain separate risks.

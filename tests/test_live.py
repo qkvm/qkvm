@@ -283,15 +283,9 @@ def comet() -> Iterator[FakeKvm]:
 
 def a_jpeg(colour: tuple[int, int, int], width: int = 320, height: int = 180) -> bytes:
     """A JPEG of one colour, made the way the program makes them."""
-    import av
+    from qkvm.video import RGBFrame, encode_jpeg
 
-    from qkvm.jetkvm import encode_jpeg
-
-    frame = av.VideoFrame(width, height, "rgb24")
-    plane = frame.planes[0]
-    row = bytes(colour) * width + bytes(plane.line_size - 3 * width)
-    plane.update(row * height)
-    return encode_jpeg(frame, None, 2)
+    return encode_jpeg(RGBFrame(width, height, bytes(colour) * width * height), None, 2)
 
 
 # --- the pass, and the line ----------------------------------------------------------------------------------
