@@ -243,8 +243,9 @@ def settings_of(data: Path) -> dict[str, Any]:
     while True:
         try:
             return json.loads((data / "qkvm.json").read_text(encoding="utf-8"))
-        except PermissionError as ex:
-            if sys.platform != "win32" or getattr(ex, "winerror", None) not in (5, 32, 33) or time.monotonic() >= deadline:
+        except PermissionError:
+            # The Windows C runtime reports sharing violations as EACCES without winerror.
+            if sys.platform != "win32" or time.monotonic() >= deadline:
                 raise
             time.sleep(0.01)
 
