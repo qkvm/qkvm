@@ -81,10 +81,13 @@ def linux_lockdown() -> None:
 
 def windows_lockdown() -> None:
     """Verify the launcher supplied a capability-free AppContainer token."""
-    assert sys.platform == "win32", "AppContainer verification is Windows-only"
+    if sys.platform != "win32":
+        raise RuntimeError("AppContainer verification is Windows-only")
     from ctypes import wintypes as wt
-    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
-    advapi = ctypes.WinDLL("advapi32", use_last_error=True)
+    # This entry point is imported for Linux checks too; WinDLL exists only on Windows.
+    windows_dll = getattr(ctypes, "WinDLL")
+    kernel = windows_dll("kernel32", use_last_error=True)
+    advapi = windows_dll("advapi32", use_last_error=True)
     kernel.GetCurrentProcess.restype = ctypes.c_void_p
     advapi.OpenProcessToken.argtypes = [ctypes.c_void_p, wt.DWORD, ctypes.POINTER(ctypes.c_void_p)]
     advapi.GetTokenInformation.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, wt.DWORD, ctypes.POINTER(wt.DWORD)]

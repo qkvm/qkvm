@@ -21,7 +21,8 @@ import uuid
 import zipfile
 from typing import Any
 
-assert sys.platform == "win32", "Windows video launcher is Windows-only"
+if sys.platform != "win32":
+    raise ImportError("Windows video launcher is Windows-only")
 
 P = ctypes.c_void_p
 SIZE = ctypes.c_size_t
@@ -227,7 +228,8 @@ class AppProcess:
             # Only start after the process/job restrictions are in place.
             if api(kernel, "ResumeThread", [P], wt.DWORD)(info.thread) == 0xFFFFFFFF:
                 raise ctypes.WinError(ctypes.get_last_error())
-            assert write_in.value is not None and read_out.value is not None
+            if write_in.value is None or read_out.value is None:
+                raise OSError("video pipe handles are unavailable")
             self.stdin = io.open(msvcrt.open_osfhandle(write_in.value, os.O_WRONLY | os.O_BINARY), "wb")
             handles.remove(write_in)
             self.stdout = io.open(msvcrt.open_osfhandle(read_out.value, os.O_RDONLY | os.O_BINARY), "rb")
