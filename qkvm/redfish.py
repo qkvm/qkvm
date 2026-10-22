@@ -37,6 +37,7 @@ from websockets.exceptions import ConnectionClosed, InvalidStatus, WebSocketExce
 
 from . import ami
 from .aspeed import Garbled, Screen
+from .video import VideoSession
 from .kvm import (
     ABOUT_RETRY,
     ABOUT_TTL,
@@ -203,7 +204,7 @@ PASS_REFUSED = {
 }
 
 
-def screen_jpeg(width: int, height: int, screen: bytearray, target: int | None, quantizer: int) -> bytes:
+def screen_jpeg(width: int, height: int, screen: bytearray, target: int | None, quantizer: int, session: VideoSession | None = None) -> bytes:
     """A screen of three bytes a pixel as a JPEG, shrunk to `target` pixels wide when that is smaller.
 
     `screen` is the one frames are being read into: it is copied here, in the thread this runs in (megabytes,
@@ -215,13 +216,14 @@ def screen_jpeg(width: int, height: int, screen: bytearray, target: int | None, 
     rgb = bytes(screen)
     if len(rgb) != 3 * width * height:
         raise ValueError("not a screen of that size")
-    return encode_jpeg(RGBFrame(width, height, rgb), target, quantizer)
+    return encode_jpeg(RGBFrame(width, height, rgb), target, quantizer, session)
 
 
 class _Console:
     """One console session with a controller, and the server's screen as it has arrived over it."""
 
     def __init__(self) -> None:
+        self.video_encoder = VideoSession()
         self.screen = Screen()
         self.frames = 0  # how many have been read: a JPEG made at an earlier count is not the latest picture
         self.since = 0.0  # when the first of them was (time.monotonic())
@@ -1530,7 +1532,7 @@ class RedfishDevice(Device):
             asked, made_of = time.monotonic(), console.frames
             target = None if size == FULL else TIERS[size][0]
             try:
-                data = await asyncio.to_thread(screen_jpeg, shown_width, shown_height, shown, target, QUANTIZER[size])
+                data = await asyncio.to_thread(screen_jpeg, shown_width, shown_height, shown, target, QUANTIZER[size], console.video_encoder)
             except Exception:  # whatever the library that makes it says of a screen caught in the middle of a change
                 raise KvmError("no_stream", "The server's screen changed while its picture was being made", 503) from None
             snap = Snapshot(data, "image/jpeg", True, asked)
@@ -1591,6 +1593,7 @@ class RedfishDevice(Device):
             console.encoded.clear()
             console.screen.given_up = True
             console.screen = Screen()
+            await asyncio.to_thread(console.video_encoder.close)
 
     async def _web(self, method: str, path: str, headers: dict[str, str] | None = None, **kwargs: Any) -> httpx.Response:
         """A request to the controller's own web page (not Redfish): the console is that page's."""

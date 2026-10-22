@@ -1,6 +1,7 @@
 """Exercise the operating-system boundary as well as the untrusted wire protocol."""
 from __future__ import annotations
 
+import asyncio
 import ctypes
 import importlib.util
 import io
@@ -18,14 +19,49 @@ import pytest
 from qkvm import _video_worker, video
 
 
-def test_real_sandbox_roundtrip_and_restart() -> None:
+def test_real_sandboxes_are_separate_and_closed_sessions_cannot_restart() -> None:
     frame = video.RGBFrame(17, 33, bytes([31, 64, 127]) * 17 * 33)
-    encoded = video.encode_jpeg(frame, None, 2)
-    assert len(video.decode_jpeg(encoded, 17, 33)) == 17 * 33 * 3
-    old = video.shared()
-    old.close()
-    assert video.shared() is not old
-    assert len(video.decode_jpeg(encoded, 17, 33)) == 17 * 33 * 3
+    first, second = video.VideoSession(), video.VideoSession()
+    try:
+        encoded = video.encode_jpeg(frame, None, 2, first)
+        assert len(video.decode_jpeg(encoded, 17, 33, second)) == 17 * 33 * 3
+        assert first._worker is not None and second._worker is not None
+        assert first._worker._process.pid != second._worker._process.pid
+        first.close()
+        with pytest.raises(video.VideoError, match="session is closed"):
+            video.encode_jpeg(frame, None, 2, first)
+        assert len(video.decode_jpeg(encoded, 17, 33, second)) == 17 * 33 * 3
+    finally:
+        first.close()
+        second.close()
+
+
+def test_rfb_connections_never_share_native_decoder_state() -> None:
+    from qkvm import rfb
+
+    jpeg = video.encode_jpeg(video.RGBFrame(16, 16, bytes([40, 80, 120]) * 256), None, 2)
+    async def close_stream() -> None:
+        pass
+
+    clients = [rfb.Client(SimpleNamespace(close=close_stream)) for _ in range(2)]
+    try:
+        for client in clients:
+            client.width = client.height = 16
+            client.rgb = bytearray(16 * 16 * 3)
+            list(client._draw_tight(0, 0, 16, 16, rfb._Bytes(b"\x90" + jpeg)))
+        workers = [client._video_decoder._worker for client in clients]
+        assert all(worker is not None for worker in workers)
+        assert workers[0]._process.pid != workers[1]._process.pid
+        # A compromised/terminated decoder for one server cannot poison the other.
+        workers[0].close()
+        with pytest.raises(rfb.RfbError):
+            list(clients[0]._draw_tight(0, 0, 16, 16, rfb._Bytes(b"\x90" + jpeg)))
+        list(clients[1]._draw_tight(0, 0, 16, 16, rfb._Bytes(b"\x90" + jpeg)))
+    finally:
+        for client in clients:
+            asyncio.run(client.close())
+            with pytest.raises(video.VideoError, match="session is closed"):
+                video.decode_jpeg(jpeg, 16, 16, client._video_decoder)
 
 
 def test_native_frames_are_never_accepted_by_parent() -> None:

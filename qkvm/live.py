@@ -1290,24 +1290,29 @@ class ConsoleSource(Source):
 
     async def run(self) -> None:
         from .redfish import QUANTIZER, screen_jpeg
+        from .video import VideoSession
 
+        encoder = VideoSession()
         device = self.machine.device
         made_of = 0
-        while self.viewers:
-            due = time.monotonic() + 1.0 / self.pace()
-            frames, width, height, shown = await device.live_screen()  # type: ignore[attr-defined]
-            if frames != made_of:
-                size = self.tier()
-                target = None if size == FULL or TIERS[size][0] >= width else TIERS[size][0]
-                try:
-                    data = await asyncio.to_thread(screen_jpeg, width, height, shown, target, QUANTIZER[size])
-                except ValueError:
-                    data = b""  # the screen changed size while its picture was being made: the next look has it whole
-                if data:
-                    made_of = frames
-                    self.resize(_as_jpeg(data))
-                    self.offer(JPEG, True, data)
-            await asyncio.sleep(max(0.0, due - time.monotonic()))
+        try:
+            while self.viewers:
+                due = time.monotonic() + 1.0 / self.pace()
+                frames, width, height, shown = await device.live_screen()  # type: ignore[attr-defined]
+                if frames != made_of:
+                    size = self.tier()
+                    target = None if size == FULL or TIERS[size][0] >= width else TIERS[size][0]
+                    try:
+                        data = await asyncio.to_thread(screen_jpeg, width, height, shown, target, QUANTIZER[size], encoder)
+                    except ValueError:
+                        data = b""  # the screen changed size while its picture was being made: the next look has it whole
+                    if data:
+                        made_of = frames
+                        self.resize(_as_jpeg(data))
+                        self.offer(JPEG, True, data)
+                await asyncio.sleep(max(0.0, due - time.monotonic()))
+        finally:
+            await asyncio.to_thread(encoder.close)
 
 
 def _parse(text: str) -> dict[str, Any]:

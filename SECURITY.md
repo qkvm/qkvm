@@ -219,7 +219,9 @@ is an internal interface; upgrading it requires reviewing and testing the bounda
 
 Isolation limits the consequences of a native-library exploit; it does not fix
 vulnerabilities in bundled libraries. A compromised worker can see video supplied
-to it, corrupt or stop its output, and attack the operating-system sandbox. Shared
-JPEG processing can include screens from multiple devices. Keep video libraries
+to it, corrupt or stop its output, and attack the operating-system sandbox. JPEG
+decoders belong to one device connection; encoders belong to one device or live
+stream. Workers are not shared across devices, and closed sessions cannot start
+a replacement worker. Keep video libraries
 and the host operating system updated. Browser-side decoding, network protocol
 libraries, administrator access and a compromised host remain separate risks.

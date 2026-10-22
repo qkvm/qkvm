@@ -40,6 +40,7 @@ from cryptography.hazmat.decrepit.ciphers.algorithms import TripleDES
 from cryptography.hazmat.primitives.ciphers import Cipher, modes
 
 from .kvm import picture_size
+from .video import VideoSession
 
 log = logging.getLogger("qkvm")
 
@@ -559,14 +560,14 @@ def _advance(steps: Iterator[None], most: float) -> tuple[bool, float]:
     return True, time.perf_counter() - began
 
 
-def decode_jpeg(data: bytes, width: int, height: int) -> bytes:
+def decode_jpeg(data: bytes, width: int, height: int, session: VideoSession | None = None) -> bytes:
     """A JPEG as three bytes a pixel. RfbError where it is not a picture of that size, or none at all."""
     if picture_size(data) != (width, height):
         raise RfbError(PROTOCOL, "a JPEG that is not of its rectangle's size")
     from .video import decode_jpeg as isolated_jpeg
 
     try:
-        return isolated_jpeg(data, width, height)
+        return isolated_jpeg(data, width, height, session)
     except Exception as ex:
         raise RfbError(PROTOCOL, f"a JPEG that cannot be read ({type(ex).__name__})") from None
 
@@ -604,6 +605,7 @@ class Client:
         if pixels not in (RGB888, RGB565) or (pixels == RGB565 and not set(encodings) <= {RAW, COPY_RECT, DESKTOP_SIZE}):
             raise ValueError("a pixel format this reader does not read, or not in these encodings")
         self.stream = stream
+        self._video_decoder = VideoSession()
         self.password = password
         self.before_password = before_password  # told the moment before the password's answer goes out
         self.clock = clock
@@ -763,7 +765,10 @@ class Client:
         await self._write(struct.pack(">BBHH", POINTER_EVENT, buttons & 0xFF, x, y))
 
     async def close(self) -> None:
-        await self.stream.close()
+        try:
+            await self.stream.close()
+        finally:
+            await asyncio.to_thread(self._video_decoder.close)
 
     # --- what the server sends ------------------------------------------------------------------------------
 
@@ -1260,7 +1265,7 @@ class Client:
             return
         if method == 0x9:
             if self.drawing:
-                self._blit(x, y, width, height, decode_jpeg(data.take(data.left()), width, height))
+                self._blit(x, y, width, height, decode_jpeg(data.take(data.left()), width, height, self._video_decoder))
             yield
             return
         filter_id = data.byte() if control & 0x40 else 0

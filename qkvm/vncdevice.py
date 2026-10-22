@@ -58,6 +58,7 @@ from .kvm import (
 from .redfish import QUANTIZER
 from .redfish import screen_jpeg as rgb_jpeg  # a screen of three bytes a pixel as a JPEG, as the server's console is made into one
 from .store import device_url
+from .video import VideoSession
 
 log = logging.getLogger("qkvm")
 
@@ -138,6 +139,7 @@ class _Session:
     """One connection to the server, from its making to its end."""
 
     def __init__(self) -> None:
+        self.video_encoder = VideoSession()
         self.client: rfb.Client | None = None  # set once the handshake is done
         self.ready = asyncio.Event()  # the handshake ended, one way or the other
         self.done = asyncio.Event()  # the connection is over
@@ -371,7 +373,7 @@ class VncDevice(Device):
             asked, made_of = time.monotonic(), client.frames
             target = None if size == FULL else TIERS[size][0]
             try:
-                data = await asyncio.to_thread(rgb_jpeg, shown_width, shown_height, shown, target, QUANTIZER[size])
+                data = await asyncio.to_thread(rgb_jpeg, shown_width, shown_height, shown, target, QUANTIZER[size], session.video_encoder)
             except Exception:  # whatever the library says of a screen caught in the middle of a change of size
                 raise KvmError("no_stream", "The screen changed while its picture was being made", 503) from None
             snap = Snapshot(data, "image/jpeg", True, asked)
@@ -635,8 +637,11 @@ class VncDevice(Device):
             session.encoded.clear()
             session.done.set()
             session.ready.set()
-            if client is not None:
-                await client.close()
+            try:
+                if client is not None:
+                    await client.close()
+            finally:
+                await asyncio.to_thread(session.video_encoder.close)
 
     def _ended(self, session: _Session, offered: str, ex: rfb.RfbError) -> KvmError:
         """What a connection that ended this way says from now on, noted where it is kept."""

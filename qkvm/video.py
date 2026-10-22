@@ -181,25 +181,52 @@ class Worker:
         self.close()
 
 
-_shared: Worker | None = None
-_shared_lock = threading.Lock()
+class VideoSession:
+    """A lazy worker owned by one device or stream, never a process-wide pool."""
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._worker: Worker | None = None
+        self._closed = False
+
+    def request(self, *args: Any, **kwargs: Any) -> tuple[int, int, int, bytes]:
+        if not self._lock.acquire(timeout=WORK_WITHIN):
+            raise VideoError("video session is busy")
+        try:
+            if self._closed:
+                raise VideoError("video session is closed")
+            if self._worker is None:
+                self._worker = Worker()
+            return self._worker.request(*args, **kwargs)
+        finally:
+            self._lock.release()
+
+    def close(self) -> None:
+        with self._lock:
+            self._closed = True
+            if self._worker is not None:
+                self._worker.close()
+
+    def __del__(self) -> None:
+        self.close()
 
 
-def shared() -> Worker:
-    global _shared
-    with _shared_lock:
-        if _shared is None or _shared._process is None:
-            _shared = Worker()
-        return _shared
+def decode_jpeg(data: bytes, width: int, height: int, session: VideoSession | None = None) -> bytes:
+    owned = session if session is not None else VideoSession()
+    try:
+        return owned.request(1, width, height, data=data)[3]
+    finally:
+        if session is None:
+            owned.close()
 
 
-def decode_jpeg(data: bytes, width: int, height: int) -> bytes:
-    return shared().request(1, width, height, data=data)[3]
-
-
-def encode_jpeg(frame: RGBFrame | VideoFrame, width: int | None, quantizer: int) -> bytes:
+def encode_jpeg(frame: RGBFrame | VideoFrame, width: int | None, quantizer: int, session: VideoSession | None = None) -> bytes:
     if isinstance(frame, RGBFrame):
-        return shared().request(3, frame.width, frame.height, width or 0, quantizer, frame.rgb)[3]
+        owned = session if session is not None else VideoSession()
+        try:
+            return owned.request(3, frame.width, frame.height, width or 0, quantizer, frame.rgb)[3]
+        finally:
+            if session is None:
+                owned.close()
     if isinstance(frame, VideoFrame):
         return frame.worker.request(4, frame.ident, 0, width or 0, quantizer)[3]
     raise VideoError("native frames must remain inside the video worker")
