@@ -41,10 +41,10 @@ MAX_CRASHES = 5  # restarts allowed within CRASH_WINDOW before giving up
 CRASH_WINDOW = 60.0
 
 
-# Libraries this program runs on, and the first version of each without a publicly known
-# vulnerability that matters here. The same floors are in pyproject.toml; this is for a copy
-# started in an environment that was put together some other way.
-SAFE_FROM = {"starlette": (1, 3, 1), "cryptography": (50, 0, 0), "anyio": (4, 14, 2), "idna": (3, 15, 0), "certifi": (2026, 10, 19), "h11": (0, 16, 0)}
+# Minimum library versions for the reviewed security/runtime baseline. These floors do not
+# certify that every bundled component is vulnerability-free. The same floors are in
+# pyproject.toml; this warns about environments maintained outside the normal installer.
+SAFE_FROM = {"starlette": (1, 3, 1), "cryptography": (50, 0, 0), "anyio": (4, 14, 2), "idna": (3, 15, 0), "certifi": (2026, 10, 19), "h11": (0, 16, 0), "aiortc": (1, 15, 0), "av": (17, 1, 0)}
 
 
 def outdated_libraries() -> dict[str, str]:
@@ -59,7 +59,7 @@ def outdated_libraries() -> dict[str, str]:
             continue
         numbers = tuple(int(part) for part in re.findall(r"[0-9]+", installed)[:3])
         if numbers < minimum:
-            found[name] = f"{name} {installed} (safe from {'.'.join(str(part) for part in minimum)})"
+            found[name] = f"{name} {installed} (required minimum {'.'.join(str(part) for part in minimum)})"
     return found
 
 

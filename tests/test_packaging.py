@@ -22,6 +22,7 @@ NEEDED = {
     "websockets": "keeps a KVM's video stream awake; JetKVM signalling",
     "cryptography": "the vault, the signature on updates, qKVM's own certificate",
     "aiortc": "a JetKVM sends its picture as WebRTC video and nothing else; by far the largest of these, loaded only for a JetKVM",
+    "av": "direct JPEG decoding and JetKVM video; enforce the audited native-library baseline",
     "anyio": "used by the above; named for a minimum version without a known hole",
     "idna": "used by the above; named for a minimum version without a known hole",
     "certifi": "outbound TLS trust bundle; excludes the compromised emSign trust chain",
@@ -72,4 +73,4 @@ def test_a_library_with_a_known_hole_is_named_so_that_it_can_be_updated(monkeypa
     monkeypatch.setattr(cli, "SAFE_FROM", {"pytest": (999, 0, 0), "nothing-of-this-name": (1, 0, 0)})
     found = cli.outdated_libraries()
     # By name, because that is what has to be typed after `pip install --upgrade`; one that is not installed is not an old one.
-    assert list(found) == ["pytest"] and found["pytest"].endswith("(safe from 999.0.0)")
+    assert list(found) == ["pytest"] and found["pytest"].endswith("(required minimum 999.0.0)")

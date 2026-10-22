@@ -2,6 +2,8 @@
 
 ## 0.2.0
 
+- Require the audited aiortc and PyAV minimums during installation and warn about older manually maintained video libraries.
+
 - Negotiate only H.264 video and retransmission with JetKVM, avoiding unused native video decoders and refusing unsupported codec fallback.
 
 - Bound native JPEG decoding to the expected rectangle plus buffer alignment, and reject inconsistent decoded dimensions before RGB conversion.
