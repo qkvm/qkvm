@@ -125,37 +125,24 @@
       <button type="button" class="icon-btn" id="focus-prev" title="Previous (left arrow key)" aria-label="Previous KVM"></button>
       <button type="button" class="icon-btn" id="focus-next" title="Next (right arrow key)" aria-label="Next KVM"></button>
       <button type="button" id="focus-again" title="Open the live picture again" hidden>Live again</button>
-      <button type="button" class="operator-only" id="focus-control" aria-pressed="false" aria-controls="focus-keys" aria-expanded="false" title="Take this machine's keyboard and mouse (C)" hidden>Control</button>
-      <button type="button" class="icon-btn" id="focus-tools-toggle" aria-label="Show control tools" title="Show control tools" aria-expanded="false" aria-controls="focus-keys" hidden>▾</button>
       <button type="button" id="focus-health" aria-pressed="false" title="How the server is: health, temperatures, fans" hidden>Health</button>
 
+      <button type="button" class="operator-only" id="focus-control" aria-pressed="false" aria-expanded="false" aria-controls="focus-keys" title="Take this machine's keyboard and mouse (C)" hidden>Control</button>
       <button type="button" class="operator-only" id="focus-actions">Actions</button>
       <a class="btn" id="focus-open" target="_blank" rel="noopener noreferrer">Open console</a>
       <button type="button" id="focus-fullscreen" title="Fullscreen (F)">Fullscreen</button>
-      <details class="focus-popover" name="focus-tools" id="focus-details">
-      <summary class="btn">Details</summary>
-      <div class="focus-details-content"><span class="muted live-line" id="focus-live" role="status" hidden></span>
-        <button type="button" id="focus-activity" aria-expanded="false" aria-controls="focus-history">Show activity</button>
-      </div>
-      </details>
       <button type="button" class="icon-btn" id="focus-close" title="Close (Esc)" aria-label="Close"></button>
     </div>
     <div class="focus-control-panel" id="focus-keys" role="toolbar" aria-label="Remote keyboard and mouse" hidden>
-      <span class="control-state">Control active</span>
+    <button type="button" id="focus-keyboard-toggle" aria-expanded="false" aria-controls="focus-keyboard" disabled>Keyboard</button>
       <button type="button" id="focus-cad" title="Ctrl+Alt+Del on the machine">Ctrl+Alt+Del</button>
       <button type="button" id="focus-win" title="The Windows key, pressed and let go">Win</button>
       <button type="button" id="focus-alt-tab" title="Alt+Tab on the machine">Alt+Tab</button>
       <button type="button" id="focus-alt-f4" title="Alt+F4 on the machine">Alt+F4</button>
       <button type="button" id="focus-prtsc" title="Print Screen">PrtSc</button>
       <button type="button" id="focus-type" title="Type text on the machine">Type text...</button>
-      <button type="button" id="focus-relative" aria-pressed="false">Relative mouse</button>
-      <button type="button" id="focus-keyboard-toggle" aria-expanded="false" aria-controls="focus-keyboard">On-screen keyboard</button>
-      <span class="muted" id="focus-release-hint">Click Control again or press Right Ctrl to release</span>
+    <button type="button" id="focus-relative" aria-pressed="false" disabled>Relative mouse</button>
       <details class="focus-input-help"><summary>Input help</summary><p class="muted" id="focus-keys-note"></p></details>
-      <div id="focus-keyboard" class="screen-keyboard" role="group" aria-label="On-screen keyboard" hidden>
-        <p class="muted">US key positions; text follows the remote keyboard layout. Shift, Ctrl, Alt and Win apply to the next key.</p>
-        <div class="screen-keyboard-rows"></div>
-      </div>
     </div>
   </div>
   <div class="ports focus-ports" id="focus-ports" role="group" aria-label="Ports" hidden></div>
@@ -165,7 +152,22 @@
     <div class="veil" id="focus-veil"></div>
   </div>
   <!-- Under the picture: what the wall saw of this machine (the history; app.js, "history"). Its own box, filled by its own code. -->
-  <div class="focus-history" id="focus-history" role="group" aria-label="What the wall saw of this machine" hidden></div>
+
+  <div class="focus-statusbar" id="focus-statusbar" aria-label="Console status">
+    <span class="muted live-line" id="focus-live" aria-label="Live stream statistics" hidden></span>
+    <span class="control-state" id="focus-control-state">Viewing</span>
+    <span class="muted" id="focus-release-hint">Right Ctrl releases control</span>
+    <details class="focus-popover" id="focus-details"><summary class="status-details" title="Stream details and activity">Details</summary>
+      <div class="focus-details-content"><span id="focus-status-meta"></span><span class="muted" id="focus-detail-stream"></span>  <div class="focus-history" id="focus-history" role="group" aria-label="What the wall saw of this machine" hidden></div></div>
+    </details>
+  </div>
+  <div id="focus-keyboard" class="screen-keyboard" role="dialog" aria-modal="false" aria-label="On-screen keyboard" hidden>
+    <div class="keyboard-titlebar" id="keyboard-drag" tabindex="0" aria-label="Move keyboard with arrow keys or drag">
+      <strong>Keyboard</strong><button type="button" id="keyboard-reset">Reset position</button><button type="button" id="keyboard-close" aria-label="Close keyboard">×</button>
+    </div>
+    <div class="keyboard-body"><p class="muted">US key positions; text follows the remote keyboard layout. Modifiers apply to the next key.</p><div class="screen-keyboard-rows"></div></div>
+    <button type="button" id="keyboard-resize" aria-label="Resize keyboard with arrow keys or drag">◢</button>
+  </div>
 </section>
 
 <div class="toasts" id="toasts" role="status" aria-live="polite"></div>

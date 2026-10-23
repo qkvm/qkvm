@@ -330,13 +330,18 @@ edge of the page: *admin took over this machine's keyboard and mouse*, or *Given
 minutes without input*.
 
 In the enlarged view, **Control** is a toggle: highlighted while you hold the keyboard and mouse.
-Click it again, or press Right Ctrl by itself, to release control. Its tools open over the picture
-without resizing the video. The arrow beside Control hides or shows these tools while keeping
-control active, so every part of the remote screen remains accessible. **On-screen keyboard** opens letters, numbers, function and navigation
+It sits beside **Actions** in a header that matches the home page height. Turning Control on
+opens a compact input row beneath the header, with keyboard, shortcuts and relative mouse.
+Click Control again, or press Right Ctrl by itself, to release control and close that row.
+The video stays in place. A thin bottom status strip always shows stream information and control state.
+**Keyboard** opens a floating panel near the bottom. Drag its title bar to move it, or drag its
+bottom-right handle to resize it. Both handles also accept arrow keys when focused. **Reset position**
+returns it to the bottom; closing it leaves Control active. The panel stays inside the browser
+when its size changes. It provides letters, numbers, function and navigation
 keys for mouse or touch input. Shift, Ctrl, Alt and Win apply to the next key only; they are not held
-on the remote machine between clicks. Closing the keyboard, losing page focus or releasing control
+on the remote machine between clicks. **Type text** briefly releases this page's live control after confirmation, waits for acknowledgement, types through the normal action channel, then requests control again. A missing acknowledgement or another session holding control blocks the text. Closing the keyboard, losing page focus or releasing control
 clears those modifiers. The labels use US key positions; the remote machine's keyboard layout
-determines the resulting text. **Details** contains stream statistics and the activity toggle.
+determines the resulting text. **Details** in the status strip opens device information, stream statistics, history graphs and permitted recent activity together.
 
 **Who may.** Whoever may see the machine may watch it: a viewer, a wall screen opened with its
 display link, a token for scripts. Taking its keyboard and mouse takes an operator or an admin,

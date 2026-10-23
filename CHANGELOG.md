@@ -2,7 +2,8 @@
 
 ## 0.2.0
 
-- Keep the enlarged video in place when Control is toggled. Group input tools in an overlay and add a collapsible on-screen keyboard with one-shot modifiers for touch or mouse input.
+- Fix Type text while this page owns live control; wait for release acknowledgement before sending. Open status, statistics and permitted activity together from Details.
+- Keep the enlarged video in place when Control is toggled. Match the home-page header height, group input tools beneath Control, show stream statistics in a thin bottom status strip and add a movable, resizable on-screen keyboard with one-shot modifiers for touch or mouse input. Keep live status beneath the device identity.
 
 - Keep JPEG decoders and encoders scoped to a device connection or live stream, preventing a compromised video worker from receiving another device's screen. Tear down workers with their owning sessions.
 - Isolate native JPEG/H.264 processing from KVM credentials using Linux seccomp or Windows AppContainer workers, with bounded messages, resource limits, deadlines and no unsandboxed fallback. Pin the reviewed WebRTC receiver interface and test the OS boundary and container compatibility.

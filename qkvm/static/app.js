@@ -36,6 +36,7 @@ function h(tag, props, ...children) {
 
 // Line icons on a 24x24 grid (Feather set). Each is a list of [shape, attributes].
 const ICONS = {
+  keyboard: [['rect', { x: 2, y: 5, width: 20, height: 14, rx: 2 }], ['path', { d: 'M6 9h.01M10 9h.01M14 9h.01M18 9h.01M6 12h.01M10 12h.01M14 12h.01M18 12h.01M7 16h10' }]],
   sun: [['circle', { cx: 12, cy: 12, r: 4 }],
     ['path', { d: 'M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41' }]],
   moon: [['path', { d: 'M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z' }]],
@@ -1640,7 +1641,17 @@ async function perform(ids, spec, onStarted) {
   acting.set(tile.device.id, spec.title);
   const finished = working(`${tile.device.name}: ${spec.title}...`);
   let result;
+  let releasedLine = null;
   try {
+    // Text actions use the device action channel. Release only this page's ownership
+    // after confirmation, and wait for the server acknowledgement before sending.
+    if (spec.body.action === 'text' && focus?.id === tile.device.id && focus.control?.on) {
+      releasedLine = focus.live;
+      giveBack();
+      const deadline = performance.now() + 3000;
+      while (releasedLine.open && !releasedLine.ended && releasedLine.owed.length && performance.now() < deadline) await sleep(25);
+      if (performance.now() >= deadline || !releasedLine.open || releasedLine.ended || releasedLine.owed.length || focus?.live !== releasedLine) throw new Error('Control release was not confirmed; no text was sent.');
+    }
     // From this machine's large view: the server is told so (a PC with Intel AMT then opens a session before switching on).
     const body = focus?.id === tile.device.id ? { ...spec.body, watching: true } : spec.body;
     result = await api('POST', `api/v1/devices/${tile.device.id}/actions`, body, ACTION_PATIENCE);
@@ -1657,6 +1668,7 @@ async function perform(ids, spec, onStarted) {
     acting.delete(tile.device.id);
     finished();
   }
+  if (releasedLine && focus?.live === releasedLine && releasedLine.open && !releasedLine.ended) askControl();
   toast(`${tile.device.name}: ${result?.note || spec.done}`, 'ok');
   afterAction(tile, spec);
   if (spec.body.action === 'reboot') onStarted?.();
@@ -1678,6 +1690,7 @@ function typeTextDialog(ids) {
           tick: true,
           question: who => `Type this on ${who}?`,
           detail: text.value + (enter.checked ? ' ⏎' : ''),
+          warning: ids.length === 1 && focus?.id === ids[0] && focus.control?.on ? 'Control is briefly released to type this text, then requested again. Another session holding control will still block this action.' : '',
         });
       },
     },
@@ -5310,7 +5323,6 @@ class Control {
     if (this.on) return;
     forgetLateLock();  // (a lock asked for before keyboard and mouse were last given back is this holding's now)
     this.on = true;
-    if (focus?.control === this) focus.toolsHidden = false;
     resetScreenKeyboard(true);
     this.down.clear();
     this.buttons.clear();
@@ -5406,7 +5418,7 @@ class Control {
 
   // The page's own keys rest while keys go to the machine: a dialog on top, or a field, gets them as ever.
   fromThePage(event) {
-    return !this.on || $('dialog[open]') || event.target.matches?.('input, textarea, select') || (event.code !== 'ControlRight' && event.target.closest?.('.focus-popover, .focus-control-panel'));
+    return !this.on || $('dialog[open]') || event.target.matches?.('input, textarea, select') || (event.code !== 'ControlRight' && event.target.closest?.('.focus-popover, .focus-control-panel, .screen-keyboard'));
   }
 
   keyDown(event) {
@@ -5703,9 +5715,7 @@ function openFocus(id) {
     focus = { id, feed, view };
     $('#focus-details').open = false;
     if (opening) {
-      $('#focus').classList.remove('show-activity');
-      $('#focus-activity').setAttribute('aria-expanded', 'false');
-      $('#focus-activity').textContent = 'Show activity';
+      $('#focus-details').open = false;
     }
     $('#focus').hidden = false;
     behindFocus(true);
@@ -5954,9 +5964,12 @@ function renderLive() {
   }
   if (line.textContent !== text) line.textContent = text;
   line.title = title;
+  $('#focus-detail-stream').textContent = text;
   const alert = $('#focus-live-alert');
-  alert.hidden = !(focus.endedBy || picture?.failed);
-  alert.textContent = alert.hidden ? '' : [text, title].filter(Boolean).join(' · ');
+  alert.hidden = false;
+  alert.textContent = (focus.endedBy || picture?.failed) ? [text, title].filter(Boolean).join(' · ') : '';
+  $('#focus-status-meta').textContent = [$('#focus-state').textContent, $('#focus-meta').textContent].filter(Boolean).join(' · ');
+  alert.title = alert.textContent;
   Object.assign(line.dataset, {
     codec: picture?.codec || '', width: picture?.size.w || 0, height: picture?.size.h || 0, fps: focus.fps || 0,
     dropped: picture ? picture.dropped + focus.live.skipped : 0, counter: picture?.counter || 0, drawn: picture?.drawn || 0,
@@ -5973,15 +5986,15 @@ function renderControl() {
   const tile = focus && tiles.get(focus.id);
   const possible = Boolean(live && live.open && !live.ended && can('operator') && tile && canDo(tile, 'control'));
   button.hidden = !possible;
-  keys.hidden = !control?.on || Boolean(focus.toolsHidden);
-  const toolsToggle = $('#focus-tools-toggle');
-  toolsToggle.hidden = !possible;
-  toolsToggle.disabled = !control?.on;
-  toolsToggle.setAttribute('aria-expanded', String(!keys.hidden));
-  toolsToggle.setAttribute('aria-label', keys.hidden ? 'Show control tools' : 'Hide control tools');
-  toolsToggle.title = keys.hidden ? 'Show control tools' : 'Hide control tools';
+  keys.hidden = !control?.on;
   button.setAttribute('aria-expanded', String(!keys.hidden));
-  if (!control?.on) $('#focus-keys .focus-input-help').open = false;
+  $('#focus-control-state').textContent = control?.on ? 'Controlling' : 'Viewing';
+  $('#focus-release-hint').style.visibility = control?.on ? 'visible' : 'hidden';
+  for (const item of keys.querySelectorAll('button')) item.disabled = !control?.on;
+  if (!control?.on) {
+    $('#focus-keys .focus-input-help').open = false;
+    resetScreenKeyboard(true);
+  }
   if (!possible) return;
   const on = control.on;
   const asking = Boolean(live.asking);
@@ -6043,7 +6056,58 @@ function resetScreenKeyboard(close = false) {
   }
 }
 
+// Only panel geometry is retained, never typed text or remote modifiers.
+let keyboardGeometry = null;
+function placeScreenKeyboard(reset = false) {
+  const panel = $('#focus-keyboard');
+  if (panel.hidden) return;
+  const vw = document.documentElement.clientWidth, vh = window.innerHeight;
+  const footer = $('#focus-statusbar').getBoundingClientRect().height;
+  const g = reset || !keyboardGeometry ? {w: Math.min(900, vw - 16), h: Math.min(420, vh - footer - 24)} : {...keyboardGeometry};
+  g.w = Math.max(Math.min(300, vw - 16), Math.min(g.w, vw - 16));
+  g.h = Math.max(Math.min(180, vh - 16), Math.min(g.h, vh - 16));
+  g.x = Math.max(8, Math.min(g.x ?? (vw - g.w) / 2, vw - g.w - 8));
+  g.y = Math.max(8, Math.min(g.y ?? vh - footer - g.h - 8, vh - g.h - 8));
+  keyboardGeometry = g;
+  Object.assign(panel.style, {left: `${g.x}px`, top: `${g.y}px`, width: `${g.w}px`, height: `${g.h}px`});
+}
+function setupKeyboardGeometry() {
+  // The wall header remains the sizing reference at every responsive breakpoint.
+  new ResizeObserver(entries => {
+    const height = entries[0].target.getBoundingClientRect().height;
+    if (height > 0) document.documentElement.style.setProperty('--console-header-height', `${height}px`);
+  }).observe($('.top'));
+  $('#keyboard-close').addEventListener('click', () => { resetScreenKeyboard(true); $('#focus-keyboard-toggle').focus(); });
+  $('#keyboard-reset').addEventListener('click', () => placeScreenKeyboard(true));
+  for (const [id, resize] of [['keyboard-drag', false], ['keyboard-resize', true]]) {
+    const handle = $('#' + id);
+    let start = null;
+    const change = (dx, dy) => {
+      keyboardGeometry = resize ? {...start.g, w: start.g.w + dx, h: start.g.h + dy} : {...start.g, x: start.g.x + dx, y: start.g.y + dy};
+      placeScreenKeyboard();
+    };
+    handle.addEventListener('pointerdown', event => {
+      if (event.button !== 0 || (event.target.closest('button') && event.target !== handle)) return;
+      event.preventDefault();
+      focus?.control?.releaseAll();
+      start = {x: event.clientX, y: event.clientY, g: {...keyboardGeometry}};
+      handle.setPointerCapture(event.pointerId);
+    });
+    handle.addEventListener('pointermove', event => { if (start) change(event.clientX - start.x, event.clientY - start.y); });
+    for (const type of ['pointerup', 'pointercancel', 'lostpointercapture']) handle.addEventListener(type, () => { start = null; });
+    handle.addEventListener('keydown', event => {
+      if (event.target !== handle || !['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(event.key)) return;
+      event.preventDefault(); event.stopPropagation();
+      start = {g: {...keyboardGeometry}};
+      change(event.key === 'ArrowLeft' ? -20 : event.key === 'ArrowRight' ? 20 : 0, event.key === 'ArrowUp' ? -20 : event.key === 'ArrowDown' ? 20 : 0);
+      start = null;
+    });
+  }
+  window.addEventListener('resize', () => placeScreenKeyboard());
+  document.addEventListener('fullscreenchange', () => placeScreenKeyboard());
+}
 function makeScreenKeyboard() {
+  setupKeyboardGeometry();
   const rows = [
     [['Esc', 'Escape'], ...Array.from({ length: 12 }, (_, i) => [`F${i + 1}`, `F${i + 1}`])],
     [['`', 'Backquote'], ...'1234567890'.split('').map(n => [n, `Digit${n}`]), ['-', 'Minus'], ['=', 'Equal'], ['Backspace', 'Backspace']],
@@ -6090,6 +6154,7 @@ function makeScreenKeyboard() {
     const open = $('#focus-keyboard').hidden;
     resetScreenKeyboard();
     $('#focus-keyboard').hidden = !open;
+    if (open) placeScreenKeyboard();
     $('#focus-keyboard-toggle').setAttribute('aria-expanded', String(open));
   });
 }
@@ -6869,6 +6934,7 @@ function decorate() {
   $('#focus-prev').append(icon('chevronLeft'));
   $('#focus-next').append(icon('chevronRight'));
   $('#focus-actions').prepend(icon('zap'));
+  $('#focus-keyboard-toggle').prepend(icon('keyboard'));
   $('#focus-health').prepend(icon('activity'));
   $('#focus-open').prepend(icon('external'));
   $('#focus-open').addEventListener('click', event => openSignedIn(event, focus && tiles.get(focus.id)));
@@ -7000,12 +7066,6 @@ async function boot() {
   $('#focus-next').addEventListener('click', () => stepFocus(1));
   $('#focus-actions').addEventListener('click', () => focus && actionsDialog(focus.id));
   $('#focus-control').addEventListener('click', controlClicked);
-  $('#focus-tools-toggle').addEventListener('click', () => {
-    if (!focus?.control?.on) return;
-    focus.toolsHidden = !focus.toolsHidden;
-    if (focus.toolsHidden) resetScreenKeyboard(true);
-    renderControl();
-  });
   $('#focus').addEventListener('pointerdown', event => {
     for (const menu of document.querySelectorAll('.focus-popover[open]')) {
       if (!menu.contains(event.target)) menu.open = false;
@@ -7020,13 +7080,7 @@ async function boot() {
     menu.querySelector('summary').focus();
   }, true);
 
-  $('#focus-activity').addEventListener('click', () => {
-    const open = $('#focus').classList.toggle('show-activity');
-    $('#focus-activity').setAttribute('aria-expanded', String(open));
-    $('#focus-activity').textContent = open ? 'Hide activity' : 'Show activity';
-    $('#focus-details').open = false;
-    if (open) redrawHistory();
-  });
+  $('#focus-details').addEventListener('toggle', () => { if ($('#focus-details').open) redrawHistory(); });
   $('#focus-again').addEventListener('click', () => focus && startLive(focus.id));
   $('#focus-cad').addEventListener('click', () => withControl(async control => {
     const name = tiles.get(focus.id)?.device.name || 'this machine';
@@ -7057,7 +7111,7 @@ async function boot() {
       if (event.key === 'Escape') arranging();
       return;
     }
-    if (event.target.matches?.('select, input, textarea') || event.target.closest?.('.focus-popover, .focus-control-panel')) return;
+    if (event.target.matches?.('select, input, textarea') || (event.target.closest?.('.focus-popover, .focus-control-panel, .screen-keyboard') && !event.target.closest?.('#focus-control'))) return;
     if (event.key === 'f' || event.key === 'F') {
       toggleFullscreen();
     } else if (event.key === '/' && !focus) {

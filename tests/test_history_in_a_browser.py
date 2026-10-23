@@ -34,7 +34,6 @@ def test_the_enlarged_view_says_when_the_machine_was_seen_and_how_much_it_was_on
                 tile(page, "Build server").focus()
                 page.keyboard.press("Enter")
                 page.locator("#focus-details > summary").click()
-                page.locator("#focus-activity").click()
                 box = page.locator("#focus-history")
                 expect(box).to_be_visible()
                 # The line: when it was last seen, and how much of the week it was online, of the time it was watched.
@@ -47,13 +46,14 @@ def test_the_enlarged_view_says_when_the_machine_was_seen_and_how_much_it_was_on
                 page.wait_for_function("() => { const c = document.querySelector('#focus-history canvas'); return c && c.width > 10 && c.height > 10; }")
                 assert "last day" in page.locator("#focus-history canvas").first.get_attribute("aria-label")
                 # The next tile is the server: its temperatures and its fans, a graph each.
-                page.keyboard.press("ArrowRight")
+                page.locator("#focus-next").click()
                 expect(page.locator("#focus-name")).to_have_text("Database server")
+                page.locator("#focus-details > summary").click()
                 expect(box.locator("figure[data-unit='C']")).to_be_visible()
                 expect(box.locator("figure[data-unit='RPM']")).to_be_visible()
                 expect(box.locator("figure[data-unit='RPM'] figcaption")).to_contain_text("Fans")
                 # Closed with the view, and empty then: nothing of one machine is shown over the next.
-                page.keyboard.press("Escape")
+                page.locator("#focus-close").click()
                 expect(page.locator("#focus")).to_be_hidden()
                 expect(box).to_be_hidden()
                 assert page.locator("#focus-history").inner_html() == ""
@@ -72,7 +72,6 @@ def test_a_viewer_sees_the_history_of_the_machines_they_may_see(tmp_path: Path, 
                 tile(page, "Build server").focus()
                 page.keyboard.press("Enter")
                 page.locator("#focus-details > summary").click()
-                page.locator("#focus-activity").click()
                 box = page.locator("#focus-history")
                 expect(box.locator(".history-line")).to_contain_text("Last seen")
                 expect(box.locator(".history-line")).to_contain_text("Online")
@@ -99,7 +98,6 @@ def test_a_history_that_cannot_be_read_is_asked_for_less_and_less_often(tmp_path
             tile(page, "Build server").focus()
             page.keyboard.press("Enter")
             page.locator("#focus-details > summary").click()
-            page.locator("#focus-activity").click()
             box = page.locator("#focus-history")
             expect(box.locator(".history-line")).to_contain_text("could not be read")
             page.clock.pause_at(page.evaluate("Date.now()") + 100)
@@ -138,7 +136,6 @@ def test_unreadable_activity_beside_busy_history_is_unavailable_and_recovers(tmp
             page.keyboard.press("Enter")
             expect(page.locator("#focus-history .history-line")).to_contain_text("Last seen")
             page.locator("#focus-details > summary").click()
-            page.locator("#focus-activity").click()
             expect(page.locator("#focus-history .history-done")).to_be_visible()
     finally:
         fake.stop()

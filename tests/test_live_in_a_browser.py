@@ -505,7 +505,7 @@ def test_the_live_picture_is_drawn_and_a_key_arrives_as_its_usage(tmp_path: Path
             # The right Ctrl by itself gives keyboard and mouse back, after everything was let go; then Esc is the page's again.
             page.keyboard.press("ControlRight")
             expect(page.locator("#focus-control")).to_have_text("Control")
-            expect(page.locator("#focus-keys")).to_be_hidden()
+            expect(page.locator("#focus-keyboard-toggle")).to_be_disabled()
             until(page, lambda: not line.held, "keyboard and mouse were not given back")
             assert line.keys()[len(wanted) :] == [] and line.said("up") and line.said("control")[-1] == {"t": "control", "on": False}
             page.keyboard.press("Escape")
@@ -665,7 +665,7 @@ def test_control_that_is_refused_is_said_and_keys_go_nowhere(tmp_path: Path, bro
                 "title", "Somebody else has this machine's keyboard and mouse. As an admin you can take them over: you are asked first (C)"
             )
             expect(page.locator("#focus-control")).to_have_attribute("aria-pressed", "false")
-            expect(page.locator("#focus-keys")).to_be_hidden()
+            expect(page.locator("#focus-keyboard-toggle")).to_be_disabled()
             line = stand_in.line()
             page.keyboard.type("xyz")  # (letters that are no key of the page's own; Enter would press the button that has the focus)
             page.keyboard.press("Delete")
@@ -749,7 +749,7 @@ def test_a_line_cut_while_keys_are_down_ends_with_nothing_down_and_the_view_sayi
             line.cut("gone", "The KVM went away")
             # Nothing is down for this page any more (the server lets go of what it had), keyboard and mouse are
             # not held, the stills are back, and the bar says why.
-            expect(page.locator("#focus-keys")).to_be_hidden()
+            expect(page.locator("#focus-keyboard-toggle")).to_be_disabled()
             expect(page.locator("#focus-control")).to_be_hidden()
             expect(page.locator("#focus-live")).to_have_text("No live picture: stills")
             expect(page.locator("#focus-live")).to_have_attribute("title", "The KVM went away")
@@ -1178,7 +1178,7 @@ def test_an_admin_takes_over_where_somebody_else_holds_the_keyboard_and_the_hold
                 # Her page: told who took them, and no take-over offered to an operator; her Ctrl let go of on the machine.
                 told(hers, "admin took over this machine's keyboard and mouse")
                 expect(hers.locator("#focus-control")).to_have_text("Controlled by admin")
-                expect(hers.locator("#focus-keys")).to_be_hidden()
+                expect(hers.locator("#focus-keyboard-toggle")).to_be_disabled()
                 until(hers, lambda: kvm_keys(comet) == [("ControlLeft", True), ("ControlLeft", False)], f"her Ctrl stayed down: {comet.state.hid}")
                 hers.keyboard.up("ControlLeft")
                 hers.keyboard.press("KeyB")  # (her page holds nothing: nothing goes)
