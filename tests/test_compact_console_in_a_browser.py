@@ -22,6 +22,7 @@ def test_compact_controls_and_video_fit(tmp_path: Path, browser: Browser, width:
             expect(page.locator(".focus-title")).to_have_attribute("data-state", "online")
             assert page.locator(".focus-title .dot").evaluate("e => getComputedStyle(e).backgroundColor") == page.locator(".tile .dot").first.evaluate("e => getComputedStyle(e).backgroundColor")
             expect(page.locator("#focus-fullscreen")).to_be_visible()
+            expect(page.locator("#focus-control")).to_be_visible()
             before = page.locator("#focus-screen").bounding_box()
             header_before = page.locator("#focus-bar").bounding_box()
             page.locator("#focus-control").click()
@@ -34,6 +35,13 @@ def test_compact_controls_and_video_fit(tmp_path: Path, browser: Browser, width:
             assert page.locator("#focus-screen").bounding_box() == before
             assert page.locator("#focus-bar").bounding_box() == header_before
             expect(page.locator("#focus-control")).to_have_text("Control")
+            page.locator("#focus-tools-toggle").click()
+            expect(page.locator("#focus-keys")).to_be_hidden()
+            expect(page.locator("#focus-control")).to_have_attribute("aria-pressed", "true")
+            assert page.locator("#focus-screen").bounding_box() == before
+            assert page.locator("#focus-bar").bounding_box() == header_before
+            page.locator("#focus-tools-toggle").click()
+            expect(page.locator("#focus-keys")).to_be_visible()
             page.locator("#focus-details > summary").click()
             page.keyboard.press("Escape")
             expect(page.locator("#focus-activity")).to_be_hidden()

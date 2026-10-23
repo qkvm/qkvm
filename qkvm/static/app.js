@@ -5310,6 +5310,7 @@ class Control {
     if (this.on) return;
     forgetLateLock();  // (a lock asked for before keyboard and mouse were last given back is this holding's now)
     this.on = true;
+    if (focus?.control === this) focus.toolsHidden = false;
     resetScreenKeyboard(true);
     this.down.clear();
     this.buttons.clear();
@@ -5972,8 +5973,14 @@ function renderControl() {
   const tile = focus && tiles.get(focus.id);
   const possible = Boolean(live && live.open && !live.ended && can('operator') && tile && canDo(tile, 'control'));
   button.hidden = !possible;
-  keys.hidden = !control?.on;
-  button.setAttribute('aria-expanded', String(Boolean(control?.on)));
+  keys.hidden = !control?.on || Boolean(focus.toolsHidden);
+  const toolsToggle = $('#focus-tools-toggle');
+  toolsToggle.hidden = !possible;
+  toolsToggle.disabled = !control?.on;
+  toolsToggle.setAttribute('aria-expanded', String(!keys.hidden));
+  toolsToggle.setAttribute('aria-label', keys.hidden ? 'Show control tools' : 'Hide control tools');
+  toolsToggle.title = keys.hidden ? 'Show control tools' : 'Hide control tools';
+  button.setAttribute('aria-expanded', String(!keys.hidden));
   if (!control?.on) $('#focus-keys .focus-input-help').open = false;
   if (!possible) return;
   const on = control.on;
@@ -6993,6 +7000,12 @@ async function boot() {
   $('#focus-next').addEventListener('click', () => stepFocus(1));
   $('#focus-actions').addEventListener('click', () => focus && actionsDialog(focus.id));
   $('#focus-control').addEventListener('click', controlClicked);
+  $('#focus-tools-toggle').addEventListener('click', () => {
+    if (!focus?.control?.on) return;
+    focus.toolsHidden = !focus.toolsHidden;
+    if (focus.toolsHidden) resetScreenKeyboard(true);
+    renderControl();
+  });
   $('#focus').addEventListener('pointerdown', event => {
     for (const menu of document.querySelectorAll('.focus-popover[open]')) {
       if (!menu.contains(event.target)) menu.open = false;

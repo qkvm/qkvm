@@ -331,7 +331,8 @@ minutes without input*.
 
 In the enlarged view, **Control** is a toggle: highlighted while you hold the keyboard and mouse.
 Click it again, or press Right Ctrl by itself, to release control. Its tools open over the picture
-without resizing the video. **On-screen keyboard** opens letters, numbers, function and navigation
+without resizing the video. The arrow beside Control hides or shows these tools while keeping
+control active, so every part of the remote screen remains accessible. **On-screen keyboard** opens letters, numbers, function and navigation
 keys for mouse or touch input. Shift, Ctrl, Alt and Win apply to the next key only; they are not held
 on the remote machine between clicks. Closing the keyboard, losing page focus or releasing control
 clears those modifiers. The labels use US key positions; the remote machine's keyboard layout
