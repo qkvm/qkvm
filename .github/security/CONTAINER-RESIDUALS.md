@@ -2,13 +2,19 @@
 
 The register below describes the earlier image and its 44 MEDIUM/37 LOW findings. The application-only candidate removes further packages and all nine HIGH attributions; use each architecture's fresh scan artifact for current counts. Retained library assessments still apply where the corresponding package is present. Package removal is not a patch to remaining libraries. See [the current container assessment](CONTAINER-ADVISORIES.md) for the new packaging and validation requirements.
 
+## Current residual risks
+
+For the application-only image, use the fresh AMD64 and ARM64 artifacts for current counts and versions. The earlier HIGH ACL-library condition is removed with `libacl1`; it is not a current exception. Native codec/C++ dependencies, retained system libraries and host-controlled resolver configuration still need review and supported upstream fixes. Package scans do not establish that every transitive native-code path is safe.
+
+Preserve decoder isolation and the supplied nonroot, read-only, capability-free deployment. Use trusted, bounded DNS search configuration, protect the data directory and backups, and replace images to apply updates. The final runtime contains no shell or package manager. The historical assessments below remain relevant only where their corresponding package and triggering functionality are still present; removed package/tool paths must not be described as current exposure.
+
 ## Previous container OS advisory assessment
 
 Reviewed 21 October 2026. The preceding image had 49 MEDIUM and 51 LOW rows, covering 60 distinct CVE/temporary identifiers. This follow-up reviews every identifier and removes eleven additional administration packages. Fresh scans of both architectures confirm 44 MEDIUM and 37 LOW rows. Nine HIGH rows remain separately assessed in [CONTAINER-ADVISORIES.md](CONTAINER-ADVISORIES.md).
 
 This is an exposure assessment, not an ignore file or a claim that retained libraries are patched. The raw Trivy report and SBOM retain all package-source attribution. Unknown transitive native-code reachability is recorded as uncertainty. Any available OS fix still blocks release at every severity.
 
-## Practical residual risks
+### Practical residual risks recorded for the previous image
 
 The main unresolved paths are native codec/C++ dependencies, the HIGH ACL-library condition, and host-controlled DNS search configuration. No remotely exploitable qKVM path was established for the reviewed advisories, but that does not prove absence of a native exploit chain. Stable library fixes and updated native wheels remain necessary. Do not mix Debian unstable libraries into the supported base just to alter scanner counts.
 
@@ -16,7 +22,7 @@ Use trusted resolver/DHCP/VPN configuration. Where DNS suffix search is unnecess
 
 Preserve the supplied nonroot/read-only/capability-free deployment. Do not run hostile shell commands, GNU tar inputs, ELF inspection or privileged maintenance inside this runtime. Protect its data directory and backups. Package tools exist only where required to preserve a consistent, auditable Debian inventory; updates replace the image.
 
-## Complete identifier register
+### Historical identifier register
 
 Counts below are package/advisory rows in the preceding image and the verified retained inventory, not counts of independent exploitable defects. Each identifier links to the primary Debian record and its upstream references. Every row has been reviewed; zero in the after column means the implicated package was removed.
 

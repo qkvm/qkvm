@@ -18,7 +18,7 @@ Remaining rows are attributed to libc6 (21), SQLite (4), GCC runtime/source pack
 
 ## Historical assessment of the previous image
 
-The following records why the earlier image had nine HIGH rows. Its exceptions are superseded by package removal above and must not be renewed for the new image.
+The following records why the earlier image had nine HIGH rows. Package presence, retained-scope columns, counts and expiry dates in this section describe that previous image only. Its exceptions are superseded by package removal above and must not be renewed for the application-only image. In particular, the ACL library and the other HIGH-associated packages described as retained below are absent from the current runtime.
 
 ### Container HIGH advisory assessment — 21 October 2026
 
@@ -26,7 +26,7 @@ The original 44 HIGH package/advisory rows per architecture represented eight di
 
 The container now removes `bsdutils`, `login`, `mount`, `util-linux`, `ncurses-bin`, `perl-base`, `libblkid1`, `liblastlog2-2`, `libmount1` and `libsmartcols1`. Removing packages also removes their executables/libraries through the package manager; package records are not hidden or rewritten. Python-linked libraries remain. This is an immutable application image: Debian's general-purpose essential-package assumption is deliberately narrowed, after installation and user creation. Upgrade by rebuilding/replacing the image.
 
-## Disposition of each original HIGH advisory
+### Disposition of each original HIGH advisory in the previous image
 
 | Advisory | Original rows | Retained scope | qKVM exposure and action |
 |---|---:|---|---|
@@ -39,7 +39,7 @@ The container now removes `bsdutils`, `login`, `mount`, `util-linux`, `ncurses-b
 | [CVE-2026-16742](https://github.com/systemd/systemd/security/advisories/GHSA-jm29-p7hh-vjhv) | 2 | `libsystemd0` | The affected homed/homework authentication components are absent. Their shared source package also produces these libraries; library presence does not install the vulnerable service. The runtime check rejects both executables. |
 | [CVE-2026-9538](https://security-tracker.debian.org/tracker/CVE-2026-9538) | 1 | None | Perl Archive::Tar can allocate excessive memory from a crafted header. That module was absent already; perl-base is now also removed and its exception deleted. qKVM does not use Perl to unpack archives. |
 
-## Remaining risks and how to reduce them
+### Residual risks and follow-up work recorded for the previous image
 
 No remotely reachable qKVM exploit for these eight CVEs was established. Component absence provides stronger evidence than an unused-feature assumption, but this review does not prove absence of every exploit chain or unknown vulnerability. The ACL library remains a conditional exposure; runtime nonroot identity, no setuid/setgid executables, dropped capabilities, no-new-privileges and a read-only root constrain its privileged trigger. Do not run the container privileged, as root, with host namespaces, or with the Docker socket mounted.
 
