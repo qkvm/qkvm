@@ -2,6 +2,8 @@
 
 ## 0.2.0
 
+- Keep the enlarged video in place when Control is toggled. Group input tools in an overlay and add a collapsible on-screen keyboard with one-shot modifiers for touch or mouse input.
+
 - Keep JPEG decoders and encoders scoped to a device connection or live stream, preventing a compromised video worker from receiving another device's screen. Tear down workers with their owning sessions.
 - Isolate native JPEG/H.264 processing from KVM credentials using Linux seccomp or Windows AppContainer workers, with bounded messages, resource limits, deadlines and no unsandboxed fallback. Pin the reviewed WebRTC receiver interface and test the OS boundary and container compatibility.
 

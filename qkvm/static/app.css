@@ -1429,7 +1429,7 @@ dialog.settings .dialog-body { display: grid; grid-template-columns: 212px minma
 
 /* Compact console chrome; the canvas keeps its existing aspect-fit and pointer mapping. */
 .focus-bar { display: flex; flex-wrap: nowrap; align-items: center; gap: 12px; padding: 8px 12px; position: relative; z-index: 4; }
-.focus-identity { flex: 1 1 240px; min-width: 180px; }
+.focus-identity { flex: 1 1 240px; min-width: 180px; display: flex; align-items: center; flex-wrap: wrap; gap: 4px 12px; }
 .focus-title { display: flex; align-items: center; gap: 8px; }
 .focus-title strong { overflow-wrap: anywhere; }
 .focus-subtitle { display: flex; flex-wrap: wrap; gap: 4px 8px; color: var(--muted); font-size: 12px; }
@@ -1441,8 +1441,8 @@ dialog.settings .dialog-body { display: grid; grid-template-columns: 212px minma
 .focus-popover > summary { list-style: none; cursor: pointer; white-space: nowrap; }
 .focus-popover > summary::-webkit-details-marker { display: none; }
 .focus-popover > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-.focus-popover > .focus-keys, .focus-details-content { position: absolute; right: 0; top: calc(100% + 6px); width: min(440px, calc(100vw - 32px)); padding: 12px; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--panel); box-shadow: 0 8px 24px #0003; }
-.focus-details-content { display: grid; gap: 10px; }
+.focus-details-content { position: absolute; right: 0; top: calc(100% + 6px); width: min(440px, calc(100vw - 32px)); padding: 12px; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--panel); box-shadow: 0 8px 24px #0003; }
+.focus-details-content { display: grid; gap: 10px; z-index: 6; }
 .focus-keys p { margin: 4px 0 0; }
 .focus:not(.show-activity) > .focus-history { display: none; }
 .focus-history { max-height: 35vh; overflow: auto; }
@@ -1451,5 +1451,21 @@ dialog.settings .dialog-body { display: grid; grid-template-columns: 212px minma
   .focus-bar { flex-wrap: wrap; gap: 6px; }
   .focus-identity { flex-basis: 100%; }
   .focus-tools { justify-content: flex-start; }
-  .focus-popover > .focus-keys, .focus-details-content { position: fixed; top: auto; right: 12px; margin-top: 6px; max-height: 60vh; overflow: auto; }
+  .focus-details-content { position: fixed; top: auto; right: 12px; margin-top: 6px; max-height: 60vh; overflow: auto; }
 }
+
+/* Control tools overlay the video: acquiring or releasing control never resizes it. */
+.focus-control-panel { position: absolute; top: 100%; left: 0; right: 0; display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 8px 12px; background: var(--panel); border-bottom: 1px solid var(--line-strong); box-shadow: 0 6px 12px #0002; max-height: 45vh; overflow: auto; }
+.control-state { color: var(--accent-text); font-size: 12px; font-weight: 600; margin-right: 4px; }
+.focus-control-panel .muted { font-size: 12px; }
+.focus-input-help { font-size: 12px; }
+.focus-input-help summary { cursor: pointer; }
+.focus-input-help p { margin: 6px 0 0; }
+#focus-control { min-width: 104px; }
+
+.screen-keyboard { flex: 1 0 100%; min-width: 0; overflow-x: auto; border-top: 1px solid var(--line-strong); padding-top: 6px; }
+.screen-keyboard p { margin: 0 0 8px; }
+.screen-keyboard-rows { min-width: 680px; max-width: 1100px; }
+.screen-keyboard-row { display: flex; gap: 4px; margin-bottom: 4px; }
+.screen-keyboard-row button { flex: 1; min-width: 40px; min-height: 40px; padding: 4px 6px; touch-action: manipulation; }
+.screen-keyboard-row .space-key { flex: 5; }

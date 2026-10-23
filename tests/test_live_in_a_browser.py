@@ -405,7 +405,7 @@ def take_control(page: Page, stand_in: LiveStandIn) -> Line:
     """Control, by its key; what comes back is the line that holds keyboard and mouse now."""
     expect(page.locator("#focus-control")).to_have_text("Control")
     page.keyboard.press("c")
-    expect(page.locator("#focus-control")).to_have_text("Give back")
+    expect(page.locator("#focus-control")).to_have_attribute("aria-pressed", "true")
     expect(page.locator("#focus-keys")).to_be_visible()
     line = stand_in.line()
     until(page, lambda: line.held, "the stand-in never gave keyboard and mouse")
@@ -609,7 +609,7 @@ def test_what_is_down_is_let_go_when_the_page_loses_the_keyboard(tmp_path: Path,
             assert len(line.keys()) == 4 and len(line.said("mb")) == 2  # nothing is let go twice
             page.wait_for_function("() => document.querySelector('#focus-live').dataset.down === '0'")
             assert live_said(page, "control") == "on"
-            expect(page.locator("#focus-control")).to_have_text("Give back")
+            expect(page.locator("#focus-control")).to_have_attribute("aria-pressed", "true")
 
             # A key held through a click that opens a dialog (Actions, here) and let go while the dialog has the
             # keyboard goes up on the machine all the same; what is pressed in the dialog goes to the dialog.
@@ -1001,7 +1001,7 @@ def test_the_page_shows_a_kvm_live_over_the_programs_line_and_its_keys_and_click
             assert comet.state.hid == []
             expect(page.locator("#focus-control")).to_have_text("Control")
             page.keyboard.press("c")
-            expect(page.locator("#focus-control")).to_have_text("Give back")
+            expect(page.locator("#focus-control")).to_have_attribute("aria-pressed", "true")
             page.keyboard.press("KeyA")
             page.keyboard.press("Shift+KeyB")
             until(page, lambda: len(kvm_keys(comet)) >= 6, f"the keys did not arrive: {comet.state.hid}")
@@ -1108,7 +1108,7 @@ def test_a_line_the_program_ends_while_a_key_is_down_leaves_nothing_down_and_the
             enlarged(page, "Machine 1")
             page.wait_for_function("() => Number(document.querySelector('#focus-live').dataset.drawn) >= 1")
             page.keyboard.press("c")
-            expect(page.locator("#focus-control")).to_have_text("Give back")
+            expect(page.locator("#focus-control")).to_have_attribute("aria-pressed", "true")
             page.keyboard.down("KeyA")
             until(page, lambda: kvm_keys(comet) == [("KeyA", True)], f"the key did not go down: {comet.state.hid}")
             # The machine's tile is changed by an admin: the program ends its lines, and lets go of what was down.
@@ -1155,7 +1155,7 @@ def test_an_admin_takes_over_where_somebody_else_holds_the_keyboard_and_the_hold
                 enlarged(hers, "Machine 1")
                 hers.wait_for_function("() => Number(document.querySelector('#focus-live').dataset.drawn) >= 1")
                 hers.keyboard.press("c")
-                expect(hers.locator("#focus-control")).to_have_text("Give back")
+                expect(hers.locator("#focus-control")).to_have_attribute("aria-pressed", "true")
                 hers.keyboard.down("ControlLeft")
                 until(hers, lambda: kvm_keys(comet) == [("ControlLeft", True)], f"her Ctrl did not go down: {comet.state.hid}")
 
@@ -1173,7 +1173,7 @@ def test_an_admin_takes_over_where_somebody_else_holds_the_keyboard_and_the_hold
                 assert kvm_keys(comet) == [("ControlLeft", True)]
                 mine.keyboard.press("c")  # (the key C asks the same question)
                 top(mine).get_by_role("button", name="Take over").click()
-                expect(mine.locator("#focus-control")).to_have_text("Give back")
+                expect(mine.locator("#focus-control")).to_have_attribute("aria-pressed", "true")
 
                 # Her page: told who took them, and no take-over offered to an operator; her Ctrl let go of on the machine.
                 told(hers, "admin took over this machine's keyboard and mouse")
@@ -1215,7 +1215,7 @@ def test_keyboard_and_mouse_given_back_for_want_of_input_are_said_in_the_page(tm
             enlarged(page, "Machine 1")
             page.wait_for_function("() => Number(document.querySelector('#focus-live').dataset.drawn) >= 1")
             page.keyboard.press("c")
-            expect(page.locator("#focus-control")).to_have_text("Give back")
+            expect(page.locator("#focus-control")).to_have_attribute("aria-pressed", "true")
             page.keyboard.down("ShiftLeft")  # and nothing more
             told(page, "Given back after 2 seconds without input")
             expect(page.locator("#focus-control")).to_have_text("Control")
@@ -1224,7 +1224,7 @@ def test_keyboard_and_mouse_given_back_for_want_of_input_are_said_in_the_page(tm
             expect(page.locator("#focus-live")).to_contain_text("Live")  # the picture goes on
             page.keyboard.up("ShiftLeft")
             page.keyboard.press("c")
-            expect(page.locator("#focus-control")).to_have_text("Give back")
+            expect(page.locator("#focus-control")).to_have_attribute("aria-pressed", "true")
             page.keyboard.press("ControlRight")
             expect(page.locator("#focus-control")).to_have_text("Control")
             page.keyboard.press("Escape")
@@ -1262,7 +1262,7 @@ def test_a_take_over_slower_than_five_seconds_is_waited_for_and_leaves_the_admin
                 enlarged(hers, "Machine 1")
                 hers.wait_for_function("() => Number(document.querySelector('#focus-live').dataset.drawn) >= 1")
                 hers.keyboard.press("c")
-                expect(hers.locator("#focus-control")).to_have_text("Give back")
+                expect(hers.locator("#focus-control")).to_have_attribute("aria-pressed", "true")
 
                 slow["on"] = True
                 sign_in(mine, live, PASSWORD, name="admin")
@@ -1275,14 +1275,14 @@ def test_a_take_over_slower_than_five_seconds_is_waited_for_and_leaves_the_admin
                 expect(mine.locator("#focus-control")).to_have_text("Asking...")
                 mine.wait_for_timeout(5500)  # (past the five seconds the page gave an answer)
                 expect(mine.locator("#focus-control")).to_have_text("Asking...")
-                expect(mine.locator("#focus-control")).to_have_text("Give back", timeout=PATIENCE)
+                expect(mine.locator("#focus-control")).to_have_attribute("aria-pressed", "true", timeout=PATIENCE)
                 told(hers, "admin took over this machine's keyboard and mouse")
                 expect(hers.locator("#focus-control")).to_have_text("Controlled by admin")
                 # Held by the admin: a key of theirs reaches the machine, and nothing gave it back meanwhile.
                 mine.keyboard.press("KeyA")
                 until(mine, lambda: ("KeyA", False) in kvm_keys(comet), f"the admin's key did not arrive: {comet.state.hid}")
                 mine.wait_for_timeout(500)
-                expect(mine.locator("#focus-control")).to_have_text("Give back")
+                expect(mine.locator("#focus-control")).to_have_attribute("aria-pressed", "true")
                 with httpx.Client(base_url=live.url, headers=CSRF, timeout=30) as olga:
                     assert olga.post("/api/v1/login", json={"name": "olga", "password": "olga may act here"}).status_code == 200
                     refused = olga.post(f"/api/v1/devices/{live.device}/actions", json={"action": "ctrl_alt_del"})  # type: ignore[attr-defined]

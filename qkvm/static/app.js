@@ -5310,6 +5310,7 @@ class Control {
     if (this.on) return;
     forgetLateLock();  // (a lock asked for before keyboard and mouse were last given back is this holding's now)
     this.on = true;
+    resetScreenKeyboard(true);
     this.down.clear();
     this.buttons.clear();
     this.under.clear();
@@ -5343,6 +5344,7 @@ class Control {
   // Everything that is down on the machine is let go (the page lost the keyboard, a dialog is opened, they are
   // given back); the holding goes on where it was not ended.
   releaseAll() {
+    resetScreenKeyboard();
     for (const usage of [...this.down]) this.line.key(usage, false);
     this.down.clear();
     this.releaseButtons();
@@ -5362,6 +5364,7 @@ class Control {
   end() {
     if (!this.on) return;
     this.on = false;
+    resetScreenKeyboard(true);
     for (const off of this.listeners) off();
     this.listeners = [];
     this.down.clear();
@@ -5402,7 +5405,7 @@ class Control {
 
   // The page's own keys rest while keys go to the machine: a dialog on top, or a field, gets them as ever.
   fromThePage(event) {
-    return !this.on || $('dialog[open]') || event.target.matches?.('input, textarea, select') || (event.code !== 'ControlRight' && event.target.closest?.('.focus-popover'));
+    return !this.on || $('dialog[open]') || event.target.matches?.('input, textarea, select') || (event.code !== 'ControlRight' && event.target.closest?.('.focus-popover, .focus-control-panel'));
   }
 
   keyDown(event) {
@@ -5697,7 +5700,6 @@ function openFocus(id) {
     }
     const opening = !focus;
     focus = { id, feed, view };
-    $('#focus-keys').open = false;
     $('#focus-details').open = false;
     if (opening) {
       $('#focus').classList.remove('show-activity');
@@ -5971,8 +5973,8 @@ function renderControl() {
   const possible = Boolean(live && live.open && !live.ended && can('operator') && tile && canDo(tile, 'control'));
   button.hidden = !possible;
   keys.hidden = !control?.on;
-  $('#focus-release-hint').hidden = !control?.on;
-  if (!control?.on) keys.open = false;
+  button.setAttribute('aria-expanded', String(Boolean(control?.on)));
+  if (!control?.on) $('#focus-keys .focus-input-help').open = false;
   if (!possible) return;
   const on = control.on;
   const asking = Boolean(live.asking);
@@ -5980,8 +5982,8 @@ function renderControl() {
   button.setAttribute('aria-pressed', String(on));
   button.setAttribute('aria-busy', String(asking));
   button.disabled = !on && owed;
-  let label = on ? 'Give back' : 'Control';
-  let title = on ? 'Give keyboard and mouse back (right Ctrl by itself does too)' : 'Take this machine\'s keyboard and mouse (C)';
+  let label = 'Control';
+  let title = on ? 'Release control (click again or press Right Ctrl)' : 'Take this machine\'s keyboard and mouse (C)';
   if (!on && asking) {
     label = 'Asking...';
     title = 'Waiting for the machine to hand over its keyboard and mouse. Some take up to a minute.';
@@ -6021,6 +6023,68 @@ async function withControl(work) {
   control.releaseAll();
   await work(control);
   if (focus?.control === control && control.on) $('#focus-screen').focus({ preventScroll: true });
+}
+
+// Modifiers are armed locally for one chord, never held down between screen-key clicks.
+const screenModifiers = new Set();
+function resetScreenKeyboard(close = false) {
+  screenModifiers.clear();
+  for (const key of document.querySelectorAll('#focus-keyboard [data-modifier]')) key.setAttribute('aria-pressed', 'false');
+  if (close) {
+    $('#focus-keyboard').hidden = true;
+    $('#focus-keyboard-toggle').setAttribute('aria-expanded', 'false');
+  }
+}
+
+function makeScreenKeyboard() {
+  const rows = [
+    [['Esc', 'Escape'], ...Array.from({ length: 12 }, (_, i) => [`F${i + 1}`, `F${i + 1}`])],
+    [['`', 'Backquote'], ...'1234567890'.split('').map(n => [n, `Digit${n}`]), ['-', 'Minus'], ['=', 'Equal'], ['Backspace', 'Backspace']],
+    [['Tab', 'Tab'], ...'QWERTYUIOP'.split('').map(k => [k, `Key${k}`]), ['[', 'BracketLeft'], [']', 'BracketRight'], ['Backslash', 'Backslash']],
+    [['Caps Lock', 'CapsLock'], ...'ASDFGHJKL'.split('').map(k => [k, `Key${k}`]), [';', 'Semicolon'], ["'", 'Quote'], ['Enter', 'Enter']],
+    [['Shift', 'ShiftLeft'], ...'ZXCVBNM'.split('').map(k => [k, `Key${k}`]), [',', 'Comma'], ['.', 'Period'], ['/', 'Slash'], ['Up', 'ArrowUp']],
+    [['Ctrl', 'ControlLeft'], ['Win', 'MetaLeft'], ['Alt', 'AltLeft'], ['Space', 'Space'], ['Left', 'ArrowLeft'], ['Down', 'ArrowDown'], ['Right', 'ArrowRight']],
+    [['Insert', 'Insert'], ['Delete', 'Delete'], ['Home', 'Home'], ['End', 'End'], ['Page Up', 'PageUp'], ['Page Down', 'PageDown'], ['PrtSc', 'PrintScreen']],
+  ];
+  const modifiers = new Set(['ShiftLeft', 'ControlLeft', 'AltLeft', 'MetaLeft']);
+  const container = $('#focus-keyboard .screen-keyboard-rows');
+  for (const row of rows) {
+    const line = document.createElement('div');
+    line.className = 'screen-keyboard-row';
+    for (const [label, code] of row) {
+      const key = document.createElement('button');
+      key.type = 'button';
+      key.textContent = label;
+      key.dataset.code = code;
+      if (code === 'Space') key.className = 'space-key';
+      if (modifiers.has(code)) {
+        key.dataset.modifier = code;
+        key.setAttribute('aria-pressed', 'false');
+      }
+      key.addEventListener('click', () => {
+        const control = focus?.control;
+        if (!control?.on || $('#focus-keyboard').hidden) return;
+        if (modifiers.has(code)) {
+          if (screenModifiers.has(code)) screenModifiers.delete(code);
+          else screenModifiers.add(code);
+          key.setAttribute('aria-pressed', String(screenModifiers.has(code)));
+          return;
+        }
+        const chord = [...screenModifiers, code].map(name => USAGES[name]);
+        control.releaseAll();  // releases physical keys and clears the armed screen modifiers
+        control.tap(chord);   // balanced down/up events through the existing owned control channel
+      });
+      line.append(key);
+    }
+    container.append(line);
+  }
+  $('#focus-keyboard-toggle').addEventListener('click', () => {
+    if (!focus?.control?.on) return;
+    const open = $('#focus-keyboard').hidden;
+    resetScreenKeyboard();
+    $('#focus-keyboard').hidden = !open;
+    $('#focus-keyboard-toggle').setAttribute('aria-expanded', String(open));
+  });
 }
 
 // --- history: what the wall saw of this machine, under the enlarged picture ------------------------------------
@@ -6841,6 +6905,7 @@ document.addEventListener('keydown', event => {
 async function boot() {
   applyTheme();
   decorate();
+  makeScreenKeyboard();
   // The page states which version of the program it belongs to. A server from before that
   // existed sends the page with the placeholder still in it: the files were updated, but the
   // old program is still running and does not know the newer page's requests.
@@ -6979,7 +7044,7 @@ async function boot() {
       if (event.key === 'Escape') arranging();
       return;
     }
-    if (event.target.matches?.('select, input, textarea') || event.target.closest?.('.focus-popover')) return;
+    if (event.target.matches?.('select, input, textarea') || event.target.closest?.('.focus-popover, .focus-control-panel')) return;
     if (event.key === 'f' || event.key === 'F') {
       toggleFullscreen();
     } else if (event.key === '/' && !focus) {

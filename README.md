@@ -329,6 +329,14 @@ somebody else has them, the button says who (*Controlled by olga*); to an admin 
 edge of the page: *admin took over this machine's keyboard and mouse*, or *Given back after 15
 minutes without input*.
 
+In the enlarged view, **Control** is a toggle: highlighted while you hold the keyboard and mouse.
+Click it again, or press Right Ctrl by itself, to release control. Its tools open over the picture
+without resizing the video. **On-screen keyboard** opens letters, numbers, function and navigation
+keys for mouse or touch input. Shift, Ctrl, Alt and Win apply to the next key only; they are not held
+on the remote machine between clicks. Closing the keyboard, losing page focus or releasing control
+clears those modifiers. The labels use US key positions; the remote machine's keyboard layout
+determines the resulting text. **Details** contains stream statistics and the activity toggle.
+
 **Who may.** Whoever may see the machine may watch it: a viewer, a wall screen opened with its
 display link, a token for scripts. Taking its keyboard and mouse takes an operator or an admin,
 in person or by a token with that role. One connection holds a machine's keyboard and mouse at
@@ -1281,6 +1289,7 @@ comes by then, it is taken for one that stopped, as after those five: called off
 moment it takes to connect again, and a live view that held its keyboard and mouse takes them
 again (a real one once sent no picture on the connection it held while its computer was woken,
 and a new connection had it at once).
+
 
 Keys, typed text, keep-awake, Wake-on-LAN, the ATX power extension and reboot are in the action
 menu. **Text is typed in the keyboard layout the JetKVM says its computer uses** (set on its own
