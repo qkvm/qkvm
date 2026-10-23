@@ -131,6 +131,7 @@
       <button type="button" class="operator-only" id="focus-actions">Actions</button>
       <a class="btn" id="focus-open" target="_blank" rel="noopener noreferrer">Open console</a>
       <button type="button" id="focus-fullscreen" title="Fullscreen (F)">Fullscreen</button>
+      <details class="focus-popover focus-overflow" id="focus-more" hidden><summary class="btn" aria-label="More console controls" title="More console controls"><span class="more-label">More</span><span aria-hidden="true">⋯</span></summary><div class="focus-overflow-content" role="group" aria-label="More console controls"></div></details>
       <button type="button" class="icon-btn" id="focus-close" title="Close (Esc)" aria-label="Close"></button>
     </div>
     <div class="focus-control-panel" id="focus-keys" role="toolbar" aria-label="Remote keyboard and mouse" hidden>
@@ -142,7 +143,8 @@
       <button type="button" id="focus-prtsc" title="Print Screen">PrtSc</button>
       <button type="button" id="focus-type" title="Type text on the machine">Type text...</button>
     <button type="button" id="focus-relative" aria-pressed="false" disabled>Relative mouse</button>
-      <details class="focus-input-help"><summary>Input help</summary><p class="muted" id="focus-keys-note"></p></details>
+      <details class="focus-input-help" id="focus-input-help"><summary>Input help</summary><p class="muted" id="focus-keys-note"></p></details>
+      <details class="focus-popover focus-overflow" id="focus-keys-more" hidden><summary class="btn" aria-label="More input controls" title="More input controls"><span class="more-label">More</span><span aria-hidden="true">⋯</span></summary><div class="focus-overflow-content" role="group" aria-label="More input controls"></div></details>
     </div>
   </div>
   <div class="ports focus-ports" id="focus-ports" role="group" aria-label="Ports" hidden></div>

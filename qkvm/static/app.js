@@ -5713,7 +5713,7 @@ function openFocus(id) {
     }
     const opening = !focus;
     focus = { id, feed, view };
-    $('#focus-details').open = false;
+    for (const menu of document.querySelectorAll('#focus .focus-popover')) menu.open = false;
     if (opening) {
       $('#focus-details').open = false;
     }
@@ -5775,6 +5775,7 @@ function renderFocus() {
   const status = focus.said?.state ? { ...(tile.status || {}), state: focus.said.state, error: focus.said.error?.code ? focus.said.error : null } : tile.status;
   const [state, message] = stateOf(status, focus.view);
   $('#focus-name').textContent = tile.device.name;
+  $('#focus-name').title = tile.device.name;
   const open = $('#focus-open');
   if (consoleLink(tile.device)) open.href = consoleLink(tile.device);
   else open.removeAttribute('href');
@@ -5979,6 +5980,7 @@ function renderLive() {
 
 // The Control button and the row of keys under the bar: as they are now.
 function renderControl() {
+  scheduleConsoleOverflow();
   const button = $('#focus-control');
   const keys = $('#focus-keys');
   const live = focus?.live;
@@ -5993,6 +5995,7 @@ function renderControl() {
   for (const item of keys.querySelectorAll('button')) item.disabled = !control?.on;
   if (!control?.on) {
     $('#focus-keys .focus-input-help').open = false;
+    $('#focus-keys-more').open = false;
     resetScreenKeyboard(true);
   }
   if (!possible) return;
@@ -6054,6 +6057,78 @@ function resetScreenKeyboard(close = false) {
     $('#focus-keyboard').hidden = true;
     $('#focus-keyboard-toggle').setAttribute('aria-expanded', 'false');
   }
+}
+
+// Move the existing controls (and their handlers/state) into More only when they no longer fit.
+// A single layout pass measures the normal row. Routine status updates do not move focused controls.
+const consoleOverflow = [];
+let consoleOverflowFrame = 0;
+function scheduleConsoleOverflow() {
+  if (consoleOverflowFrame) return;
+  consoleOverflowFrame = requestAnimationFrame(() => {
+    consoleOverflowFrame = 0;
+    for (const fit of consoleOverflow) fit();
+  });
+}
+function setupConsoleOverflow() {
+  for (const [row, more, priorities] of [
+    [$('.focus-tools'), $('#focus-more'), {'focus-prev': 20, 'focus-next': 20, 'focus-again': 80, 'focus-health': 60, 'focus-open': 40, 'focus-fullscreen': 30}],
+    [$('#focus-keys'), $('#focus-keys-more'), {'focus-keyboard-toggle': 100, 'focus-cad': 70, 'focus-win': 20, 'focus-alt-tab': 40, 'focus-alt-f4': 10, 'focus-prtsc': 10, 'focus-type': 90, 'focus-relative': 60, 'focus-input-help': 0}],
+  ]) {
+    const items = [...row.children].filter(item => item !== more);
+    const panel = more.querySelector('.focus-overflow-content');
+    const summary = more.querySelector('summary');
+    let signature = '';
+    const fit = () => {
+      if (!row.getClientRects().length) return;
+      const header = row.classList.contains('focus-tools');
+      const parent = header ? $('#focus-bar') : row;
+      const css = getComputedStyle(parent);
+      const gap = parseFloat(getComputedStyle(row).gap) || 0;
+      const available = parent.clientWidth - parseFloat(css.paddingLeft) - parseFloat(css.paddingRight)
+        - (header ? parseFloat(getComputedStyle($('.focus-identity')).minWidth) + parseFloat(css.gap) : 0);
+      const visible = items.filter(item => !item.hidden && getComputedStyle(item).display !== 'none');
+      const next = [window.innerWidth, available, ...visible.map(item => item.id + item.textContent)].join('|');
+      if (signature === next) return;
+      signature = next;
+      const active = document.activeElement;
+      // Restore the original order before measuring intrinsic button widths; menu rows use different widths.
+      for (const item of items) row.insertBefore(item, more);
+      more.hidden = false;
+      const widths = new Map(visible.map(item => [item, item.getBoundingClientRect().width]));
+      let used = visible.reduce((sum, item) => sum + widths.get(item), 0) + Math.max(0, visible.length - 1) * gap;
+      const moved = new Set();
+      if (used > available) {
+        used += summary.getBoundingClientRect().width + gap;
+        const candidates = visible.filter(item => item.id in priorities).sort((a, b) => priorities[a.id] - priorities[b.id] || items.indexOf(b) - items.indexOf(a));
+        for (const item of candidates) {
+          if (used <= available) break;
+          moved.add(item);
+          used -= widths.get(item) + gap;
+        }
+      }
+      for (const item of items) if (moved.has(item)) panel.append(item);
+      more.hidden = !moved.size;
+      // Keep Close at the far right, after More, regardless of the fitted set.
+      if (header) row.append($('#focus-close'));
+      if (more.hidden) more.open = false;
+      if (items.some(item => item === active || item.contains(active))) {
+        (moved.has(items.find(item => item === active || item.contains(active))) && !more.open ? summary : active).focus({preventScroll: true});
+      } else if (active === summary && more.hidden) {
+        visible.find(item => !item.disabled)?.focus({preventScroll: true});
+      }
+    };
+    consoleOverflow.push(fit);
+    new ResizeObserver(scheduleConsoleOverflow).observe(row === $('#focus-keys') ? row : $('#focus-bar'));
+    more.addEventListener('toggle', () => { if (more.open) focus?.control?.releaseAll(); });
+    panel.addEventListener('click', event => {
+      if (!event.target.closest('button, a')) return;
+      more.open = false;
+      // Do not steal focus from a dialog or the picture after its action ran.
+      if (panel.contains(document.activeElement)) summary.focus({preventScroll: true});
+    });
+  }
+  window.addEventListener('resize', scheduleConsoleOverflow);
 }
 
 // Only panel geometry is retained, never typed text or remote modifiers.
@@ -6934,6 +7009,8 @@ function decorate() {
   $('#focus-prev').append(icon('chevronLeft'));
   $('#focus-next').append(icon('chevronRight'));
   $('#focus-actions').prepend(icon('zap'));
+  $('#focus-actions').setAttribute('aria-label', 'Actions');
+  $('#focus-actions').title = 'Actions';
   $('#focus-keyboard-toggle').prepend(icon('keyboard'));
   $('#focus-health').prepend(icon('activity'));
   $('#focus-open').prepend(icon('external'));
@@ -6979,6 +7056,7 @@ async function boot() {
   applyTheme();
   decorate();
   makeScreenKeyboard();
+  setupConsoleOverflow();
   // The page states which version of the program it belongs to. A server from before that
   // existed sends the page with the placeholder still in it: the files were updated, but the
   // old program is still running and does not know the newer page's requests.
