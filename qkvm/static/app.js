@@ -4939,7 +4939,7 @@ class LiveLine {
   }
 
   // Keyboard and mouse asked for. Answered through `told.control`; the server has a few seconds. `from`: taken
-  // over from whoever holds them, as an admin may, where that is still who the server said (`by`, as it came).
+  // over from the observed grant, as an admin may (`from`, or `by` for an older server).
   askControl(from = null) {
     if (!this.open || this.ended || this.control || this.asking || this.owes()) return false;
     this.asking = {
@@ -5017,9 +5017,11 @@ class LiveLine {
       const pointer = ['absolute', 'relative', 'both'].includes(said.pointer) ? said.pointer : '';
       this.told.state(serverText(said.state, 40), { code: serverText(error.code, 40), message: serverText(error.message) }, pointer);
     } else if (kind === 'control') {
-      // (`by` as it came as well: a take-over names whom it takes them from in the server's own words.)
-      this.answered(said.on === true, serverText(said.code, 40), serverText(said.message), serverText(said.by, 60),
-        typeof said.by === 'string' && said.by.length <= 200 ? said.by : '');
+      // Keep display text separate from the exact grant reference. Only older servers that omit
+      // `from` use their name as the reference; an invalid supplied reference must not fall back.
+      const reference = Object.hasOwn(said, 'from') ? said.from : said.by;
+      this.answered(said.on === true, serverText(said.code, 40), serverText(said.message), serverText(said.by, 64),
+        typeof reference === 'string' && reference.length > 0 && reference.length <= 200 ? reference : '');
     } else if (kind === 'bye') {
       // A code with a ':' in it is this program's own and no server's to say.
       const code = serverText(said.code, 40);
@@ -5891,7 +5893,7 @@ function askControl() {
 // Somebody else holds the keyboard and mouse, and this is an admin in person: they may be taken over (the server
 // asks again whether this account may, and whether they are still who it said).
 function mayTakeOver() {
-  return Boolean(focus?.refused?.code === 'taken' && focus.refused.by && can('admin') && !me?.token);
+  return Boolean(focus?.refused?.code === 'taken' && focus.refused.by && focus.refused.from && can('admin') && !me?.token);
 }
 
 // Control, or the key C: taken over after a question that names whoever has them, where that is what is offered.
@@ -5904,7 +5906,7 @@ function controlClicked() {
 async function takeOver() {
   const live = focus?.live;
   const refused = focus?.refused;
-  if (!live || !refused?.by || live.owes()) return;  // (as Control rests while the server still owes a word)
+  if (!live || !refused?.by || !refused.from || live.owes()) return;  // (as Control rests while the server still owes a word)
   const name = tiles.get(focus.id)?.device.name || 'this machine';
   const yes = await confirmBox({
     title: 'Take over keyboard and mouse',
@@ -5912,7 +5914,7 @@ async function takeOver() {
     action: 'Take over',
   });
   if (!yes || focus?.live !== live || focus.refused !== refused) return;
-  if (live.askControl(refused.from || refused.by)) focus.refused = null;
+  if (live.askControl(refused.from)) focus.refused = null;
   renderControl();
 }
 

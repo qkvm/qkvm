@@ -655,11 +655,13 @@ def test_an_admin_takes_over_from_an_operator_who_is_told_who_and_what_she_had_d
             mine.say(**{"t": "control", "on": True, "take": True, **whom})
             refused = mine.word("control")
             assert refused["on"] is False and refused["code"] == "taken" and refused["by"] == "olga", (whom, refused)
-        mine.say(**{"t": "control", "on": True, "take": True, "from": "olga"})
+        mine.say(**{"t": "control", "on": True, "take": True, "from": refused["from"]})
         assert mine.word("control") == {"t": "control", "on": True}
         mine.say(t="k", u=0x06, d=True)  # KeyC, at once
         mine.say(t="k", u=0x06, d=False)
-        assert hers.word("control") == {"t": "control", "on": False, "code": "taken", "message": "admin took over this machine's keyboard and mouse", "by": "admin"}
+        revoked = hers.word("control")
+        assert isinstance(revoked["from"], str) and len(revoked["from"]) == 32 and revoked["from"] != refused["from"]
+        assert revoked == {"t": "control", "on": False, "code": "taken", "message": "admin took over this machine's keyboard and mouse", "by": "admin", "from": revoked["from"]}
         hers.say(t="k", u=0x04, d=True)  # hers, after: nothing
         hers.say(t="up")
         wait_until(lambda: len(comet.state.hid) >= 6, f"the take-over did not reach the KVM: {comet.state.hid}")

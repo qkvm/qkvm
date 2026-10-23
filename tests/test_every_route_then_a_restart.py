@@ -421,7 +421,10 @@ def test_a_take_over_and_the_live_views_leave_files_that_a_start_reads(tmp_path:
             hers.say(t="control", on=True)
             assert hers.word("control")["on"] is True
             mine = first.line(admin, device)
-            mine.say(t="control", on=True, take=True, **{"from": "olga"})
+            mine.say(t="control", on=True)
+            offered = mine.word("control")
+            assert offered["code"] == "taken" and offered["by"] == "olga"
+            mine.say(t="control", on=True, take=True, **{"from": offered["from"]})
             assert mine.word("control") == {"t": "control", "on": True}
             assert hers.word("control")["code"] == "taken"
             hers.close()

@@ -456,6 +456,7 @@ def test_a_way_in_made_for_a_line_that_is_stopped_meanwhile_is_closed_all_the_sa
         asking = asyncio.create_task(s.machine.control(s.b, True))
         await asyncio.sleep(0.01)
         s.machine.holder = s.a  # (somebody else took them while the way in was made: it is closed again)
+        s.machine.control_reference = "another-control-lease"
         way_b.opening.set_result(None)
         await asyncio.sleep(0.01)
         asking.cancel()
@@ -828,10 +829,10 @@ def test_an_admin_takes_over_the_holder_is_told_who_and_what_they_had_down_is_le
         await s.machine.input(s.a, {"t": "k", "u": 0xE0, "d": True})  # A holds Ctrl down
         await s.machine.input(s.a, {"t": "mb", "b": 1, "d": True})  # and the left button
         way_a.slow_up = way_a.slow_button_up = 0.2  # (a machine slow to take the letting go)
-        assert await s.machine.control(s.b, True) == live.refused("taken", "Somebody else has this machine's keyboard and mouse", by="A")
+        assert await s.machine.control(s.b, True) == live.refused("taken", "Somebody else has this machine's keyboard and mouse", by="A", reference=s.machine.control_reference)
         assert await s.machine.control(s.b, True, take=True, taking_from="A") == {"t": "control", "on": True}
         assert s.machine.holder is s.b and s.machine.hid is way_b and not s.a.control and s.b.control
-        assert told(s.a)[-1] == {"t": "control", "on": False, "code": "taken", "message": "B took over this machine's keyboard and mouse", "by": "B"}
+        assert told(s.a)[-1] == {"t": "control", "on": False, "code": "taken", "message": "B took over this machine's keyboard and mouse", "by": "B", "from": s.machine.control_reference}
         await s.machine.input(s.b, {"t": "k", "u": 0x06, "d": True})  # B's first key, at once
         await s.machine.input(s.a, {"t": "k", "u": 0x04, "d": True})  # A's, after: from a line that holds nothing, nothing
         await s.machine.input(s.a, {"t": "up"})
@@ -863,6 +864,7 @@ def test_a_key_of_the_holders_still_on_its_way_at_a_take_over_lands_and_is_let_g
         way_a.hold("key")
         typing = asyncio.create_task(s.machine.input(s.a, {"t": "k", "u": 0xE1, "d": True}))
         await asyncio.sleep(0.01)
+        assert (await s.machine.control(s.b, True))["code"] == "taken"  # observe the holder before confirmation
         assert await s.machine.control(s.b, True, take=True, taking_from="A") == {"t": "control", "on": True}
         admins = asyncio.create_task(s.machine.input(s.b, {"t": "k", "u": 0x04, "d": True}))
         await asyncio.sleep(0.1)
@@ -931,6 +933,7 @@ def test_a_take_over_answered_after_the_way_in_was_made_asks_again_who_holds_the
         await s.take(s.a)
         c = s.line("C")
         way_b.opening = asyncio.get_running_loop().create_future()
+        assert (await s.machine.control(s.b, True))["code"] == "taken"  # observe the holder before confirmation
         asking = asyncio.create_task(s.machine.control(s.b, True, take=True, taking_from="A"))
         await asyncio.sleep(0.01)
         assert await s.machine.control(s.a, False) == {"t": "control", "on": False}
@@ -998,6 +1001,7 @@ def test_a_check_of_the_account_that_fails_during_a_take_over_ends_the_line_and_
 
         s.lines.may_take = may_take  # type: ignore[method-assign]
         s.machine.device._unexpected = lambda what, error: None  # type: ignore[attr-defined]
+        assert (await s.machine.control(s.b, True))["code"] == "taken"  # observe the holder before confirmation
         answer = await s.machine.control(s.b, True, take=True, taking_from="A")
         assert answer["on"] is False and answer["code"] == "taken", answer
         assert s.b.leaving == "internal", "a line whose right to take over could not be found out went on"
@@ -1030,10 +1034,12 @@ def test_a_wait_for_the_holder_before_that_runs_out_gives_up_on_that_one_alone(m
         way_a.hold("key")
         typing = asyncio.create_task(s.machine.input(s.a, {"t": "k", "u": 0xE0, "d": True}))
         await asyncio.sleep(0.01)
+        assert (await s.machine.control(s.b, True))["code"] == "taken"  # observe the holder before confirmation
         assert await s.machine.control(s.b, True, take=True, taking_from="A") == {"t": "control", "on": True}
         waiting = asyncio.create_task(s.machine.input(s.b, {"t": "k", "u": 0x04, "d": True}))
         await asyncio.sleep(0.1)
         way_b.closing = asyncio.get_running_loop().create_future()  # (B's way in is slow to close)
+        assert (await s.machine.control(c, True))["code"] == "taken"
         assert await s.machine.control(c, True, take=True, taking_from="B") == {"t": "control", "on": True}
         await waiting  # B's wait ran out, and B holds nothing by now: nothing of B's goes
         assert ("way B", "key", 0x04, True) not in s.said

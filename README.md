@@ -430,10 +430,15 @@ with a field `t`. From the program: `hello` (`v: 2`, `ticket`, `video`: the code
 of `h264` and `jpeg`, `max_w`, `max_fps`), `shape` (`max_w`, `max_fps`), `key_frame` (a frame was
 lost: send a key frame; of JPEG the last picture is sent again, once in half a second at the
 most), `control` (`on`; and to take them over from whoever holds them, as an admin in person
-may, `take`: true, with `from`: the `by` the refusal named, as a text, which a take-over has to
-have, so that they are taken only from whom the person was asked about; without it, or with
-another holder by then, it is refused `taken` with the `by` of now; where nobody holds them it
-is an ordinary asking; sixty takings and givings back a minute of one account, on all its lines
+may, `take`: true, with `from`: the opaque `from` reference of the refusal that this live line
+received, after confirmation naming its `by` display name. The reference identifies one grant
+of control, not an account name: another session or a release and reacquisition invalidates it,
+even for the same account. A stale or missing confirmation is refused `taken` with the current
+`by` and `from`; ask the person again, never retry takeover automatically. Older clients may
+send the observed `by` name only while that same live line's observed grant remains unchanged.
+These checks do not grant permission: only a currently authorized administrator may take over,
+and permission and the grant are checked again after the device connection opens. Where nobody
+holds control it is an ordinary asking; sixty takings and givings back a minute of one account, on all its lines
 together, and a line that asks more ends with `bye flooding`),
 `k` (`u`: a key by its USB HID usage on page 7, 4 to 0xE7, but 0x66, the keyboard's Power key,
 which is dropped unsent: a machine's power is under Power, asked first; `d`:

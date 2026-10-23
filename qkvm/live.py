@@ -229,14 +229,16 @@ class Picture:
         self.message = HEAD.pack(kind, KEY if key else 0, 0, counter & 0xFFFFFFFF, time.monotonic_ns() // 1000) + data
 
 
-MOST_NAME = 60  # letters of a holder's name a refusal carries (`by`)
+MOST_NAME = 64  # the full maximum account name, also bounded for token display names
 
 
-def refused(code: str, message: str, by: str | None = None) -> dict[str, Any]:
-    """What a line is told when it asked for keyboard and mouse and does not get them; `by`: who has them, where somebody has."""
+def refused(code: str, message: str, by: str | None = None, reference: str | None = None) -> dict[str, Any]:
+    """Control refusal; `by` names the holder, `reference` identifies the observed grant for confirmation."""
     word: dict[str, Any] = {"t": "control", "on": False, "code": code, "message": message}
     if by is not None:
         word["by"] = by[:MOST_NAME]
+    if reference is not None:
+        word["from"] = reference
     return word
 
 
@@ -1333,6 +1335,7 @@ class Line:
     def __init__(self, ws: WebSocket, holder: Holder, machine: Machine, wants: frozenset[str], max_w: int, max_fps: float) -> None:
         self.ws = ws
         self.holder = holder
+        self.offered_control: str | None = None  # the control lease this viewer was last shown
         self.machine = machine
         self.wants = wants  # the codecs it can show
         self.max_w, self.max_fps = max_w, max_fps
@@ -1425,6 +1428,7 @@ class Machine:
         self.viewers: set[Line] = set()
         self.sources: dict[str, Source] = {}
         self.holder: Line | None = None  # the line that has keyboard and mouse
+        self.control_reference: str | None = None  # renewed for every grant, including reacquisition by the same line
         self.hid: Hid | None = None
         self.input_at = 0.0  # when the holder last sent input (INPUT), or took keyboard and mouse: see IDLE_GIVE_BACK
         self.state: tuple[Any, Any, Any, Any] | None = None  # what the lines were last told of how the machine is
@@ -1594,28 +1598,33 @@ class Machine:
     # --- keyboard and mouse ---
 
     def _not_taken(self, line: Line, take: bool, taking_from: str | None) -> dict[str, Any] | None:
-        """Where somebody else holds keyboard and mouse: the refusal this line gets, or None where it takes them over.
+        """Confirm the exact observed control lease, and the administrator's current permission.
 
-        Only an admin, in person, takes them over (`Lines.may_take`, asked at this moment: a role lowered a second ago
-        counts), and only from whom they were asked about (`taking_from`, the `by` of the refusal they were shown, which a
-        take-over has to say): whoever holds them now may be somebody else by the time the question was answered. A check
-        of the account that fails is no yes: the line ends (`internal`), as one whose standing cannot be found out does."""
-        assert self.holder is not None
+        Names are display text, not lease identity. A legacy name-based confirmation is accepted only
+        on the viewer that was shown this unchanged lease. Releasing and reacquiring control renews
+        the reference even on the same line. These checks run again after asynchronous HID admission.
+        """
+        assert self.holder is not None and self.control_reference is not None
         by = self.holder.holder.name[:MOST_NAME]
+
+        def taken(message: str) -> dict[str, Any]:
+            line.offered_control = self.control_reference
+            return refused("taken", message, by=by, reference=self.control_reference)
+
         if not take:
-            return refused("taken", "Somebody else has this machine's keyboard and mouse", by=by)
+            return taken("Somebody else has this machine's keyboard and mouse")
         try:
             may_take = self.lines.may_take(line.holder, self.device_id)
         except Exception as ex:
             self.device._unexpected("asking whether a live line may take keyboard and mouse over failed", ex)
             line.end("internal", "qKVM could not find out whether this line may go on")
-            return refused("taken", "Somebody else has this machine's keyboard and mouse", by=by)
+            return taken("Somebody else has this machine's keyboard and mouse")
         if not may_take:
-            return refused("taken", "Somebody else has this machine's keyboard and mouse, and only an admin may take them over", by=by)
+            return taken("Somebody else has this machine's keyboard and mouse, and only an admin may take them over")
         if taking_from is None:
-            return refused("taken", "Somebody else has this machine's keyboard and mouse: a take-over says whom it takes them from", by=by)
-        if taking_from != by:
-            return refused("taken", "Somebody else has this machine's keyboard and mouse by now", by=by)
+            return taken("Somebody else has this machine's keyboard and mouse: a take-over says whom it takes them from")
+        if line.offered_control != self.control_reference or taking_from not in (self.control_reference, by):
+            return taken("Control changed or was not confirmed on this live line. Confirm the current holder again.")
         return None
 
     async def control(self, line: Line, on: bool, take: bool = False, taking_from: str | None = None) -> dict[str, Any]:
@@ -1674,9 +1683,12 @@ class Machine:
             self._owe(asyncio.create_task(self._close_hid(hid, held=False)))
             return refusal
         taken_from = self.holder
+        reference = secrets.token_urlsafe(24)
         if taken_from is not None:
-            self._let_go(taken_from, "taken", f"{line.holder.name} took over this machine's keyboard and mouse", by=line.holder.name)
+            self._let_go(taken_from, "taken", f"{line.holder.name} took over this machine's keyboard and mouse", by=line.holder.name, reference=reference)
         self.holder, self.hid, line.control = line, hid, True
+        self.control_reference = reference
+        line.offered_control = None
         hid.authorized = lambda: self._input_allowed(line, hid)
         self.input_at = time.monotonic()
         detail: dict[str, Any] = {"user": line.holder.name, "device": self.device.spec.name, "device_id": self.device_id, "on": True}
@@ -1709,7 +1721,7 @@ class Machine:
     def _owe(self, task: asyncio.Task[None]) -> None:
         self.lines.owed(task, self.device_id)
 
-    def _let_go(self, line: Line, why: str | None, message: str | None, by: str | None = None) -> None:
+    def _let_go(self, line: Line, why: str | None, message: str | None, by: str | None = None, reference: str | None = None) -> None:
         """Keyboard and mouse leave this line: given back (no reason), or taken away for a reason, which the line is told unless it is going.
         `by`: who took them over (why "taken"), which the line is told and the log says.
 
@@ -1718,10 +1730,12 @@ class Machine:
         if self.holder is not line:
             return
         hid, self.holder, self.hid, line.control = self.hid, None, None, False
+        self.control_reference = None
+        line.offered_control = reference
         if hid is not None:
             hid.end()  # (at once: a word of the line's still on its way finds the line gone when it is through)
         if why is not None and why != "closed":
-            line.say(refused(why, message or "", by=by))  # (said to a line that is leaving: nothing, its goodbye says why)
+            line.say(refused(why, message or "", by=by, reference=reference))  # (said to a line that is leaving: nothing, its goodbye says why)
         detail: dict[str, Any] = {"user": line.holder.name, "device": self.device.spec.name, "device_id": self.device_id, "on": False}
         if why is not None:
             detail["why"] = why
@@ -2161,8 +2175,8 @@ class Lines:
                 if not self.control_said(line.holder):
                     line.end("flooding", "This account takes and gives back keyboard and mouse far more often than a person would")
                     continue
-                # `take`: from whoever holds them (true, and nothing else, asks it); `from`: whom, as a text, which a take-over
-                # has to say (left out, null or of another kind, it takes nothing from anybody: Machine._not_taken).
+                # `take` must be true; `from` confirms the observed control grant. Legacy names still require
+                # an unchanged grant observed on this line. Missing/nontext/stale references cannot take over.
                 said_from = word.get("from")
                 taking_from = said_from if isinstance(said_from, str) else None
                 line.say(await answer_to(machine.control(line, on, take=word.get("take") is True, taking_from=taking_from)))

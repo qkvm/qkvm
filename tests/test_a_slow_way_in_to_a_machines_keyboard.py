@@ -60,7 +60,10 @@ def test_a_way_in_not_made_in_time_is_answered_takes_nothing_from_the_holder_and
         wait_until(lambda: comet.state.key_lines == 1, "her line for keys was never opened")
         slow["on"] = True
         mine = wall.line(admin, device)
-        mine.say(t="control", on=True, take=True, **{"from": "olga"})
+        mine.say(t="control", on=True)
+        offered = mine.word("control")
+        assert offered["code"] == "taken" and offered["by"] == "olga"
+        mine.say(t="control", on=True, take=True, **{"from": offered["from"]})
         answer = mine.word("control", timeout=2.0)  # (within the second, not after the way in's two and a half)
         assert answer["on"] is False and answer["code"] == "timeout", answer
         # She holds them still, and was told nothing.
@@ -104,7 +107,10 @@ def test_a_take_over_whose_asker_went_away_while_its_way_in_was_made_takes_nothi
         assert hers.word("control")["on"] is True
         slow["on"] = True
         mine = wall.line(admin, device)
-        mine.say(t="control", on=True, take=True, **{"from": "olga"})
+        mine.say(t="control", on=True)
+        offered = mine.word("control")
+        assert offered["code"] == "taken" and offered["by"] == "olga"
+        mine.say(t="control", on=True, take=True, **{"from": offered["from"]})
         time.sleep(0.3)
         try:
             for step in range(70 if meanwhile != "nothing" else 0):
