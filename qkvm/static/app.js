@@ -5402,7 +5402,7 @@ class Control {
 
   // The page's own keys rest while keys go to the machine: a dialog on top, or a field, gets them as ever.
   fromThePage(event) {
-    return !this.on || $('dialog[open]') || event.target.matches?.('input, textarea, select');
+    return !this.on || $('dialog[open]') || event.target.matches?.('input, textarea, select') || (event.code !== 'ControlRight' && event.target.closest?.('.focus-popover'));
   }
 
   keyDown(event) {
@@ -5697,6 +5697,13 @@ function openFocus(id) {
     }
     const opening = !focus;
     focus = { id, feed, view };
+    $('#focus-keys').open = false;
+    $('#focus-details').open = false;
+    if (opening) {
+      $('#focus').classList.remove('show-activity');
+      $('#focus-activity').setAttribute('aria-expanded', 'false');
+      $('#focus-activity').textContent = 'Show activity';
+    }
     $('#focus').hidden = false;
     behindFocus(true);
     renderFocus();
@@ -5759,6 +5766,7 @@ function renderFocus() {
   if (consoleLink(tile.device)) open.href = consoleLink(tile.device);
   else open.removeAttribute('href');
   $('#focus-bar').dataset.state = state;
+  $('#focus .focus-title').dataset.state = state;
   $('#focus').dataset.state = state;
   const screen = pictured(tile.device, focus.view, state);
   $('#focus-screen').classList.toggle('has-frame', Boolean(focus.view.hasFrame));
@@ -5771,7 +5779,7 @@ function renderFocus() {
   $('#focus-health').setAttribute('aria-pressed', String(Boolean(focus.health)));
   $('#focus-state').textContent = stateLabel(state, tile.status);
   if (state !== 'online') fillVeil($('#focus-veil'), state, veilContent(tile.device, tile.status, focus.view, state, message));
-  $('#focus-meta').textContent = [tile.device.host, metaText(tile.status), screen ? stillNote(focus.view) : ''].filter(Boolean).join(' · ');
+  $('#focus-meta').textContent = [tile.device.host === tile.device.name ? '' : tile.device.host, metaText(tile.status), screen ? stillNote(focus.view) : ''].filter(Boolean).join(' · ');
   fillPorts($('#focus-ports'), tile);
   renderLive();
   renderControl();
@@ -5943,6 +5951,9 @@ function renderLive() {
   }
   if (line.textContent !== text) line.textContent = text;
   line.title = title;
+  const alert = $('#focus-live-alert');
+  alert.hidden = !(focus.endedBy || picture?.failed);
+  alert.textContent = alert.hidden ? '' : [text, title].filter(Boolean).join(' · ');
   Object.assign(line.dataset, {
     codec: picture?.codec || '', width: picture?.size.w || 0, height: picture?.size.h || 0, fps: focus.fps || 0,
     dropped: picture ? picture.dropped + focus.live.skipped : 0, counter: picture?.counter || 0, drawn: picture?.drawn || 0,
@@ -5960,6 +5971,8 @@ function renderControl() {
   const possible = Boolean(live && live.open && !live.ended && can('operator') && tile && canDo(tile, 'control'));
   button.hidden = !possible;
   keys.hidden = !control?.on;
+  $('#focus-release-hint').hidden = !control?.on;
+  if (!control?.on) keys.open = false;
   if (!possible) return;
   const on = control.on;
   const asking = Boolean(live.asking);
@@ -6915,6 +6928,27 @@ async function boot() {
   $('#focus-next').addEventListener('click', () => stepFocus(1));
   $('#focus-actions').addEventListener('click', () => focus && actionsDialog(focus.id));
   $('#focus-control').addEventListener('click', controlClicked);
+  $('#focus').addEventListener('pointerdown', event => {
+    for (const menu of document.querySelectorAll('.focus-popover[open]')) {
+      if (!menu.contains(event.target)) menu.open = false;
+    }
+  });
+  $('#focus').addEventListener('keydown', event => {
+    const menu = event.target.closest('.focus-popover[open]');
+    if (event.key !== 'Escape' || !menu) return;
+    event.preventDefault();
+    event.stopPropagation();
+    menu.open = false;
+    menu.querySelector('summary').focus();
+  }, true);
+
+  $('#focus-activity').addEventListener('click', () => {
+    const open = $('#focus').classList.toggle('show-activity');
+    $('#focus-activity').setAttribute('aria-expanded', String(open));
+    $('#focus-activity').textContent = open ? 'Hide activity' : 'Show activity';
+    $('#focus-details').open = false;
+    if (open) redrawHistory();
+  });
   $('#focus-again').addEventListener('click', () => focus && startLive(focus.id));
   $('#focus-cad').addEventListener('click', () => withControl(async control => {
     const name = tiles.get(focus.id)?.device.name || 'this machine';
@@ -6945,7 +6979,7 @@ async function boot() {
       if (event.key === 'Escape') arranging();
       return;
     }
-    if (event.target.matches?.('select, input, textarea')) return;
+    if (event.target.matches?.('select, input, textarea') || event.target.closest?.('.focus-popover')) return;
     if (event.key === 'f' || event.key === 'F') {
       toggleFullscreen();
     } else if (event.key === '/' && !focus) {

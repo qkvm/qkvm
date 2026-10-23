@@ -151,6 +151,7 @@ def test_a_click_after_a_hand_over_whose_button_was_let_go_elsewhere_reaches_the
             page.mouse.move(5, 5, steps=2)  # (beside the picture, where its up does not come to the picture)
             page.mouse.up(button="left")
             page.evaluate("() => { HTMLCanvasElement.prototype.requestPointerLock = window.lockWas; }")
+            page.locator("#focus-keys > summary").click()
             page.locator("#focus-relative").click()
             page.wait_for_function("() => document.pointerLockElement?.id === 'focus-canvas'")
             expect(page.locator("#focus-relative")).to_have_attribute("aria-pressed", "true")

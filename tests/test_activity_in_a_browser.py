@@ -39,6 +39,8 @@ def test_an_admin_sees_what_was_done_to_a_machine_beside_its_history_and_all_of_
                 sign_in(page, live, name="admin")
                 tile(page, "Build server").focus()
                 page.keyboard.press("Enter")
+                page.locator("#focus-details > summary").click()
+                page.locator("#focus-activity").click()
                 done = page.locator("#focus-history .history-done")
                 # Who did what to it, newest first, beside the history; its own live view (the enlarged view opens one) is not
                 # among the three lines, nor what was done to the other machine.

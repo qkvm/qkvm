@@ -116,37 +116,45 @@
 
 <section class="focus" id="focus" hidden>
   <div class="focus-bar" id="focus-bar">
-    <span class="dot"></span>
-    <strong id="focus-name"></strong>
-    <span class="muted" id="focus-state"></span>
-    <span class="meta" id="focus-meta"></span>
-    <!-- The live picture's own line: what comes over it, how fast, and what was dropped. -->
-    <span class="muted live-line" id="focus-live" role="status" hidden></span>
-    <div class="ports" id="focus-ports" role="group" aria-label="Ports" hidden></div>
-    <span class="spacer"></span>
-    <button type="button" class="icon-btn" id="focus-prev" title="Previous (left arrow key)" aria-label="Previous KVM"></button>
-    <button type="button" class="icon-btn" id="focus-next" title="Next (right arrow key)" aria-label="Next KVM"></button>
-    <button type="button" id="focus-again" title="Open the live picture again" hidden>Live again</button>
-    <button type="button" class="operator-only" id="focus-control" aria-pressed="false" title="Take this machine's keyboard and mouse (C)" hidden>Control</button>
-    <button type="button" id="focus-health" aria-pressed="false" title="How the server is: health, temperatures, fans" hidden>Health</button>
-    <button type="button" class="operator-only" id="focus-actions">Actions</button>
-    <a class="btn" id="focus-open" target="_blank" rel="noopener noreferrer">Open console</a>
-    <button type="button" class="icon-btn" id="focus-close" title="Close (Esc)" aria-label="Close"></button>
-  </div>
-  <!-- While keyboard and mouse are held: the keys a browser keeps for itself, as buttons, and what else is so. -->
-  <div class="focus-keys" id="focus-keys" role="toolbar" aria-label="Keys the browser keeps" hidden>
-    <button type="button" id="focus-cad" title="Ctrl+Alt+Del on the machine">Ctrl+Alt+Del</button>
-    <button type="button" id="focus-win" title="The Windows key, pressed and let go">Win</button>
-    <button type="button" id="focus-alt-tab" title="Alt+Tab on the machine: the next window">Alt+Tab</button>
-    <button type="button" id="focus-alt-f4" title="Alt+F4 on the machine: closes its window">Alt+F4</button>
-    <button type="button" id="focus-prtsc" title="Print Screen">PrtSc</button>
-    <button type="button" id="focus-type" title="Type a text on the machine">Type text...</button>
+    <div class="focus-identity">
+      <div class="focus-title"><span class="dot"></span><strong id="focus-name"></strong></div>
+      <div class="focus-subtitle"><span id="focus-state"></span><span class="meta" id="focus-meta"></span></div>
+      <span id="focus-live-alert" role="status" hidden></span>
+      <span class="muted" id="focus-release-hint" hidden>Right Ctrl releases control</span>
+    </div>
+    <div class="focus-tools">
+      <button type="button" class="icon-btn" id="focus-prev" title="Previous (left arrow key)" aria-label="Previous KVM"></button>
+      <button type="button" class="icon-btn" id="focus-next" title="Next (right arrow key)" aria-label="Next KVM"></button>
+      <button type="button" id="focus-again" title="Open the live picture again" hidden>Live again</button>
+      <button type="button" class="operator-only" id="focus-control" aria-pressed="false" title="Take this machine's keyboard and mouse (C)" hidden>Control</button>
+      <button type="button" id="focus-health" aria-pressed="false" title="How the server is: health, temperatures, fans" hidden>Health</button>
+      <details class="focus-popover" name="focus-tools" id="focus-keys" hidden>
+      <summary class="btn">Keyboard</summary>
+      <div class="focus-keys" role="toolbar" aria-label="Keys the browser keeps">
+      <button type="button" id="focus-cad" title="Ctrl+Alt+Del on the machine">Ctrl+Alt+Del</button>
+      <button type="button" id="focus-win" title="The Windows key, pressed and let go">Win</button>
+      <button type="button" id="focus-alt-tab" title="Alt+Tab on the machine: the next window">Alt+Tab</button>
+      <button type="button" id="focus-alt-f4" title="Alt+F4 on the machine: closes its window">Alt+F4</button>
+      <button type="button" id="focus-prtsc" title="Print Screen">PrtSc</button>
+      <button type="button" id="focus-type" title="Type a text on the machine">Type text...</button>
     <span class="divider"></span>
-    <button type="button" id="focus-relative" aria-pressed="false" title="The mouse by how far it moves, for games and some BIOS screens. Esc gives the pointer back to this PC.">Relative mouse</button>
-    <button type="button" id="focus-fullscreen" title="Fullscreen (F)">Fullscreen</button>
-    <span class="spacer"></span>
-    <span class="muted" id="focus-keys-note"></span>
+      <button type="button" id="focus-relative" aria-pressed="false" title="The mouse by how far it moves, for games and some BIOS screens. Esc gives the pointer back to this PC.">Relative mouse</button>
+        <p class="muted" id="focus-keys-note"></p>
+      </div>
+      </details>
+      <button type="button" class="operator-only" id="focus-actions">Actions</button>
+      <a class="btn" id="focus-open" target="_blank" rel="noopener noreferrer">Open console</a>
+      <button type="button" id="focus-fullscreen" title="Fullscreen (F)">Fullscreen</button>
+      <details class="focus-popover" name="focus-tools" id="focus-details">
+      <summary class="btn">Details</summary>
+      <div class="focus-details-content"><span class="muted live-line" id="focus-live" role="status" hidden></span>
+        <button type="button" id="focus-activity" aria-expanded="false" aria-controls="focus-history">Show activity</button>
+      </div>
+      </details>
+      <button type="button" class="icon-btn" id="focus-close" title="Close (Esc)" aria-label="Close"></button>
+    </div>
   </div>
+  <div class="ports focus-ports" id="focus-ports" role="group" aria-label="Ports" hidden></div>
   <div class="focus-screen" id="focus-screen" tabindex="-1">
     <canvas id="focus-canvas" role="img" aria-label="Enlarged screen"></canvas>
     <div class="panel" id="focus-panel" role="group" aria-label="How the server is doing"></div>
