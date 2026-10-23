@@ -6122,26 +6122,26 @@ function makeScreenKeyboard() {
   for (const row of rows) {
     const line = document.createElement('div');
     line.className = 'screen-keyboard-row';
-    for (const [label, code] of row) {
+    for (const [label, keyCode] of row) {
       const key = document.createElement('button');
       key.type = 'button';
       key.textContent = label;
-      key.dataset.code = code;
-      if (code === 'Space') key.className = 'space-key';
-      if (modifiers.has(code)) {
-        key.dataset.modifier = code;
+      key.dataset.code = keyCode;
+      if (keyCode === 'Space') key.className = 'space-key';
+      if (modifiers.has(keyCode)) {
+        key.dataset.modifier = keyCode;
         key.setAttribute('aria-pressed', 'false');
       }
       key.addEventListener('click', () => {
         const control = focus?.control;
         if (!control?.on || $('#focus-keyboard').hidden) return;
-        if (modifiers.has(code)) {
-          if (screenModifiers.has(code)) screenModifiers.delete(code);
-          else screenModifiers.add(code);
-          key.setAttribute('aria-pressed', String(screenModifiers.has(code)));
+        if (modifiers.has(keyCode)) {
+          if (screenModifiers.has(keyCode)) screenModifiers.delete(keyCode);
+          else screenModifiers.add(keyCode);
+          key.setAttribute('aria-pressed', String(screenModifiers.has(keyCode)));
           return;
         }
-        const chord = [...screenModifiers, code].map(name => USAGES[name]);
+        const chord = [...screenModifiers, keyCode].map(name => USAGES[name]);
         control.releaseAll();  // releases physical keys and clears the armed screen modifiers
         control.tap(chord);   // balanced down/up events through the existing owned control channel
       });

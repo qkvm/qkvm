@@ -127,7 +127,8 @@ def test_the_page_uses_no_word_the_file_does_not_have() -> None:
         states |= set(re.findall(r"(\w+): '", line))
     assert states - set(STATES) == set(), states - set(STATES)
 
-    codes = set(re.findall(r"\bcode\s*[!=]==\s*'(\w+)'", SCRIPT))
+    # KeyboardEvent.code is a physical key, not an application error code.
+    codes = page_error_codes(SCRIPT)
     reached = SCRIPT[SCRIPT.index("const CANNOT_BE_REACHED = [") :].split("\n", 1)[0]
     codes |= set(re.findall(r"'(\w+)'", reached))
     known = set(WORDS["codes"]) | set(WORDS["refusals"]) | PAGES_OWN_CODES | LINE_CODES
@@ -153,3 +154,11 @@ def test_every_entry_of_the_activity_log_has_a_name_on_the_page() -> None:
     assert len(written) > 40 and "live_control" in written
     named = SCRIPT[SCRIPT.index("const EVENTS = {") :].split("\n};", 1)[0]
     assert written - set(re.findall(r"\b([a-z_]+): '", named)) == set(), written - set(re.findall(r"\b([a-z_]+): '", named))
+
+
+def page_error_codes(script: str) -> set[str]:
+    return set(re.findall(r"(?<!event\.)\bcode\s*[!=]==\s*'(\w+)'", script))
+
+
+def test_error_code_check_distinguishes_keyboard_events_without_hiding_unknown_errors() -> None:
+    assert page_error_codes("event.code !== 'ControlRight'; keyCode === 'Space'; ex.code === 'unknown_refusal'; code === 'unknown_stream'") == {"unknown_refusal", "unknown_stream"}
