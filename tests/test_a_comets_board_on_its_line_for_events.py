@@ -161,8 +161,13 @@ def test_no_line_is_opened_for_the_board_where_nobody_watches_the_kvms_picture(t
             assert fake.state.ws_streams == [] and fake.state.viewers == 0, "a line was opened to a KVM whose picture nobody watched"
             before = asked(fake)
             fake.state.computer_on = False
-            wait_until(lambda: board_of(client, device)["power"] is False, "a computer switched off was never said to be off")
-            assert asked(fake) > before
+            # A request already counted by the fake's middleware may read the new power state after this
+            # thread changes it. Wait for both the state and a subsequent poll, not just the first response.
+            wait_until(
+                lambda: board_of(client, device)["power"] is False and asked(fake) > before,
+                "the unwatched board did not keep polling and report the computer switched off",
+            )
+            assert fake.state.ws_streams == [] and fake.state.viewers == 0, "a line was opened while polling the unwatched board"
     finally:
         fake.stop()
 
