@@ -18,6 +18,7 @@ from tests.fake_kvm import FakeKvm
 from tests.test_alerts import Inbox
 from tests.test_unlock import fits, kept_sign_in, let_in
 from tests.test_wall import PASSWORD, add, snap, wait_until, wall
+from tests.settings_file import settings_text
 
 
 @pytest.fixture(autouse=True)
@@ -57,12 +58,12 @@ def test_reset_password_from_the_command_line_leaves_no_saved_password_in_the_fo
         assert admin.put("/api/v1/alerts", json={"enabled": False}).status_code == 200
     assert run_cli(["--data-dir", str(data), "--reset-password"]) == 0
     assert "Accounts cleared" in capsys.readouterr().out
-    now = json.loads((data / "qkvm.json").read_text(encoding="utf-8"))
+    now = json.loads(settings_text(data / "qkvm.json", encoding="utf-8"))
     assert now["users"] == [] and now["devices"][0]["secret"] is None and not now["unlock"] and not now["recovery"]
     found: list[tuple[str, str]] = []
     for path in sorted(p for p in data.iterdir() if p.is_file() and p.name != "qkvm.json"):
         try:
-            left = json.loads(path.read_text(encoding="utf-8"))
+            left = json.loads(settings_text(path, encoding="utf-8"))
         except (ValueError, UnicodeDecodeError):
             continue
         if not isinstance(left, dict):

@@ -130,10 +130,10 @@ button, .btn {
   box-shadow: var(--shadow-xs);
   cursor: pointer;
   user-select: none;
-  transition: background-color var(--fast), border-color var(--fast), color var(--fast), box-shadow var(--fast), transform .1s;
+  transition: background-color var(--fast), border-color var(--fast), color var(--fast), box-shadow var(--fast);
 }
 button:hover, .btn:hover { background: var(--hover); }
-button:active, .btn:active { transform: translateY(1px); box-shadow: none; }
+button:active, .btn:active { transform: none; box-shadow: inset 0 1px 3px #0002; }
 button:disabled { opacity: .5; cursor: default; pointer-events: none; }
 button .icon, .btn .icon { width: 14px; height: 14px; }
 button.primary, .btn.primary {
@@ -824,6 +824,19 @@ pre.wrap { white-space: pre-wrap; word-break: break-all; margin: 0 0 14px; }
 .reading[data-tone="warn"] b, .reading[data-tone="warn"] span { color: #fbbf24; }
 .reading[data-tone="bad"] b { color: #f87171; }
 .panel-hardware { margin: 0; font-size: clamp(10px, 2.9cqw, 15px); color: #94a3b8; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* Why there is no picture: on a tile in the lines it has room for (the whole sentence on hover), enlarged all of it. */
+.panel-why {
+  margin: 0;
+  font-size: clamp(10px, 2.7cqw, 14px);
+  line-height: 1.35;
+  color: #cbd5e1;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  line-clamp: 3;
+  overflow: hidden;
+}
+.panel-actions { display: flex; justify-content: flex-start; }
 .sensors { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 6px; }
 .sensors div {
   display: flex;
@@ -842,6 +855,7 @@ pre.wrap { white-space: pre-wrap; word-break: break-all; margin: 0 0 14px; }
 /* Small tiles (a wall of many) keep the power state and the two readings that matter most. */
 @container (max-width: 250px) {
   .panel-hardware, .panel-power > span:last-child:not(.locating), .reading:nth-child(n+3) { display: none; }
+  .panel-why { -webkit-line-clamp: 2; line-clamp: 2; }
   .panel-power > span.locating { font-size: 0; gap: 0; }  /* the dot alone */
   .locating i { width: 9px; height: 9px; }
 }
@@ -901,6 +915,10 @@ pre.wrap { white-space: pre-wrap; word-break: break-all; margin: 0 0 14px; }
 .twin:hover { background: color-mix(in srgb, var(--warn) 12%, transparent); }
 .results li.ask { border-left-color: var(--warn); flex-wrap: wrap; }
 .results li.ask > span { flex: 1 1 100%; }  /* the question on a line of its own, the answers under it */
+/* A Proxmox's virtual machines, to tick and add: under the question, the whole width */
+.pick-guests { flex: 1 1 100%; display: grid; gap: 8px; }
+.pick-guests .picklist { margin-left: 0; max-height: 240px; }
+.pick-guests .results { margin: 0; }
 
 /* Multi-port KVMs: one button per input, built like the filter in the top bar. Always shown,
    because it says which computer the picture belongs to. */
@@ -1009,9 +1027,54 @@ pre.wrap { white-space: pre-wrap; word-break: break-all; margin: 0 0 14px; }
 .focus .reading b { font-size: clamp(18px, 2.6cqw, 30px); }
 .focus .reading span, .focus .panel-power > span:last-child { font-size: 12px; }
 .focus .panel-hardware { font-size: 15px; white-space: normal; }
+.focus .panel-why { font-size: 15px; display: block; overflow: visible; }
 .focus .veil-icon { width: 52px; height: 52px; }
 .focus .veil-icon .icon { width: 24px; height: 24px; }
 .focus .veil strong { font-size: 17px; }
+/* The live picture's own line in the bar: codec, size, pictures a second, what was dropped. */
+.focus-bar .live-line { font-variant-numeric: tabular-nums; }
+/* While keyboard and mouse are held: a second row of the same controls, for the keys a browser keeps to
+   itself, with what else is so said at its right end and never under a button. */
+.focus-keys {
+  position: relative;
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 6px 14px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line-strong);
+}
+.focus-keys .muted { font-size: 12px; }
+.focus-screen:focus { outline: none; }
+/* Held: the picture is the machine's screen, and the pointer over it is the machine's own. */
+.focus-screen.controlling { cursor: default; }
+.focus-screen.controlling canvas { touch-action: none; }
+
+/* --- under the enlarged picture: what the wall saw of this machine (the history) ---------------------------
+   A box of its own, the last thing in the enlarged view; the picture above it keeps the room that is left. */
+.focus-history { flex: none; padding: 8px 14px 10px; border-top: 1px solid var(--line); background: var(--bg); font-size: 12px; }
+.focus-history .history-line { margin: 0; display: flex; flex-wrap: wrap; gap: 2px 18px; align-items: baseline; font-variant-numeric: tabular-nums; }
+.focus-history .history-line b { font-weight: 600; }
+.focus-history .history-graphs { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 6px 18px; margin-top: 6px; }
+.focus-history figure { margin: 0; min-width: 0; }
+.focus-history figcaption { display: flex; justify-content: space-between; gap: 8px; margin-bottom: 2px; font-size: 11px; color: var(--muted); white-space: nowrap; }
+.focus-history figcaption span { overflow: hidden; text-overflow: ellipsis; }
+.focus-history canvas { display: block; width: 100%; height: 56px; }
+/* What was done to the machine (admins), beside its history: a column of its own at the right, under it where there is no room. */
+.focus-history:has(> .history-done) { display: grid; grid-template-columns: minmax(0, 1fr) minmax(240px, 36%); column-gap: 24px; align-items: start; }
+.focus-history > .history-done { grid-column: 2; grid-row: 1 / span 2; min-width: 0; }
+.focus-history .done-head { display: flex; align-items: baseline; gap: 10px; margin: 0 0 2px; }
+.focus-history .done-head b { font-weight: 600; }
+.focus-history .done-list { margin: 0; padding: 0; list-style: none; min-height: calc(3 * 1.5em); }
+.focus-history .done-list li { overflow: hidden; line-height: 1.5; text-overflow: ellipsis; white-space: nowrap; }
+.focus-history .done-list b { font-weight: 600; }
+.focus-history .done-when { color: var(--muted); font-variant-numeric: tabular-nums; }
+@media (max-width: 760px) {
+  .focus-history:has(> .history-done) { grid-template-columns: minmax(0, 1fr); }
+  .focus-history > .history-done { grid-column: 1; grid-row: auto; margin-top: 6px; }
+}
 
 /* --- dialogs ---------------------------------------------------------------- */
 
@@ -1150,6 +1213,16 @@ dialog.settings .dialog-body { display: grid; grid-template-columns: 212px minma
 .toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin: 0 0 14px; }
 .toolbar input[type="search"] { flex: 0 1 320px; height: 32px; padding: 0 10px; }
 .toolbar select { min-width: 190px; }
+.toolbar input.who { width: 190px; height: 32px; padding: 0 10px; }
+.toolbar .when { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); }
+.toolbar input[type="datetime-local"] { height: 32px; padding: 0 8px; }
+.toolbar input[type="datetime-local"]:focus { outline: none; border-color: var(--accent-text); box-shadow: 0 0 0 3px var(--accent-soft); }
+@media (max-width: 760px) {
+  /* One under the other, each as wide as the list: not a ragged column of boxes of their own widths. */
+  .toolbar > :is(input, select, .when) { flex: 1 1 100%; width: auto; min-width: 0; }
+  .toolbar .when > span { width: 3em; }
+  .toolbar .when > input { flex: 1; min-width: 0; }
+}
 @media (max-width: 760px) {
   /* No room for a column: the sections become one row that scrolls sideways, and never a second row. */
   dialog.settings .dialog-body { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); }
@@ -1346,4 +1419,87 @@ dialog.settings .dialog-body { display: grid; grid-template-columns: 212px minma
     animation-iteration-count: 1 !important;
     transition-duration: .01ms !important;
   }
+  /* A spinner is no decoration: it says that work is still going on, and stopped it says the opposite. It
+     turns slower here, and goes on turning. */
+  .spinner, button[aria-busy="true"]::after {
+    animation-duration: 1.4s !important;
+    animation-iteration-count: infinite !important;
+  }
+}
+
+/* Console chrome shares the wall's height. Overflow opens over the picture, never reflows it. */
+.focus-bar { position: relative; z-index: 6; display: flex; align-items: center; flex-wrap: nowrap; gap: 10px; padding: 4px 10px; height: var(--console-header-height, 49px); box-sizing: border-box; flex: none; }
+.focus-identity { flex: 1; min-width: clamp(90px, 22vw, 210px); display: grid; grid-template-columns: minmax(0, max-content) minmax(0, 1fr); gap: 0 10px; }
+.focus-title { min-width: 0; display: flex; align-items: center; gap: 8px; }
+.focus-title .dot { flex: none; }
+.focus-title strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.focus-subtitle { display: flex; gap: 8px; min-width: 0; overflow: hidden; color: var(--muted); font-size: 12px; white-space: nowrap; }
+.focus-subtitle .meta { font-size: inherit; overflow: hidden; text-overflow: ellipsis; }
+#focus-live-alert { grid-column: 1 / -1; margin-left: 16px; height: 14px; line-height: 14px; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.focus-tools { display: flex; align-items: center; flex-wrap: nowrap; gap: 4px; flex: none; min-width: 0; }
+.focus-tools > * { flex: none; }
+.focus-tools button, .focus-tools .btn { padding: 5px 9px; min-height: 30px; font-size: 12px; white-space: nowrap; }
+.focus-tools > .icon-btn { width: 30px; height: 30px; padding: 4px; }
+#focus-control { min-width: 86px; max-width: 156px; overflow: hidden; text-overflow: ellipsis; }
+#focus-control .icon { flex: none; }
+.focus-popover { position: relative; }
+.focus-popover > summary { list-style: none; cursor: pointer; white-space: nowrap; }
+.focus-popover > summary::-webkit-details-marker { display: none; }
+.focus-popover > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.focus-overflow:not([open]) > .focus-overflow-content { display: none; }
+.focus-overflow[open] > summary { background: var(--accent-soft); color: var(--accent-text); }
+.focus-overflow-content, .focus-details-content { position: absolute; right: 0; top: calc(100% + 6px); padding: 8px; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--panel); box-shadow: 0 8px 24px #0003; z-index: 6; }
+.focus-overflow-content { display: flex; flex-direction: column; gap: 4px; width: min(240px, calc(100vw - 24px)); max-height: calc(100dvh - var(--console-header-height, 49px) - 80px); overflow: auto; }
+.focus-overflow-content > button, .focus-overflow-content > .btn { width: 100%; min-height: 34px; height: auto; justify-content: flex-start; text-align: left; padding: 6px 10px; white-space: nowrap; }
+.focus-overflow-content > .icon-btn::after { content: attr(aria-label); }
+.focus-overflow-content .focus-input-help { margin: 0; padding: 6px 10px; white-space: normal; }
+.focus-overflow-content .focus-input-help p { position: static; width: auto; padding: 4px 0; border: 0; box-shadow: none; }
+.focus-details-content { display: grid; gap: 8px; width: min(760px, calc(100vw - 24px)); max-height: min(65vh, 600px); overflow: auto; padding: 12px; }
+#focus-details .focus-history { max-height: none; overflow: visible; margin: 0; padding: 10px 0 0; background: transparent; }
+.focus-ports { padding: 4px 12px; }
+
+/* The input row has its own overflow menu, and stays the same height in every state. */
+.focus-control-panel { position: absolute; top: 100%; left: 0; right: 0; display: flex; flex-wrap: nowrap; align-items: center; gap: 8px; height: 42px; box-sizing: border-box; padding: 6px 12px; background: var(--panel); border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); box-shadow: 0 2px 5px #0002; }
+.focus-control-panel > * { flex: none; }
+.focus-control-panel button, .focus-control-panel summary.btn { min-height: 28px; padding: 4px 10px; font-size: 12px; white-space: nowrap; }
+.focus-control-panel > button { height: 28px; }
+.focus-control-panel .muted { font-size: 12px; }
+.focus-input-help { position: relative; margin-left: auto; white-space: nowrap; font-size: 12px; }
+.focus-input-help summary { cursor: pointer; }
+.focus-input-help p { position: absolute; top: 100%; right: 0; width: min(420px, calc(100vw - 24px)); margin: 6px 0 0; white-space: normal; padding: 10px; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; }
+#focus-keys-more { margin-left: auto; }
+.focus-tools :focus-visible, .focus-control-panel :focus-visible { outline-offset: -2px; }
+
+/* Telemetry and details stay at the bottom; the keyboard floats independently. */
+.focus-statusbar { position: relative; z-index: 5; display: flex; align-items: center; gap: 12px; height: 26px; flex: none; padding: 0 10px; border-top: 1px solid var(--line); background: var(--panel); font-size: 11px; }
+.focus-statusbar #focus-live { flex: 1; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-variant-numeric: tabular-nums; }
+.control-state { color: var(--accent-text); font-weight: 600; }
+.focus-statusbar .control-state, #focus-release-hint { font-size: inherit; white-space: nowrap; }
+.status-details { font-size: 11px; padding: 2px 4px; }
+.focus-statusbar .focus-details-content { top: auto; bottom: calc(100% + 5px); }
+.screen-keyboard { position: fixed; z-index: 7; display: flex; flex-direction: column; box-sizing: border-box; padding: 0; border: 1px solid var(--line-strong); border-radius: 10px; background: var(--panel); box-shadow: 0 8px 32px #0005; overflow: hidden; }
+.keyboard-titlebar { display: flex; align-items: center; gap: 8px; padding: 6px 10px; cursor: move; touch-action: none; border-bottom: 1px solid var(--line); }
+.keyboard-titlebar strong { flex: 1; }
+.keyboard-titlebar button { font-size: 12px; padding: 4px 8px; }
+.keyboard-body { overflow: auto; min-height: 0; flex: 1; padding: 8px 10px 22px; }
+.keyboard-body p { font-size: 12px; margin: 0 0 8px; }
+.screen-keyboard-rows { min-width: 680px; }
+.screen-keyboard-row { display: flex; gap: 4px; margin-bottom: 4px; }
+.screen-keyboard-row button { flex: 1; min-width: 40px; min-height: 40px; padding: 4px 6px; touch-action: manipulation; }
+.screen-keyboard-row .space-key { flex: 5; }
+#keyboard-resize { position: absolute; bottom: 0; right: 0; padding: 0; width: 24px; height: 24px; min-height: 0; cursor: nwse-resize; touch-action: none; }
+@media (max-width: 900px) {
+  #focus-release-hint { display: none; }
+  .focus-statusbar { gap: 6px; padding: 0 6px; }
+  .focus-statusbar .focus-details-content { position: fixed; top: auto; bottom: 30px; right: 8px; }
+}
+@media (max-width: 640px) {
+  .focus-bar { gap: 6px; padding-inline: 6px; }
+  .focus-identity { grid-template-columns: minmax(0, 1fr); }
+  .focus-subtitle { display: none; } /* Full device status remains in Details; the status dot always stays visible. */
+  #focus-control { width: 86px; max-width: 86px; }
+  #focus-actions { width: 30px; padding: 4px; font-size: 0; gap: 0; }
+  .focus-overflow > summary { width: 30px; padding: 4px; }
+  .focus-overflow .more-label { display: none; }
+  .focus-control-panel { padding-inline: 8px; gap: 6px; }
 }

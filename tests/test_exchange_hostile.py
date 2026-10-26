@@ -25,6 +25,7 @@ from tests.test_tokens import script as a_script
 from tests.test_totp import switch_on
 from tests.test_users import OTHER, account, browser, visitor
 from tests.test_wall import PASSWORD, add, wall
+from tests.settings_file import settings_text, write_settings_text
 
 PASSPHRASE = "a passphrase for the file"
 F = {"format": exchange.FORMAT, "version": 1}
@@ -95,7 +96,7 @@ def test_half_a_character_in_a_file_does_not_take_the_wall_away(tmp_path: Path, 
         seen = admin.get("/api/v1/wall")
         seen_by_viewer = viewer.get("/api/v1/wall")
         print(f"\n[{where}] typed into the form: {typed.status_code} | from a file, read: {summary.status_code}, take in: {reply.status_code} {reply.text[:80]}, GET /api/v1/wall admin: {seen.status_code}, viewer: {seen_by_viewer.status_code}")
-        on_disk = json.loads((tmp_path / "qkvm.json").read_text(encoding="utf-8"))["devices"]
+        on_disk = json.loads(settings_text(tmp_path / "qkvm.json", encoding="utf-8"))["devices"]
         print(f"[{where}] devices in qkvm.json: {len(on_disk)}")
     with wall(tmp_path, sign_in=False) as admin:  # and after a restart
         assert admin.post("/api/v1/login", json={"name": "admin", "password": PASSWORD}).status_code == 200
@@ -211,12 +212,12 @@ def test_a_file_cannot_reach_what_is_not_a_device_an_action_or_those_settings(tm
 
     before_keys = [f.name for f in fields(DeviceRecord)]
     with wall(tmp_path) as admin:
-        before = json.loads((tmp_path / "qkvm.json").read_text(encoding="utf-8"))
+        before = json.loads(settings_text(tmp_path / "qkvm.json", encoding="utf-8"))
         reply = taken(admin, json.dumps(hostile))
         print("\n", reply.status_code, {k: v for k, v in reply.json().items() if k != "left_out"}, len(reply.json()["left_out"]), "left out")
         for line in reply.json()["left_out"]:
             print("   ", line)
-    after = json.loads((tmp_path / "qkvm.json").read_text(encoding="utf-8"))
+    after = json.loads(settings_text(tmp_path / "qkvm.json", encoding="utf-8"))
     for part in ("users", "tokens", "recovery", "recovery_created"):
         assert after[part] == before[part], part
     assert after["unlock"] != {"kdf": {}, "key": {}}  # (the wall fits its own key in the background: it is that or nothing)
@@ -415,7 +416,7 @@ def test_two_at_once_add_nothing_twice(tmp_path: Path) -> None:
         print("\n", sorted((a.status_code, a.json().get("devices")) for a in answers))
         assert sum(a.json().get("devices", 0) for a in answers) == 20 and len(admin.get("/api/v1/wall").json()["devices"]) == 20
         assert len(admin.get("/api/v1/actions").json()["actions"]) == 10
-    saved = json.loads((tmp_path / "qkvm.json").read_text(encoding="utf-8"))
+    saved = json.loads(settings_text(tmp_path / "qkvm.json", encoding="utf-8"))
     assert len({d["id"] for d in saved["devices"]} | {a["id"] for a in saved["actions"]}) == 30
 
 
@@ -492,12 +493,12 @@ def test_when_putting_a_device_on_the_wall_fails_half_way(tmp_path: Path, monkey
         monkeypatch.undo()
         monkeypatch.setattr(vault, "SCRYPT_N", 2**12)
         in_memory = [d["name"] for d in admin.get("/api/v1/wall").json()["devices"]]
-        on_disk = [d["name"] for d in json.loads((tmp_path / "qkvm.json").read_text(encoding="utf-8"))["devices"]]
+        on_disk = [d["name"] for d in json.loads(settings_text(tmp_path / "qkvm.json", encoding="utf-8"))["devices"]]
         live = sorted(admin.core.store.device(i).name for i in admin.app.state._state.get("x", {}) or []) if False else None  # noqa: F841
         print(f"\nanswer {reply.status_code}; on the wall {in_memory}; in qkvm.json {on_disk}; interval {admin.get('/api/v1/settings').json()['interval']}; alerts {admin.get('/api/v1/alerts').json()['enabled']}")
         # ...and the next thing anybody saves writes them down
         assert admin.post("/api/v1/actions", json={"name": "unrelated", "kind": "keys", "keys": "KeyA"}).status_code == 201
-        later = [d["name"] for d in json.loads((tmp_path / "qkvm.json").read_text(encoding="utf-8"))["devices"]]
+        later = [d["name"] for d in json.loads(settings_text(tmp_path / "qkvm.json", encoding="utf-8"))["devices"]]
         print("after an unrelated change, in qkvm.json:", later)
         assert reply.status_code == 500
         assert in_memory == [] and later == [], "the answer was 'something went wrong', and the file's devices and settings are on the wall all the same"
@@ -557,7 +558,7 @@ def test_a_lock_that_asks_for_the_most_work(tmp_path: Path) -> None:
 def test_a_devices_saved_password_does_not_open_as_a_file_and_the_other_way_round(tmp_path: Path, fake: FakeKvm) -> None:
     with wall(tmp_path) as admin:
         add(admin, fake.url, name="Rack KVM")
-        saved = json.loads((tmp_path / "qkvm.json").read_text(encoding="utf-8"))
+        saved = json.loads(settings_text(tmp_path / "qkvm.json", encoding="utf-8"))
         # the wall's own records, put together as a "file": the admin's lock, and a device's password as the content
         made_up = json.dumps({**F, "lock": saved["users"][0]["auth"], "sealed": saved["devices"][0]["secret"]})
         reply = looked(admin, made_up, PASSWORD)
@@ -628,7 +629,7 @@ def test_devices_that_all_say_they_are_one_device(tmp_path: Path, mark: str) -> 
         there = looked(admin, file).json()
         reply = taken(admin, file, ("devices",))
         assert reply.status_code == 200
-        saved = json.loads((tmp_path / "qkvm.json").read_text(encoding="utf-8"))["devices"]
+        saved = json.loads(settings_text(tmp_path / "qkvm.json", encoding="utf-8"))["devices"]
         seen = admin.get("/api/v1/wall")
         twins = sum(len(d["same_as"]) for d in seen.json()["devices"])
         if mark.startswith("aa:"):
@@ -646,11 +647,11 @@ def test_a_tile_is_told_of_a_few_others_that_are_the_same_device_and_not_of_hund
     with wall(tmp_path) as admin:
         assert taken(admin, json.dumps({**F, "devices": [{"url": nowhere(4000 + i), "kind": "kvmd"} for i in range(60)]}), ("devices",)).json()["devices"] == 60
     path = tmp_path / "qkvm.json"
-    said = json.loads(path.read_text(encoding="utf-8"))
+    said = json.loads(settings_text(path, encoding="utf-8"))
     for device in said["devices"]:
         device["ident"] = "aa:" + "0" * 16
     for file in (path, tmp_path / "qkvm.bak"):
-        file.write_text(json.dumps(said), encoding="utf-8")
+        write_settings_text(file, json.dumps(said), encoding="utf-8")
     with wall(tmp_path, sign_in=False) as admin:
         assert admin.post("/api/v1/login", json={"name": "admin", "password": PASSWORD}).status_code == 200
         from qkvm import server

@@ -19,13 +19,17 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from starlette.requests import Request
+from starlette.requests import HTTPConnection, Request
 
 log = logging.getLogger("qkvm")
 
 COOKIE = "qkvm_session"
 IDLE_TTL = 12 * 3600  # a normal login ends after this long without activity
 REMEMBER_TTL = 30 * 86400  # "keep this browser signed in", for wall displays
+# A live line of a sign-in by the identity proxy in front of qKVM goes on this long at most after the proxy last vouched
+# for that person on a request (the page asks every few seconds while it is shown): such a sign-in holds only while the
+# proxy's word comes with each request, and a line makes none of its own.
+SSO_LIVE_UNCONFIRMED = 600.0
 
 # Names that cannot be pointed at this server by someone else's public DNS.
 PRIVATE_SUFFIXES = (".ts.net", ".local", ".lan", ".internal", ".home.arpa")
@@ -101,7 +105,7 @@ def same_text(a: str, b: str) -> bool:
     return hmac.compare_digest(a.encode("utf-8"), b.encode("utf-8"))
 
 
-def _proxied(request: Request) -> bool:
+def _proxied(request: HTTPConnection) -> bool:
     return any(h in request.headers for h in ("x-forwarded-for", "forwarded", "x-real-ip"))
 
 
@@ -128,7 +132,7 @@ def _address(text: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
     return address
 
 
-def _believed(request: Request, address: ipaddress.IPv4Address | ipaddress.IPv6Address | None) -> bool:
+def _believed(request: HTTPConnection, address: ipaddress.IPv4Address | ipaddress.IPv6Address | None) -> bool:
     """Whether what this address says about who is calling is believed: a proxy that qKVM was told
     about when it was started; or, where it was told of none, one on this machine (`tailscale serve`).
 
@@ -159,13 +163,13 @@ def sso_name(request: Request, header: str) -> str | None:
     return said[0].strip() or None if len(said) == 1 else None
 
 
-def is_local(request: Request) -> bool:
+def is_local(request: HTTPConnection) -> bool:
     """True for a browser on this machine talking to the wall directly (not through a proxy)."""
     address = _address(request.client.host) if request.client else None
     return address is not None and address.is_loopback and not _proxied(request)
 
 
-def client_allowed(request: Request) -> bool:
+def client_allowed(request: HTTPConnection) -> bool:
     """Whether the caller is one of those qKVM was told to answer (--allow-from). Without that option: anybody.
 
     This computer itself is always answered, as long as nobody is being passed on through it: the
@@ -178,7 +182,7 @@ def client_allowed(request: Request) -> bool:
     return address is not None and any(address in network for network in networks)
 
 
-def client_ip(request: Request) -> str:
+def client_ip(request: HTTPConnection) -> str:
     """Who is calling: the address the connection comes from, or, where that is a proxy that is believed,
     the address the proxy says it is passing on."""
     host = request.client.host if request.client else "unknown"
@@ -222,6 +226,7 @@ class Session:
     aged: float = 0.0
     since: float = 0.0
     taken_up: bool = False  # it was made by an earlier run of this program, and read back from what that one wrote down
+    vouched: float = 0.0  # (signed in by the proxy) when the proxy last named this account on a request, on the clock that only goes forward
 
     def age(self) -> float:
         return self.aged + time.monotonic() - self.since
@@ -484,11 +489,14 @@ class Sessions:
             own = sorted((s.created, place, k) for place, (k, s) in enumerate(self._sessions.items()) if s.user == user)
             for _, _, key in own[: len(own) - MOST_OF_ONE + 1]:
                 del self._sessions[key]
-        self._sessions[self._key(token)] = Session(time.time(), now, REMEMBER_TTL if remember else IDLE_TTL, ip, user, sso, mark, 0.0, now)
+        self._sessions[self._key(token)] = Session(time.time(), now, REMEMBER_TTL if remember else IDLE_TTL, ip, user, sso, mark, 0.0, now, vouched=now)
         self._keep()
         return token
 
-    def get(self, token: str | None) -> Session | None:
+    def get(self, token: str | None, *, use: bool = True) -> Session | None:
+        """The sign-in behind this cookie, while it holds. `use`: this is a request of the person's, which keeps it from ending
+        for want of use; not so where something asks on its own (whether a live line may go on: a line that is open
+        kept the sign-in it was opened with alive for as long as it was open)."""
         if not token:
             return None
         key = self._key(token)
@@ -500,7 +508,8 @@ class Sessions:
             del self._sessions[key]
             self._keep()
             return None
-        session.seen = now
+        if use:
+            session.seen = now
         return session
 
     @staticmethod

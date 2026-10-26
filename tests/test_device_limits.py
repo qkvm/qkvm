@@ -24,6 +24,7 @@ from qkvm.kvm import DeviceSpec, KvmDevice, KvmError, bounded
 from tests.fake_kvm import FakeKvm
 from tests.test_hardening import AsItCame
 from tests.test_wall import add, wall
+from tests.settings_file import settings_text
 
 GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
@@ -393,7 +394,7 @@ def test_a_device_that_cannot_be_said_goodbye_to_is_removed_all_the_same(tmp_pat
             monkeypatch.setattr(KvmDevice, "close", close)
             removed = client.delete(f"/api/v1/devices/{device}")
             assert removed.status_code == 200, removed.text
-            assert [d["id"] for d in json.loads((tmp_path / "qkvm.json").read_text(encoding="utf-8"))["devices"]] == []
+            assert [d["id"] for d in json.loads(settings_text(tmp_path / "qkvm.json", encoding="utf-8"))["devices"]] == []
             monkeypatch.undo()
     finally:
         fake.stop()

@@ -30,6 +30,7 @@ from qkvm import kvm, update, vault
 from qkvm.store import Store, StoreError
 from tests.test_users import OTHER
 from tests.test_wall import PASSWORD, add, closed_port, wall
+from tests.settings_file import settings_text, write_settings_text
 
 
 @pytest.fixture(autouse=True)
@@ -45,9 +46,9 @@ def a_wall(folder: Path, change: Any) -> None:
         add(admin, f"http://127.0.0.1:{closed_port()}", force=True, kind="kvmd", name="The one device")
         assert admin.post("/api/v1/users", json={"name": "olga", "role": "operator", "password": OTHER}).status_code == 201
     for name in ("qkvm.json", "qkvm.bak"):
-        saved = json.loads((folder / name).read_text(encoding="utf-8"))
+        saved = json.loads(settings_text(folder / name, encoding="utf-8"))
         change(saved)
-        (folder / name).write_text(json.dumps(saved, indent=2), encoding="utf-8")
+        write_settings_text(folder / name, json.dumps(saved, indent=2), encoding="utf-8")
 
 
 def looked_at(folder: Path) -> dict[str, int] | None:

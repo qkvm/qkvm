@@ -20,7 +20,8 @@ import pytest
 
 from qkvm import kvm, update, vault
 from tests.fake_kvm import FakeKvm
-from tests.test_wall import add, snap, wall
+from tests.test_wall import add, snap, wait_until, wall
+from tests.settings_file import settings_text, write_settings_text
 
 NONE_OF_THEM: dict[str, Any] = {
     "cut short": lambda pem: pem[:400],
@@ -58,9 +59,9 @@ def test_a_tile_whose_certificate_is_none_is_left_alone_says_so_once_and_can_be_
             tile = add(admin, device.url, name="Build server")
             real = admin.get("/api/v1/wall").json()["devices"][0]["fingerprint"]
         for name in ("qkvm.json", "qkvm.bak"):
-            saved = json.loads((tmp_path / "wall" / name).read_text(encoding="utf-8"))
+            saved = json.loads(settings_text(tmp_path / "wall" / name, encoding="utf-8"))
             saved["devices"][0]["cert_pem"] = NONE_OF_THEM[what](saved["devices"][0]["cert_pem"])
-            (tmp_path / "wall" / name).write_text(json.dumps(saved), encoding="utf-8")
+            write_settings_text(tmp_path / "wall" / name, json.dumps(saved), encoding="utf-8")
         tried = []
         made = kvm.pinned_context
         monkeypatch.setattr(kvm, "pinned_context", lambda pem: (tried.append(time.monotonic()), made(pem))[1])
@@ -85,7 +86,8 @@ def test_a_tile_whose_certificate_is_none_is_left_alone_says_so_once_and_can_be_
             asked = admin.get(f"/api/v1/devices/{tile}/certificate").json()
             assert asked["presented"] == real
             assert admin.post(f"/api/v1/devices/{tile}/trust", json={"fingerprint": real}).status_code == 200
-            assert admin.get(snap(tile)).status_code == 200
+            # (Its picture comes once the new connection is up: 503 "Connecting" meanwhile, which a busy computer answered.)
+            wait_until(lambda: admin.get(snap(tile)).status_code == 200, "trusting the certificate did not bring the picture back", timeout=30)
             print(f">>> {what}: the fingerprint shown for the tile before it was put right: {shown}; in the dialog, as remembered: {asked['saved']}")
             assert shown is None and asked["saved"] is None, "the tile says its certificate cannot be read, and the dialog shows a fingerprint as remembered for it"
     finally:

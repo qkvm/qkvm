@@ -13,6 +13,7 @@ from qkvm import kvm, update, vault
 from qkvm.kvm import DeviceSpec, KvmDevice, KvmError
 from tests.fake_kvm import FakeKvm
 from tests.test_wall import add, snap, wall
+from tests.settings_file import settings_text, write_settings_text
 
 
 @pytest.fixture(autouse=True)
@@ -31,9 +32,9 @@ OF_ANOTHER_KIND = [False, 0, [], {}, True, 7, 1.5, ["-----BEGIN CERTIFICATE-----
 def edited(folder: Path, value: Any) -> None:
     """Both copies of the settings file as a hand or a script left them: the first device's certificate is `value`."""
     for name in ("qkvm.json", "qkvm.bak"):
-        state = json.loads((folder / name).read_text(encoding="utf-8"))
+        state = json.loads(settings_text(folder / name, encoding="utf-8"))
         state["devices"][0]["cert_pem"] = value
-        (folder / name).write_text(json.dumps(state), encoding="utf-8")
+        write_settings_text(folder / name, json.dumps(state), encoding="utf-8")
 
 
 @pytest.mark.parametrize("value", OF_ANOTHER_KIND, ids=repr)

@@ -217,17 +217,16 @@ def test_the_unlock_file_is_known_for_being_in_the_data_folder_however_its_path_
 
 
 def test_switched_off_the_unlock_file_opens_no_copy_that_is_still_lying_there(tmp_path: Path) -> None:
-    import json
 
     data = tmp_path / "data"
     with wall(data, unlock_secret=SECRET) as admin:
         wait_until(lambda: fits(admin), "never made to fit")
         assert admin.put("/api/v1/alerts", json={"enabled": False}).status_code == 200  # (the copy from before a change has it by now)
-    assert json.loads((data / "qkvm.bak").read_text(encoding="utf-8")).get("unlock")
+    assert Store(data / "qkvm.json").snapshot().get("unlock")
     with wall(data, sign_in=False) as nobody:  # started without the option
         assert not fits(nobody)
     for name in ("qkvm.json", "qkvm.bak"):  # what the file opened is gone from the copy qKVM keeps of its settings too
-        assert not json.loads((data / name).read_text(encoding="utf-8")).get("unlock"), name
+        assert not Store(data / name).snapshot().get("unlock"), name
 
 
 # --- as it comes: a key of its own, and browsers that asked to be kept --------------------------------------------

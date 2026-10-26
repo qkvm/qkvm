@@ -21,6 +21,7 @@ from qkvm.vault import Vault
 from tests.fake_kvm import FakeKvm
 from tests.test_users import OTHER, visitor
 from tests.test_wall import PASSWORD, add, wall
+from tests.settings_file import settings_text, write_settings_text
 
 
 @pytest.fixture(autouse=True)
@@ -110,21 +111,21 @@ def test_a_record_under_a_name_that_is_anothers_is_a_damaged_file(tmp_path: Path
     with wall(tmp_path) as admin:
         add(admin, fake.url)
         action = admin.post("/api/v1/actions", json={"name": "Unlock disk", "kind": "text", "text": "the passphrase"}).json()["action"]
-    said = json.loads((tmp_path / "qkvm.json").read_text(encoding="utf-8"))
+    said = json.loads(settings_text(tmp_path / "qkvm.json", encoding="utf-8"))
     secret = said["actions"][0]["secret"]
     said["devices"][0].update(id=f"action:{action['id']}", secret=secret, url="http://127.0.0.1:9")
     for file in ("qkvm.json", "qkvm.bak"):
-        (tmp_path / file).write_text(json.dumps(said), encoding="utf-8")
+        write_settings_text(tmp_path / file, json.dumps(said), encoding="utf-8")
     with pytest.raises(StoreError):
         Core(tmp_path)
     for odd in ("alerts:webhook", "", "x" * 65, 7, None):
         said["devices"][0]["id"] = odd
         for file in ("qkvm.json", "qkvm.bak"):
-            (tmp_path / file).write_text(json.dumps(said), encoding="utf-8")
+            write_settings_text(tmp_path / file, json.dumps(said), encoding="utf-8")
         with pytest.raises(StoreError):
             Core(tmp_path)
     said["devices"][0]["id"] = "admin"  # what this program gave as an id at one time: still one
-    (tmp_path / "qkvm.json").write_text(json.dumps(said), encoding="utf-8")
+    write_settings_text(tmp_path / "qkvm.json", json.dumps(said), encoding="utf-8")
     assert Core(tmp_path).store.devices[0].id == "admin"
 
 
@@ -180,7 +181,7 @@ def test_what_the_machines_were_last_seen_as_is_tried_again_where_it_could_not_b
     assert again == changed  # but again after a while, although nothing has changed since
     monkeypatch.setattr(os, "replace", real_replace)
     watcher.write(again)
-    assert watcher.to_write() is None and json.loads((tmp_path / "watch.json").read_text(encoding="ascii"))["stable"] == {"a": "offline"}
+    assert watcher.to_write() is None and json.loads(settings_text(tmp_path / "watch.json", encoding="ascii"))["stable"] == {"a": "offline"}
 
 
 def test_a_devices_password_is_in_nothing_that_shows_how_it_is_talked_to() -> None:
@@ -195,7 +196,7 @@ def test_starting_over_leaves_nobody_with_a_way_in_that_an_account_gave_out(tmp_
         collector = visitor(admin, 50031)
         assert collector.get("/metrics", headers={"Authorization": f"Bearer {token}"}).status_code == 200
     assert cli.main(["--data-dir", str(tmp_path), "--reset-password"]) == 0
-    assert json.loads((tmp_path / "qkvm.json").read_text(encoding="utf-8"))["server"]["metrics_token"] == ""
+    assert json.loads(settings_text(tmp_path / "qkvm.json", encoding="utf-8"))["server"]["metrics_token"] == ""
     with wall(tmp_path) as admin:  # set up again, by whoever started over
         assert visitor(admin, 50032).get("/metrics", headers={"Authorization": f"Bearer {token}"}).status_code in (401, 404)
 

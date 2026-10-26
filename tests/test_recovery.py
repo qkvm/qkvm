@@ -11,6 +11,7 @@ from tests.fake_kvm import FakeKvm
 from tests.test_totp import code_for, switch_on
 from tests.test_users import OTHER, account, browser, visitor
 from tests.test_wall import CSRF, PASSWORD, add, snap, wall
+from tests.settings_file import settings_text
 
 NEW = "a brand new password"
 
@@ -48,7 +49,7 @@ def test_a_forgotten_password_is_replaced_with_the_recovery_key(tmp_path: Path, 
         device = add(client, fake.url)
         session = client.get("/api/v1/session").json()
         assert session["recovery"] is True and session["recovery_created"] > 0
-        assert key.replace("-", "") not in (tmp_path / "qkvm.json").read_text()  # only a locked copy is kept
+        assert key.replace("-", "") not in settings_text(tmp_path / "qkvm.json")  # only a locked copy is kept
 
     with wall(tmp_path, sign_in=False) as client:  # some time later: restarted, and the password is forgotten
         assert client.get("/api/v1/session").json()["recovery_created"] is None  # not a detail for strangers

@@ -26,6 +26,7 @@ import pytest
 from qkvm import exchange, kvm, update, vault
 from qkvm.store import Store, StoreError
 from tests.test_wall import PASSWORD, add, closed_port, wall
+from tests.settings_file import settings_text, write_settings_text
 
 OTHER = "another good password"
 F = {"format": exchange.FORMAT, "version": 1}
@@ -47,9 +48,9 @@ def a_wall(folder: Path) -> None:
 
 
 def edited(folder: Path, change: Any) -> None:
-    saved = json.loads((folder / "qkvm.json").read_text(encoding="utf-8"))
+    saved = json.loads(settings_text(folder / "qkvm.json", encoding="utf-8"))
     change(saved)
-    (folder / "qkvm.json").write_text(json.dumps(saved), encoding="utf-8")
+    write_settings_text(folder / "qkvm.json", json.dumps(saved), encoding="utf-8")
     (folder / "qkvm.bak").unlink()  # (so that what is read is this file, or nothing)
 
 

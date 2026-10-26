@@ -20,6 +20,7 @@ from tests.test_sso import PROXY, STARTED, through_proxy
 from tests.test_unlock import fits
 from tests.test_users import OTHER, account, visitor
 from tests.test_wall import PASSWORD, wait_until, wall
+from tests.settings_file import settings_text, write_settings_text
 
 
 @pytest.fixture(autouse=True)
@@ -172,17 +173,17 @@ def test_what_is_carried_along_shadows_nothing_this_version_knows(tmp_path: Path
         wait_until(lambda: fits(admin), "never made to fit")
         account(admin, "olga", "viewer")
     path = data / "qkvm.json"
-    said = json.loads(path.read_text(encoding="utf-8"))
+    said = json.loads(settings_text(path, encoding="utf-8"))
     olga = said["users"][1]
     # A second entry with olga's id, as an admin with no password and no second step, and things this version does not know.
     said["users"].append({**olga, "role": "admin", "name": "olga2", "later": {"role": "admin"}})
     said["users"][1]["later"] = {"role": "admin", "suspended": False}
     said["server"]["later"] = {"require_totp": ""}
     said["later"] = {"users": [], "version": 99}
-    path.write_text(json.dumps(said), encoding="utf-8")
+    write_settings_text(path, json.dumps(said), encoding="utf-8")
     store = Store(path)
     store.save()
-    after = json.loads(path.read_text(encoding="utf-8"))
+    after = json.loads(settings_text(path, encoding="utf-8"))
     assert [(u["name"], u["role"]) for u in after["users"]] == [("admin", "admin"), ("olga", "viewer"), ("olga2", "admin")]  # as the file said, no more
     assert after["version"] == 1 and after["later"] == {"users": [], "version": 99} and after["server"]["require_totp"] == ""
     assert all(set(u) >= {"id", "name", "role", "auth"} for u in after["users"])

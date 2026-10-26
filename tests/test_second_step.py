@@ -15,6 +15,7 @@ from qkvm.vault import Vault
 from tests.test_totp import codes_around_now
 from tests.test_users import OTHER, account, browser, visitor
 from tests.test_wall import PASSWORD, fast, wait_until, wall  # noqa: F401
+from tests.settings_file import settings_text, write_settings_text
 
 
 def test_a_sign_in_with_a_second_step_that_waits_its_turn_behind_an_admins_change(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -88,9 +89,9 @@ def test_settings_from_before_have_no_step_and_are_read(tmp_path: Path) -> None:
         secret = str(admin.post("/api/v1/totp/begin", json={"password": PASSWORD}).json()["secret"])
         first, second, third = codes_around_now(secret)
         assert admin.post("/api/v1/totp/enable", json={"code": first}).status_code == 200
-    saved = json.loads((tmp_path / "qkvm.json").read_text(encoding="utf-8"))
+    saved = json.loads(settings_text(tmp_path / "qkvm.json", encoding="utf-8"))
     assert saved["users"][0].pop("totp_step") > 0  # as the version before wrote it: without
-    (tmp_path / "qkvm.json").write_text(json.dumps(saved), encoding="utf-8")
+    write_settings_text(tmp_path / "qkvm.json", json.dumps(saved), encoding="utf-8")
     with wall(tmp_path, sign_in=False) as later:
         assert later.core.store.users[0].totp_step == 0  # type: ignore[attr-defined]
         assert later.post("/api/v1/login", json={"password": PASSWORD, "code": second}).status_code == 200

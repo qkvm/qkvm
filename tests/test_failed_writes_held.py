@@ -14,6 +14,7 @@ from tests.test_totp import code_for, switch_on
 from tests.test_unlock import fits, kept_sign_in, let_in
 from tests.test_users import OTHER, account, browser, visitor
 from tests.test_wall import PASSWORD, wait_until, wall
+from tests.settings_file import settings_text
 
 
 @pytest.fixture(autouse=True)
@@ -78,7 +79,7 @@ def test_what_takes_access_away_through_saved_is_refused_and_put_back(tmp_path: 
         assert len(admin.get("/api/v1/tokens").json()["tokens"]) == 2
         # ... and something unrelated that is saved afterwards makes none of it permanent.
         assert admin.put("/api/v1/alerts", json={"enabled": False}).status_code == 200
-    saved = json.loads((data / "qkvm.json").read_text(encoding="utf-8"))
+    saved = json.loads(settings_text(data / "qkvm.json", encoding="utf-8"))
     assert len(saved["tokens"]) == 2 and [u["name"] for u in saved["users"]] == ["admin", "olga"]
     assert saved["users"][0]["totp"] and saved["server"]["require_totp"] == "admin" and saved["server"]["metrics_token"]
     assert (saved["users"][1]["role"], saved["users"][1]["suspended"]) == ("operator", False)

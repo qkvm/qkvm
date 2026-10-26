@@ -19,6 +19,7 @@ import qkvm
 from qkvm import exchange, kvm, update, vault
 from qkvm.store import Store, StoreError
 from tests.test_wall import add, closed_port, wall
+from tests.settings_file import settings_text, write_settings_text
 
 F = {"format": exchange.FORMAT, "version": 1}
 
@@ -34,9 +35,9 @@ def fast(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_the_page_shows_what_was_wrong_with_a_file_that_was_set_aside(tmp_path: Path) -> None:
     with wall(tmp_path) as admin:
         add(admin, f"http://127.0.0.1:{closed_port()}", force=True, kind="kvmd")
-    saved = json.loads((tmp_path / "qkvm.json").read_text(encoding="utf-8"))
+    saved = json.loads(settings_text(tmp_path / "qkvm.json", encoding="utf-8"))
     saved["alerts"]["paused_until"] = "tomorrow"
-    (tmp_path / "qkvm.json").write_text(json.dumps(saved), encoding="utf-8")
+    write_settings_text(tmp_path / "qkvm.json", json.dumps(saved), encoding="utf-8")
     with wall(tmp_path) as admin:
         entry = next(e for e in admin.get("/api/v1/audit?limit=500").json()["entries"] if e["event"] == "settings_restored")
     page = (Path(qkvm.__file__).parent / "static" / "app.js").read_text(encoding="utf-8")
@@ -72,9 +73,9 @@ def test_a_wall_that_ran_with_0_or_1_for_no_or_yes_in_its_file_still_starts(tmp_
     with wall(tmp_path) as admin:
         add(admin, f"http://127.0.0.1:{closed_port()}", force=True, kind="kvmd", name="The one device")
     for name in ("qkvm.json", "qkvm.bak"):  # (as one run of the build before the checks leaves the two copies: every save writes both)
-        saved = json.loads((tmp_path / name).read_text(encoding="utf-8"))
+        saved = json.loads(settings_text(tmp_path / name, encoding="utf-8"))
         ONES_AND_NOUGHTS[what](saved)
-        (tmp_path / name).write_text(json.dumps(saved, indent=2), encoding="utf-8")
+        write_settings_text(tmp_path / name, json.dumps(saved, indent=2), encoding="utf-8")
     try:
         Store(tmp_path / "qkvm.json")
     except StoreError as ex:

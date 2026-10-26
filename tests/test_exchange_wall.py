@@ -16,6 +16,7 @@ from tests.fake_kvm import FakeKvm
 from tests.test_tokens import script as a_script
 from tests.test_users import account, browser, visitor
 from tests.test_wall import PASSWORD, add, wait_until, wall
+from tests.settings_file import settings_text
 
 PASSPHRASE = "a passphrase for the file"
 
@@ -88,7 +89,7 @@ def test_a_wall_is_taken_to_another_and_its_devices_work_there(tmp_path: Path, f
         # ...and the device is in the log by name and address, as one that was typed in is.
         assert [(entry["device"], entry["url"], entry["note"]) for entry in entries if entry["event"] == "device_added"] == [("Rack KVM", fake.url, "from a file")]
     # And it is there after a restart, sealed with this wall's own key under ids of this wall's making.
-    saved = json.loads((tmp_path / "two" / "qkvm.json").read_text(encoding="utf-8"))
+    saved = json.loads(settings_text(tmp_path / "two" / "qkvm.json", encoding="utf-8"))
     assert [d["name"] for d in saved["devices"]] == ["Rack KVM"] and saved["devices"][0]["secret"] and "secret" not in json.dumps(saved["devices"][0]["secret"])
     assert len({record["id"] for record in (*saved["devices"], *saved["actions"])}) == 3
 
@@ -233,7 +234,30 @@ def test_a_file_cannot_make_a_wall_do_what_an_admin_could_not_type(tmp_path: Pat
         # (But for how long the program has run, which is a clock: a second later than "before" on a slow day.)
         same = lambda settings: {k: v for k, v in settings.items() if k not in ("interval", "uptime")}  # noqa: E731
         assert after["interval"] == 5 and same(after) == same(before)
-    saved = json.loads((tmp_path / "qkvm.json").read_text(encoding="utf-8"))
+    saved = json.loads(settings_text(tmp_path / "qkvm.json", encoding="utf-8"))
     device = saved["devices"][0]
     assert device["id"] != "alerts:webhook" and len(device["id"]) == 8 and device["secret"] is None and device["ident"] == ""
     assert saved["server"]["allowed_hosts"] == [] and saved["recovery"] is not None and len(saved["users"]) == 1
+
+
+def test_the_summary_of_a_file_says_how_a_console_over_vncs_is_checked(tmp_path: Path) -> None:
+    # A console over vncs:// is taken in with the certificate check its file says, "not checked" too, which the summary
+    # said only of addresses with https://: an entry that would not check its certificate was shown as one that would.
+    file = {
+        "format": exchange.FORMAT,
+        "version": 1,
+        "devices": [
+            {"url": "vncs://unchecked.invalid:5901", "kind": "vnc", "name": "Unchecked console", "tls": "insecure"},
+            {"url": "vncs://checked.invalid:5901", "kind": "vnc", "name": "Checked console", "tls": "pinned"},
+            {"url": "vnc://plain.invalid:5901", "kind": "vnc", "name": "Plain console", "tls": "insecure"},
+            {"url": "https://kvm.invalid", "kind": "kvmd", "name": "A KVM", "tls": "insecure"},
+        ],
+    }
+    with wall(tmp_path) as admin:
+        there = admin.post("/api/v1/import/read", json={"file": json.dumps(file)}).json()
+        assert [(device["name"], device["tls"]) for device in there["devices"]] == [
+            ("Unchecked console", "insecure"),
+            ("Checked console", "pinned"),
+            ("Plain console", ""),  # (nothing to check over plain vnc://)
+            ("A KVM", "insecure"),
+        ]

@@ -19,6 +19,7 @@ from tests.test_totp import switch_on
 from tests.test_unlock import SECRET, fits, kept_sign_in, let_in
 from tests.test_users import visitor
 from tests.test_wall import PASSWORD, add, wait_until, wall
+from tests.settings_file import settings_text, write_settings_text
 
 
 @pytest.fixture(autouse=True)
@@ -127,7 +128,7 @@ def test_the_recovery_key_that_was_replaced_opens_nothing_that_is_left_in_the_fo
         assert admin.post("/api/v1/recovery", json={"password": PASSWORD}).status_code == 200
     found = []
     for name in ("qkvm.json", "qkvm.bak"):
-        record = json.loads((data / name).read_text(encoding="utf-8")).get("recovery")
+        record = json.loads(settings_text(data / name, encoding="utf-8")).get("recovery")
         if record and Vault.open(record, tidy_recovery_key(old)) is not None:
             found.append(name)
     print("\nthe cancelled recovery key still opens the key to everything in:", found)
@@ -141,15 +142,15 @@ def test_a_program_that_is_gone_back_to_keeps_what_the_newer_one_wrote(tmp_path:
     with wall(data) as admin:
         wait_until(lambda: fits(admin), "never made to fit")
     path = data / "qkvm.json"
-    newer = json.loads(path.read_text(encoding="utf-8"))
+    newer = json.loads(settings_text(path, encoding="utf-8"))
     newer["version"] = 2
     newer["server"]["sign_in_ends_after_hours"] = 1  # a rule a later version has, and this one has not heard of
     newer["users"][0]["must_change_password"] = True
     newer["banned_addresses"] = ["203.0.113.0/24"]
-    path.write_text(json.dumps(newer, indent=2), encoding="utf-8")
+    write_settings_text(path, json.dumps(newer, indent=2), encoding="utf-8")
     with wall(data) as old:  # the older program is started on it (gone back to, by itself), and one thing is changed
         assert old.put("/api/v1/alerts", json={"enabled": False}).status_code == 200
-    after = json.loads(path.read_text(encoding="utf-8"))
+    after = json.loads(settings_text(path, encoding="utf-8"))
     lost = [name for name, there in (
         ("version 2", after["version"] == 2),
         ("server.sign_in_ends_after_hours", "sign_in_ends_after_hours" in after["server"]),
@@ -200,7 +201,7 @@ def test_going_from_one_way_of_starting_to_another_leaves_nothing_that_opens_the
         found = []
         for path in sorted(p for p in data.rglob("*") if p.is_file()):
             try:
-                said = json.loads(path.read_text(encoding="utf-8"))
+                said = json.loads(settings_text(path, encoding="utf-8"))
             except (ValueError, UnicodeDecodeError, OSError):
                 continue
             record = said.get("unlock") if isinstance(said, dict) else None

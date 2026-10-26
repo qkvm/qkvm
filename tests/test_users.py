@@ -10,6 +10,7 @@ from qkvm import kvm, update, vault
 from qkvm.server import required_role
 from tests.fake_kvm import FakeKvm
 from tests.test_wall import CSRF, PASSWORD, add, snap, wall
+from tests.settings_file import settings_text
 
 OTHER = "another long password"
 
@@ -146,7 +147,7 @@ def test_a_viewer_alone_can_open_the_wall_after_a_restart(tmp_path: Path, fake: 
     with wall(tmp_path, sign_in=False) as client:  # restarted: the saved KVM passwords are locked again
         assert client.post("/api/v1/login", json={"name": "victor", "password": OTHER}).status_code == 200
         assert client.get(snap(device)).status_code == 200  # their password unlocked them
-    assert OTHER not in (tmp_path / "qkvm.json").read_text() and PASSWORD not in (tmp_path / "qkvm.json").read_text()
+    assert OTHER not in settings_text(tmp_path / "qkvm.json") and PASSWORD not in settings_text(tmp_path / "qkvm.json")
 
 
 def test_the_last_admin_cannot_be_lost(tmp_path: Path) -> None:

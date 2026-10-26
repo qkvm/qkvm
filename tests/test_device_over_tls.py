@@ -109,6 +109,7 @@ def test_over_tls_no_task_of_the_library_is_left_and_nothing_is_on_the_terminal(
     async def run() -> int:
         kvmd = KvmDevice(DeviceSpec("d", "Hostile", f"https://127.0.0.1:{device.port}", "admin", "secret", tls="insecure"))
         kvmd._token = "t"
+        kvmd._glinet = True  # (known for a GLKVM, as a look finds one: the family is not asked of a device that only speaks this line)
         await kvmd._http()  # as every request to the device does first: how its certificate is checked is known from here on
         for _ in range(connections):
             kvmd._wanted_at = time.monotonic()

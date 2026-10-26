@@ -26,6 +26,7 @@ from qkvm.core import Core
 from tests.test_device_limits import OddDevice, frame
 from tests.test_wall import PASSWORD, wall
 from tests.test_what_a_library_says import Terminal, a_kvm_at
+from tests.settings_file import settings_text
 
 F = {"format": exchange.FORMAT, "version": 1}
 PASSPHRASE = "a passphrase for the file"
@@ -120,7 +121,7 @@ def test_a_start_at_which_the_password_work_has_no_memory_says_so_and_keeps_the_
         while admin.core.store.unlock is None:  # type: ignore[attr-defined]
             assert time.monotonic() < deadline, "the key in the data folder was never made to fit"
             time.sleep(0.05)
-    fitted = json.loads((tmp_path / "qkvm.json").read_text(encoding="utf-8"))["unlock"]
+    fitted = json.loads(settings_text(tmp_path / "qkvm.json", encoding="utf-8"))["unlock"]
     assert fitted is not None
 
     def no_room(*given: Any, **named: Any) -> bytes:

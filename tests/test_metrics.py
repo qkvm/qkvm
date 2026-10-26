@@ -13,6 +13,7 @@ from qkvm import kvm, metrics, update, vault
 from tests.fake_kvm import FakeKvm
 from tests.test_users import account, browser
 from tests.test_wall import CSRF, PASSWORD, add, wait_until, wall
+from tests.settings_file import settings_text
 
 
 @pytest.fixture(autouse=True)
@@ -63,7 +64,7 @@ def test_metrics_are_off_until_an_admin_makes_a_token_and_need_it_from_then_on(t
         made = admin.post("/api/v1/metrics/token").json()
         token = made["token"]
         assert len(token) > 40 and token.startswith("qkvm_")
-        assert token not in (tmp_path / "qkvm.json").read_text(encoding="utf-8")  # what is kept cannot be used to collect
+        assert token not in settings_text(tmp_path / "qkvm.json", encoding="utf-8")  # what is kept cannot be used to collect
         state = admin.get("/api/v1/metrics").json()
         assert state["enabled"] is True and "token" not in state  # shown once
 

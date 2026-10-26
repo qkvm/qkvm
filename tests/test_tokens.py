@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 from qkvm import kvm, update, vault
 from tests.fake_kvm import FakeKvm
 from tests.test_wall import PASSWORD, add, snap, wait_until, wall
+from tests.settings_file import settings_text
 
 SECRET = "what-is-in-the-file-that-is-kept-somewhere-else"
 
@@ -65,7 +66,7 @@ def test_a_script_acts_with_a_token_of_its_own(tmp_path: Path, pair: tuple[FakeK
         assert 29 * 86400 < record["expires"] - time.time() <= 30 * 86400
         listed = admin.get("/api/v1/tokens").json()["tokens"]
         assert [(t["name"], t["kind"], t["used"]) for t in listed] == [("nightly", "api", None)]
-        assert token not in admin.get("/api/v1/tokens").text and token not in (tmp_path / "qkvm.json").read_text()
+        assert token not in admin.get("/api/v1/tokens").text and token not in settings_text(tmp_path / "qkvm.json")
 
         robot = script(admin, token)
         assert [d["name"] for d in robot.get("/api/v1/wall").json()["devices"]] == ["Build server"]  # what it is for, no more

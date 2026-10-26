@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -47,6 +48,21 @@ def fake() -> Iterator[FakeKvm]:
     server.stop()
 
 
+def written_down(core: Core, device: str, state: str) -> bool:
+    """Whether the alert watcher has written the machine down as `state` (watch.json): what a start takes up again, and
+    what the next change is told against. (A fixed 0.6 s for that, a busy computer had not written it yet.) Asked of the
+    watcher, which keeps what it wrote last: read from the file itself, the test held it open at the moment the watcher
+    replaced it, which Windows refused ("Access is denied"), and the watcher tries again only a minute later."""
+    try:
+        return bool(json.loads(core.watcher._written or "{}")["stable"].get(device) == state)
+    except (ValueError, KeyError):
+        return False
+
+
+def told(inbox: Inbox, title: str) -> bool:
+    return title in inbox.titles()
+
+
 def state_of(client: TestClient, device: str) -> str | None:
     said = client.get("/api/v1/status").json().get(device) or {}
     return said.get("state")
@@ -66,16 +82,14 @@ def test_a_machine_that_did_not_come_back_with_qkvm_is_told(tmp_path: Path, inbo
             assert admin.put("/api/v1/alerts", json={"enabled": True, "webhook": inbox.url}).status_code == 200
             wait_until(lambda: fits(admin), "never made to fit")
             assert admin.get(snap(device)).status_code == 200
-            time.sleep(0.6)  # the watcher knows it as online
+            wait_until(lambda: written_down(admin.core, device, "online"), "the watcher never wrote it down as online", timeout=30)  # type: ignore[attr-defined]
             assert state_of(admin, device) == "online"
         fake.stop()  # the power cut: qKVM and the machine go down together, and only qKVM comes back
         with wall(data, sign_in=False) as later:
             assert later.get("/healthz").json()["locked"] is False  # it carries on by itself, as promised
             assert later.post("/api/v1/login", json={"password": PASSWORD}).status_code == 200  # only to look at the state
             wait_until(lambda: state_of(later, device) == "offline", "never seen as offline", timeout=30)
-            time.sleep(2.0)  # forty looks
-            print("\nposted to the alert address after the restart:", inbox.titles())
-            assert "Build server is offline" in inbox.titles(), "it was online before the restart and is offline after it, and nobody was told"
+            wait_until(lambda: told(inbox, "Build server is offline"), f"it was online before the restart and is offline after it, and nobody was told: {inbox.titles()}", timeout=30)
     finally:
         fake.stop()
 
@@ -91,7 +105,7 @@ def test_what_a_pause_held_back_is_told_after_it_although_qkvm_was_restarted_mea
             assert admin.put("/api/v1/alerts", json={"enabled": True, "webhook": inbox.url}).status_code == 200
             wait_until(lambda: fits(admin), "never made to fit")
             assert admin.get(snap(device)).status_code == 200
-            time.sleep(0.6)
+            wait_until(lambda: written_down(admin.core, device, "online"), "the watcher never wrote it down as online", timeout=30)  # type: ignore[attr-defined]
             assert admin.post("/api/v1/alerts/pause", json={"minutes": 60}).status_code == 200
             fake.state.signal = False  # goes wrong within the pause
 
@@ -103,10 +117,8 @@ def test_what_a_pause_held_back_is_told_after_it_although_qkvm_was_restarted_mea
             assert later.get("/api/v1/alerts").json()["paused_until"] is not None  # the pause outlasted the restart...
             time.sleep(0.6)
             assert later.post("/api/v1/alerts/pause", json={"minutes": 0}).status_code == 200  # ...and is over now
-            time.sleep(2.0)
+            wait_until(lambda: told(inbox, "Build server has no video signal"), f"what went wrong within the pause was never told: {inbox.titles()}", timeout=30)
             assert state_of(later, device) == "no_signal"  # still wrong
-            print("\nposted to the alert address:", inbox.titles())
-            assert "Build server has no video signal" in inbox.titles(), "what went wrong within the pause was never told"
     finally:
         fake.stop()
 
@@ -125,16 +137,14 @@ def test_a_change_is_told_although_the_listeners_were_reopened_meanwhile(tmp_pat
             device = add(admin, fake.url, name="Build server")
             assert admin.put("/api/v1/alerts", json={"enabled": True, "webhook": inbox.url}).status_code == 200
             assert admin.get(snap(device)).status_code == 200
-            time.sleep(0.6)
+            wait_until(lambda: written_down(core, device, "online"), "the watcher never wrote it down as online", timeout=30)
             assert state_of(admin, device) == "online"
             cookie = str(admin.cookies.get(COOKIE))
         fake.state.signal = False  # while the listeners are being re-opened
         with TestClient(create_app(core), headers=CSRF, client=("127.0.0.1", 50000)) as again:
             again.cookies.set(COOKIE, cookie)
             wait_until(lambda: state_of(again, device) == "no_signal", "never seen without a picture", timeout=20)
-            time.sleep(2.0)
-            print("\nposted to the alert address:", inbox.titles())
-            assert "Build server has no video signal" in inbox.titles()
+            wait_until(lambda: told(inbox, "Build server has no video signal"), f"the change was never told: {inbox.titles()}", timeout=30)
     finally:
         fake.stop()
 

@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
+import errno
 import hashlib
+import json
 import logging
 import re
+import socket
 import ssl
 import threading
 import time
@@ -18,7 +22,7 @@ from urllib.parse import urlsplit
 import httpx
 from websockets.asyncio.client import ClientConnection
 from websockets.asyncio.client import connect as _ws_connect
-from websockets.exceptions import WebSocketException
+from websockets.exceptions import InvalidStatus, WebSocketException
 from websockets.frames import CloseCode, Opcode
 
 log = logging.getLogger("qkvm")
@@ -48,6 +52,30 @@ ACTIONS: dict[str, tuple[str, dict[str, str]]] = {
     "jiggler_on": ("/api/hid/set_params", {"jiggler": "1"}),  # the KVM nudges the mouse to keep the computer awake
     "jiggler_off": ("/api/hid/set_params", {"jiggler": "0"}),
 }
+# What a tile can do, by word: the whole vocabulary, in the order a list of them is written in. A driver
+# says which hold for every device of its kind (`Device.can`), and its look at the device adds what that
+# one has (`can` in its status: a power board, several inputs, a light): what a client may ask of the
+# machine, said by the server, so that no client guesses it from the kind. Each word opens actions of
+# POST /api/v1/devices/{id}/actions, or a request (the README, "The API", says which). The words and the
+# labels the page shows for them are in static/words.json; one that is not in there is a mistake.
+ABILITIES = (
+    "screen", "keys", "text", "jiggler", "power", "reset", "fingerbot", "power_state", "wol", "ports", "reboot", "resume",
+    "locator", "console", "live", "control", "bios_setup",
+)  # fmt: skip
+
+
+# How a machine's pointer is moved over the live line (`Device.pointer_kind`): to a place, by steps, or either.
+POINTER_ABSOLUTE, POINTER_RELATIVE, POINTER_BOTH = "absolute", "relative", "both"
+
+
+def can_do(*words: str | None) -> list[str]:
+    """These abilities as a list: each once, in the order of ABILITIES. None stands for one that does not hold."""
+    said = {word for word in words if word is not None}
+    if unknown := said - set(ABILITIES):
+        raise ValueError(f"not an ability: {', '.join(sorted(unknown))}")
+    return [word for word in ABILITIES if word in said]
+
+
 MAC = re.compile(r"[0-9A-Fa-f]{2}([:-][0-9A-Fa-f]{2}){5}")
 # Up to eight key names as browsers and kvmd spell them: "ControlLeft,AltLeft,Delete".
 KEYS = re.compile(r"[A-Z][A-Za-z0-9]{1,15}(,[A-Z][A-Za-z0-9]{1,15}){0,7}")
@@ -63,6 +91,106 @@ BACKOFF_MAX = 15.0  # ...up to this long between attempts
 STATUS_TTL = 4.0
 STATUS_FIRST_WAIT = 1.5  # how long the very first status of a device may hold a caller up
 ABOUT_TTL = 600.0  # model and firmware version rarely change
+ABOUT_RETRY = 60.0  # ...and how soon a kvmd KVM is asked again whose answer said neither whether it is GL.iNet's nor stock (see KvmDevice._glinet)
+# A power board the KVM said it has, this long ago or less, is not taken away by a look that says otherwise or says
+# nothing. A Comet's board answers one asker at a time and tells whoever asks meanwhile that there is none (two askers
+# at once on a real one, 2026-10-14: one answer in five); the tile's power buttons went with each such answer.
+BOARD_KEPT = 60.0
+# ...and what it said of the computer is kept this long through such answers, which say nothing of it: the tile went from
+# "Powered off" to "No signal" and back at each, while the computer stayed as it was.
+POWER_KEPT = 10.0
+# How long a KVM's power board holds each button after it has answered the click. A Comet answers at once and holds on
+# (its own page says half a second, and six and a half for the long press; on a real one a computer that was off came on
+# at a long press and went off again seconds later, its `busy` long over) and stock kvmd holds a tenth and five and a
+# half seconds. Until the button is let go the machine is being done something to: a second press meanwhile was taken
+# by the board as well, and a power button pressed twice undoes itself.
+HELD = {"atx_power": 0.5, "atx_power_long": 6.5, "atx_reset": 0.5}
+# The click's answer is waited for this long (the next piece of it, as for every request). Only a 4xx is a no: a 5xx (the
+# KVM's web server says 502, 503 or 504 while kvmd restarts behind it, kvmd itself 500), none in time, or one that broke off
+# says neither, and the board may have pressed. Then the board is left alone, whoever asks, for as long as a click taken
+# then can still come to be pressed and held: this long and the button's hold (HELD), from when the answer came or was given
+# up on (a KVM may go on with a request whose asker gave up). Said "not pressed", the page offered the press again, and a
+# power button pressed twice undoes itself.
+BOARD_ANSWER = 8.0
+# After the button is let go, a press that must change the computer's power (a short one on a computer that is off, the
+# long one on a computer that is on) is waited for until the board shows the change, this long at most, this often. A
+# Comet's word followed the computer three or four seconds late, on and off alike.
+SEEN_WITHIN = 20.0
+SEEN_EVERY = 1.0
+# A KVM's power board says how it is on the KVM's line for events (kvmd's /api/ws), at once and at every change, as the KVM's
+# own page reads it; asked at /api/atx instead, a Comet's board answers one asker at a time and tells whoever asks meanwhile
+# that there is none (the wall's questions, once a look, gave a second wall or a script beside it "no board": one answer in
+# five, on a real one). So where the wall holds that line anyway, while somebody watches the KVM's picture (the keepalive,
+# `_hold_stream_open`), it hears the board there and does not ask it. No line is opened for the board alone: three times the
+# sleeping PC behind a real Comet woke within seconds of one being opened (twice more it did not). The line is asked
+# whether it is there every EVENTS_PING seconds (kvmd's own `ping`, answered `pong`), and what it said of the board counts
+# while it was heard from within EVENTS_QUIET seconds. Before a press the board is asked all the same (see `_board_now`).
+EVENTS_PING = 5.0
+EVENTS_QUIET = 12.0
+MOST_EVENT = 2**20  # bytes one message on that line may be (what arrives is mostly thrown away, but is held in memory first)
+MOST_BOARD_WORD = 4096  # ...and the longest that is read as the board's state (a Comet's is some 90 bytes)
+# Set once the KVM has answered a power button's click, for the time the button is held and its change waited for: a
+# request cut off after that (the wall stopped) was pressed, and is said so, not "may have been done" and offered again.
+PRESS_ANSWERED: contextvars.ContextVar[bool] = contextvars.ContextVar("press_answered", default=False)
+# Said by a driver that knows when its press goes out (the Fingerbot's): False until the click is on its way, True from then
+# on; None where the driver does not say. A request cut off by qKVM stopping while it was False pressed nothing: the KVM was
+# only being asked (whether a Fingerbot is paired, say), and the log says so, not "it may have been done".
+PRESS_SENT: contextvars.ContextVar[bool | None] = contextvars.ContextVar("press_sent", default=None)
+# GL.iNet's Fingerbot, paired with a Comet over Bluetooth, presses a machine's power button with an arm, for a machine
+# that has no ATX board. The Comet says whether one is paired in a `fingerbot` event on its line for events
+# (`{"exist": true}`, and nothing more: a real one, 2026-10-18), and has no route that says it. A press is
+# POST /api/fingerbot/click with the time to hold, in milliseconds, and the strength (`angle_enum`); the Comet's own page
+# offers 0.5, 3 and 8 seconds. These two: a short press, and the eight seconds that force a computer off.
+FINGERBOT_PRESSES = {"fingerbot_power": 0.5, "fingerbot_power_long": 8.0}
+FINGERBOT_STRENGTHS = {"firm": "2", "light": "1"}  # the Comet's `angle_enum` for "Firmly Press" (its own page's default) and "Lightly Press"
+# The real one answered every press 1.9 to 2.5 seconds after it was sent, "success", for half a second, three and eight alike:
+# its answer says the Fingerbot took the press, not that the press is over. So the machine is held for the press's own time
+# after the answer, and a moment more for the arm to come back up (that moment was not measured: the Fingerbot lay loose on a
+# desk). The answer is waited for as long as the Comet's own page waits: eight seconds beside the press's own time.
+FINGERBOT_ANSWER = 8.0
+FINGERBOT_BACK = 1.0
+# A line to the KVM's events is opened before a press only where the KVM has not said either way (nobody has watched its
+# picture since qKVM started, say), and its word waited for this long. The real one said it 0.2 to 2.0 s after a line
+# opened, and twice some 4.3 s (each time while another line of somebody else's was open to it, on which it then said it
+# again). A press goes to the machine anyway, so the line opened for it wakes nothing that the press would not; where the
+# KVM said there is none, a press is refused without one (opened for nothing, a line can wake a sleeping computer: see
+# EVENTS_PING).
+FINGERBOT_ASK_WITHIN = 10.0
+# What it said (that none is paired), or that it said nothing when it was asked, stands for this long: a press meanwhile is
+# refused without a line opened to ask again. After that it is asked again: one may have been paired since, and a script
+# with nobody watching the picture has no other way to find out (the Comet saying it of its own accord was not seen).
+FINGERBOT_ASK_AGAIN = 120.0
+# Its battery is a question of its own (GET /api/fingerbot/battery, answered `{"battery": 101}` in kvmd's `result`: a round
+# trip to the Fingerbot, 0.6 to 0.7 s on the real one), which the Comet's own page asks once when its accessories are opened:
+# here once an hour while one is paired (one paired anew within ten minutes of the last question), again after ten minutes
+# where it was not answered, never while a press is under way or may be. Below FINGERBOT_LOW percent it is low, as the Comet's own page shows it.
+FINGERBOT_BATTERY_EVERY = 3600.0
+FINGERBOT_BATTERY_RETRY = 600.0
+FINGERBOT_LOW = 25
+# ...and its answer is waited for this long, no longer (and the whole of it a few seconds more, for a connection and one that
+# trickles in): a person's press waits for a question under way (the Comet talks to its Fingerbot one request at a time),
+# and a Fingerbot out of reach is not to hold the press up for half a minute.
+FINGERBOT_BATTERY_WAIT = 3.0
+
+
+class FingerbotTurn:
+    """One request to a Comet's Fingerbot at a time from this program (a press, a question of its battery), shared by the
+    clients of one KVM at one address (see KvmDevice.takes_over); and until when it may still be pressing after a press
+    whose answer said neither yes nor no (time.monotonic()), during which nothing more is sent to it. The same for the
+    KVM's power board (`board_until`, see BOARD_ANSWER): the machine's power buttons, which are one."""
+
+    def __init__(self) -> None:
+        self.lock = asyncio.Lock()
+        self.held_until = 0.0
+        self.board_until = 0.0
+
+    def held(self) -> float:
+        """Seconds it may still be pressing; 0 where it is not."""
+        return max(0.0, self.held_until - time.monotonic())
+
+    def board_held(self) -> float:
+        """Seconds the KVM's power board may still be pressing a button; 0 where it is not."""
+        return max(0.0, self.board_until - time.monotonic())
 LOGIN_BACKOFF = 60.0  # after a rejected password, don't try again for this long
 # ...and for longer after each rejection that follows it without a login accepted in between: from the fourth
 # on, once an hour. A password that was rejected does not become right by being offered again, and a device
@@ -73,8 +201,14 @@ STILL_THERE_EVERY = 30.0  # while a password waits to be offered again, how ofte
 SIGN_IN_PATIENCE = 2.5  # an answer to a sign-in is waited for this many times longer than any other: some devices hold a no back on purpose
 UNANSWERED_MOST = 300.0  # the longest a password is held back after sign-ins that nothing answered, where no no was heard before them
 KEEPALIVE_IDLE = 30.0  # drop the stream keepalive once nobody has asked for a frame for this long
+# The owner's standard for what costs a machine something each time and is done now and then, or held for nobody (decided
+# 2026-10-18): a guest's console held after its last viewer; a lying Proxmox's console asked for again; a still of a PC with
+# Intel AMT whose tile is only shown; how such a PC's KVM is set up (consent) read again.
+STANDARD_HOLD = 300.0
+KEEPALIVE_LASTS = 5.0  # ...and one that the KVM ended sooner than this after it was made is begun again only after a pause
 MAX_REPLY = 2 * 1024 * 1024  # bytes a device may send in answer to anything but a picture
 MAX_PICTURE = 32 * 1024 * 1024  # ...and as one picture (a 4K frame, uncompressed, is 25 MB)
+MOST_UNIT = 8 * 1024 * 1024  # ...and as one picture of its H.264 stream, an access unit (a 4K key frame is a megabyte or two)
 PACKED_MARGIN = 64 * 1024  # bytes a packed answer may be larger, as it arrives, than the most it may unpack to
 MAX_PROBE = 64 * 1024  # ...and to "are you a KVM?", asked of addresses nothing is known about
 # The size a picture may claim to be. A hundred kilobytes can say they are sixteen thousand pixels square,
@@ -98,6 +232,12 @@ NO_SAID = "Login rejected - check the username and password"  # what a tile says
 
 class AlreadySo(Exception):
     """An action found nothing to do: what it was to bring about is so already. Its text says what ("already on")."""
+
+
+class NotSeen(AlreadySo):
+    """A power button was pressed, and the change it was to bring was not seen within the time it was looked for. Done,
+    with a word on what was seen ("pressed, but the computer is still off"): not a failure, whose retry would press the
+    button a second time on a computer that may be on its way."""
 
 
 def wait_after_rejections(times: int) -> float:
@@ -217,9 +357,17 @@ class Rejected:
         self._known.pop(what, None)
 
     def forget(self, spec: DeviceSpec) -> None:
-        """A person has typed this password for this device just now: it is tried as if for the first time."""
+        """A person has typed this password for this device just now: it is tried as if for the first time.
+
+        Also where it is counted for the place the device is at as a whole (the guests of one Proxmox, which share
+        the one verdict on a token): a device whose address goes on past its host and port.
+        """
+        parts = urlsplit(spec.base_url)
+        whole = f"{parts.scheme.lower()}://{parts.netloc.lower()}"  # (as a device's address is written: see store.device_url)
         for road in ROADS:
             self._known.pop(self.what(road, spec), None)
+            if whole != spec.base_url:
+                self._known.pop(self.what(road, DeviceSpec(spec.id, spec.name, whole, spec.username, spec.password, spec.tls, spec.cert_pem, spec.kind)), None)
 
     def clear(self) -> None:
         self._known.clear()
@@ -268,6 +416,10 @@ class DeviceSpec:
     tls: str = "pinned"  # "pinned" | "system" | "insecure"
     cert_pem: str | None = None
     kind: str = "kvmd"  # which driver talks to it
+    # The machine behind the address, by the number it gave for itself when it was added (store.DeviceRecord.machine):
+    # a driver that can tell checks it before anything is sent to the machine. "": none remembered.
+    machine: str = ""
+    fingerbot_strength: str = "firm"  # how hard a Fingerbot paired with the KVM presses: "firm" | "light" (FINGERBOT_STRENGTHS)
 
 
 @dataclass(frozen=True)
@@ -276,6 +428,9 @@ class Snapshot:
     content_type: str
     signal: bool  # False when the device captured its "no signal" placeholder
     taken_at: float  # when the device was asked for it (time.monotonic())
+    # A still kept between sessions, and handed out as it is until the next (a PC with Intel AMT whose tile is only shown):
+    # the snapshot route says how old it is (X-KVM-Age), and the tile says so.
+    still: bool = False
 
 
 def tier_for(width: int) -> str:
@@ -361,6 +516,47 @@ def other_way(url: str) -> str | None:
     return f"{'http' if parts.scheme == 'https' else 'https'}://{host}"
 
 
+MOST_ASKED = 4  # addresses of one name that are each asked whether anything listens there
+
+
+async def listens(url: str) -> bool:
+    """Whether anything takes connections at the host and port of `url`, or may: False only where it was plainly refused.
+
+    A JetKVM as it comes has nothing on its HTTPS port, and says so at once. A port that takes a connection,
+    or lets one wait (a device slow to wake, a firewall that drops instead of refusing), is not that.
+    """
+    parts = urlsplit(url)
+    port = parts.port or (443 if parts.scheme == "https" else 80)
+    try:
+        async with asyncio.timeout(3.0):  # (never wait_for, which loses a stop up to Python 3.11: see Listening.message)
+            found = await asyncio.get_running_loop().getaddrinfo(parts.hostname, port, type=socket.SOCK_STREAM)
+    except (OSError, TimeoutError):
+        return True  # where it is cannot be found out just now: not "nothing is there"
+    addresses = list(dict.fromkeys(str(entry[4][0]) for entry in found))
+    if len(addresses) > MOST_ASKED:
+        # Not all of them are asked, so "every one refused" cannot be said: and that is the answer on which
+        # a password goes out in the clear to what answers the plain way.
+        return True
+
+    async def refuses(address: str) -> bool:
+        # Each address by itself: asked for by name, two refusals come back as one error that does not say
+        # what it is made of, and on Windows a refusal takes two seconds, so that two were never both heard.
+        try:
+            async with asyncio.timeout(4.0):
+                _, writer = await asyncio.open_connection(address, port)
+        except ConnectionRefusedError:
+            return True
+        except TimeoutError:
+            return False
+        except OSError as ex:
+            # (An address of a kind this computer has no way to, IPv6 where there is none: nothing is there for it either.)
+            return ex.errno in (errno.ENETUNREACH, errno.EADDRNOTAVAIL, errno.EAFNOSUPPORT)
+        writer.close()
+        return False
+
+    return not all(await asyncio.gather(*(refuses(address) for address in addresses))) if addresses else True
+
+
 def unverified_context() -> ssl.SSLContext:
     """For looking at a certificate without judging it, and for devices set to "don't check"."""
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
@@ -440,7 +636,8 @@ async def publicly_trusted(base_url: str) -> bool:
             writer.transport.abort()  # nothing was sent that would deserve a goodbye
 
 
-def _transport_error(ex: BaseException, tls: str) -> KvmError:
+def _certificate_refused(ex: BaseException, tls: str) -> KvmError | None:
+    """What stands against a connection that failed on the device's certificate; None where that was not it."""
     cause: BaseException | None = ex
     while cause is not None:
         if isinstance(cause, ssl.SSLCertVerificationError):
@@ -448,10 +645,27 @@ def _transport_error(ex: BaseException, tls: str) -> KvmError:
                 return KvmError("cert_mismatch", "Certificate does not match the one saved for this device")
             return KvmError("cert_invalid", "The device's certificate is not trusted")
         cause = cause.__cause__ or cause.__context__
+    return None
+
+
+def _transport_error(ex: BaseException, tls: str) -> KvmError:
+    refused = _certificate_refused(ex, tls)
+    if refused is not None:
+        return refused
     if isinstance(ex, (httpx.ConnectError, httpx.ConnectTimeout)):
         return KvmError("unreachable", "Device is unreachable")
     if isinstance(ex, httpx.TimeoutException):
         return KvmError("timeout", "Device did not respond in time", 504)
+    return KvmError("dropped", "The device closed the connection")
+
+
+def ws_error(ex: BaseException, tls: str) -> KvmError:
+    """The same, for a WebSocket to a device that could not be opened."""
+    refused = _certificate_refused(ex, tls)
+    if refused is not None:
+        return refused
+    if isinstance(ex, OSError):
+        return KvmError("unreachable", "Device is unreachable")
     return KvmError("dropped", "The device closed the connection")
 
 
@@ -775,6 +989,23 @@ class _ToADevice(ClientConnection):
         super().process_event(event)
 
 
+class WarningsOnly(logging.LoggerAdapter):  # type: ignore[type-arg]
+    """A logger that passes on warnings and worse, and nothing finer, whatever level anybody sets on any logger, and when.
+
+    (A level of its own would not hold: a logging configuration given later that names a logger above it, the library's
+    or the web server's, sets every logger below that back to no level at all, and so to whatever that one is at.)"""
+
+    def isEnabledFor(self, level: int) -> bool:
+        return level >= logging.WARNING and self.logger.isEnabledFor(level)
+
+
+# What the WebSocket library logs at its finer levels names every header it sends, a device's session or an API token
+# among them. Its connections to devices log through the one above, which says nothing finer than a warning, whatever
+# level the library's own loggers are set to, now or later (cli.setup_logging keeps those to warnings as well; this does
+# not lean on it). Under "websockets", so that what it does say goes where the library's other lines go, once a minute.
+_TO_DEVICES = WarningsOnly(logging.getLogger("websockets.to_devices"), {})
+
+
 class ws_connect(_ws_connect):  # named like the function it takes the place of, and used the way that is
     """A websocket to a device: to that device, straight to it, and as it is sent.
 
@@ -789,7 +1020,7 @@ class ws_connect(_ws_connect):  # named like the function it takes the place of,
     """
 
     def __init__(self, uri: str, **options: Any) -> None:
-        super().__init__(uri, proxy=None, compression=None, create_connection=_ToADevice, **options)
+        super().__init__(uri, proxy=None, compression=None, create_connection=_ToADevice, logger=_TO_DEVICES, **options)
 
     def process_redirect(self, exc: Exception) -> Exception | str:
         return exc  # "not here, over there" is an answer like any other that is not a connection
@@ -804,6 +1035,75 @@ def number(value: Any, low: float = 0, high: float = 1_000_000) -> int | float |
 
 def flag(value: Any) -> bool | None:
     return value if isinstance(value, bool) else None
+
+
+# GLKVM says how the computer behind its power board is in a word of its own, which its own page shows; the power light
+# in `leds` stays false there whatever the computer does (a Comet with its ATX board, 2026-10-14: "power": "on" and
+# "leds": {"power": false} on a running PC). Stock kvmd has no word, and its light is the one in `leds`. A computer
+# asleep is on: the power is there, and a short press wakes it (as a PC with Intel AMT is said to be).
+POWER_WORDS = {"on": True, "sleep": True, "off": False}
+
+
+def power_said(atx: Any) -> bool | None:
+    """Whether the computer behind a KVM's power board is on, by what kvmd's /api/atx answered; None where it does not say.
+
+    Where the answer has GLKVM's word, the word decides, and a word of another kind or one not known says nothing: the
+    light beside it is no witness there.
+    """
+    if isinstance(atx, dict) and "power" in atx:
+        word = atx["power"]
+        return POWER_WORDS.get(word) if isinstance(word, str) else None
+    return flag(_dig(atx, "leds", "power"))
+
+
+def board_heard(event: Any) -> dict[str, Any] | None:
+    """What a power board says of itself on the KVM's line for events (an `atx` event); None where that is no state at all.
+
+    The whole of it each time, as GLKVM (a real Comet) and stock kvmd (by its source: its poller yields the whole state)
+    send it, in the shape of /api/atx's answer. Only what the wall reads of it is kept, each by its kind (a value of another
+    kind is kept as saying nothing): whether the board is there and busy, GLKVM's word for the computer's power, and the
+    two lights.
+    """
+    if not isinstance(event, dict):
+        return None
+    said: dict[str, Any] = {name: flag(event.get(name)) for name in ("enabled", "busy")}
+    if "power" in event:  # (only where it is: a word of another kind says nothing, and the light beside it is no witness then)
+        word = event["power"]
+        said["power"] = word if isinstance(word, str) and word in POWER_WORDS else None
+    lights = event.get("leds")
+    said["leds"] = {name: flag(lights.get(name)) for name in ("power", "hdd")} if isinstance(lights, dict) else {}
+    return said
+
+
+def fingerbot_heard(event: Any) -> bool | None:
+    """Whether a Fingerbot is paired with the KVM, by its `fingerbot` event: `{"exist": true}` on a real Comet with one, and
+    (by its size, in a record of the line that kept the keys and the size of each event) `{"exist": false}` on a Comet
+    without. None where that is no answer: another kind, or nothing."""
+    return flag(event.get("exist")) if isinstance(event, dict) else None
+
+
+def battery_said(result: Any) -> int | None:
+    """A Fingerbot's battery in percent, by the Comet's answer at /api/fingerbot/battery (`{"battery": 101}` on a real one);
+    None where it is no number. One above a hundred is a full one (the Comet's own page counts anything from 70 up as
+    full), and one beyond what a battery can say is no answer."""
+    value = number(_dig(result, "battery"), 0, 255)
+    return None if value is None else min(100, round(value))
+
+
+EVENT_PING = '{"event_type": "ping", "event": {}}'  # kvmd answers it with a `pong` (GLKVM's too, on a real Comet)
+
+
+def event_of(message: str | bytes) -> tuple[str, Any] | None:
+    """One message of a kvmd KVM's line for events, as its type and what it says; None for anything else (deep nesting too)."""
+    if not isinstance(message, str):
+        return None
+    try:
+        said = json.loads(message)
+    except (ValueError, RecursionError):
+        return None
+    if not isinstance(said, dict) or not isinstance(said.get("event_type"), str):
+        return None
+    return said["event_type"], said.get("event")
 
 
 def share_window(fresh: float | None) -> float:
@@ -836,6 +1136,13 @@ def _ports_from(switch: Any) -> dict[str, Any] | None:
             for index in range(count)
         ],
     }
+
+
+def _stock_about(info: Any) -> dict[str, Any]:
+    """What stock kvmd says it is, in its /api/info: the model of its platform ("v4plus"; "test_model" in kvmd's own test
+    environment) and the version of kvmd itself, which is what a PiKVM's software is known by."""
+    version = plain(_dig(info, "system", "kvmd", "version"), 32)
+    return {"model": plain(_dig(info, "hw", "platform", "model"), 40), "version": f"kvmd {version}" if version else None}
 
 
 # A session token is sent back to the device in a header on every request: only characters that are safe there.
@@ -900,16 +1207,29 @@ class Device:
 
     kind = ""  # what DeviceRecord.kind says for devices this driver handles
     picture = True  # it shows the computer's screen; False for a server's management controller, which only says how it is
+    # What every device of this kind can be asked, of ABILITIES. A look at the device adds what that one has
+    # (`can` in the status it reads); a client goes by that list, and by this one until there is a look.
+    can: tuple[str, ...] = ()
     # Kept open for longer than the longest pause between two looks (a tile that is watched is asked every
     # second, one that is only watched over for alerts every fifteen): otherwise every look begins with a new
     # connection, and over HTTPS with a new handshake, at the device's cost as much as at ours.
     LIMITS = httpx.Limits(max_connections=8, max_keepalive_connections=4, keepalive_expiry=30.0)
+    # How long a device of this kind has to accept a connection and to send the next piece of an answer, where it is
+    # not WAITS (read when the connection is made, so that what is set there holds): a driver whose device is a slower
+    # computer (a server's management controller) gives it more.
+    WAITS: httpx.Timeout | None = None
 
     def __init__(self, spec: DeviceSpec, on_pin: Callable[[str], Awaitable[None]] | None = None) -> None:
         self.spec = spec
         self.on_pin = on_pin  # told when a certificate is trusted on first contact
         # Told when the device answers at its other address from now on (a JetKVM whose HTTPS mode was switched).
         self.on_move: Callable[[str], Awaitable[None]] | None = None
+        # Told what the wall sees of the device at every look (the history keeps it; see history.py). Must not wait.
+        self.on_status: Callable[[dict[str, Any]], None] | None = None
+        # Told the number the machine behind the device gives for itself, where the driver has just taken one (DeviceSpec.machine):
+        # the first one it saw, where none was remembered; or a server's controller's beside its computer's. Called with what
+        # was remembered until then and what is from now on; kept with the tile from then on (DeviceManager._known).
+        self.on_known: Callable[[str, str], Awaitable[None]] | None = None
         self._closed = False  # retired: whatever is still under way on it ends, and nothing new starts
         self._client: httpx.AsyncClient | None = None
         self._tls: ssl.SSLContext | None = None  # how the device's certificate is checked; None without TLS
@@ -948,7 +1268,7 @@ class Device:
         """Sign in and read what the device says about itself. Raises KvmError if it can't."""
         raise NotImplementedError
 
-    async def snapshot(self, width: int, fresh: float | None = None) -> Snapshot:
+    async def snapshot(self, width: int, fresh: float | None = None, big: bool = False) -> Snapshot:
         """Latest frame, at least `width` pixels wide when the source has that many.
 
         `fresh`: how old, in seconds, a frame may be and still do (see share_window).
@@ -957,6 +1277,10 @@ class Device:
 
     def tidy(self) -> None:
         """Let go of what is only kept for viewers, once there are none. Called every half minute."""
+
+    def watched(self) -> None:
+        """Whoever sends an action has this machine's large view, or its live view, open (the action said so: `watching`).
+        Nothing for most machines; a PC with Intel AMT opens a session before switching on then, to show the start."""
 
     async def act(self, action: str, *, mac: str = "", keys: str = "", text: str = "", port: int = 0, still: Callable[[], bool] | None = None) -> None:
         raise NotImplementedError
@@ -1140,7 +1464,7 @@ class Device:
                         self._client = httpx.AsyncClient(
                             base_url=self.spec.base_url,
                             verify=verify,
-                            timeout=WAITS,
+                            timeout=self.WAITS or WAITS,
                             limits=self.LIMITS,
                             # Straight to the device, whatever proxy this computer is told to use for the web: the
                             # device is on the local network, and its password is not for a proxy to see.
@@ -1238,7 +1562,21 @@ class Device:
             await asyncio.wait({self._status_task}, timeout=STATUS_FIRST_WAIT)
         status = self._status or {"state": "connecting", "error": None}
         seen = None if self._last_ok is None else max(0, round(time.time() - self._last_ok))
-        return {**status, "last_seen_ago": seen}
+        # (`can`: what the look found; the driver's own list where the look found nothing, or there was none yet.)
+        found = {"can": can_do(*self.can), **status, "last_seen_ago": seen}
+        if self.on_status is not None and not self._closed:
+            self.on_status(found)
+        return found
+
+    def pointer_kind(self) -> str | None:
+        """How the machine's pointer can be moved over the live line: "absolute" (to a place: `m`), "relative" (by steps:
+        `mr`), "both", or None where that is not known (or the machine takes no mouse). Said to the line's viewers."""
+        return POINTER_BOTH if "control" in self.abilities() else None
+
+    def abilities(self) -> list[str]:
+        """What this tile can do, as the last look at the device found it; the driver's own list until there was one."""
+        found = (self._status or {}).get("can")
+        return list(found) if isinstance(found, list) else can_do(*self.can)
 
     async def _refresh_status(self) -> None:
         try:
@@ -1266,9 +1604,19 @@ class Device:
 
 
 class KvmDevice(Device):
-    """A GLKVM / PiKVM device, over kvmd's HTTP API."""
+    """A GLKVM / PiKVM device, over kvmd's HTTP API.
+
+    GL.iNet's firmware is kvmd with routes of its own beside kvmd's: its version and host name, Wake-on-LAN, and a
+    restart of the KVM itself. Stock kvmd has none of them (kvmd 4.226 answers 404 for each, before it asks who is
+    asking), and says what it is in /api/info instead. Which of the two a device is, is found out from its answer to
+    the first of them (`_glinet`).
+    """
 
     kind = "kvmd"
+    # Every such KVM: its screen, keys and text, keep-awake. A look adds Wake-on-LAN (what the KVM has saved to wake) and
+    # its own restart unless the KVM said it has not got GL.iNet's routes for them, the power board and the inputs where
+    # it has them, and takes keep-awake away where the KVM says it is switched off in its own settings.
+    can = ("screen", "keys", "text", "jiggler", "live", "control")
 
     def __init__(self, spec: DeviceSpec, on_pin: Callable[[str], Awaitable[None]] | None = None) -> None:
         super().__init__(spec, on_pin)
@@ -1285,17 +1633,69 @@ class KvmDevice(Device):
         self._source_width: int | None = None
         self._about: dict[str, Any] = {}
         self._about_at = 0.0
+        # Whether it has GL.iNet's own routes: True where it answered the first of them, False where it said there is no
+        # such thing (stock kvmd), None while that is not known (not asked yet, or answered with an error of the moment).
+        self._glinet: bool | None = None
+        self._jiggler_off = False  # the KVM said at the last look that keep-awake is switched off in its own settings
         self._single_port_at: float | None = None  # when the device last said it has no port switch
         self._port_seen: int | None = None  # which computer was on screen at the last look (a multi-port KVM)
         self._usb_unsure = False  # another one is since, and the device has not found its keyboard there yet
+        # Whether the KVM's mouse is absolute, as it said at the last look (/api/hid, `mouse.absolute`; None: not said). kvmd
+        # drops a move of the other kind: relative steps while its mouse is absolute (stock kvmd, W7), and places while it is
+        # relative (a real Comet set to "usb_rel", 2026-10-18: the pointer never moved, while steps moved it).
+        self._mouse_absolute: bool | None = None
+        self._board_at: float | None = None  # when the KVM last said it has a power board
+        self._power_seen: tuple[float, bool | None] = (float("-inf"), None)  # when its board last said whether the computer is on, and what
+        # What the power board said last on the line for events the keepalive holds (see EVENTS_PING): None where no such
+        # line is held, or it has not said yet. `_board_news` is set at every word of the board there, and when the line ends.
+        self._events_heard_at = float("-inf")  # when that line was last heard from, of anything
+        self._board_said: dict[str, Any] | None = None
+        self._board_news = asyncio.Event()
+        self._board_words = 0  # how many it said there, all lines together
+        # Whether a Fingerbot is paired with the KVM, as it said last (its `fingerbot` event, on the keepalive's line or on
+        # one opened before a press); None while it has not said. Kept when the line ends: it is how the KVM is set up.
+        self._fingerbot: bool | None = None
+        self._fingerbot_heard_at = float("-inf")  # when it last said so (the same again included)
+        self._fingerbot_silent_at = float("-inf")  # when a line opened to ask it last heard nothing of it (see FINGERBOT_ASK_AGAIN)
+        self._fingerbot_words = 0  # how often that changed (a look under way when it does is not the last word: see _refresh_status)
+        # The Comet talks to its Fingerbot one request at a time (a press sent while another was being taken failed): a
+        # press and a question of the battery never go out together from here.
+        self._fingerbot_turn = FingerbotTurn()
+        self._battery: int | None = None  # its battery in percent, as last answered (see FINGERBOT_BATTERY_EVERY)
+        self._battery_next = 0.0  # when it may be asked again
+        self._battery_asked_at = float("-inf")  # when it was last asked
+        self._battery_task: asyncio.Task[None] | None = None
+        self._owed: set[asyncio.Future[None]] = set()  # lines asked for the Fingerbot, being closed in a task of their own
         self._keepalive: asyncio.Task[None] | None = None
+        self._keepalive_fails = 0  # keepalives in a row that did not get, or did not keep, their connection
+        self._keepalive_again_at = 0.0  # ...and when one may be begun again
         self._wanted_at = 0.0
         self._ended_said = float("-inf")  # when it was last written down that the connection which keeps the picture coming ended
 
     async def close(self) -> None:
         self._closed = True
-        await stopped([self._keepalive, *self._fetching.values()])
+        await stopped([self._keepalive, self._battery_task, *self._fetching.values(), *self._owed])
         await super().close()
+
+    def pointer_kind(self) -> str | None:
+        # (By what its mouse is at the last look: kvmd drops a move of the other kind. Not known: nothing is said.)
+        return None if self._mouse_absolute is None else POINTER_ABSOLUTE if self._mouse_absolute else POINTER_RELATIVE
+
+    def takes_over(self, retired: Device) -> None:
+        # Which family the KVM is, as the client before found it (the same device at the same address), where this one
+        # has not asked yet: until it has, its session would go into the address of a stock kvmd's event line.
+        if isinstance(retired, KvmDevice) and self._glinet is None:
+            self._glinet, self._jiggler_off = retired._glinet, retired._jiggler_off
+        # One request to the Fingerbot at a time, across an edit too: a press of the client before may still be holding the
+        # button (a tile renamed during a hold had the new client ask the battery while the arm was down).
+        if isinstance(retired, KvmDevice):
+            self._fingerbot_turn = retired._fingerbot_turn
+        # And whether a Fingerbot is paired with it, and its battery, which the KVM says only when a line is opened: a tile
+        # saved anew (another name, its password typed again) lost its Fingerbot's buttons until its picture was watched.
+        if isinstance(retired, KvmDevice) and self._fingerbot is None:
+            self._fingerbot, self._battery, self._battery_next = retired._fingerbot, retired._battery, retired._battery_next
+            self._fingerbot_heard_at, self._fingerbot_silent_at = retired._fingerbot_heard_at, retired._fingerbot_silent_at
+            self._battery_asked_at = retired._battery_asked_at
 
     def tidy(self) -> None:
         if (self._frames or self._fetching) and time.monotonic() - self._wanted_at > KEEPALIVE_IDLE:
@@ -1355,7 +1755,8 @@ class KvmDevice(Device):
             return token
 
     async def _request(
-        self, method: str, path: str, *, urgent: bool = False, vital: bool = True, still: Callable[[], bool] | None = None, **kwargs: Any
+        self, method: str, path: str, *, urgent: bool = False, vital: bool = True, still: Callable[[], bool] | None = None,
+        within: float | None = None, **kwargs: Any,
     ) -> httpx.Response:
         """Send an authenticated request.
 
@@ -1368,6 +1769,8 @@ class KvmDevice(Device):
         `still`: asked just before the request goes out, where signing in may have taken a while: whether
         whoever wanted it may still have it. The device may have forgotten this program and be slow to let it
         in again, and a power button is not pressed for an account that was removed half a minute ago.
+
+        `within`: the time for the whole exchange (see `bounded`); left out, what the request's own waits add up to.
         """
         if not urgent:
             self._check_backoff()
@@ -1384,7 +1787,7 @@ class KvmDevice(Device):
                 request = client.build_request(method, path, headers={"Cookie": f"auth_token={token}"}, **kwargs)
                 if still is not None and not still():
                     raise KvmError("stopped", "It was not done: whoever asked for it may no longer do that", 403)
-                resp = await self._send(client, request, limit)
+                resp = await self._send(client, request, limit, within)
             except KvmError as ex:
                 raise failed(ex) from None
             except (httpx.RemoteProtocolError, httpx.ReadError, httpx.WriteError) as ex:
@@ -1436,7 +1839,11 @@ class KvmDevice(Device):
     async def identify(self) -> dict[str, Any]:
         """Log in and read what the device says about itself. Raises KvmError if it can't."""
         await self._get_result("/api/auth/check", urgent=True)
-        version = await self._optional("/api/upgrade/version", urgent=True)
+        version = await self._glinet_version(urgent=True)
+        if self._glinet is False:
+            # Stock kvmd: what it is, and the name it goes by (the one its own page shows), are in /api/info.
+            info = await self._optional("/api/info", urgent=True)
+            return {**_stock_about(info), "hostname": plain(_dig(info, "meta", "server", "host"))}
         hostname = await self._optional("/api/system/get_hostname", urgent=True)
         return {
             "model": plain(_dig(version, "model"), 40),
@@ -1444,9 +1851,36 @@ class KvmDevice(Device):
             "hostname": plain(_dig(hostname, "hostname")),
         }
 
+    async def _glinet_version(self, urgent: bool = False, vital: bool = True) -> dict[str, Any] | None:
+        """GL.iNet's own account of the firmware (its model and version); None where there is none to have.
+
+        On the way, what the answer says of the KVM is noted (`_glinet`): a 404 is stock kvmd, which has none of
+        GL.iNet's routes; an answer of the shape GL.iNet's firmware gives is that firmware. Anything else (an error of
+        the moment, an answer of another kind) says neither, and what was known before stays as it was.
+        """
+        try:
+            resp = await self._request("GET", "/api/upgrade/version", urgent=urgent, vital=vital)
+        except KvmError as ex:
+            if ex.code != "bad_response":  # (one that sends this program on to an address that is none, say: no answer, as before)
+                raise
+            return None
+        if resp.status_code == 404:
+            self._glinet = False
+            return None
+        if resp.status_code != 200:
+            return None
+        try:
+            result = read_json(resp)["result"]
+        except (ValueError, KeyError, TypeError):
+            return None
+        if not isinstance(result, dict):
+            return None
+        self._glinet = True
+        return result
+
     # --- snapshots ----------------------------------------------------------
 
-    async def snapshot(self, width: int, fresh: float | None = None) -> Snapshot:
+    async def snapshot(self, width: int, fresh: float | None = None, big: bool = False) -> Snapshot:
         """Latest frame, at least `width` pixels wide when the source has that many.
 
         Callers wanting the same size share one device request, and so do viewers whose turns to
@@ -1544,6 +1978,11 @@ class KvmDevice(Device):
         if not (0 < wide <= MAX_PICTURE_SIDE and 0 < high <= MAX_PICTURE_SIDE and wide * high <= MAX_PICTURE_PIXELS):
             # Small to send, enormous to draw: it would be the browser that pays for looking at it.
             raise KvmError("bad_response", f"The device sent a picture of {wide} by {high} pixels, which is not shown")
+        # The KVM gave a picture: its streamer is held from now on, as a browser on its own page holds it, and not only
+        # once it was found stopped. One that somebody else's viewer had running goes on by itself for a while after that
+        # viewer has gone (kvmd: ten seconds), and then stops; held only then, the pictures broke off ("waking it up"),
+        # and came back as the KVM's own placeholder ("no live video") while its streamer started again.
+        self._start_keepalive()
         return Snapshot(
             data=resp.content,
             content_type=kind,
@@ -1551,37 +1990,208 @@ class KvmDevice(Device):
             taken_at=asked,
         )
 
+    def _keepalive_due(self) -> bool:
+        # Not for a client that was retired: nothing would stop it, and it would hold the KVM's streamer with the old
+        # session. Nor at once again after one that never got its connection: a KVM that gives pictures and refuses the
+        # line for them (or a proxy before it that passes no WebSocket on) was asked for one at every picture, thirty
+        # a second for a live line. Asked again after a pause that grows, as a device that is down is.
+        due = not self._closed and time.monotonic() >= self._keepalive_again_at
+        return due and (self._keepalive is None or self._keepalive.done())
+
     def _start_keepalive(self) -> None:
-        if self._keepalive is None or self._keepalive.done():
+        if self._keepalive_due():
             self._keepalive = asyncio.create_task(self._hold_stream_open())
+            self._keepalive.add_done_callback(self._keepalive_ended)
+
+    def _keepalive_ended(self, task: asyncio.Task[None]) -> None:
+        """An error nobody foresaw that ended the keepalive is said once a minute (as `_unexpected` says it), never left unseen."""
+        if not task.cancelled() and (error := task.exception()) is not None:
+            self._unexpected("keeping the picture's line failed", error)
+
+    async def _learn_family(self) -> None:
+        """Where it is not known yet whether the KVM has GL.iNet's routes (see `_glinet`), ask it; unknown stays unknown."""
+        try:
+            await self._read_about()
+        except KvmError:
+            pass
 
     async def _hold_stream_open(self) -> None:
-        """Stay connected to the kvmd websocket, as a browser viewer would, while the wall is watched."""
+        """Stay connected to the kvmd websocket, as a browser viewer would, while the wall is watched; and hear its power board
+        there (see EVENTS_PING)."""
         url = "ws" + self.spec.base_url[len("http"):] + "/api/ws"
+        opened_at: float | None = None
+        # Whether the KVM said anything after the first ping. One that ends the line at a ping it does not know lasted as long
+        # as the first ping took to come (EVENTS_PING, as long as KEEPALIVE_LASTS), and would be held anew at every picture.
+        # (A line this program let go of because nobody watched any more held, whatever came on it.)
+        answered = let_go = False
         try:
-            token = self._token or await self._login()
+            if self._glinet is None:
+                # Whether the session may go into the address (see `_line`): asked here, in the keepalive's own task, and
+                # not on the way to the picture that began it, which waited for the answer before it was handed over.
+                await self._learn_family()
+            token = self._token or await self._login()  # (after that question, which may have signed in anew)
             async with ws_connect(
-                # GLKVM's own web client passes the token both ways; do the same.
-                f"{url}?stream=1&auth_token={token}",
+                # GLKVM's own web client passes the token both ways; do the same, where it is known to be one (see `_line`).
+                f"{url}?stream=1" + (f"&auth_token={token}" if self._glinet is True else ""),
                 ssl=self._tls,
                 additional_headers={"Cookie": f"auth_token={token}"},
                 open_timeout=6,
                 close_timeout=1,  # a device that is gone gets no ten seconds to say goodbye in
-                max_size=2**20,  # what arrives is thrown away, but is held in memory first
+                max_size=MOST_EVENT,
+                max_queue=4,  # messages that may wait to be read; more, and the device is made to wait, not this program's memory
             ) as ws:
-                heard = Listening(ws, 2**20)
+                opened_at = asked_at = self._events_heard_at = time.monotonic()
+                heard = Listening(ws, MOST_EVENT)
                 while time.monotonic() - self._wanted_at < KEEPALIVE_IDLE:
+                    if time.monotonic() - asked_at >= EVENTS_PING:
+                        asked_at = time.monotonic()
+                        async with asyncio.timeout(EVENTS_PING):  # (never asyncio.wait_for: on Python 3.11 it can lose a stop)
+                            await ws.send(EVENT_PING)
                     try:
-                        await heard.message(5)
+                        message = await heard.message(max(0.0, asked_at + EVENTS_PING - time.monotonic()))
                     except TimeoutError:
-                        pass
+                        continue
+                    self._events_heard_at = time.monotonic()
+                    if asked_at > opened_at:
+                        answered = True  # (something came after a ping: a KVM that ended the line at its first one did not)
+                    self._heard_on_the_line(message)
+                let_go = True
         except (KvmError, OSError, WebSocketException, TimeoutError) as ex:
             # Why it ended is, for a connection the device closed, a text of the device's choosing: said as
             # one line, whatever it holds. And once a minute: a device can end one a second.
             now = time.monotonic()
             if now - self._ended_said >= SAY_AGAIN:
                 self._ended_said = now
-                log.info("%s: stream keepalive ended: %s", self.label, plain(str(ex), 200))
+                log.info("%s: stream keepalive ended: %s", self.label, plain(str(ex), 200) or type(ex).__name__)
+        finally:
+            self._board_said = None  # (what the board says is asked again from now on)
+            self._board_moved()
+            if opened_at is not None and time.monotonic() - opened_at >= KEEPALIVE_LASTS and (answered or let_go):
+                self._keepalive_fails = 0
+            else:  # (it never had its connection, or the KVM ended it at once: not begun again before a pause that grows)
+                self._keepalive_fails += 1
+                self._keepalive_again_at = time.monotonic() + min(BACKOFF_MAX, ERROR_HOLD * 2 ** min(self._keepalive_fails - 1, 10))
+
+    # --- what the power board says on the keepalive's line (see EVENTS_PING) -----
+
+    def _board_heard(self) -> dict[str, Any] | None:
+        """What the power board said last on the keepalive's line, where that line is held and was heard from of late; else None."""
+        if self._closed or self._board_said is None or self._keepalive is None or self._keepalive.done():
+            return None
+        if time.monotonic() - self._events_heard_at > EVENTS_QUIET:
+            return None
+        return self._board_said
+
+    def _board_moved(self) -> None:
+        """Whoever waits for the board's next word is told: it came, or the line it comes on ended."""
+        news, self._board_news = self._board_news, asyncio.Event()
+        news.set()
+
+    def _heard_on_the_line(self, message: str | bytes) -> None:
+        """One message on the keepalive's line: kept where it is the power board's state (an `atx` event), else let be.
+
+        Only a message that can be one is read as JSON (on the one thread there is: a line carries the KVM's other states
+        too, a megabyte each at the most). A word that says what was said before is no news: a KVM that repeated its
+        state would otherwise have the tile looked at again at every repetition, every question of the look with it.
+        """
+        if not isinstance(message, str) or len(message) > MOST_BOARD_WORD or ('"atx"' not in message and '"fingerbot"' not in message):
+            return
+        said = event_of(message)
+        if said is not None and said[0] == "fingerbot":
+            self._fingerbot_said(fingerbot_heard(said[1]))
+            return
+        if said is None or said[0] != "atx" or (board := board_heard(said[1])) is None or board == self._board_said:
+            return
+        self._board_said = board
+        self._board_words += 1
+        self._status_at = 0.0  # what the tile says may be out of date now: it is looked at again when next asked
+        self._board_moved()
+
+    def _fingerbot_said(self, there: bool | None) -> None:
+        """The KVM said whether a Fingerbot is paired with it (None: what it said is no answer, and changes nothing)."""
+        if there is None:
+            return
+        self._fingerbot_heard_at = time.monotonic()
+        if there == self._fingerbot:
+            return
+        self._fingerbot = there
+        self._fingerbot_words += 1
+        if not there:
+            # One paired anew (perhaps another) is asked soon: within FINGERBOT_BATTERY_RETRY of the last question, and not at
+            # every word of a KVM that says yes and no in turn (each question is a round trip on the Fingerbot's battery).
+            self._battery = None
+            self._battery_next = min(self._battery_next, self._battery_asked_at + FINGERBOT_BATTERY_RETRY)
+        self._status_at = 0.0  # its buttons come or go on the tile: looked at again when next asked
+
+    # --- the live line (see live.py) ------------------------------------------
+
+    def hold_stream(self) -> None:
+        """Somebody is watching the live picture: keep the KVM's streamer running, as a browser on its own page would."""
+        self._wanted_at = time.monotonic()
+        self._start_keepalive()
+
+    async def live_picture(self, size: str) -> Snapshot:
+        """One picture as the KVM gives it now, for the live line: what a tile gets, without the sharing between tiles."""
+        now = self._wanted_at = time.monotonic()
+        self._check_backoff()
+        return await self._fetch_snapshot(size, now)
+
+    async def media_line(self) -> ClientConnection:
+        """The KVM's own H.264 line (stock PiKVM's media WebSocket), signed in. KvmError `no_media` where it has none."""
+        if self._glinet is None:
+            await self._learn_family()  # (the line for events, held beside it by `hold_stream`, is to know where its session may go)
+        return await self._line("/api/media/ws", MOST_UNIT, KvmError("no_media", "The KVM has no H.264 line", 404))
+
+    async def input_line(self) -> ClientConnection:
+        """The KVM's WebSocket for keys and the mouse, signed in, and not holding its streamer (`stream=0`): that is the picture's business."""
+        refused = KvmError("not_allowed", "The KVM does not let this program send keys and the mouse", 403)
+        if self._glinet is None:
+            await self._learn_family()  # (whether the session may go in the address: see `_line`)
+        return await self._line("/api/ws?stream=0", 2**20, refused, token_in_query=self._glinet is True)
+
+    async def _line(self, path: str, most: int, refused: KvmError, token_in_query: bool = False) -> ClientConnection:
+        """A WebSocket to the KVM at `path`, signed in; signed in anew, once, where it refuses the session it gave.
+
+        `refused`: what stands where the KVM answers the handshake with anything but a session it does not take.
+        `token_in_query`: the session goes in the address as well as in the cookie, as GLKVM's own page sends it
+        to the line for events (the keepalive does the same). Not to stock kvmd, which takes the cookie and writes the
+        address of every request into its log, where the session stood for anybody who reads it; nor to a KVM not yet
+        known to be a GLKVM (its answer said neither), which may be stock kvmd; nor to the media line, which is stock kvmd's.
+        """
+        self._check_backoff()
+        relogged = False
+        while True:
+            token = self._token or await self._login()
+            await self._http()  # (how the certificate is checked is settled there)
+            url = "ws" + self.spec.base_url[len("http"):] + path + (f"&auth_token={token}" if token_in_query else "")
+            try:
+                ws = await ws_connect(
+                    url,
+                    ssl=self._tls,
+                    additional_headers={"Cookie": f"auth_token={token}"},
+                    open_timeout=6,
+                    close_timeout=1,  # a device that is gone gets no ten seconds to say goodbye in
+                    max_size=most,  # (what arrives is read through Listening, which bounds it as it comes; this is the library's own bound)
+                    max_queue=4,  # pictures that may wait to be read; more, and the device is made to wait, not this program's memory
+                )
+            except InvalidStatus as ex:
+                self._answered()
+                status = ex.response.status_code
+                if status in (401, 403):
+                    if not relogged:
+                        # The session was replaced, or ran out: once more, with a new one.
+                        relogged = True
+                        if self._token == token:
+                            self._token = None
+                        continue
+                    raise KvmError("auth_failed", "Device keeps rejecting the session") from None
+                raise KvmError(refused.code, f"{refused.message} (HTTP {status})", refused.status) from None
+            except TimeoutError as ex:
+                raise self._failed(KvmError("timeout", "Device did not respond in time", 504)) from ex
+            except (OSError, WebSocketException) as ex:
+                raise self._failed(ws_error(ex, self.spec.tls)) from ex
+            self._answered()
+            return ws
 
     # --- actions ------------------------------------------------------------
 
@@ -1592,8 +2202,20 @@ class KvmDevice(Device):
         'keys'  press the key combination `keys` on the connected computer
         'text'  type `text` on the connected computer
         'port'  show input `port` (counted from 0) of a multi-port KVM
+        'fingerbot_power', 'fingerbot_power_long'  the power button, pressed or held by a Fingerbot (FINGERBOT_PRESSES)
         """
+        if action in FINGERBOT_PRESSES:
+            await self._fingerbot_press(action, still)
+            return
         extra: dict[str, Any] = {}
+        # What the last look found the KVM has not got is not sent. (Where nothing is known yet, it is sent, and the KVM says.)
+        if action == "reboot" and self._glinet is False:
+            raise KvmError("invalid", "This KVM offers no restart of itself", 422)
+        if action == "wol" and self._glinet is False:
+            raise KvmError("invalid", "This KVM offers no Wake-on-LAN that qKVM can use", 422)
+        if action == "jiggler_on" and self._jiggler_off:
+            # (Sent all the same, kvmd answers yes and leaves it off: "done" would be said of nothing done.)
+            raise KvmError("invalid", "Keep-awake is switched off in this KVM's own settings", 422)
         if action == "port":
             if not 0 <= port < len(_dig(self._status, "ports", "list") or []):
                 raise KvmError("invalid", "This KVM has no such port", 422)
@@ -1607,6 +2229,10 @@ class KvmDevice(Device):
         elif action == "keys":
             if not KEYS.fullmatch(keys):
                 raise KvmError("invalid", "Not a valid key combination", 422)
+            if "Power" in keys.split(","):
+                # (kvmd is told the names as they come, and has the keyboard's Power key, which shuts a machine down without
+                # the question a power action is asked first: the live line does not send it either, nor does any other driver.)
+                raise KvmError("invalid", "The keyboard's Power key is not sent. A machine's power is under Power.", 422)
             path, params = "/api/hid/events/send_shortcut", {"keys": keys}
         elif action == "text":
             if not text or len(text) > MAX_TEXT:
@@ -1618,13 +2244,44 @@ class KvmDevice(Device):
             path, params = ACTIONS[action]
         else:
             raise KvmError("invalid", "This KVM cannot do that", 422)
+        before: bool | None = None  # whether the computer was on before a power button was pressed (None: not known)
+        if action in HELD and (left := self._fingerbot_turn.held()) > 0:
+            # (Two power buttons of one machine: pressed together, the one undoes the other.)
+            raise KvmError("busy", f"Its Fingerbot may still be pressing the power button: its last press got no clear answer. Try again in {int(left) + 1} seconds.", 409)
+        if action in HELD:
+            self._board_not_now()
+            extra = {"timeout": httpx.Timeout(BOARD_ANSWER, connect=WAITS.connect)}
+            try:
+                before, busy = await self._board_now(ask=True)
+            except KvmError:  # (taken away meanwhile: the press itself is refused for that below, as it was before)
+                before, busy = None, False
+            if busy:
+                raise KvmError("busy", "The KVM's power board is pressing a button at this moment (from its own page, or another program). Wait for it to finish.", 409)
+            if before is False and flag(_dig(self._status, "video", "signal")) is not False:
+                before = None  # a light that says "off" beside a picture is not wired up: it is no witness of what a press does
         try:
             resp = await self._request("POST", path, urgent=True, params=params, still=still, **extra)
+        except asyncio.CancelledError:
+            if action in HELD:
+                self._board_may_be_pressing(action)  # (qKVM stopping, or its listeners reopened: cut off while the click was on its way)
+            raise
         except KvmError as ex:
             # A KVM that is already going down may never answer its own reboot request.
             if action == "reboot" and ex.code in ("dropped", "timeout"):
                 return
+            if action in HELD and (ex is RETIRED or ex.code in ("timeout", "dropped")):
+                # (No answer in time, one that broke off, or the connection taken away meanwhile: the click may have gone out.)
+                self._board_may_be_pressing(action)
+                if ex.code == "timeout":
+                    raise KvmError("timeout", "The KVM did not say whether its board pressed the button. It may have: look at the machine before pressing again.", 504) from None
+                if ex.code == "dropped":
+                    raise KvmError("dropped", "The KVM's answer to the press broke off. It may have pressed: look at the machine before pressing again.") from None
             raise
+        if resp.status_code != 200 and action in HELD and not 400 <= resp.status_code < 500:
+            # Neither its yes nor a no: its web server's 502, 503 or 504 while kvmd restarts, or kvmd's own 500, after the board
+            # may have been told. Whether it pressed is not known, and a press is not offered again on the strength of it.
+            self._board_may_be_pressing(action)
+            raise KvmError("timeout", f"The KVM's answer to the press says neither that it pressed nor that it did not (HTTP {resp.status_code}). It may have: look at the machine before pressing again.", 504)
         if resp.status_code != 200:
             try:
                 result = read_json(resp)["result"]
@@ -1632,6 +2289,9 @@ class KvmDevice(Device):
             except (ValueError, KeyError, TypeError, AttributeError):
                 detail = None
             raise KvmError("action_failed", plain(detail, 200) or f"The device refused (HTTP {resp.status_code})")
+        if action in HELD:
+            PRESS_ANSWERED.set(True)
+            await self._let_go(action, before, self._board_words)
         if action == "port":
             # What was on screen belongs to the other computer now.
             self._frames.clear()
@@ -1641,8 +2301,272 @@ class KvmDevice(Device):
                 self._status["ports"]["active"] = port
             self._status_at = 0.0
 
+    async def _board_now(self, ask: bool = False, since: int | None = None) -> tuple[bool | None, bool]:
+        """What the KVM's power board says at this moment: whether the computer is on (None: it does not say), and whether
+        it is pressing a button. From the keepalive's line where that says the board is there (see `_board_heard`); asked
+        otherwise, and a second time where the first answer said there is no board: a Comet's board says so to whoever asks
+        while it answers somebody else (on its line for events too). One that does not answer is not asked again: it says
+        nothing.
+
+        `ask`: asked all the same, before a press. A Comet's board says `busy` for the first half second of a press, and its
+        line says the board's state as it read it last, about every second and a quarter: on a real one the line never said
+        busy, and a press from the KVM's own page half a second before went unseen there. Busy where either says so; the
+        computer's power as the answer says it, the fresher of the two.
+
+        `since`: the count of the board's words on the line (`_board_words`) at the click. What the line said before is from
+        before the press (the Comet's reading of its board may be a second and a quarter old), and is no witness of what
+        the press did: the board is asked until the line has said something since.
+        """
+        heard = self._board_heard()
+        if heard is not None and flag(heard.get("enabled")) is not True:
+            heard = None  # (a "no board" on the line: asked, as above)
+        if heard is not None and since is not None and self._board_words == since:
+            heard = None
+        if heard is not None and not ask:
+            return power_said(heard), flag(heard.get("busy")) is True
+        heard_busy = heard is not None and flag(heard.get("busy")) is True
+        for _ in range(2):
+            try:
+                atx = await self._get_result("/api/atx", urgent=True, vital=False)
+            except KvmError as ex:
+                if ex is RETIRED or self._closed:
+                    raise RETIRED.with_traceback(None) from None
+                break
+            if flag(_dig(atx, "enabled")) is True:
+                return power_said(atx), heard_busy or flag(_dig(atx, "busy")) is True
+        if heard is not None:
+            return power_said(heard), heard_busy
+        return None, False
+
+    def _board_not_now(self) -> None:
+        """Raise `busy` where the KVM's power board may still be pressing a button after a click of this program's that got
+        no clear answer (BOARD_ANSWER): whoever asks, a Fingerbot's press on the same machine too, through a client made
+        anew by an edit as well (the turn is shared)."""
+        if (left := self._fingerbot_turn.board_held()) > 0:
+            raise KvmError("busy", f"Its power board may still be pressing a button: its last press got no clear answer. Look at the machine; try again in {int(left) + 1} seconds.", 409)
+
+    def _board_may_be_pressing(self, action: str) -> None:
+        """A click of `action` came to no clear answer: the board may take it as late as now, and hold the button."""
+        turn = self._fingerbot_turn
+        turn.board_until = max(turn.board_until, time.monotonic() + BOARD_ANSWER + HELD[action])
+
+    async def _let_go(self, action: str, before: bool | None, words: int) -> None:
+        """After a power button's click was answered: wait until the board has let go of the button (HELD), and then, for a
+        press that must change the computer's power, until the board shows the change, SEEN_WITHIN at the most. Where it
+        does not, the press was made all the same, and NotSeen says what was seen instead. `words`: how many words the board
+        had said on its line when the click was answered (see `_board_now`)."""
+        await asyncio.sleep(HELD[action])
+        self._status_at = 0.0  # what the tile says may be out of date now
+        changes: dict[tuple[str, bool | None], bool] = {("atx_power", False): True, ("atx_power_long", True): False}
+        wanted = changes.get((action, before))
+        if wanted is None:
+            return  # a running system asked to shut down takes the time it takes; a reset leaves the power as it was
+        pressed = "pressed" if wanted else "held"
+        deadline = time.monotonic() + SEEN_WITHIN
+        said = False  # whether the board has said anything of the computer since
+        looking: asyncio.Task[tuple[bool | None, bool]] | None = None
+        news = self._board_news
+        while True:
+            # A look is not cut off (it may be a sign-in, or a connection being made, on a connection that stays in use:
+            # see `bounded`). One that is still under way when the time is up goes on by itself, and is not asked again.
+            if looking is None or looking.done():
+                news = self._board_news  # (taken before the look: a word that comes while it is read is not missed)
+                looking = asyncio.ensure_future(self._board_now(since=words))
+                looking.add_done_callback(_looked_at)
+            await asyncio.wait({looking}, timeout=max(0.0, deadline - time.monotonic()))
+            on: bool | None = None
+            if looking.done() and not looking.cancelled():
+                try:
+                    on = looking.result()[0]
+                except KvmError:  # (only RETIRED: the tile was edited or removed, or the wall locked itself, meanwhile)
+                    raise NotSeen(f"{pressed}; not seen: its connection ended") from None
+                looking = None
+            if on is wanted:
+                self._refresh_soon()
+                return
+            said = said or on is not None
+            if time.monotonic() >= deadline:
+                if not said:
+                    raise NotSeen(f"{pressed}; its board has not said since")
+                raise NotSeen("pressed, but the computer is still off" if wanted else "held, but the computer is still on")
+            if looking is None:
+                left = min(SEEN_EVERY, max(0.0, deadline - time.monotonic()))
+                if self._board_heard() is None:  # (no line held: asked again in a moment)
+                    await asyncio.sleep(left)
+                    continue
+                # The board's next word on its line for events, rather than the next asking: the press is answered as soon
+                # as the change is said (and the line's end is told the same way: then it is asked).
+                try:
+                    async with asyncio.timeout(left):
+                        await news.wait()
+                except TimeoutError:
+                    pass
+
+    # --- a Fingerbot paired with the KVM (see FINGERBOT_PRESSES) -------------------------------------------------
+
+    async def _fingerbot_press(self, action: str, still: Callable[[], bool] | None) -> None:
+        """Have the Fingerbot paired with the KVM press the power button, or hold it, as hard as this machine's is set to.
+
+        Done once the Comet has said the Fingerbot took the press and the press's own time has passed after that, and the
+        arm's way back: until then the machine is being done something to, and a second press is refused (by the wall's
+        one thing at a time). Only a 4xx is a no ("Press Failed" on the Comet's page: its 400, "Failed to click"), and
+        nothing was pressed as far as the Comet knows. Anything else that is not its yes (a 5xx, a proxy's page, a yes of
+        another shape, an answer that broke off, none within the time the Comet's own page gives it) may have pressed: then
+        the Fingerbot is left alone for as long as that press can last (FingerbotTurn.held_until), whoever asks.
+        """
+        seconds = FINGERBOT_PRESSES[action]
+        PRESS_SENT.set(False)
+        if self._glinet is False:
+            raise KvmError("invalid", "This KVM has no Fingerbot: that is a GL.iNet Comet's", 422)
+        self._fingerbot_not_now()
+        turn = self._fingerbot_turn
+        async with turn.lock:  # (a question of its battery under way is let finish: see FINGERBOT_BATTERY_WAIT)
+            self._fingerbot_not_now()  # (as it is now: the turn may have been waited for)
+            there: bool | None = self._fingerbot
+            if there is not True:
+                # Not said either way since qKVM started (nobody has watched its picture), or not of late: asked.
+                try:
+                    there = await self._ask_fingerbot()
+                except KvmError as ex:
+                    # (Retired meanwhile too: the KVM was only being asked, and nothing was pressed.)
+                    raise KvmError("action_failed", f"Nothing was pressed: the KVM could not be asked whether a Fingerbot is paired with it ({ex.message})") from None
+            if there is False:
+                raise KvmError("invalid", "No Fingerbot is paired with this KVM", 422)
+            if there is None:
+                self._fingerbot_silent_at = time.monotonic()
+                raise KvmError("action_failed", "Nothing was pressed: the KVM did not say whether a Fingerbot is paired with it")
+            if self._closed:
+                # The tile was edited or removed, or qKVM let go of the KVM, while it was being asked: not sent. (Said as
+                # "may have been done" where it comes later, on the way: see `_request`.)
+                raise KvmError("action_failed", "Nothing was pressed: the KVM was changed or let go of while it was being asked")
+            strength = FINGERBOT_STRENGTHS.get(self.spec.fingerbot_strength, FINGERBOT_STRENGTHS["firm"])
+
+            def may_be_pressing() -> None:
+                # What follows said neither yes nor no: the Comet may take the press as late as now (it may go on with a
+                # request whose asker gave up), and it took a second press a second into another. Nothing more goes to the
+                # Fingerbot, from whoever, for as long as a press taken now can last: an answer's time, its own and the arm's.
+                turn.held_until = max(turn.held_until, time.monotonic() + FINGERBOT_ANSWER + seconds + FINGERBOT_BACK)
+
+            PRESS_SENT.set(True)
+            try:
+                resp = await self._request(
+                    "POST", "/api/fingerbot/click", urgent=True, vital=False, still=still,
+                    params={"press_time": str(round(seconds * 1000)), "angle_enum": strength},
+                    timeout=httpx.Timeout(FINGERBOT_ANSWER + seconds, connect=WAITS.connect),
+                )  # fmt: skip
+            except asyncio.CancelledError:
+                may_be_pressing()  # (qKVM stopping, or its listeners reopened: cut off while the press was on its way)
+                raise
+            except KvmError as ex:
+                if ex is RETIRED or ex.code in ("timeout", "dropped"):
+                    may_be_pressing()
+                if ex.code == "timeout":
+                    raise KvmError("timeout", "The KVM did not say whether its Fingerbot pressed. It may have: look at the machine before pressing again.", 504) from None
+                if ex.code == "dropped":
+                    raise KvmError("dropped", "The KVM's answer to the press broke off. It may have pressed: look at the machine before pressing again.") from None
+                raise
+            try:
+                said = read_json(resp)
+            except ValueError:
+                said = None
+            if 400 <= resp.status_code < 500:
+                why = plain(_dig(said, "result", "error_msg"), 120) or plain(_dig(said, "result", "error"), 120)
+                raise KvmError("action_failed", f"The Fingerbot did not press: the KVM said \"{why}\"" if why else f"The Fingerbot did not press (the KVM answered HTTP {resp.status_code})")
+            if resp.status_code != 200 or _dig(said, "ok") is not True or _dig(said, "result", "result") != "success":
+                # Neither its yes nor a no (a 5xx: kvmd's own error, or a proxy's, after the Fingerbot may have been told; a yes
+                # of another shape): whether it pressed is not known, and a press is not offered again on the strength of it.
+                may_be_pressing()
+                raise KvmError("timeout", f"The KVM's answer to the press says neither that it pressed nor that it did not (HTTP {resp.status_code}). It may have: look at the machine before pressing again.", 504)
+            PRESS_ANSWERED.set(True)
+            await asyncio.sleep(seconds + FINGERBOT_BACK)
+        self._status_at = 0.0
+
+    def _fingerbot_not_now(self) -> None:
+        """Raise what stands against a press of the Fingerbot at this moment, where something does: one that may still be
+        pressing, or a word of the KVM's of a moment ago (FINGERBOT_ASK_AGAIN) that none is paired, or nothing said."""
+        if (left := self._fingerbot_turn.held()) > 0:
+            raise KvmError("busy", f"The Fingerbot may still be pressing: the last press got no clear answer. Try again in {int(left) + 1} seconds.", 409)
+        self._board_not_now()  # (two power buttons of one machine: pressed together, the one undoes the other)
+        now = time.monotonic()
+        if self._fingerbot is False and now - self._fingerbot_heard_at < FINGERBOT_ASK_AGAIN:
+            # As it said a moment ago. Not asked again on a line of its own, which may wake its computer, for a press that is
+            # not made: where one has been paired since, it says so on the line held while its picture is watched, or when
+            # it is asked again a while later.
+            raise KvmError("invalid", "No Fingerbot is paired with this KVM", 422)
+        if self._fingerbot is not True and now - self._fingerbot_silent_at < FINGERBOT_ASK_AGAIN:
+            left = FINGERBOT_ASK_AGAIN - (now - self._fingerbot_silent_at)
+            raise KvmError("action_failed", f"Nothing was pressed: the KVM did not say whether a Fingerbot is paired with it when it was asked a moment ago. It is asked again in {int(left) + 1} seconds, or as soon as its picture is watched.")
+
+    async def _ask_fingerbot(self) -> bool | None:
+        """Whether a Fingerbot is paired with the KVM, asked on a line of its own to the KVM's events, which is the only way
+        it says that: its `fingerbot` event, waited for FINGERBOT_ASK_WITHIN seconds. None where it said nothing in that
+        time; KvmError where the line could not be had."""
+        if self._glinet is None:
+            await self._learn_family()
+        if self._glinet is False:
+            return False  # (stock kvmd: no Fingerbot, and no line opened to ask it)
+        ws = await self._line(
+            "/api/ws?stream=0", MOST_EVENT, KvmError("not_allowed", "The KVM does not let this program hear its events", 403), token_in_query=True
+        )
+        try:
+            heard = Listening(ws, MOST_EVENT)
+            until = time.monotonic() + FINGERBOT_ASK_WITHIN
+            while True:
+                message = await heard.message(until - time.monotonic())
+                if isinstance(message, str) and len(message) <= MOST_BOARD_WORD and '"fingerbot"' in message:
+                    said = event_of(message)
+                    if said is not None and said[0] == "fingerbot" and (there := fingerbot_heard(said[1])) is not None:
+                        self._fingerbot_said(there)
+                        return there
+        except (TimeoutError, KvmError, OSError, WebSocketException):
+            return None
+        finally:
+            # Closed to the end in a task of its own: this one may be being stopped (qKVM stopping), and nothing that must
+            # finish is waited for there. (See close: such a task is stopped with the client.)
+            closing = asyncio.ensure_future(ws.close())
+            self._owed.add(closing)
+            closing.add_done_callback(self._owed.discard)
+            closing.add_done_callback(_looked_at)
+
+    def _battery_soon(self) -> None:
+        """Have the Fingerbot's battery asked in the background, where one is paired and it is time (FINGERBOT_BATTERY_EVERY)."""
+        turn = self._fingerbot_turn
+        if self._closed or self._fingerbot is not True or time.monotonic() < self._battery_next or turn.lock.locked() or turn.held() > 0:
+            return
+        if self._battery_task is not None and not self._battery_task.done():
+            return
+        self._battery_asked_at = time.monotonic()
+        self._battery_next = self._battery_asked_at + FINGERBOT_BATTERY_RETRY  # (sooner once it has answered: see _read_battery)
+        self._battery_task = asyncio.create_task(self._read_battery())
+        self._battery_task.add_done_callback(self._battery_ended)
+
+    async def _read_battery(self) -> None:
+        async with self._fingerbot_turn.lock:
+            if self._fingerbot_turn.held() > 0:
+                return  # (a press with no clear answer came first: the Fingerbot may be pressing)
+            try:
+                # (Waited for FINGERBOT_BATTERY_WAIT, and the whole of it not much longer: a person's press waits for it.)
+                waits = httpx.Timeout(FINGERBOT_BATTERY_WAIT, connect=WAITS.connect)
+                resp = await self._request("GET", "/api/fingerbot/battery", vital=False, timeout=waits, within=FINGERBOT_BATTERY_WAIT + (WAITS.connect or 0.0))
+                result = read_json(resp)["result"] if resp.status_code == 200 else None
+            except (KvmError, ValueError, KeyError, TypeError):
+                return  # (asked again after FINGERBOT_BATTERY_RETRY; what it said before stays)
+        battery = battery_said(result)
+        if battery is not None and self._fingerbot is True:
+            self._battery = battery
+            self._battery_next = time.monotonic() + FINGERBOT_BATTERY_EVERY
+            self._fingerbot_words += 1  # (a look under way now would mark the tile fresh without it)
+            self._status_at = 0.0
+
+    def _battery_ended(self, task: asyncio.Task[None]) -> None:
+        """An error nobody foresaw is said once a minute (as `_unexpected` says it), never left unseen."""
+        if not task.cancelled() and (error := task.exception()) is not None:
+            self._unexpected("asking the Fingerbot's battery failed", error)
+
     async def wol_targets(self) -> list[dict[str, str]]:
         """Machines the KVM has saved for Wake-on-LAN (GLKVM only)."""
+        if self._glinet is False:
+            return []  # (stock kvmd has no such list: asked, it says 404)
         result = await self._optional("/api/wol/list", urgent=True)
         targets = []
         devices = _dig(result, "devices")
@@ -1656,8 +2580,9 @@ class KvmDevice(Device):
     # --- status -------------------------------------------------------------
 
     async def _read_about(self) -> dict[str, Any]:
-        if not self._about or time.monotonic() - self._about_at > ABOUT_TTL:
-            version = await self._optional("/api/upgrade/version", vital=False)
+        # (Asked again sooner while its answer said neither family: one error of the moment is not ten minutes of not knowing.)
+        if not self._about or time.monotonic() - self._about_at > (ABOUT_TTL if self._glinet is not None else ABOUT_RETRY):
+            version = await self._glinet_version(vital=False)  # (stock kvmd's is read from /api/info, at every look: see _read_status)
             self._about = {"model": plain(_dig(version, "model"), 40), "version": plain(_dig(version, "version"), 40)}
             self._about_at = time.monotonic()
         return self._about
@@ -1669,6 +2594,25 @@ class KvmDevice(Device):
         ports = _ports_from(await self._optional("/api/switch", vital=False))
         self._single_port_at = time.monotonic() if ports is None else None
         return ports
+
+    async def _refresh_status(self) -> None:
+        # A word of the board on its line that comes while a look is under way may come after the look read the board,
+        # and the look's end would mark the tile fresh with what was said before it: until the next look, four seconds
+        # on, or fifteen for the alerts. Looked at again when next asked, then.
+        words = self._board_words, self._fingerbot_words
+        await super()._refresh_status()
+        if (self._board_words, self._fingerbot_words) != words:
+            self._status_at = 0.0
+
+    async def _board_word(self) -> Any:
+        """What the power board says, for a look: as the keepalive's line said it last, where that line is held, was heard
+        from of late and says the board is there; asked otherwise. A Comet's line says "no board" while the board answers
+        somebody else's questions at /api/atx (a real one, for as long as two others asked), which says nothing of the board:
+        then it is asked here as well, and may answer this asker (and where it says "no board" too, see BOARD_KEPT)."""
+        heard = self._board_heard()
+        if heard is not None and flag(heard.get("enabled")) is True:
+            return heard
+        return await self._get_result("/api/atx", vital=False)
 
     async def _read_status(self) -> dict[str, Any]:
         try:
@@ -1691,7 +2635,7 @@ class KvmDevice(Device):
         info, hid, atx, about, ports = await asyncio.gather(
             self._get_result("/api/info", vital=False),
             self._get_result("/api/hid", vital=False),
-            self._get_result("/api/atx", vital=False),
+            self._board_word(),
             self._read_about(),
             self._read_ports(),
             return_exceptions=True,
@@ -1704,6 +2648,19 @@ class KvmDevice(Device):
         width = number(_dig(source, "resolution", "width"), 1, 100_000)
         self._source_width = width if isinstance(width, int) else None
         signal = flag(signal)
+        # The power board, and what it says of the computer: only from an answer in which it says it is there. One that
+        # says it is not, or that did not come, from a KVM whose board was there a moment ago leaves the buttons where
+        # they are and keeps what the board said last of the computer, for a while (a Comet's board says "none" and
+        # "off" to whoever asks while it answers somebody else).
+        board = flag(_dig(atx, "enabled")) is True
+        now = time.monotonic()
+        started = False  # the board saw the computer come on since the last look
+        if board:
+            said = power_said(atx)
+            started = said is True and self._power_seen[1] is False
+            self._board_at, self._power_seen = now, (now, said)
+        has_atx = board or (self._board_at is not None and now - self._board_at < BOARD_KEPT)
+        power = self._power_seen[1] if has_atx and now - self._power_seen[0] < POWER_KEPT else None
         keyboard, mouse = flag(_dig(hid, "keyboard", "online")), flag(_dig(hid, "mouse", "online"))
         active = ports.get("active") if isinstance(ports, dict) else None
         if active is not None and active != self._port_seen:
@@ -1712,13 +2669,37 @@ class KvmDevice(Device):
             # Shift): that is not knowing, and is told as not knowing, not as a cable that is out.
             self._usb_unsure = self._port_seen is not None
             self._port_seen = active
+        if started:
+            # So does a Comet after the computer behind it came on: "no keyboard" until the first key (a real one,
+            # 2026-10-14, at the computer's sign-in screen; the first Shift found it).
+            self._usb_unsure = True
         if keyboard is True:
             self._usb_unsure = False
         elif self._usb_unsure:
             keyboard = mouse = None
+        has_ports = isinstance(ports, dict)
+        if self._glinet is False:
+            about = _stock_about(info)  # (stock kvmd says what it is in /api/info, which is read anyway)
+        if isinstance(hid, dict):
+            # Stock kvmd says whether keep-awake is enabled in its settings. Where it is not, switching it on is answered
+            # with a yes, and nothing is switched. (Only a plain false says so: anything else is no answer.)
+            self._jiggler_off = flag(_dig(hid, "jiggler", "enabled")) is False
+            self._mouse_absolute = flag(_dig(hid, "mouse", "absolute"))
+        glinet = self._glinet is not False  # (as `act` has it: refused only where the KVM said it has no such thing)
+        fingerbot = self._fingerbot is True and glinet  # (as the KVM said last on a line to its events: see _heard_on_the_line)
+        if fingerbot:
+            self._battery_soon()
         return {
             "state": "no_signal" if signal is False else "online",
             "error": None,
+            # What this one can be asked, beside what every KVM can: Wake-on-LAN and its own restart unless it said it has not got
+            # GL.iNet's routes for them, the power and reset buttons where it has a power board, and another input where it has several.
+            "can": can_do(
+                *(word for word in self.can if not (word == "jiggler" and self._jiggler_off)),
+                "wol" if glinet else None, "reboot" if glinet else None,
+                "power" if has_atx else None, "reset" if has_atx else None, "ports" if has_ports else None,
+                "fingerbot" if fingerbot else None,
+            ),
             "video": {
                 "signal": signal,
                 "width": width,
@@ -1727,15 +2708,19 @@ class KvmDevice(Device):
             },
             "usb": {"keyboard": keyboard, "mouse": mouse},
             "atx": {
-                "enabled": flag(_dig(atx, "enabled")) is True,
-                "power": flag(_dig(atx, "leds", "power")),
-                "hdd": flag(_dig(atx, "leds", "hdd")),
+                "enabled": has_atx,
+                "power": power,
+                "hdd": flag(_dig(atx, "leds", "hdd")) if board else None,
             },
+            # A Fingerbot paired with the KVM, which presses the power button (`fingerbot` in `can`): its battery in percent
+            # (null until it was asked, or where it was no number), and whether that is low. Null without one. It says
+            # nothing of the computer's power.
+            "fingerbot": {"battery": self._battery, "low": None if self._battery is None else self._battery < FINGERBOT_LOW} if fingerbot else None,
             "health": {
                 "temp": number(_dig(health, "temp", "cpu"), -100, 300),
                 "cpu": number(_dig(health, "cpu", "percent"), 0, 100),
                 "mem": number(_dig(health, "mem", "percent"), 0, 100),
             },
             "about": {"model": _dig(about, "model"), "version": _dig(about, "version")},
-            "ports": ports if isinstance(ports, dict) else None,
+            "ports": ports if has_ports else None,
         }

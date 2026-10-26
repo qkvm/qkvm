@@ -24,6 +24,7 @@ from qkvm.store import Store, StoreError
 from tests.fake_kvm import FakeKvm
 from tests.test_totp import switch_on
 from tests.test_wall import CSRF, PASSWORD, add, closed_port, snap, wall
+from tests.settings_file import settings_text, write_settings_text
 
 
 @pytest.fixture(autouse=True)
@@ -43,9 +44,9 @@ def test_the_certificate_dialog_of_a_tile_whose_certificate_is_damaged_is_the_wa
         with wall(tmp_path / "wall") as admin:
             tile = add(admin, device.url, name="Build server")
             real = admin.get("/api/v1/wall").json()["devices"][0]["fingerprint"]
-        saved = json.loads((tmp_path / "wall" / "qkvm.json").read_text(encoding="utf-8"))
+        saved = json.loads(settings_text(tmp_path / "wall" / "qkvm.json", encoding="utf-8"))
         saved["devices"][0]["cert_pem"] = saved["devices"][0]["cert_pem"][:400]  # cut short
-        (tmp_path / "wall" / "qkvm.json").write_text(json.dumps(saved), encoding="utf-8")
+        write_settings_text(tmp_path / "wall" / "qkvm.json", json.dumps(saved), encoding="utf-8")
         (tmp_path / "wall" / "qkvm.bak").unlink()
         before = device.state.logins
         with wall(tmp_path / "wall") as admin:
@@ -96,9 +97,9 @@ def edited(folder: Path, change: Any) -> None:
     with wall(folder) as admin:
         add(admin, f"http://127.0.0.1:{closed_port()}", force=True, kind="kvmd", name="The one device")
     for name in ("qkvm.json", "qkvm.bak"):
-        saved = json.loads((folder / name).read_text(encoding="utf-8"))
+        saved = json.loads(settings_text(folder / name, encoding="utf-8"))
         change(saved)
-        (folder / name).write_text(json.dumps(saved), encoding="utf-8")
+        write_settings_text(folder / name, json.dumps(saved), encoding="utf-8")
 
 
 def test_allowed_host_names_with_something_among_them_that_is_no_name_are_not_used(tmp_path: Path) -> None:

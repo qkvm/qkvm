@@ -10,6 +10,8 @@ import time
 from collections.abc import AsyncIterator, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -24,6 +26,7 @@ from tests.test_alerts import Inbox, baseline
 from tests.test_hardening import LiveWall
 from tests.test_users import OTHER, account, browser, visitor
 from tests.test_wall import CSRF, PASSWORD, add, snap, wait_until, wall
+from tests.settings_file import settings_text
 
 
 @pytest.fixture(autouse=True)
@@ -54,7 +57,11 @@ def spec(url: str) -> DeviceSpec:
 
 
 def test_a_kvm_that_went_silent_holds_up_no_tile(tmp_path: Path, fake: FakeKvm, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(kvm, "WAITS", httpx.Timeout(0.5))
+    # (A request that went to the KVM would take as long as giving up on it takes, `give_up`; one answered from what is known
+    # takes a round trip through the wall. Half a second against 0.4 left a busy computer no room: one request took 0.77 s.
+    # So giving up takes two seconds here, and a request that waited would take at least that.)
+    give_up = 2.0
+    monkeypatch.setattr(kvm, "WAITS", httpx.Timeout(give_up))
     monkeypatch.setattr(kvm, "ERROR_HOLD", 1.0)
     monkeypatch.setattr(kvm, "FIRST_CONTACT_WAIT", 0.1)
     with wall(tmp_path) as client:
@@ -64,12 +71,12 @@ def test_a_kvm_that_went_silent_holds_up_no_tile(tmp_path: Path, fake: FakeKvm, 
         assert client.get(snap(device)).json()["code"] == "timeout"  # the one request that finds out
 
         # From here on its tile is answered from what is known. Had each request gone to the KVM
-        # to see for itself, each would have taken the half second it takes to give up.
+        # to see for itself, each would have taken the time it takes to give up.
         asked = fake.state.requests
-        began = time.monotonic()
         for _ in range(10):
+            began = time.monotonic()
             assert client.get(snap(device)).json()["code"] == "timeout"
-        assert time.monotonic() - began < 0.4
+            assert time.monotonic() - began < give_up / 2
         assert fake.state.requests == asked  # nobody even looks before the pause after the failure is over
 
         # When it is, the status refresh looks, in the background. The first such look gets a moment
@@ -78,8 +85,8 @@ def test_a_kvm_that_went_silent_holds_up_no_tile(tmp_path: Path, fake: FakeKvm, 
         for _ in range(2):
             began = time.monotonic()
             assert client.get(snap(device)).json()["code"] == "timeout"
-            assert time.monotonic() - began < 0.4
-            time.sleep(0.7)  # the look gives up after half a second
+            assert time.monotonic() - began < give_up / 2
+            time.sleep(give_up + 0.2)  # the look gives up after `give_up`
         assert 1 <= fake.state.requests - asked <= 2
 
         fake.state.stall = 0  # and that refresh is what notices that it is back
@@ -91,12 +98,14 @@ def test_one_request_that_failed_does_not_black_out_a_kvm_that_is_there(
 ) -> None:
     monkeypatch.setattr(kvm, "ERROR_HOLD", 0.2)
     monkeypatch.setattr(kvm, "STATUS_TTL", 30)  # nothing else looks at the KVM during this test
-    monkeypatch.setattr(kvm, "WAITS", httpx.Timeout(0.3))
+    # (Every request is given two seconds, the press that hangs thirty: given 0.3 s, a busy computer's ordinary answer
+    # took longer, and the picture asked for after it was a 504.)
+    monkeypatch.setattr(kvm, "WAITS", httpx.Timeout(2.0))
     with wall(tmp_path) as client:
         device = add(client, fake.url)
         assert client.get(snap(device)).status_code == 200
         assert client.get("/api/v1/status").json()[device]["state"] == "online"
-        fake.state.slow["/api/hid/events/send_shortcut"] = 5  # the KVM is slow to press keys, this once
+        fake.state.slow["/api/hid/events/send_shortcut"] = 30  # the KVM is slow to press keys, this once
         pressed = client.post(f"/api/v1/devices/{device}/actions", json={"action": "ctrl_alt_del"})
         assert pressed.json()["code"] == "timeout"
         fake.state.slow.clear()
@@ -109,13 +118,15 @@ def test_a_detail_of_the_status_that_hangs_does_not_take_the_pictures_away(
     tmp_path: Path, fake: FakeKvm, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(kvm, "ERROR_HOLD", 1.0)
-    monkeypatch.setattr(kvm, "WAITS", httpx.Timeout(0.3))
+    # (Every request is given two seconds, the detail that hangs thirty, and the page looks for three times the two: given
+    # 0.3 s, a busy computer's ordinary answer took longer, and a picture was a 504.)
+    monkeypatch.setattr(kvm, "WAITS", httpx.Timeout(2.0))
     with wall(tmp_path) as client:
         device = add(client, fake.url)
         assert client.get(snap(device)).status_code == 200
-        fake.state.slow["/api/atx"] = 5  # one of the things the status is made of never arrives in time
+        fake.state.slow["/api/atx"] = 30  # one of the things the status is made of never arrives in time
         began = time.monotonic()
-        while time.monotonic() - began < 2.0:  # the page: status and pictures, over and over
+        while time.monotonic() - began < 6.0:  # the page: status and pictures, over and over
             assert client.get("/api/v1/status").json()[device]["state"] == "online"
             assert client.get(snap(device)).status_code == 200
             time.sleep(0.1)
@@ -187,9 +198,17 @@ def test_requests_waiting_for_a_connection_do_not_go_out_once_the_kvm_is_retired
         device = KvmDevice(spec(fake.url))
         await device.snapshot(640)  # signed in, and the status is known
         fake.state.stall = 30
+        before = fake.state.requests
         asking = [asyncio.ensure_future(device._get_result("/api/info", urgent=True)) for _ in range(14)]
-        await asyncio.sleep(0.4)
-        reached = fake.state.requests  # eight are with the KVM, six wait for one of the eight connections
+        # Eight are with the KVM, six wait for one of the eight connections. (Waited for: after a fixed 0.4 s a busy
+        # computer had only seven there, and the eighth, on its way already, reached the KVM after the count was taken.)
+        for _ in range(3000):
+            if fake.state.requests - before >= 8:
+                break
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.2)  # (and a moment for a ninth, which must not come)
+        reached = fake.state.requests
+        assert reached - before == 8, f"{reached - before} requests reached the KVM, of fourteen over eight connections"
         await device.close()
         fake.state.stall = 0  # the eight are let go: connections come free
         answers = await asyncio.gather(*asking, return_exceptions=True)
@@ -296,7 +315,7 @@ def test_an_account_that_lost_its_rights_while_a_kvm_was_slow_adds_nothing(tmp_p
         # Allowed when the request came in, no longer allowed when it was time to change something.
         assert reply.status_code == (403 if meanwhile == "demoted" else 401), reply.text
         assert admin.get("/api/v1/wall").json()["devices"] == []
-        assert json.loads((tmp_path / "qkvm.json").read_text())["devices"] == []
+        assert json.loads(settings_text(tmp_path / "qkvm.json"))["devices"] == []
 
 
 def test_the_same_kvm_added_twice_at_once_ends_up_on_the_wall_once(tmp_path: Path, fake: FakeKvm) -> None:
@@ -309,7 +328,7 @@ def test_the_same_kvm_added_twice_at_once_ends_up_on_the_wall_once(tmp_path: Pat
             replies = list(pool.map(lambda browser: browser.post("/api/v1/devices", json=new), [admin, other]))
         assert sorted(reply.status_code for reply in replies) == [201, 409]
         assert len(admin.get("/api/v1/wall").json()["devices"]) == 1
-        assert len(json.loads((tmp_path / "qkvm.json").read_text())["devices"]) == 1
+        assert len(json.loads(settings_text(tmp_path / "qkvm.json"))["devices"]) == 1
 
 
 def test_settings_written_from_many_threads_at_once_stay_whole(tmp_path: Path) -> None:
@@ -336,7 +355,7 @@ def test_a_certificate_trusted_on_first_contact_is_saved(tmp_path: Path) -> None
     device = FakeKvm(tls_dir=tmp_path / "cert")  # has its address, but is not switched on yet
 
     def saved() -> str | None:
-        return json.loads((tmp_path / "data" / "qkvm.json").read_text())["devices"][0]["cert_pem"]  # type: ignore[no-any-return]
+        return json.loads(settings_text(tmp_path / "data" / "qkvm.json"))["devices"][0]["cert_pem"]  # type: ignore[no-any-return]
 
     with wall(tmp_path / "data") as client:
         added = add(client, device.url, force=True)
@@ -366,42 +385,86 @@ def test_viewers_that_refresh_slowly_share_a_picture(tmp_path: Path, fake: FakeK
         assert kvm.share_window(3600) == kvm.MAX_SHARED_AGE  # however long is asked for, a picture is never that stale
 
 
-def test_a_viewer_on_a_slow_link_is_not_handed_its_own_last_picture(tmp_path: Path, fake: FakeKvm) -> None:
+def test_a_viewer_on_a_slow_link_is_not_handed_its_own_last_picture(
+    tmp_path: Path, fake: FakeKvm, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Control only the device clock: HTTP scheduling before snapshot() starts must
+    # not consume the 0.1-second margin between the cache age and the next turn.
+    clock = [time.monotonic()]
+    monkeypatch.setattr(kvm, "time", SimpleNamespace(monotonic=lambda: clock[0], time=time.time))
+    original = KvmDevice._fetch_snapshot
+
+    async def delayed(device: KvmDevice, size: str, asked: float) -> kvm.Snapshot:
+        clock[0] += 0.3  # delivery takes time; the frame must retain its request time
+        return await original(device, size, asked)
+
+    monkeypatch.setattr(KvmDevice, "_fetch_snapshot", delayed)
     with wall(tmp_path) as client:
         device = add(client, fake.url)
-        fake.state.slow_snapshot = 0.3  # the KVM is far away
-        began = time.monotonic()
+        began = clock[0]
         assert client.get(snap(device), params={"age": 0.4}).status_code == 200
-        time.sleep(max(0.0, began + 0.5 - time.monotonic()))  # the tile's next turn, half a second after the first
+        assert len(fake.state.snapshot_queries) == 1
+        clock[0] = began + 0.5
         assert client.get(snap(device), params={"age": 0.4}).status_code == 200
-        # The first picture arrived 0.2 s ago but was asked for 0.5 s ago: too old to pass off as a new one.
+        # Delivered 0.2 s ago, requested 0.5 s ago: the next turn needs a new frame.
         assert len(fake.state.snapshot_queries) == 2
 
 
 def test_a_kvm_that_is_slow_with_its_picture_keeps_no_tile_waiting(
     tmp_path: Path, fake: FakeKvm, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    release = threading.Event()
+    fetching: list[KvmDevice] = []
+    original = KvmDevice._fetch_snapshot
+
+    async def held(device: KvmDevice, size: str, asked: float) -> kvm.Snapshot:
+        fetching.append(device)
+        assert await asyncio.to_thread(release.wait, 20), "picture was never released"
+        return await original(device, size, asked)
+
+    monkeypatch.setattr(KvmDevice, "_fetch_snapshot", held)
     with wall(tmp_path) as client:
-        device = add(client, fake.url)
-        assert client.get("/api/v1/status").json()[device]["state"] == "online"
-        monkeypatch.setattr(kvm, "PICTURE_PATIENCE", 0.3)
-        fake.state.slow_snapshot = 1.2
-        began = time.monotonic()
-        reply = client.get(snap(device))
-        assert (reply.status_code, reply.json()["code"]) == (503, "no_stream")  # the tile shows "connecting"
-        assert time.monotonic() - began < 0.9  # ...and its place in the browser's queue is free again
-        # While that request is with the KVM, nobody else waits for it either.
-        began = time.monotonic()
-        assert client.get(snap(device)).status_code == 503
-        assert time.monotonic() - began < 0.2
-        # It carried on by itself, and what it brought goes to whoever asks next: the KVM is asked once.
-        time.sleep(1.3)
-        assert client.get(snap(device)).status_code == 200
-        assert len(fake.state.snapshot_queries) == 1
-        # That picture has been handed out now. The next request is for a new one.
-        fake.state.slow_snapshot = 0
-        assert client.get(snap(device)).status_code == 200
-        assert len(fake.state.snapshot_queries) == 2
+        try:
+            device = add(client, fake.url)
+            assert client.get("/api/v1/status").json()[device]["state"] == "online"
+            monkeypatch.setattr(kvm, "PICTURE_PATIENCE", 0.3)
+            waiting = AsyncMock(wraps=asyncio.wait)
+            with monkeypatch.context() as patch:
+                patch.setattr(asyncio, "wait", waiting)
+                reply = client.get(snap(device))
+            assert (reply.status_code, reply.json()["code"]) == (503, "no_stream")
+            picture_waits = [call for call in waiting.await_args_list if any(
+                task.get_coro().__qualname__ == "KvmDevice._fetch" for task in call.args[0]
+            )]
+            assert len(picture_waits) == 1
+            # Subtracting monotonic timestamps can round just above the budget.
+            assert 0 < picture_waits[0].kwargs["timeout"] <= kvm.PICTURE_PATIENCE + 1e-6
+            assert len(fetching) == 1
+            machine = fetching[0]
+            pending = next(iter(machine._fetching.values()))
+            assert not pending.done()
+            # Windows timers may wake just before the monotonic deadline. Ensure
+            # it has expired before checking that later callers do not wait again.
+            deadline = next(iter(machine._fetching_since.values())) + kvm.PICTURE_PATIENCE
+            wait_until(lambda: time.monotonic() >= deadline, "picture budget did not expire")
+            waiting.reset_mock()
+            with monkeypatch.context() as patch:
+                patch.setattr(asyncio, "wait", waiting)
+                assert client.get(snap(device)).status_code == 503
+            assert not any(
+                task.get_coro().__qualname__ == "KvmDevice._fetch"
+                for call in waiting.await_args_list for task in call.args[0]
+            )
+            assert not pending.done()
+            assert len(fetching) == 1
+            release.set()
+            wait_until(pending.done, "released picture did not finish")
+            assert client.get(snap(device)).status_code == 200
+            assert len(fake.state.snapshot_queries) == 1
+            assert client.get(snap(device)).status_code == 200
+            assert len(fake.state.snapshot_queries) == 2
+        finally:
+            release.set()
 
 
 def test_a_tile_whose_turn_came_late_is_not_handed_its_own_last_picture(fake: FakeKvm) -> None:

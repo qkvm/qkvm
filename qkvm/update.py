@@ -3,7 +3,7 @@
 A release is a GitHub release tagged v<version> with these files attached:
 
     qkvm-<version>-py3-none-any.whl    the program
-    SHA256SUMS                             "<sha256>  <file name>" for the wheel
+    SHA256SUMS                             "<sha256>  <file name>" for the wheel (and the source archive)
     SHA256SUMS.sig                         Ed25519 signature of SHA256SUMS, base64 (optional)
 
 An update is never unpacked over the running program. It goes into the data folder
@@ -21,13 +21,17 @@ import importlib.metadata
 import io
 import json
 import logging
+import os
+import platform
 import re
 import shutil
-import sys
+import tempfile
 import time
 import zipfile
 import zlib
+from collections.abc import Callable
 from dataclasses import dataclass
+from email.parser import Parser
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -35,6 +39,10 @@ from urllib.parse import urlsplit
 import httpx
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+from packaging.markers import UndefinedComparison
+from packaging.requirements import InvalidRequirement, Requirement
+from packaging.specifiers import InvalidSpecifier, SpecifierSet
+from packaging.version import InvalidVersion, Version
 
 from ._version import __version__
 from .kvm import public_context
@@ -66,6 +74,11 @@ REPO = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}")
 
 class UpdateError(Exception):
     """An update could not be found, trusted or installed. The message is fit to show."""
+
+
+class NoLongerAllowed(Exception):
+    """Whoever asked for an installation lost the right to it while it was under way: nothing was installed, and nothing
+    failed (the next one who may, installs it). The message is fit to show."""
 
 
 @dataclass(frozen=True)
@@ -112,25 +125,80 @@ def _checksum_for(sums: bytes, name: str) -> str:
 
 
 def _check_requirements(metadata: str) -> None:
-    """An update can replace the program's own files, not the libraries it needs."""
-    for line in metadata.splitlines():
-        key, _, value = line.partition(":")
-        value = value.strip()
-        if key == "Requires-Python" and value.startswith(">="):
-            wanted = tuple(int(part) for part in re.findall(r"\d+", value)[:2])
-            if sys.version_info[:2] < wanted:
-                raise UpdateError(f"This version needs Python {value[2:].strip()} or newer")
-        elif key == "Requires-Dist" and "extra ==" not in value:
-            name = re.match(r"[A-Za-z0-9._-]+", value)
-            if name is None:
+    """An update replaces only this program: the installed Python and active dependencies must already satisfy it."""
+    use_pip = "Install the new version with pip instead: pip install --upgrade qkvm"
+    headers = Parser().parsestr(metadata)
+    if headers.defects or len(headers.get_all("Requires-Python", [])) > 1:
+        raise UpdateError(f"The release has invalid dependency metadata. {use_pip}")
+    # Core metadata permits folded headers; the package description after the blank line is not metadata.
+    def unfolded(value: str) -> str:
+        return " ".join(value.splitlines()).strip()
+
+    try:
+        python_spec = SpecifierSet(unfolded(headers.get("Requires-Python", "")))
+        python_version = Version(platform.python_version())
+        if not python_spec.contains(python_version, prereleases=True):
+            raise UpdateError(f"This version needs Python {python_spec}; this copy runs {python_version}. {use_pip}")
+        for value in headers.get_all("Requires-Dist", []):
+            requirement = Requirement(unfolded(value))
+            # The app installs no optional extras. Evaluate the whole marker: a literal substring such as
+            # 'extra ==' may be only one branch of a condition that still applies to the base installation.
+            if requirement.marker is not None and not requirement.marker.evaluate({"extra": ""}):
                 continue
+            if requirement.url or requirement.extras:
+                # A name/version cannot prove the origin of a direct URL, or that an extra's dependencies
+                # are installed. Leave those installations to pip instead of accepting incomplete proof.
+                raise UpdateError(f"This version needs an installation of '{requirement.name}' that the in-app updater cannot verify. {use_pip}")
             try:
-                importlib.metadata.version(name.group())
+                installed = Version(importlib.metadata.version(requirement.name))
             except importlib.metadata.PackageNotFoundError:
-                raise UpdateError(
-                    f"This version needs the Python package '{name.group()}', which is not installed. "
-                    "Install the new version with pip instead: pip install --upgrade qkvm"
-                ) from None
+                raise UpdateError(f"This version needs the Python package '{requirement.name}', which is not installed. {use_pip}") from None
+            if not requirement.specifier.contains(installed, prereleases=True):
+                raise UpdateError(f"This version needs '{requirement.name}{requirement.specifier}'; installed is {installed}. {use_pip}")
+    except (InvalidRequirement, InvalidSpecifier, InvalidVersion, UndefinedComparison, KeyError, RecursionError):
+        raise UpdateError(f"The release's dependency requirements could not be verified. {use_pip}") from None
+
+
+def check_startup_requirements(package: Path, version: str) -> None:
+    """Check the selected package before it opens settings, including updates installed by an older updater."""
+    # An in-app update changes qkvm.__path__, not sys.path: looking up qkvm through importlib.metadata
+    # would find the original installation's requirements. Read the metadata beside the code being run.
+    # A source checkout or editable install has no metadata beside its source package and is left alone.
+    metadata_dir = package.parent / f"{PACKAGE}-{version}.dist-info"
+    try:
+        metadata = (metadata_dir / "METADATA").read_text(encoding="utf-8")
+    except FileNotFoundError:
+        if not metadata_dir.exists():
+            return
+        raise UpdateError("This copy is missing its package metadata. Reinstall it with: pip install --upgrade qkvm") from None
+    except (OSError, UnicodeError):
+        raise UpdateError("This copy's package metadata could not be read. Reinstall it with: pip install --upgrade qkvm") from None
+    headers = Parser().parsestr(metadata)
+    try:
+        valid = (
+            not headers.defects
+            and len(headers.get_all("Name", [])) == 1
+            and headers["Name"].strip().lower() == PACKAGE
+            and len(headers.get_all("Version", [])) == 1
+            and Version(headers["Version"].strip()) == Version(version)
+        )
+    except InvalidVersion:
+        valid = False
+    if not valid:
+        raise UpdateError("This copy's package metadata does not match its code. Reinstall it with: pip install --upgrade qkvm")
+    _check_requirements(metadata)
+
+
+def _write_private(path: Path, data: bytes) -> None:
+    """Replace an update file atomically with an owner-only file, regardless of the caller's umask."""
+    descriptor, name = tempfile.mkstemp(prefix=".qkvm-update-", dir=path.parent)
+    temporary = Path(name)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(data)
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def unpack(wheel: bytes, version: str, destination: Path) -> None:
@@ -161,16 +229,21 @@ def unpack(wheel: bytes, version: str, destination: Path) -> None:
         declared = re.search(r'__version__\s*=\s*"([^"]+)"', archive.read(f"{PACKAGE}/_version.py").decode("utf-8", "replace"))
         if declared is None or parse_version(declared.group(1)) != parse_version(version):
             raise UpdateError("The package is not the version the release says it is")
-        metadata = next((n for n in names if n.endswith(".dist-info/METADATA")), None)
-        if metadata:
-            _check_requirements(archive.read(metadata).decode("utf-8", "replace"))
+        metadata = [n for n in names if n.endswith(".dist-info/METADATA")]
+        if len(metadata) != 1:
+            raise UpdateError("The package must contain exactly one dependency metadata file")
+        _check_requirements(archive.read(metadata[0]).decode("utf-8", "replace"))
 
         staging = destination.with_name(destination.name + ".tmp")
         shutil.rmtree(staging, ignore_errors=True)
+        staging.mkdir(mode=0o700)
         for member in members:
-            target = staging.joinpath(*member.filename.split("/"))
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(archive.read(member))
+            parts = member.filename.split("/")
+            parent = staging
+            for part in parts[:-1]:
+                parent = parent / part
+                parent.mkdir(mode=0o700, exist_ok=True)
+            _write_private(parent / parts[-1], archive.read(member))
     shutil.rmtree(destination, ignore_errors=True)
     staging.rename(destination)
 
@@ -255,8 +328,10 @@ class Updater:
         except ValueError:
             return None  # a tag that is not a plain version: not something to offer
         assets = {str(a["name"]): str(a["browser_download_url"]) for a in data.get("assets", [])}
-        wheel = next((n for n in assets if n.startswith(f"{PACKAGE}-") and n.endswith(".whl")), None)
-        if wheel is None or not all(self._trusted(url) for url in assets.values()):
+        # The wheel of the tag's own version, by its exact name: never another wheel a release happens to carry (one
+        # attached to it by hand, whatever order GitHub lists its files in).
+        wheel = f"{PACKAGE}-{str(data['tag_name']).strip().removeprefix('v')}-py3-none-any.whl"
+        if wheel not in assets or not all(self._trusted(url) for url in assets.values()):
             return None
         return Release(
             version=version,
@@ -341,10 +416,13 @@ class Updater:
             raise UpdateError(f"The download failed ({status})")
         return data
 
-    async def install(self) -> str:
+    async def install(self, still: Callable[[], bool] | None = None) -> str:
         """Download the newest release, check it, and make it the version used from the next start.
 
         Returns the version installed. The running program is not touched.
+
+        `still`: whether whoever asked may still have it installed, asked once the download is in and checked, right before
+        anything is written (the download takes seconds, and more on a slow line): NoLongerAllowed where not.
         """
         release = self.latest
         if release is None or not self.available:
@@ -368,7 +446,12 @@ class Updater:
                 wheel = await self._download(client, release.wheel_url, MAX_WHEEL)
             if hashlib.sha256(wheel).hexdigest() != _checksum_for(sums, release.wheel_name):
                 raise UpdateError("The download does not match its checksum")
+            if still is not None and not still():
+                raise NoLongerAllowed("It was not installed: whoever asked for it may no longer do that")
             await asyncio.to_thread(self._activate, release.version, wheel)
+        except NoLongerAllowed:
+            self.state = "idle"  # (nothing was written, and nothing failed)
+            raise
         except UpdateError as ex:
             self._failed(ex)
         except httpx.HTTPError:
@@ -384,7 +467,9 @@ class Updater:
         return release.version
 
     def _activate(self, version: str, wheel: bytes) -> None:
-        self.directory.mkdir(parents=True, exist_ok=True)
+        self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if os.name == "posix":
+            self.directory.chmod(0o700)
         unpack(wheel, version, self.directory / version)
         pointer = self.directory / "current.json"
         try:
@@ -394,11 +479,9 @@ class Updater:
             previous, ran = None, False
         if not isinstance(previous, str):
             previous, ran = None, False  # (what is written below is a version's name or nothing: never whatever stood there)
-        tmp = pointer.with_suffix(".tmp")
         # (Whether the one before got through its first half minute is kept with it: the starter goes back to
         # it as a version that ran, or as one that is still on trial. See __main__.roll_back.)
-        tmp.write_text(json.dumps({"version": version, "previous": previous, "previous_proven": ran}), encoding="utf-8")
-        tmp.replace(pointer)
+        _write_private(pointer, json.dumps({"version": version, "previous": previous, "previous_proven": ran}).encode("utf-8"))
         # Keep the new version and the one to fall back to; older ones only take up space.
         for entry in self.directory.iterdir():
             if entry.is_dir() and entry.name not in (version, previous):

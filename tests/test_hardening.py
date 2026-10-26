@@ -626,9 +626,10 @@ def test_a_connection_that_asks_for_nothing_is_not_kept_for_ever(tmp_path: Path,
         assert browser.get("/healthz").status_code == 200
         time.sleep(1.0)
         assert browser.get("/healthz").json()["status"] == "ok"
-        # There is nothing in qKVM that is talked to over a websocket, and so no way in for one.
+        # One thing in qKVM is talked to over a websocket, the live line (live.py, tests/test_live.py), and it is let in
+        # by a pass of its own; a websocket to anything else is refused before any of the program is reached.
         upgrade = {"Connection": "Upgrade", "Upgrade": "websocket", "Sec-WebSocket-Version": "13", "Sec-WebSocket-Key": "dGhlIHNhbXBsZSBub25jZQ=="}
-        assert browser.get("/api/ws", headers=upgrade).status_code in (401, 404)
+        assert browser.get("/api/ws", headers=upgrade).status_code == 403
 
 
 # --- who may come, and how -----------------------------------------------------------------------------
@@ -880,12 +881,16 @@ def test_an_answer_that_is_not_taken_is_not_waited_with_for_ever(monkeypatch: py
     monkeypatch.setattr(cli, "STALLED_AFTER", 0.1)
 
     class Line(asyncio.Transport):
-        def __init__(self, waiting: int) -> None:
+        """What waits on a connection whose caller takes `pace` bytes a second of it, by the clock: what is taken is so
+        whenever the program looks. (Taken a little at each of the test's own turns of the loop, a busy computer held
+        the loop past the program's look, nothing was taken by then, and the slow caller was let go of.)"""
+
+        def __init__(self, waiting: int, pace: float) -> None:
             super().__init__()
-            self.waiting, self.dropped = waiting, False
+            self.waiting, self.pace, self.began, self.dropped = waiting, pace, time.monotonic(), False
 
         def get_write_buffer_size(self) -> int:
-            return self.waiting
+            return max(0, self.waiting - int(self.pace * (time.monotonic() - self.began)))
 
         def is_closing(self) -> bool:
             return self.dropped
@@ -899,22 +904,20 @@ def test_an_answer_that_is_not_taken_is_not_waited_with_for_ever(monkeypatch: py
     async def nothing(scope: Any, receive: Any, send: Any) -> None:
         return None
 
-    async def handed_over(taken_each_time: int) -> bool:
+    async def handed_over(pace: float) -> bool:
         """Whether a connection with 200,000 bytes waiting is still there after half a second."""
         config = uvicorn.Config(nothing, **cli.SERVER_OPTIONS)
-        line, http = Line(200_000), cli.Http(config, ServerState(), {})
+        line, http = Line(200_000, pace), cli.Http(config, ServerState(), {})
         http.connection_made(line)
         http.pause_writing()  # what the system says when more is waiting than it keeps ready
-        for _ in range(25):
-            await asyncio.sleep(0.02)
-            line.waiting = max(0, line.waiting - taken_each_time)
+        await asyncio.sleep(0.5)
         http.connection_lost(None)
         return not line.dropped
 
     assert asyncio.run(handed_over(0)) is False  # takes nothing: let go
-    assert asyncio.run(handed_over(20)) is False  # a few bytes now and then, to look alive: let go
-    assert asyncio.run(handed_over(5_000)) is True  # slow, and getting there: waited for
-    assert asyncio.run(handed_over(50_000)) is True  # took it all: nothing to wait for
+    assert asyncio.run(handed_over(1_000)) is False  # a few bytes now and then, to look alive: let go
+    assert asyncio.run(handed_over(250_000)) is True  # slow, and getting there: waited for
+    assert asyncio.run(handed_over(2_500_000)) is True  # took it all: nothing to wait for
 
 
 def test_https_said_at_start_is_what_is_served(tmp_path: Path) -> None:

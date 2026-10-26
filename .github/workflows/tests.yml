@@ -7,6 +7,7 @@ name: Tests
 on:
   push:
   pull_request:
+  workflow_dispatch:
   schedule:
     - cron: "17 5 * * 1"  # Mondays: a library can get a known hole without anything changing here
 
@@ -16,6 +17,7 @@ permissions:
 jobs:
   tests:
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -31,7 +33,7 @@ jobs:
       - name: Install
         run: python -m pip install . pytest
       - name: Test
-        run: python -m pytest -q
+        run: python -m pytest -v --full-trace
 
   # The checks a developer runs, in the versions named here: a new release of a checker that finds
   # fault where the one before did not is taken up on purpose, and not met as a red run.
@@ -50,6 +52,18 @@ jobs:
         run: python -m ruff check .
       - name: Types
         run: python -m mypy
+      - name: Container policy regression tests
+        run: python .github/security/test-container-policy.py
+      - name: Release CI policy regression tests
+        run: python .github/security/test-required-ci.py
+      - name: Published image digest regression tests
+        run: python .github/security/test-image-digests.py
+      - name: Source archive regression tests
+        run: python .github/security/test-sdist.py
+      - name: Bundled native library gate regression tests
+        run: python .github/security/test-native-versions.py
+      - name: Moving image tag regression tests
+        run: python .github/security/test-newest-release.py
 
   # The page itself, run in a real browser against stand-in KVMs: what a person presses, and what they
   # then see; and, in a second file, against the program as it is started (an update, a restart onto HTTPS). Playwright and its browser are for this job only and nothing a wall is installed with; in
@@ -69,7 +83,32 @@ jobs:
           python -m pip install . pytest playwright==1.63.0
           python -m playwright install --with-deps chromium
       - name: The page, in a browser
-        run: python -m pytest -q tests/test_in_a_browser.py tests/test_in_a_browser_with_the_program_itself.py
+        run: python -m pytest -q tests/*browser*.py
+
+  # The RFB reader against real VNC servers: TigerVNC's Xvnc with a terminal in it (what is typed is read back
+  # from a file, the pointer's place is asked of the X server), and QEMU's own server showing its firmware's
+  # screen (compared with the screenshot QEMU takes of itself). Both servers are installed for this job only and
+  # are nothing a wall is installed with; the test file skips itself where QKVM_REAL_VNC is not set. (`vncpasswd` is in
+  # tigervnc-tools, which the server only recommends: without it, in a fresh Ubuntu 24.04, the TigerVNC test fails.)
+  vnc:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+      - name: Install the servers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends tigervnc-standalone-server tigervnc-common tigervnc-tools xterm xdotool qemu-system-x86
+      - name: Install
+        run: python -m pip install . pytest
+      - name: Against real servers
+        run: python -m pytest -q tests/test_real_vnc.py
+        env:
+          QKVM_REAL_VNC: "1"
 
   # What a fresh install pulls in today, looked up in the list of known vulnerabilities.
   audit:
@@ -81,15 +120,28 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.13"
-      - name: Install
-        run: python -m pip install . pip-audit==2.10.0
-      - name: Known vulnerabilities
-        run: python -m pip_audit
+      - name: Build the wheel
+        run: |
+          python -m pip install build
+          python -m build --wheel
+      - name: Known vulnerabilities in the installed wheel dependencies
+        run: bash .github/security/audit-wheel.sh dist/*.whl dependency-audit
+      - name: Retain dependency audit evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dependency-security
+          path: dependency-audit/
+          if-no-files-found: warn
+          retention-days: 90
+          overwrite: true
 
   # What a release publishes, made and tried on every push, so that a release does not find out
-  # first: the package, installed by itself where no source lies about, and the image.
+  # first: the package, installed by itself where no source lies about, and the image. On the runner
+  # the release builds on (release.yml names ubuntu-24.04), and with no name of its own: the required
+  # check is called by this job's id, package.
   package:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -97,10 +149,18 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.13"
-      - name: Build
+      # The very install and build the release makes (release.yml, the job build): the same tools pinned by hash,
+      # the same commands, so that every commit proves them before a tag does.
+      - name: Build, with the tools pinned by hash, as the release does
         run: |
-          python -m pip install build twine
-          python -m build
+          python -m pip install --require-hashes --no-deps --only-binary :all: -r .github/security/build-requirements.txt
+          python -m build --no-isolation
+      # As the release's job packages does, before anything is installed beside them, with Python's own library only.
+      - name: The source archive is the wheel's source, and the wheel holds nothing else
+        run: python -I -S .github/security/check-sdist.py dist/*.whl dist/*.tar.gz
+      - name: The packages are well formed
+        run: |
+          python -m pip install twine
           python -m twine check --strict dist/*
       - name: Install the wheel by itself and start it
         run: |
@@ -109,24 +169,202 @@ jobs:
           cd /tmp
           /tmp/clean/bin/qkvm --version
           /tmp/clean/bin/qkvm --data-dir /tmp/qkvm-data --port 8799 &
-          for attempt in $(seq 1 30); do curl -fsS http://127.0.0.1:8799/healthz && break; sleep 1; done
+          for _ in $(seq 1 30); do curl -fsS http://127.0.0.1:8799/healthz && break; sleep 1; done
           curl -fsS http://127.0.0.1:8799/ | grep -q "<title>"
+      # The source archive goes to PyPI too: as the release checks it, it installs by itself as this version.
+      - name: The source archive installs by itself
+        run: |
+          version=$(python -c "import runpy; print(runpy.run_path('qkvm/_version.py')['__version__'])")
+          python -m venv /tmp/from-source
+          /tmp/from-source/bin/pip install dist/*.tar.gz
+          cd /tmp && test "$(/tmp/from-source/bin/qkvm --version)" = "qkvm $version"
 
-  image:
+  # The Redfish driver against controllers of other makes, without hardware (tests/test_controllers.py):
+  # each maker's own emulator or capture is started on this runner's loopback and the tests run against
+  # each. These tools are for this job only and nothing a wall is installed with; each is pinned, by tag
+  # and commit, or by version. In this job:
+  #   DMTF Redfish-Mockup-Server 1.3.0 (BSD-3), serving DSP2043's public-rackmount1 (the standard's own
+  #     example, the copy that repository carries) and a Dell iDRAC9 capture out of dell/iDRAC-Redfish-Scripting
+  #     (GPL-2.0; the capture is data read by the server, and nothing of it is copied into qKVM);
+  #   HPE ilo-redfish-emulator v1.1.0 (BSD-3), run from its source as its setup script lays it out, bound to
+  #     loopback (its own main binds every interface), with its requirements pinned here since it does not;
+  #   sushy-tools 2.2.0 (Apache-2.0) with its fake systems driver: the standard's shapes, and power that switches
+  #     one to eleven seconds after it was told to.
+  # The versions of the libraries pinned for the emulators are what ran on a developer's PC on 2026-10-14.
+  controllers:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Build
-        run: docker build -t qkvm:test .
-      - name: Start it as the compose file does, and wait until it says it is well
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+      - name: Install
+        run: python -m pip install . pytest
+      - name: Fetch the emulators, pinned
         run: |
-          docker run -d --name qkvm --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges:true -p 8787:8787 qkvm:test
-          for attempt in $(seq 1 45); do
-            [ "$(docker inspect -f '{{.State.Health.Status}}' qkvm)" = healthy ] && break
-            sleep 2
+          python -m venv /tmp/emulators
+          /tmp/emulators/bin/pip install --quiet sushy-tools==2.2.0 Flask==3.1.3 Werkzeug==3.1.9 requests==2.34.2 urllib3==2.8.0 \
+            grequests==0.7.0 gevent==26.9.0 multipart==1.3.0 \
+            Flask-RESTful==0.3.10 aniso8601==10.0.1 pytz==2025.2 six==1.17.0 StringGenerator==0.4.4 pyOpenSSL==25.3.0 hvac==2.3.0 json-merge-patch==0.2
+          git clone --quiet --depth 1 --branch 1.3.0 https://github.com/DMTF/Redfish-Mockup-Server /tmp/mockup-server
+          test "$(git -C /tmp/mockup-server rev-parse HEAD)" = 23d21f9a3610f6b6fbb71ffc941296b159a524d2
+          git clone --quiet --depth 1 --branch v1.1.0 https://github.com/HewlettPackard/ilo-redfish-emulator /tmp/ilo
+          test "$(git -C /tmp/ilo rev-parse HEAD)" = 845f64cb7b36eef437e660a5c5177dd2a2b43cd7
+          git init --quiet /tmp/dell
+          git -C /tmp/dell remote add origin https://github.com/dell/iDRAC-Redfish-Scripting
+          git -C /tmp/dell sparse-checkout set "iDRAC Redfish Mockup Clients"
+          git -C /tmp/dell fetch --quiet --depth 1 --filter=blob:none origin 3bc6e7b67ef69745208de0516411db4bf2eda43f
+          git -C /tmp/dell checkout --quiet FETCH_HEAD
+          mkdir /tmp/idrac
+          unzip -q "/tmp/dell/iDRAC Redfish Mockup Clients/R660xs_iDRAC9_7_20_10_05_mockup_client.zip" -d /tmp/idrac
+          mkdir -p /tmp/ilo-work/api_emulator/redfish/static
+          cp -r /tmp/ilo/src/. /tmp/ilo-work/
+          cp -r /tmp/ilo/mockups/. /tmp/ilo-work/api_emulator/redfish/static/
+      - name: Start them, on loopback
+        run: |
+          cd /tmp/mockup-server
+          /tmp/emulators/bin/python redfishMockupServer.py -H 127.0.0.1 -p 8870 -D public-rackmount1 -S > /tmp/rackmount.log 2>&1 &
+          /tmp/emulators/bin/python redfishMockupServer.py -H 127.0.0.1 -p 8871 -D /tmp/idrac/R660xs_iDRAC9_7_20_10_05_mockup_client > /tmp/idrac.log 2>&1 &
+          cd /tmp/ilo-work
+          /tmp/emulators/bin/python - > /tmp/ilo.log 2>&1 <<'EOF' &
+          # HPE's emulator.py binds 0.0.0.0 unless it is put in debug mode: the same Flask app, on loopback, with the certificate it makes for itself.
+          import g
+          g.staticfolder = "DL360"
+          import emulator
+          emulator.generate_certs()
+          g.app.run(host="127.0.0.1", port=8872, ssl_context=(emulator.CERT_FILE, emulator.KEY_FILE))
+          EOF
+          /tmp/emulators/bin/sushy-emulator --fake -i 127.0.0.1 -p 8873 > /tmp/sushy.log 2>&1 &
+          for port in 8870 8871 8873; do
+            for _ in $(seq 1 60); do curl -fsS "http://127.0.0.1:$port/redfish/v1/" > /dev/null && break; sleep 1; done
           done
-          docker logs qkvm
-          test "$(docker inspect -f '{{.State.Health.Status}}' qkvm)" = healthy
-          curl -fsS http://127.0.0.1:8787/healthz
+          for _ in $(seq 1 60); do curl -fsSk https://127.0.0.1:8872/redfish/v1/ > /dev/null && break; sleep 1; done
+      - name: The driver against each
+        env:
+          QKVM_TEST_RACKMOUNT: http://127.0.0.1:8870
+          QKVM_TEST_IDRAC: http://127.0.0.1:8871
+          QKVM_TEST_ILO: https://127.0.0.1:8872
+          QKVM_TEST_SUSHY: http://127.0.0.1:8873
+        run: python -m pytest -q tests/test_controllers.py
+      - name: What the emulators said
+        if: failure()
+        run: tail -n 40 /tmp/rackmount.log /tmp/idrac.log /tmp/ilo.log /tmp/sushy.log
+
+  # OpenBMC itself, in QEMU: bmcweb's Redfish on 443 of the romulus board (root / 0penBmc), which has no host
+  # behind it and no video engine, so what is tried is the controller: sign-in, status, where its console is.
+  # A failure here does not fail the Tests run (continue-on-error below), but a release requires this job to pass
+  # (check-required-ci.py). The image is OpenBMC's latest good master build, named by its number and its SHA-256
+  # in the run's summary (why it is not pinned: at the step that fetches it). It was green on build 1776 for
+  # 59669e8 (the run of 2026-10-25, by the times OpenBMC's Jenkins gives).
+  controllers-openbmc:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+      - name: Install
+        run: python -m pip install . pytest
+      # Not pinned yet: OpenBMC's Jenkins keeps its last three daily builds only and publishes no checksum, so a
+      # pinned build number would be gone within days and this job, which a release requires, would fail from then
+      # on. Until the image is kept somewhere of the project's own and pinned by its SHA-256, the last good build is
+      # taken by its number and that number and the image's SHA-256 are written into the run's summary: a green run
+      # says exactly which firmware it was green on.
+      - name: QEMU and OpenBMC's romulus image
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-system-arm
+          job="https://jenkins.openbmc.org/job/latest-master/label=docker-builder,target=romulus"
+          build=$(curl -fsSL "$job/lastSuccessfulBuild/buildNumber")
+          [[ "$build" =~ ^[0-9]+$ ]]
+          curl -fsSL -o /tmp/romulus.mtd "$job/$build/artifact/openbmc/build/tmp/deploy/images/romulus/obmc-phosphor-image-romulus.static.mtd"
+          echo "OpenBMC romulus build $build, sha256 $(sha256sum /tmp/romulus.mtd | cut -d ' ' -f 1)" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Start it, on loopback
+        run: |
+          qemu-system-arm -M romulus-bmc -display none -monitor none -serial file:/tmp/romulus-console.log \
+            -drive file=/tmp/romulus.mtd,format=raw,if=mtd \
+            -net nic -net user,hostfwd=tcp:127.0.0.1:8874-:443 > /tmp/qemu.log 2>&1 &
+          for _ in $(seq 1 150); do curl -fsSk https://127.0.0.1:8874/redfish/v1/ > /dev/null && break; sleep 2; done
+          curl -fsSk https://127.0.0.1:8874/redfish/v1/ | head -c 400
+      - name: The driver against it
+        env:
+          QKVM_TEST_OPENBMC: https://127.0.0.1:8874
+        run: python -m pytest -q tests/test_controllers.py -k openbmc
+      - name: What it said
+        if: failure()
+        run: tail -n 60 /tmp/qemu.log /tmp/romulus-console.log
+
+  # sushy-tools over libvirt: the same emulator, but the power it switches is a QEMU guest's, for real (GitHub's
+  # Linux runners have /dev/kvm). The guest has an empty disk and no operating system, so a graceful shutdown
+  # is accepted and ignored, as a real server with nothing on it does (QKVM_TEST_SUSHY_NO_OS). Written on a PC
+  # without libvirt and not yet seen to run: continue-on-error until it has been green once.
+  controllers-libvirt:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+      - name: Install
+        run: python -m pip install . pytest
+      - name: libvirt, QEMU, and a guest with nothing on it
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libvirt-daemon-system libvirt-clients qemu-system-x86 qemu-utils python3-libvirt
+          sudo systemctl start libvirtd
+          sudo qemu-img create -q -f qcow2 /var/lib/libvirt/images/qkvm-empty.qcow2 64M
+          cat > /tmp/guest.xml <<'EOF'
+          <domain type='kvm'>
+            <name>qkvm-guest</name><memory unit='MiB'>128</memory><vcpu>1</vcpu>
+            <os><type arch='x86_64'>hvm</type><boot dev='hd'/></os>
+            <devices>
+              <disk type='file' device='disk'><driver name='qemu' type='qcow2'/><source file='/var/lib/libvirt/images/qkvm-empty.qcow2'/><target dev='vda' bus='virtio'/></disk>
+              <graphics type='vnc' port='-1' listen='127.0.0.1'/>
+            </devices>
+          </domain>
+          EOF
+          sudo virsh -q define /tmp/guest.xml
+          sudo python3 -m venv --system-site-packages /tmp/emulators
+          sudo /tmp/emulators/bin/pip install --quiet sushy-tools==2.2.0
+      - name: Start it, on loopback
+        run: |
+          # The log intentionally belongs to the runner, not root.
+          # shellcheck disable=SC2024
+          sudo /tmp/emulators/bin/sushy-emulator --libvirt-uri qemu:///system -i 127.0.0.1 -p 8876 > /tmp/sushy-libvirt.log 2>&1 &
+          for _ in $(seq 1 60); do curl -fsS http://127.0.0.1:8876/redfish/v1/ > /dev/null && break; sleep 1; done
+          curl -fsS http://127.0.0.1:8876/redfish/v1/Systems
+      - name: The driver switches the guest on and off
+        env:
+          QKVM_TEST_SUSHY: http://127.0.0.1:8876
+          QKVM_TEST_SUSHY_NO_OS: "1"
+        run: python -m pytest -q tests/test_controllers.py -k sushy
+      - name: What it said
+        if: failure()
+        run: tail -n 60 /tmp/sushy-libvirt.log
+
+  # The same archive build, runtime checks and security policy that gate every release, on the runners the
+  # release's image jobs use (release.yml names ubuntu-24.04 and ubuntu-24.04-arm). The required checks are named
+  # by the matrix value, image (amd64) and image (arm64), not by the runner.
+  image:
+    # Kernel sandbox checks must execute natively, not through syscall emulation.
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/security
+        with:
+          arch: ${{ matrix.arch }}

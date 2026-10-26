@@ -17,6 +17,7 @@ from qkvm.core import Core
 from qkvm.store import Store
 from tests.fake_kvm import FakeKvm
 from tests.test_wall import PASSWORD, add, wall
+from tests.settings_file import settings_text, write_settings_text
 
 FULL = OSError(28, "No space left on device")
 
@@ -63,11 +64,11 @@ def test_a_start_that_could_not_finish_restoring_the_backup_does_not_leave_a_wal
     with wall(data) as admin:
         add(admin, fake.url)
         assert admin.put("/api/v1/alerts", json={"enabled": False}).status_code == 200  # one more change: qkvm.bak has the device too
-    assert json.loads((data / "qkvm.bak").read_text(encoding="utf-8"))["devices"]
+    assert json.loads(settings_text(data / "qkvm.bak", encoding="utf-8"))["devices"]
 
     # The settings file is unreadable at the next start (an editor that saved it on a full disk leaves it cut short),
     # and the disk is still full when qKVM, having read the backup, writes the settings anew.
-    (data / "qkvm.json").write_text('{"version": 1, "server": {', encoding="utf-8")
+    write_settings_text(data / "qkvm.json", '{"version": 1, "server": {', encoding="utf-8")
     disk = refuse_writes(monkeypatch)
     disk["full"] = True
     with pytest.raises(OSError):
@@ -81,9 +82,9 @@ def test_a_start_that_could_not_finish_restoring_the_backup_does_not_leave_a_wal
         claimed = anybody.post("/api/v1/setup", json={"name": "stranger", "password": "whoever comes first"})
         print("a stranger's first-run setup:", claimed.status_code, "role:", claimed.json().get("user", {}).get("role"))
         # The owner's settings are still in qkvm.bak at this point. The second thing the stranger saves replaces them.
-        print("qkvm.bak holds the owner's devices:", len(json.loads((data / "qkvm.bak").read_text(encoding="utf-8"))["devices"]))
+        print("qkvm.bak holds the owner's devices:", len(json.loads(settings_text(data / "qkvm.bak", encoding="utf-8"))["devices"]))
         anybody.put("/api/v1/alerts", json={"enabled": False})
-        kept = json.loads((data / "qkvm.bak").read_text(encoding="utf-8"))
+        kept = json.loads(settings_text(data / "qkvm.bak", encoding="utf-8"))
         print("after one more change, qkvm.bak holds devices:", len(kept["devices"]), "accounts:", [u["name"] for u in kept["users"]])
         assert said["initialized"] is True, "the wall came up as a new one, with the owner's settings lying beside it in qkvm.bak"
 
@@ -103,7 +104,7 @@ def test_a_device_whose_removal_could_not_be_saved_is_not_shown_as_removed(tmp_p
         again = admin.delete(f"/api/v1/devices/{device}")
         print("the wall lists:", on_wall, "| asked to remove it again:", again.status_code, again.json()["message"])
         disk["full"] = False
-    saved = json.loads((data / "qkvm.json").read_text(encoding="utf-8"))["devices"]
+    saved = json.loads(settings_text(data / "qkvm.json", encoding="utf-8"))["devices"]
     print("in qkvm.json:", [(d["name"], "password saved" if d["secret"] else "no password") for d in saved])
     with wall(data) as later:
         back = [d["id"] for d in later.get("/api/v1/wall").json()["devices"]]
@@ -124,7 +125,7 @@ def test_where_qkvm_listens_is_not_changed_by_a_later_save_after_the_change_itse
         # Something unrelated is saved, by anybody, any time later.
         assert admin.post("/api/v1/tokens", json={"name": "a script"}).status_code == 201
         print("activity log, newest first:", [entry["event"] for entry in admin.get("/api/v1/audit").json()["entries"]])
-    on_disk = json.loads((data / "qkvm.json").read_text(encoding="utf-8"))["server"]["bind"]
+    on_disk = json.loads(settings_text(data / "qkvm.json", encoding="utf-8"))["server"]["bind"]
     print("bind before:", before["bind"], "| bind in qkvm.json now:", on_disk)
     assert on_disk == before["bind"], "the refused change was written by the next save: at the next start qKVM listens on every address"
 
@@ -170,7 +171,7 @@ def test_an_alert_address_that_was_refused_with_the_rest_of_the_form_is_not_in_u
         shown = admin.get("/api/v1/alerts").json()
         print("refused as a whole:", answer.status_code, answer.json()["message"], "| has_webhook now:", shown["has_webhook"])
         assert admin.post("/api/v1/tokens", json={"name": "a script"}).status_code == 201  # something unrelated is saved
-    on_disk = json.loads((data / "qkvm.json").read_text(encoding="utf-8"))["alerts"]["webhook"]
+    on_disk = json.loads(settings_text(data / "qkvm.json", encoding="utf-8"))["alerts"]["webhook"]
     print("an address is saved in qkvm.json:", on_disk is not None)
     assert on_disk is None, "the address from the refused form is saved, and is where alerts go once they are switched on"
 
@@ -208,7 +209,7 @@ def test_a_token_that_was_taken_back_does_not_work_again_when_the_settings_are_r
         print("token taken back:", gone.status_code, gone.json())  # the last change: qkvm.bak is the state just before it
     # A hand edit (the page itself sends people to edit allowed_hosts in this file) that left one brace too many.
     path = data / "qkvm.json"
-    path.write_text(path.read_text(encoding="utf-8") + "}", encoding="utf-8")
+    write_settings_text(path, settings_text(path, encoding="utf-8") + "}", encoding="utf-8")
     with wall(data, sign_in=False) as later:
         print("started from the backup; damaged file set aside as:", later.core.store.recovered_from.name)  # type: ignore[attr-defined]
         later.cookies.clear()
@@ -221,7 +222,7 @@ def test_a_token_that_was_taken_back_does_not_work_again_when_the_settings_are_r
     with wall(other) as admin:
         changed = admin.post("/api/v1/password", json={"current": PASSWORD, "new": new})
         print("password changed:", changed.status_code)
-    (other / "qkvm.json").write_text((other / "qkvm.json").read_text(encoding="utf-8") + "}", encoding="utf-8")
+    write_settings_text(other / "qkvm.json", settings_text(other / "qkvm.json", encoding="utf-8") + "}", encoding="utf-8")
     with wall(other, sign_in=False) as later:
         old, newer = later.post("/api/v1/login", json={"password": PASSWORD}), later.post("/api/v1/login", json={"password": new})
         print("after a start from the backup: the old password", old.status_code, "| the new one", newer.status_code)
@@ -243,13 +244,13 @@ def test_reset_password_leaves_nothing_of_the_accounts_or_the_saved_passwords_in
     print(capsys.readouterr().out.strip())
     # The second copy of the settings is of what was just saved: nothing of what was erased is in it either.
     for name in ("qkvm.json", "qkvm.bak"):
-        left = json.loads((data / name).read_text(encoding="utf-8"))
+        left = json.loads(settings_text(data / name, encoding="utf-8"))
         assert not left["users"] and left["recovery"] is None and left["unlock"] is None, name
         assert [d["id"] for d in left["devices"]] == [device] and all(d["secret"] is None for d in left["devices"]), name
         assert left["alerts"]["webhook"] is None, name  # (encrypted for the accounts as well: it would go nowhere)
     assert not any(Vault.open(found, (data / "unlock.key").read_text(encoding="ascii").strip()) for found in [left["unlock"]] if found)
     # And the accounts are not one unreadable settings file away from being back:
-    (data / "qkvm.json").write_text("", encoding="utf-8")
+    write_settings_text(data / "qkvm.json", "", encoding="utf-8")
     with wall(data, sign_in=False) as later:
         assert later.get("/api/v1/session").json()["initialized"] is False
         assert later.post("/api/v1/login", json={"password": PASSWORD}).status_code == 409
@@ -269,7 +270,7 @@ def test_what_the_key_before_opened_the_folder_with_is_gone_after_the_start_that
     with wall(data, sign_in=False, locked_start=True) as later:
         assert later.get("/healthz").json()["locked"] is True
     for name in ("qkvm.json", "qkvm.bak"):  # one save takes it out of both: the second copy is of what was saved last
-        left = json.loads((data / name).read_text(encoding="utf-8")).get("unlock")
+        left = json.loads(settings_text(data / name, encoding="utf-8")).get("unlock")
         assert left is None or Vault.open(left, kept_copy) is None, f"{name}: README, 'a copy of it that somebody kept opens nothing afterwards'"
 
 
@@ -304,7 +305,7 @@ def test_the_same_when_only_the_copy_to_qkvm_bak_is_refused_which_nobody_is_told
     with wall(data, sign_in=False, locked_start=True) as later:
         assert later.get("/healthz").json()["locked"] is True
     assert not (data / "qkvm.bak").exists()
-    assert json.loads((data / "qkvm.json").read_text(encoding="utf-8"))["unlock"] is None
+    assert json.loads(settings_text(data / "qkvm.json", encoding="utf-8"))["unlock"] is None
 
     # Where it can be neither renewed nor taken away, it still holds what the old key opens, and that is said to
     # whoever starts qKVM: it is theirs to remove.
@@ -320,7 +321,7 @@ def test_the_same_when_only_the_copy_to_qkvm_bak_is_refused_which_nobody_is_told
     core = Core(data, locked_start=True)
     told = core.unlock_at_start()
     assert told is not None and "qkvm.bak" in told and "remove that file by hand" in told
-    left = json.loads((data / "qkvm.bak").read_text(encoding="utf-8")).get("unlock")
+    left = json.loads(settings_text(data / "qkvm.bak", encoding="utf-8")).get("unlock")
     assert left is not None and Vault.open(left, kept_copy) is not None  # (which is why it has to be said)
 
 

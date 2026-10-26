@@ -18,6 +18,7 @@ from qkvm import kvm, update, vault
 from tests.fake_kvm import FakeKvm
 from tests.test_totp import code_for
 from tests.test_wall import PASSWORD, add, snap, wall
+from tests.settings_file import settings_text, write_settings_text
 
 
 @pytest.fixture(autouse=True)
@@ -38,9 +39,9 @@ def test_a_device_whose_saved_password_does_not_open_is_sent_no_sign_in(tmp_path
         with wall(tmp_path) as admin:
             tile = add(admin, device.url)
             assert admin.get(snap(tile)).status_code == 200
-        saved = json.loads((tmp_path / "qkvm.json").read_text(encoding="utf-8"))
+        saved = json.loads(settings_text(tmp_path / "qkvm.json", encoding="utf-8"))
         saved["devices"][0]["secret"]["nonce"] = "!"
-        (tmp_path / "qkvm.json").write_text(json.dumps(saved), encoding="utf-8")
+        write_settings_text(tmp_path / "qkvm.json", json.dumps(saved), encoding="utf-8")
         device.state.tokens.clear()  # (the device has forgotten who was signed in, as after its restart)
         before = device.state.logins
         with wall(tmp_path) as admin:
@@ -80,9 +81,9 @@ def test_the_way_out_the_answer_names_works_on_a_key_that_does_not_open(tmp_path
     with wall(tmp_path) as admin:
         begun = admin.post("/api/v1/totp/begin", json={"password": PASSWORD}).json()
         assert admin.post("/api/v1/totp/enable", json={"code": code_for(begun["secret"])}).status_code == 200
-    saved = json.loads((tmp_path / "qkvm.json").read_text(encoding="utf-8"))
+    saved = json.loads(settings_text(tmp_path / "qkvm.json", encoding="utf-8"))
     saved["users"][0]["totp"]["nonce"] = "!"
-    (tmp_path / "qkvm.json").write_text(json.dumps(saved), encoding="utf-8")
+    write_settings_text(tmp_path / "qkvm.json", json.dumps(saved), encoding="utf-8")
     with wall(tmp_path, sign_in=False) as visitor:
         refused = visitor.post("/api/v1/login", json={"password": PASSWORD, "code": code_for(begun["secret"])})
         assert (refused.status_code, refused.json()["code"]) == (409, "no_second_step")

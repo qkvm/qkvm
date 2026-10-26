@@ -23,6 +23,7 @@ from qkvm.update import Updater
 from tests.fake_github import make_wheel
 from tests.fake_kvm import FakeKvm
 from tests.test_wall import add, wall
+from tests.settings_file import settings_text, write_settings_text
 
 DEEP = "[" * 100_000 + "0" + "]" * 100_000
 HALF = "[" * 100_000  # (never closed: the same to a reader that gives up on the way in)
@@ -75,7 +76,7 @@ def test_the_same_note_when_an_update_is_installed(tmp_path: Path, said: str) ->
     (tmp_path / "updates").mkdir()
     (tmp_path / "updates" / "current.json").write_text(said, encoding="utf-8")
     Updater(tmp_path, "", current="1.0.0")._activate("9.9.9", make_wheel("9.9.9"))
-    assert json.loads((tmp_path / "updates" / "current.json").read_text(encoding="utf-8")) == {"version": "9.9.9", "previous": None, "previous_proven": False}
+    assert json.loads(settings_text(tmp_path / "updates" / "current.json", encoding="utf-8")) == {"version": "9.9.9", "previous": None, "previous_proven": False}
 
 
 @BOTH
@@ -145,7 +146,7 @@ def test_the_note_of_which_version_runs_with_something_nested_beside_a_proper_ve
     assert said in (None, {"version": "9.9.9", "previous": None, "previous_proven": False})  # not read at all, or read without it
     starter.proven(tmp_path, "9.9.9")
     if said is not None:
-        assert json.loads(file.read_text(encoding="utf-8")) == {"version": "9.9.9", "previous": None, "previous_proven": False, "proven": True}
+        assert json.loads(settings_text(file, encoding="utf-8")) == {"version": "9.9.9", "previous": None, "previous_proven": False, "proven": True}
     assert starter.gone_back(tmp_path) is (said is not None)
     assert not file.exists() or said is None  # gone back to the files the program came with
 
@@ -161,7 +162,7 @@ def test_the_same_note_where_the_version_before_is_no_version(tmp_path: Path, be
     # ...and installing over a note whose own version is such a thing writes a version's name or nothing.
     file.write_text('{"version": ' + beside + ', "proven": true}', encoding="utf-8")
     Updater(tmp_path, "", current="1.0.0")._activate("9.9.8", make_wheel("9.9.8"))
-    assert json.loads(file.read_text(encoding="utf-8")) == {"version": "9.9.8", "previous": None, "previous_proven": False}
+    assert json.loads(settings_text(file, encoding="utf-8")) == {"version": "9.9.8", "previous": None, "previous_proven": False}
 
 
 def test_a_folder_in_the_list_of_walls_whose_name_no_folder_can_have(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -223,7 +224,7 @@ def test_something_nested_inside_what_the_settings_file_keeps_sealed(tmp_path: P
             add(admin, fake.url)
             assert admin.post("/api/v1/actions", json={"name": "Types", "kind": "text", "text": "abc"}).status_code == 201
             assert admin.put("/api/v1/alerts", json={"enabled": True, "webhook": "https://example.net/hook"}).status_code == 200
-        good = {name: (folder / name).read_text(encoding="utf-8") for name in ("qkvm.json", "qkvm.bak")}
+        good = {name: settings_text(folder / name, encoding="utf-8") for name in ("qkvm.json", "qkvm.bak")}
 
         def spoiled(text: str) -> str:
             saved = json.loads(text)
@@ -237,12 +238,12 @@ def test_something_nested_inside_what_the_settings_file_keeps_sealed(tmp_path: P
             sealed["more"] = "(nested)"
             return json.dumps(saved).replace('"(nested)"', records(depth), 1)
 
-        (folder / "qkvm.json").write_text(spoiled(good["qkvm.json"]), encoding="utf-8")
+        write_settings_text(folder / "qkvm.json", spoiled(good["qkvm.json"]), encoding="utf-8")
         with wall(folder, sign_in=False) as admin:
             assert admin.core.store.restored  # type: ignore[attr-defined]
             assert admin.get("/healthz").status_code == 200
         for name in good:
-            (folder / name).write_text(spoiled(good["qkvm.json"]), encoding="utf-8")
+            write_settings_text(folder / name, spoiled(good["qkvm.json"]), encoding="utf-8")
         with pytest.raises(StoreError):
             Core(folder)
     finally:

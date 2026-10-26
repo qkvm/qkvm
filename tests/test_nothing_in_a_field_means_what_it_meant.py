@@ -24,6 +24,7 @@ import pytest
 from qkvm import kvm, update, vault
 from tests.test_users import OTHER, account
 from tests.test_wall import PASSWORD, add, closed_port, wall
+from tests.settings_file import settings_text, write_settings_text
 
 
 @pytest.fixture(autouse=True)
@@ -36,9 +37,9 @@ def fast(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def nothing_in(folder: Path, change: Any) -> None:
     for name in ("qkvm.json", "qkvm.bak"):
-        saved = json.loads((folder / name).read_text(encoding="utf-8"))
+        saved = json.loads(settings_text(folder / name, encoding="utf-8"))
         change(saved)
-        (folder / name).write_text(json.dumps(saved, indent=2), encoding="utf-8")
+        write_settings_text(folder / name, json.dumps(saved, indent=2), encoding="utf-8")
 
 
 def test_an_account_with_nothing_for_its_role_is_no_admin(tmp_path: Path) -> None:

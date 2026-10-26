@@ -22,9 +22,12 @@ NEEDED = {
     "websockets": "keeps a KVM's video stream awake; JetKVM signalling",
     "cryptography": "the vault, the signature on updates, qKVM's own certificate",
     "aiortc": "a JetKVM sends its picture as WebRTC video and nothing else; by far the largest of these, loaded only for a JetKVM",
+    "av": "direct JPEG decoding and JetKVM video; enforce the audited native-library baseline",
     "anyio": "used by the above; named for a minimum version without a known hole",
     "idna": "used by the above; named for a minimum version without a known hole",
+    "certifi": "outbound TLS trust bundle; excludes the compromised emSign trust chain",
     "h11": "reads every request, for uvicorn; named for a minimum version without a known hole",
+    "packaging": "validates update dependency versions and environment markers before activation",
 }
 
 
@@ -41,7 +44,10 @@ def test_the_packages_asked_for_are_the_few_that_are_needed() -> None:
 
 def test_each_package_has_a_lowest_version_it_is_known_to_work_with() -> None:
     for requirement in PROJECT["dependencies"]:
-        assert ">=" in requirement, f"{requirement}: say from which version on"
+        if requirement.startswith("aiortc"):
+            assert requirement == "aiortc==1.15.0", "review the decoder boundary before changing its receiver"
+        else:
+            assert ">=" in requirement, f"{requirement}: say from which version on"
 
 
 def test_the_page_brings_everything_it_needs() -> None:
@@ -58,7 +64,7 @@ def test_the_versions_looked_for_at_start_are_the_ones_asked_for_on_installing()
     # together some other way, or grown old, is told so. Two lists that say the same thing have to.
     from qkvm.cli import SAFE_FROM
 
-    asked = {re.split(r"[\s<>=!~\[;]", requirement, maxsplit=1)[0].lower(): requirement.split(">=", 1)[1] for requirement in PROJECT["dependencies"]}
+    asked = {re.split(r"[\s<>=!~\[;]", requirement, maxsplit=1)[0].lower(): re.split(r">=|==", requirement, maxsplit=1)[1] for requirement in PROJECT["dependencies"]}
     for name, minimum in SAFE_FROM.items():
         numbers = tuple(int(part) for part in asked[name].split("."))
         assert numbers + (0,) * (3 - len(numbers)) == minimum, name
@@ -70,4 +76,4 @@ def test_a_library_with_a_known_hole_is_named_so_that_it_can_be_updated(monkeypa
     monkeypatch.setattr(cli, "SAFE_FROM", {"pytest": (999, 0, 0), "nothing-of-this-name": (1, 0, 0)})
     found = cli.outdated_libraries()
     # By name, because that is what has to be typed after `pip install --upgrade`; one that is not installed is not an old one.
-    assert list(found) == ["pytest"] and found["pytest"].endswith("(safe from 999.0.0)")
+    assert list(found) == ["pytest"] and found["pytest"].endswith("(required minimum 999.0.0)")

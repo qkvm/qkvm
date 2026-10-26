@@ -1,0 +1,135 @@
+name: Build and scan the release image
+description: Build one OCI archive, verify its runtime assumptions, then audit that exact archive.
+inputs:
+  arch:
+    description: Linux architecture (amd64 or arm64)
+    required: true
+# What the archive and its evidence are, by hash, taken right after the scan and the native step, before the suite's
+# test tools are installed on this runner (until then it has installed only skopeo, from Ubuntu's own archive, and run
+# BuildKit and Trivy, named by digest and held to a hash). The release's image jobs hand them on as job outputs.
+outputs:
+  archive:
+    description: SHA-256 of image-<arch>/image.tar
+    value: ${{ steps.hashes.outputs.archive }}
+  scan:
+    description: SHA-256 of image-<arch>/evidence/scanned-image.json
+    value: ${{ steps.hashes.outputs.scan }}
+  native:
+    description: SHA-256 of image-<arch>/evidence/native-versions.json
+    value: ${{ steps.hashes.outputs.native }}
+runs:
+  using: composite
+  steps:
+    # BuildKit and the SBOM generator below are named by digest, as the actions are by commit: their tags move.
+    - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      with:
+        driver-opts: image=moby/buildkit:v0.33.1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
+    - name: Install the image transfer tool
+      shell: bash
+      run: |
+        sudo apt-get update --quiet
+        sudo apt-get install --yes --no-install-recommends skopeo
+    - name: Prepare the archive destination
+      shell: bash
+      env:
+        ARCH: ${{ inputs.arch }}
+      run: mkdir -p "image-$ARCH"
+    - name: Build once, without registry credentials
+      uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+      with:
+        context: .
+        platforms: linux/${{ inputs.arch }}
+        pull: true
+        no-cache: true
+        outputs: type=oci,dest=image-${{ inputs.arch }}/image.tar
+        provenance: true
+        attests: type=sbom,generator=docker/buildkit-syft-scanner:1.12.0@sha256:ae4f3b554449e7e25548e7d8ccc029d17357348e30c6e3df01b92bc93654d6a9
+        labels: |
+          org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          org.opencontainers.image.revision=${{ github.sha }}
+    - name: Test the image and the exception preconditions
+      shell: bash
+      env:
+        ARCH: ${{ inputs.arch }}
+      run: |
+        skopeo --override-os linux --override-arch "$ARCH" copy \
+          "oci-archive:image-$ARCH/image.tar" docker-daemon:qkvm:security
+        docker run --rm --pull=never --platform "linux/$ARCH" -i --network none \
+          --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges:true \
+          --entrypoint python qkvm:security -P - < .github/security/check-image-runtime.py
+        trap 'docker logs qkvm-security; docker rm --force --volumes qkvm-security; docker volume rm --force qkvm-security-keys' EXIT
+        # The key gets a named volume of its own, as every deployment must give it (the image declares none for it).
+        docker run -d --name qkvm-security --pull=never --platform "linux/$ARCH" \
+          --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges:true \
+          -v qkvm-security-keys:/keys -p 127.0.0.1:8787:8787 qkvm:security
+        for _ in $(seq 1 45); do
+          [ "$(docker inspect -f '{{.State.Health.Status}}' qkvm-security)" = healthy ] && break
+          sleep 2
+        done
+        test "$(docker inspect -f '{{.State.Health.Status}}' qkvm-security)" = healthy
+        docker cp qkvm-security:/data/tls/cert.pem "$RUNNER_TEMP/qkvm-security-cert.pem"
+        curl --fail --silent --show-error --cacert "$RUNNER_TEMP/qkvm-security-cert.pem" https://127.0.0.1:8787/healthz
+    - name: Fresh vulnerability scan of the archive that will be published
+      shell: bash
+      env:
+        ARCH: ${{ inputs.arch }}
+      run: bash .github/security/scan-image.sh "image-$ARCH/image.tar" "$ARCH" "image-$ARCH/evidence"
+    # The scanner reads package records only. FFmpeg and its codecs in PyAV, libsrtp and its OpenSSL in pylibsrtp,
+    # the OpenSSL in cryptography and the CPython built from source are asked their versions in the image itself,
+    # kept with the scan's evidence, and held to the minimums kept in native-minimums.json.
+    - name: Record and gate the native libraries the scan cannot see
+      shell: bash
+      env:
+        ARCH: ${{ inputs.arch }}
+      run: |
+        docker run --rm --pull=never --platform "linux/$ARCH" -i --network none \
+          --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges:true \
+          --entrypoint python qkvm:security -P -s - < .github/security/native-versions.py > "image-$ARCH/evidence/native-versions.json"
+        python3 .github/security/check-native-versions.py "image-$ARCH/evidence/native-versions.json" \
+          --minimums .github/security/native-minimums.json --arch "$ARCH" | tee "image-$ARCH/evidence/native-policy.txt"
+    # (Into a variable first: a failing substitution in an argument of echo passes set -e unseen.)
+    - id: hashes
+      name: The hashes of the archive and its evidence, before the suite's test tools are installed
+      shell: bash
+      env:
+        ARCH: ${{ inputs.arch }}
+      run: |
+        set -euo pipefail
+        archive=$(sha256sum "image-$ARCH/image.tar" | cut -d ' ' -f 1)
+        scan=$(sha256sum "image-$ARCH/evidence/scanned-image.json" | cut -d ' ' -f 1)
+        native=$(sha256sum "image-$ARCH/evidence/native-versions.json" | cut -d ' ' -f 1)
+        for value in "$archive" "$scan" "$native"; do [[ "$value" =~ ^[0-9a-f]{64}$ ]]; done
+        {
+          echo "archive=$archive"
+          echo "scan=$scan"
+          echo "native=$native"
+        } >> "$GITHUB_OUTPUT"
+    - name: Run the application suite inside the final runtime
+      shell: bash
+      run: |
+        # Test tooling is mounted read-only; it is never installed in the image. Wheels pinned by hash only: no code of
+        # theirs runs at install, on this runner, where the evidence lies.
+        python3 -m pip install --require-hashes --no-deps --only-binary :all: --target "$RUNNER_TEMP/qkvm-image-test-deps" -r .github/security/image-test-requirements.txt
+        docker run --rm --pull=never --read-only --tmpfs /tmp \
+          --tmpfs /data:uid=10001,gid=10001 --cap-drop ALL --security-opt no-new-privileges:true \
+          -v "$GITHUB_WORKSPACE:/work:ro" \
+          -v "$RUNNER_TEMP/qkvm-image-test-deps:/testdeps:ro" \
+          -e PYTHONPATH=/testdeps -e CI=true -w /tmp \
+          --entrypoint python qkvm:security -P -c 'import qkvm, pytest; assert qkvm.__file__.startswith("/usr/local/"); raise SystemExit(pytest.main(["--import-mode=importlib", "-q", "-p", "no:cacheprovider", "/work/tests"]))'
+    - name: Record the immutable archive checksum, of the archive that was scanned
+      shell: bash
+      env:
+        ARCH: ${{ inputs.arch }}
+      run: |
+        cd "image-$ARCH" || exit
+        python3 "$GITHUB_WORKSPACE/.github/security/image-digests.py" check-archive --arch "$ARCH" evidence/scanned-image.json image.tar
+        sha256sum image.tar > SHA256SUMS
+    - name: Retain scan results, including blocked findings
+      if: always()
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: container-security-${{ inputs.arch }}
+        path: image-${{ inputs.arch }}/evidence/
+        if-no-files-found: warn
+        retention-days: 90
+        overwrite: true

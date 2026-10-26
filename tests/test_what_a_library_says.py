@@ -13,6 +13,7 @@ import functools
 import hashlib
 import io
 import logging
+import logging.config
 import os
 import socket
 import struct
@@ -134,6 +135,7 @@ def nothing_else_listening() -> Iterator[None]:
 def a_kvm_at(port: int) -> KvmDevice:
     kvmd = KvmDevice(DeviceSpec("d", "Hostile", f"http://127.0.0.1:{port}", "admin", "secret", tls="insecure"))
     kvmd._token = "t"  # signed in already: this is about the connection that keeps the picture coming
+    kvmd._glinet = True  # ...and known for a GLKVM, as a look finds one: the family is not asked of a device that only speaks this line
     return kvmd
 
 
@@ -307,40 +309,47 @@ def test_the_stand_in_terminal_counts_what_it_says() -> None:
 
 
 @pytest.mark.parametrize("when", ["in answer to something the wall said", "together with its answer to the handshake"])
-def test_what_a_device_said_just_before_it_reset_the_connection_is_heard(when: str) -> None:
-    # A device that says something and hangs up the hard way in the same breath. On Windows the reset is known
-    # of before what came just ahead of it is handed over; for a while "is the connection closing?" was asked
-    # before anything was worked through, and what such a device had said was thrown away, its answer to the
-    # handshake among it.
-    # (What Windows itself throws away is another matter, and not the program's: words that arrived while
-    # nobody was reading are gone once a reset comes in behind them, where Linux hands them over. A wall that
-    # is late to look, as on a loaded machine, has lost them before it sees anything. This test once let the
-    # words come while the wall was between two reads, and heard them 39 times in 40 on an idle machine and 18
-    # on a loaded one. Here the wall is reading when they come, and then does not look until the device has
-    # hung up, as a loaded machine would not have: the reset is known of before the words are handed over,
-    # the moment they used to be thrown away. Forty in forty.)
+def test_what_a_device_said_just_before_it_reset_the_connection_is_heard(when: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    # A TCP reset may discard bytes that Windows has not delivered yet. First
+    # establish that the message reached the parser, then reset before recv().
+    # The separate closing-transport regression in test_beside_the_fix covers
+    # data_received after transport shutdown, without relying on OS ordering.
     said = b'{"the last": "words"}'
     tries = 40
-    hung_up = threading.Event()  # set by the device once it has said its words and reset the connection
+    delivered, hung_up = threading.Event(), threading.Event()
+    original = kvm._ToADevice.process_event
 
-    def answers_and_resets(conn: socket.socket) -> None:
-        conn.recv(4096)  # whatever the wall said
-        conn.sendall(frame(0x1, said))
+    def received(connection: kvm._ToADevice, event: object) -> None:
+        original(connection, event)
+        if getattr(event, "opcode", None) == 1 and getattr(event, "data", None) == said:
+            delivered.set()
+
+    monkeypatch.setattr(kvm._ToADevice, "process_event", received)
+
+    def reset_after_delivery(conn: socket.socket) -> None:
+        delivered.wait(5)
         reset(conn)
         hung_up.set()
 
+    def answers_and_resets(conn: socket.socket) -> None:
+        conn.recv(4096)
+        conn.sendall(frame(0x1, said))
+        reset_after_delivery(conn)
+
     asked = when == "in answer to something the wall said"
-    device = OddDevice(answers_and_resets) if asked else InOneBreath(frame(0x1, said), then=reset)
+    device = OddDevice(answers_and_resets) if asked else InOneBreath(frame(0x1, said), then=reset_after_delivery)
 
     async def run() -> list[str]:
         heard = []
         for _ in range(tries):
+            delivered.clear()
+            hung_up.clear()
             try:
                 async with kvm.ws_connect(f"ws://127.0.0.1:{device.port}/", open_timeout=5, close_timeout=1) as ws:
                     if asked:
-                        hung_up.clear()
                         await ws.send("say it")
-                        hung_up.wait(5)  # the loop held, on purpose, until the words and the reset have both landed
+                    assert await asyncio.to_thread(hung_up.wait, 5), "device did not reset"
+                    assert delivered.is_set(), "message did not reach the parser"
                     heard.append(str(await asyncio.wait_for(ws.recv(), 5)))
             except Exception as ex:
                 heard.append(type(ex).__name__)
@@ -354,11 +363,12 @@ def test_what_a_device_said_just_before_it_reset_the_connection_is_heard(when: s
 
 
 def test_requests_from_nobody_are_a_line_of_each_kind_and_not_a_line_each(tmp_path: Path) -> None:
-    # The web server writes a warning for every request that is none, and two for every one that asks for a
-    # WebSocket, which this program does not speak. Anybody who reaches the port can send those, signed in
-    # or not: six hundred of them were nine hundred lines in two seconds, in the log (whose history is
-    # kept to a size, and was gone in minutes at that rate) and on the terminal (which is kept to none).
-    # The program itself, started as it is started.
+    # The web server writes a warning for every request that is none; and it wrote two for every one that asked
+    # for a WebSocket while this program spoke none (it speaks one now, the live line of live.py, and a request
+    # for a WebSocket anywhere else is refused by the router without a line). Anybody who reaches the port can
+    # send those, signed in or not: six hundred of them were nine hundred lines in two seconds, in the log
+    # (whose history is kept to a size, and was gone in minutes at that rate) and on the terminal (which is
+    # kept to none). The program itself, started as it is started.
     port, data = closed_port(), tmp_path / "data"
     env = {**os.environ, "PYTHONPATH": str(Path(cli.__file__).resolve().parent.parent)}
     env.pop("QKVM_CHILD", None)
@@ -394,4 +404,77 @@ def test_requests_from_nobody_are_a_line_of_each_kind_and_not_a_line_each(tmp_pa
     written = (tmp_path / "terminal.txt").read_text(encoding="utf-8", errors="replace")
     counted = {what: (log.count(what), written.count(what)) for what in ("Invalid HTTP request received", "Unsupported upgrade request", "No supported WebSocket library")}
     print(f">>> {2 * many} requests from nobody: (lines in qkvm.log, lines on the terminal) {counted}")
-    assert all(in_log == 1 and on_terminal <= 1 for in_log, on_terminal in counted.values()), counted
+    assert counted["Invalid HTTP request received"][0] == 1 and counted["Invalid HTTP request received"][1] <= 1, counted
+    assert counted["Unsupported upgrade request"] == (0, 0) and counted["No supported WebSocket library"] == (0, 0), counted
+
+
+def test_a_logging_configuration_given_later_puts_no_device_session_in_the_log() -> None:
+    # The WebSocket library writes, at its finer levels, every header it sends: a KVM's session in the cookie. Its
+    # connections to devices log through a logger that says nothing finer than a warning. A level of that logger's own did
+    # not hold: a logging configuration given later that names the library's logger (its lines at DEBUG, to look into
+    # something) sets every logger below it back to no level, and so to DEBUG.
+    from tests.fake_kvm import FakeKvm, FakeState
+
+    heard: list[str] = []
+
+    class Heard(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            heard.append(record.getMessage())
+
+    library, to_devices = logging.getLogger("websockets"), logging.getLogger("websockets.to_devices")
+    kept = [(logger, logger.level, list(logger.handlers), logger.propagate, logger.disabled) for logger in (library, to_devices)]
+    hearing = Heard(logging.DEBUG)
+    fake = FakeKvm(FakeState()).start()
+    try:
+        logging.config.dictConfig({"version": 1, "disable_existing_loggers": False, "loggers": {"websockets": {"level": "DEBUG"}}})
+        library.addHandler(hearing)
+
+        async def run() -> str:
+            device = KvmDevice(DeviceSpec(id="ab12cd34", name="One", base_url=fake.url, username="admin", password="secret"))
+            try:
+                line = await device.input_line()
+                await line.send('{"event_type": "key", "event": {"key": "KeyA", "state": false}}')
+                await line.close()
+                assert device._token
+                return device._token
+            finally:
+                await device.close()
+
+        session = asyncio.run(run())
+    finally:
+        library.removeHandler(hearing)
+        for logger, level, handlers, propagate, disabled in kept:
+            logger.setLevel(level)
+            logger.handlers[:] = handlers
+            logger.propagate, logger.disabled = propagate, disabled
+        fake.stop()
+    assert not any(session in said for said in heard), "a device's session is in the log"
+    assert not any("KeyA" in said for said in heard), "what was sent to a device is in the log"
+
+
+def test_an_answer_cut_off_before_its_length_is_said_in_a_line_and_nothing_else_is_changed(as_the_program_logs: tuple[Terminal, Path]) -> None:
+    # (The delta review of 1f7c5f3: a download cut off because its reader lost the right to it ends shorter than it said,
+    # h11 refuses that end, and the web server wrote "Exception in ASGI application" with a whole traceback, which reads
+    # as a fault of qKVM's. The delta review of baf2ad7: told by the error's words alone, an answer that ends short by a
+    # fault was said as such a cut-off too. Only one that SentOnlyWhile cut off is: by the note it puts on the error.)
+    import h11
+
+    from qkvm.server import SentOnlyWhile
+
+    terminal, data = as_the_program_logs
+    web = logging.getLogger("uvicorn.error")
+    on_purpose = h11.LocalProtocolError("Too little data for declared Content-Length")
+    on_purpose.add_note(SentOnlyWhile.CUT_OFF)
+    for error in (on_purpose, h11.LocalProtocolError("Too little data for declared Content-Length"), ValueError("something else")):
+        try:
+            raise error
+        except Exception as raised:
+            web.error("Exception in ASGI application" + chr(10), exc_info=raised)
+    cli.stop_logging()
+    written = (data / "qkvm.log").read_text(encoding="utf-8")
+    assert [line for line in written.splitlines() if "a download was cut off before its end" in line] == [
+        line for line in written.splitlines() if " WARNING uvicorn.error: a download was cut off before its end" in line
+    ] and written.count("a download was cut off before its end") == 1, written
+    assert written.count("Traceback") == 2 and "LocalProtocolError: Too little data" in written and "ValueError: something else" in written, written
+    shown = terminal.getvalue()
+    assert shown.count("WARNING: a download was cut off before its end") == 1 and shown.count("Traceback") == 2, shown

@@ -1,20 +1,13 @@
-"""The key that opens the saved passwords at start, so that qKVM carries on by itself after a restart.
+"""Automatic unlocking of the inner credential key after server startup.
 
-The devices' passwords are saved encrypted, and an account's password opens them. Left at that, qKVM can
-reach no device after a restart until somebody signs in: after a power cut nothing is watched, no alert
-goes out, no collector is answered and every screen on a wall asks for a password, until a person has
-been by. Its owner met that on the first day and chose otherwise, so there are three ways, and the first
-is how it comes:
+The complete settings file always needs its independent external storage key
+(vault_storage.py). The choices here control the additional inner lock:
 
-* A key of qKVM's own, in the data folder (`own_secret`). It carries on by itself, and that is said as
-  what it is: the key lies beside what it opens, so a copy of the data folder is all it takes to read
-  the saved device passwords. The accounts' own passwords are not in it either way.
-* --unlock-file FILE: the same, with the key kept where the data folder and its backups do not go (a
-  systemd credential, a Docker secret, another disk). Each is useless without the other.
-* --locked-start: no key. Only an account's password opens the saved passwords, a copy of the data
-  folder is worth nothing without one, and after a restart somebody has to sign in.
+* own_secret: an automatic-unlock secret in the data folder;
+* --unlock-file: that automatic-unlock secret outside the data folder;
+* --locked-start: no automatic-unlock secret; a successful account sign-in is required.
 
-The data folder holds what the key opens, made the first time somebody signs in while that key is in use.
+None of these secrets, nor an account password, replaces the external storage key.
 """
 
 from __future__ import annotations

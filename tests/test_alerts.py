@@ -15,6 +15,7 @@ from qkvm.alerts import Alert, Watcher
 from tests.fake_kvm import FakeKvm
 from tests.test_users import OTHER, account, visitor
 from tests.test_wall import add, snap, wait_until, wall
+from tests.settings_file import settings_text
 
 
 @pytest.fixture(autouse=True)
@@ -121,7 +122,7 @@ def test_alerts_are_posted_when_a_kvm_changes(tmp_path: Path, inbox: Inbox) -> N
             assert admin.put("/api/v1/alerts", json={"enabled": True, "webhook": "nonsense"}).status_code == 422
             saved = admin.put("/api/v1/alerts", json={"enabled": True, "webhook": inbox.url})
             assert saved.status_code == 200 and saved.json()["has_webhook"] is True
-            assert inbox.url not in (tmp_path / "qkvm.json").read_text()  # stored encrypted: it may hold a token
+            assert inbox.url not in settings_text(tmp_path / "qkvm.json")  # stored encrypted: it may hold a token
             assert inbox.url not in json.dumps(admin.get("/api/v1/alerts").json())  # and never sent back to a browser
 
             assert admin.post("/api/v1/alerts/test").status_code == 200
@@ -250,7 +251,7 @@ def test_a_muted_kvm_and_a_pause_keep_quiet_and_what_is_still_wrong_is_told_afte
             paused = admin.post("/api/v1/alerts/pause", json={"minutes": 60})
             assert paused.status_code == 200 and paused.json()["paused_until"] > time.time() + 3500
             assert admin.get("/api/v1/alerts").json()["paused_until"] == paused.json()["paused_until"]
-            assert '"paused_until"' in (tmp_path / "qkvm.json").read_text()  # a restart in the middle of it does not end it
+            assert '"paused_until"' in settings_text(tmp_path / "qkvm.json")  # a restart in the middle of it does not end it
             loud.state.signal = False
             time.sleep(1.0)
             assert len(inbox.titles()) == 2

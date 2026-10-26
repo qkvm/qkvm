@@ -22,24 +22,82 @@ from urllib.parse import urlsplit
 
 import uvicorn
 from uvicorn.protocols.http.h11_impl import H11Protocol
+from uvicorn.protocols.websockets.websockets_sansio_impl import WebSocketsSansIOProtocol
+from websockets.exceptions import InvalidState
+from websockets.frames import Frame
 
-from . import unlock
+from . import activity, history, live, unlock, vault_migration
 from ._version import __version__
 from ._where import default_data_dir
 from .core import Core
+from .kvm import WarningsOnly
 from .netbind import BindError, normalize, open_sockets, resolve
-from .server import create_app
-from .store import InstanceLock, ServerSettings, StoreError
+from .server import SentOnlyWhile, create_app
+from .store import InstanceLock, ServerSettings, Store, StoreError, holds_nothing, sealed_beside
+from .update import UpdateError, check_startup_requirements
+from .vault_storage import MAGIC, MigrationRequired
 
 log = logging.getLogger("qkvm")
 MAX_CRASHES = 5  # restarts allowed within CRASH_WINDOW before giving up
 CRASH_WINDOW = 60.0
 
 
-# Libraries this program runs on, and the first version of each without a publicly known
-# vulnerability that matters here. The same floors are in pyproject.toml; this is for a copy
-# started in an environment that was put together some other way.
-SAFE_FROM = {"starlette": (1, 3, 1), "cryptography": (50, 0, 0), "anyio": (4, 14, 2), "idna": (3, 15, 0), "h11": (0, 16, 0)}
+# Minimum library versions for the reviewed security/runtime baseline. These floors do not
+# certify that every bundled component is vulnerability-free. The same floors are in
+# pyproject.toml; this warns about environments maintained outside the normal installer.
+SAFE_FROM = {"starlette": (1, 3, 1), "cryptography": (50, 0, 0), "anyio": (4, 14, 2), "idna": (3, 15, 0), "certifi": (2026, 10, 19), "h11": (0, 16, 0), "aiortc": (1, 15, 0), "av": (17, 1, 0)}
+
+
+def _plain_file(path: Path) -> bool:
+    found = path.stat()
+    return stat.S_ISREG(found.st_mode) and found.st_nlink == 1
+
+
+def _legacy_vault_update_trial(data_dir: Path) -> bool:
+    """Only an unproven in-app update over untouched legacy data may return to its old binary."""
+    if os.environ.get("QKVM_CHILD") != "1" or os.environ.get("QKVM_CONTAINER") == "1":
+        return False
+    package = data_dir / "updates" / __version__ / "qkvm"
+    if Path(__file__).resolve().parent != package.resolve():
+        return False
+    try:
+        current = json.loads((data_dir / "updates" / "current.json").read_text(encoding="utf-8"))
+        if not isinstance(current, dict) or current.get("version") != __version__ or current.get("proven") is True:
+            return False
+        # No automatic rollback after migration has left an archive, encrypted copy or remnant.
+        remnants = [data_dir / vault_migration.ARCHIVE, *data_dir.glob("qkvm.*.migration-*"), *data_dir.glob("vault-migration.recovery.migration-*")]
+        if any(path.exists() or path.is_symlink() for path in remnants):
+            return False
+        # What 0.1.x itself leaves and passes over is no remnant of a migration (L-W7): a write's leftover that holds
+        # nothing (what a power cut leaves: store.holds_nothing), and a damaged copy it set aside, which is never sealed.
+        # A leftover that holds settings, or anything sealed, still keeps the trial where it is.
+        for path in (data_dir / "qkvm.tmp", data_dir / "qkvm.bak.new"):
+            if path.is_symlink() or (path.exists() and not (_plain_file(path) and holds_nothing(path.read_bytes()))):
+                return False
+        for path in data_dir.glob("qkvm.damaged-*.json"):
+            if path.is_symlink() or not _plain_file(path):
+                return False
+            with path.open("rb") as stream:
+                if stream.read(len(MAGIC)).startswith(b"QKVM-VAULT-"):
+                    return False
+        # The settings, or their second copy alone (0.1.x starts from it where a start was cut off): each there is
+        # 0.1.x's own, or holds nothing.
+        primary = data_dir / "qkvm.json"
+        if not (primary.exists() or (data_dir / "qkvm.bak").exists()):
+            return False
+        for path in (primary, data_dir / "qkvm.bak"):
+            if path.is_symlink():
+                return False
+            if path.exists():
+                if not _plain_file(path):
+                    return False
+                raw = path.read_bytes()
+                if not (holds_nothing(raw) or raw.lstrip().startswith(b"{")):
+                    return False
+        # Validate without writing, and never return an existing owner to a first-run setup.
+        return bool(Store(primary, read_only=True).users)
+    except (OSError, StoreError, ValueError, RecursionError):
+        return False
 
 
 def outdated_libraries() -> dict[str, str]:
@@ -53,8 +111,10 @@ def outdated_libraries() -> dict[str, str]:
         except PackageNotFoundError:
             continue
         numbers = tuple(int(part) for part in re.findall(r"[0-9]+", installed)[:3])
-        if numbers < minimum:
-            found[name] = f"{name} {installed} (safe from {'.'.join(str(part) for part in minimum)})"
+        if name == "aiortc" and installed != "1.15.0":
+            found[name] = f"{name} {installed} (video isolation requires reviewed version 1.15.0)"
+        elif numbers < minimum:
+            found[name] = f"{name} {installed} (required minimum {'.'.join(str(part) for part in minimum)})"
     return found
 
 
@@ -107,6 +167,12 @@ class Http(H11Protocol):
 
     def data_received(self, data: bytes) -> None:
         super().data_received(data)
+        if self.transport.get_protocol() is not self:
+            # The request was for the live line, and the connection is the WebSocket's now (`Line`, which keeps time of
+            # its own). Left running, these clocks closed every line twenty seconds after it opened.
+            self._stop_the_clock()
+            self._taken()
+            return
         if self.cycle is not None and not self.cycle.response_complete:
             self._stop_the_clock()  # a whole request is here and being answered (its body has a clock of its own)
         else:
@@ -172,10 +238,165 @@ class Http(H11Protocol):
             self.transport.close()
 
 
+# What the WebSocket library logs of a connection at its finer levels is every frame: the pass in a live line's first
+# message, and every key after it. A live line's connection logs through a logger that says nothing finer than a warning,
+# whatever any level says (`--log-level debug` included: kvm.WarningsOnly); to the web server's logger, so that what it
+# does say goes where its other lines go.
+_LINE_FRAMES = WarningsOnly(logging.getLogger("uvicorn.error"), {})
+
+
 # How the web server is run, whatever it listens on.
+class Line(WebSocketsSansIOProtocol):
+    """The web server's WebSocket, for the live line (live.py), with what it does not do by itself: hang up on a viewer that stops taking what is sent.
+
+    As it comes, it answers every ping straight into what waits to be sent, without a bound, and it keeps a
+    connection whose viewer takes nothing off it for as long as the viewer keeps it: a viewer that sent pings by
+    the million and read nothing had the answers held for it without end, and one that read nothing at all kept
+    a machine's keyboard and mouse, the keys it had down with them, for as long as its connection lived. So the
+    pings are counted, what waits to be sent is looked at, and a connection that has not drained for a while is
+    dropped: the program is told that the line is gone, as it is, and lets go of what it held.
+
+    And it reads, before any pass was shown, every frame anybody who reaches the port sends: a pong nobody asked for,
+    a piece of a message that never ends (kept, every one, for the message: two million pieces of no bytes in four
+    seconds, eighty megabytes in twenty, the program's loop at a sixth of its pace meanwhile). The program counts the
+    messages it is handed (live.MOST_A_SECOND); every other frame is counted here, and so are the pieces of a message.
+    """
+
+    _second = 0.0  # the second being counted in, and the pings and other frames that came in it
+    _pings = 0
+    _frames = 0
+    _pieces = 0  # of the message that is coming
+    _paused_since: float | None = None  # since when more waits to be sent than is kept ready, and the viewer has taken none of it
+    _hung_up = False
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        # The connection the web server made, logging through the logger above: whatever it asks to say finer than a warning
+        # is dropped there, unformatted, whether or not it found out at its making that the web server's logger is finer.
+        self.conn.logger = _LINE_FRAMES
+        self.conn.debug = False
+
+    def data_received(self, data: bytes) -> None:
+        if self._hung_up:
+            return
+        super().data_received(data)
+        if not self._hung_up and self.transport.get_write_buffer_size() > live.MOST_UNSENT_TO_VIEWER:
+            self._hang_up()
+
+    def _counted(self) -> bool:
+        """One more frame of those the program does not count itself: False, and hung up on, where that is more in a second than a viewer has reason to send."""
+        if self._hung_up:
+            return False
+        now = time.monotonic()
+        if now - self._second >= 1.0:
+            self._second, self._pings, self._frames = now, 0, 0
+        self._frames += 1
+        if self._frames > live.MOST_FRAMES_A_SECOND:
+            self._hang_up()
+            return False
+        return True
+
+    def handle_ping(self) -> None:
+        if not self._counted():
+            return
+        self._pings += 1
+        if self._pings > live.MOST_PINGS_A_SECOND or self.transport.get_write_buffer_size() > live.MOST_UNSENT_TO_VIEWER:
+            self._hang_up()
+            return
+        super().handle_ping()
+
+    def handle_pong(self, event: Frame) -> None:
+        if self._counted():
+            super().handle_pong(event)
+
+    def handle_text(self, event: Frame) -> None:
+        # A whole message the program is handed, it counts; the first piece of one in pieces, or one that comes after the
+        # line was closed (thrown away unread, and read on all the same), is counted here.
+        if self._hung_up:
+            return  # (the rest of what came in one read, after the hang-up: nobody's)
+        if (event.fin and not self.close_sent) or self._counted():
+            self._pieces = 1
+            super().handle_text(event)
+
+    def handle_bytes(self, event: Frame) -> None:
+        if self._hung_up:
+            return
+        if (event.fin and not self.close_sent) or self._counted():
+            self._pieces = 1
+            super().handle_bytes(event)
+
+    def handle_cont(self, event: Frame) -> None:
+        if not self._counted():
+            return
+        self._pieces += 1
+        if self._pieces > live.MOST_PIECES:
+            self._hang_up()  # (a message in more pieces than any client sends one: the web server keeps what came, piece by piece)
+            return
+        super().handle_cont(event)
+
+    def shutdown(self) -> None:
+        # The web server is stopping, and says goodbye on every connection. On one that is closing already (its viewer said
+        # goodbye, or the line did, and the answer still waits to be taken) the library refuses to say it twice, and the
+        # web server's stop went no further: not to the connections after this one, and not to the program's own stop
+        # (every line letting go of what it held, every device's connection closed). Dropped as it stands instead; and so is
+        # one where anything else goes wrong in that goodbye, for the same reason.
+        try:
+            super().shutdown()
+        except InvalidState:
+            self.transport.abort()
+        except Exception:
+            log.debug("saying goodbye on a live line as the web server stopped failed", exc_info=True)
+            self.transport.abort()
+
+    def keepalive_timeout(self) -> None:
+        # The viewer answered none of the pings: it is gone. Dropped as the connection stands, and not closed: closing waits
+        # for what is still to be sent to be taken, which is what a viewer that is gone never does, and the program would
+        # hear of the end only then (minutes on, for a computer that vanished with something unsent), keeping the
+        # machine's keyboard and mouse for it meanwhile, and the keys it had down.
+        self.pong_timer = None
+        self.pending_ping_payload = None
+        if not self._hung_up:
+            self._hang_up()
+
+    # What is sent waits while more waits to be sent than is kept ready (`writable`), so that a viewer that falls behind is
+    # brought forward to the next key frame, and one that is not read at all ends (`slow`), instead of everything sent to it
+    # piling up in this program's memory. The web server does this itself from some version after 0.46, which this
+    # program still runs on (pyproject.toml), and which does not: so it is done here as well, in the same three places.
+    def pause_writing(self) -> None:
+        super().pause_writing()
+        self.writable.clear()
+        since = self._paused_since = time.monotonic()
+        self.loop.call_later(live.STUCK_AFTER, self._still_stuck, since)
+
+    def resume_writing(self) -> None:
+        self._paused_since = None
+        super().resume_writing()
+        self.writable.set()
+
+    def connection_lost(self, exc: Exception | None) -> None:
+        super().connection_lost(exc)
+        self.writable.set()  # (a send that waits is let go, and finds the line gone: a lost connection is never resumed)
+
+    def _still_stuck(self, since: float) -> None:
+        if self._paused_since == since and not self._hung_up:
+            self._hang_up()
+
+    def _hang_up(self) -> None:
+        self._hung_up = True
+        self.transport.abort()  # the connection is lost, and the program is told so (a disconnect), as for a viewer that went away
+
+
 SERVER_OPTIONS: dict[str, Any] = {
     "http": Http,
-    "ws": "none",  # nothing in qKVM is talked to over a websocket: there is no way in for one
+    # The live line (live.py) is the one thing in qKVM that is talked to over a WebSocket: let in by a pass of its own,
+    # every message from it bounded, asked by the web server every few seconds whether it is there (a line that has
+    # answered none of three such askings is gone, and what it held down on a machine is let go of), and hung up on
+    # when it stops taking what is sent (`Line` above).
+    "ws": Line,
+    "ws_max_size": live.MOST_WORD,
+    "ws_ping_interval": live.ASK_EVERY,
+    "ws_ping_timeout": live.ASK_EVERY * 3,
+    "ws_per_message_deflate": False,  # pictures do not pack; and what a client sent packed would be unpacked before it is counted
     "log_config": None,  # keep the handlers set up in setup_logging
     "log_level": "warning",
     "access_log": False,  # tiles poll for a frame every second; an access log would be nothing but noise
@@ -272,6 +493,20 @@ class _Unsaid(logging.Filter):
         return not getattr(record, "said", False) and record.name.split(".", 1)[0] in OURS
 
 
+class _CutShort(logging.Filter):
+    """An answer that ended before the length it said: h11 refuses that end, and the web server writes "Exception in
+    ASGI application" with a traceback, which reads as a fault of qKVM's. qKVM ends an answer so on purpose, a
+    download whose reader lost the right to the rest, and it is said in a line. Told by the note SentOnlyWhile puts on
+    the error then, not by its words: an answer that ends short by a fault is written as it was, with its traceback."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        error = record.exc_info[1] if record.exc_info else None
+        if error is not None and SentOnlyWhile.CUT_OFF in getattr(error, "__notes__", ()):
+            record.msg, record.args, record.exc_info, record.exc_text = "a download was cut off before its end: whoever was reading it may no longer have the rest", (), None, None
+            record.levelno, record.levelname = logging.WARNING, "WARNING"
+        return True
+
+
 class _OnceAMinute(logging.Filter):
     """Lets each kind of line through once a minute, and no more than `MOST` kinds in one.
 
@@ -341,6 +576,7 @@ def setup_logging(data_dir: Path, level: str) -> None:
         if name != "qkvm":
             # The web server writes a line for every request that is none, and for every one that asks for
             # something it does not do: requests anybody can send who reaches the port, signed in or not.
+            ours.addFilter(_CutShort())
             ours.addFilter(_OnceAMinute())
         logger.handlers[:] = [ours]
         logger.propagate = False
@@ -687,12 +923,29 @@ def by_hand(holder: dict[str, Any] | None) -> str:
     return f"Ctrl+C in the window it runs in, or: {'taskkill /F /T /PID' if sys.platform == 'win32' else 'kill'} {pid}"
 
 
+def history_said(folder: Path) -> None:
+    """What `qkvm status` says of the history kept in `folder` (what the wall saw of its machines): how large it is. Only looks."""
+    size = history.size_of(folder)
+    if size:
+        say(f"  the history takes {history.said_size(size)} ({history.FILE})")
+    count, aside = history.aside_in(folder)
+    if count:
+        # Left for somebody to look at, and gone by themselves once older than the history is kept.
+        say(f"  and {count} {'copy' if count == 1 else 'copies'} of it that could not be read {'takes' if count == 1 else 'take'} {history.said_size(aside)} (history.damaged-*.sqlite)")
+    # ...and so does the activity log: its files (the record), and its index beside them.
+    text, files, index = activity.size_of(folder)
+    if files:
+        made = f", and its index {history.said_size(index)} ({activity.FILE})" if index else ""
+        say(f"  the activity log takes {history.said_size(text)} in {files} {'file' if files == 1 else 'files'} (audit.log){made}")
+
+
 def describe(where: Path, holder: dict[str, Any] | None) -> None:
     """What `qkvm status` says of one running copy."""
     version = holder.get("version") if holder else None
     say(f"qKVM{f' {version}' if isinstance(version, str) else ''} is running with {where}{who(holder)}")
     for url in (holder.get("listening") if holder else None) or []:
         say(f"  {url}")
+    history_said(where)
 
 
 def ask(command: str, data_dir: Path, folder_said: bool) -> int:
@@ -729,6 +982,8 @@ def ask(command: str, data_dir: Path, folder_said: bool) -> int:
             say(f"qkvm: qKVM is not running with {where}{hint}: there is nothing to restart", error=True)
             return 1
         say(f"qKVM is not running with {where}{hint}")
+        if command == "status":
+            history_said(data_dir)
         return 3 if command == "status" else 0  # 3: what a service manager expects of "not running"
     holder = lock.holder()
     if command == "status":
@@ -781,6 +1036,60 @@ def ask(command: str, data_dir: Path, folder_said: bool) -> int:
     say(f"qkvm: the running copy{who(holder)} did not {command} within {ASK_PATIENCE:.0f} seconds.", error=True)
     say(f"      It may be an older version, which does not listen for this. To end it: {by_hand(holder)}", error=True)
     return 1
+
+
+def _mount_of(folder: Path, mountinfo: Path = Path("/proc/self/mountinfo")) -> tuple[str, str] | None:
+    """What is mounted at `folder`, as Linux says it: (the root within its source, the file system). None where nothing
+    is said (no such file, or nothing mounted there)."""
+    try:
+        lines = mountinfo.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+    target, found = (os.path.realpath(folder) if os.name == "posix" else folder.as_posix()), None  # (a path as Linux writes it)
+
+    def unescaped(text: str) -> str:  # (a space and a few others are written as octal: \040)
+        return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), text)
+
+    for line in lines:
+        mounted, _, described = line.partition(" - ")
+        fields, kind = mounted.split(" "), described.split(" ")
+        if len(fields) >= 5 and kind[0] and unescaped(fields[4]) == target:
+            found = (unescaped(fields[3]), kind[0])  # (the last one there wins: it is the one mounted over the rest)
+    return found
+
+
+def _key_would_go_with_the_container(key: Path) -> str | None:
+    """In a container: why no new storage key may be made at `key`, or None where it may (or need not be made).
+
+    The image names /keys/vault.key. A folder that is no mount of its own lives in the container, and the only key that
+    opens the settings went with it at `docker rm` (or at once, under --rm): every account, authenticator secret and
+    device password then stays sealed for good. A named volume or a bind mount there keeps it. Only the making of a new
+    key is held to this: a key that is there (an earlier container's volume, a secret handed in) is read as before.
+    """
+    if os.environ.get("QKVM_CONTAINER") != "1" or key.exists() or key.is_symlink():
+        return None
+    what = "no volume of its own"
+    if os.path.ismount(key.parent):
+        # A mount of its own, and still none that outlasts the container: a tmpfs (memory), an anonymous volume (one
+        # named by Docker or Podman with 64 hexadecimal digits: no later container is given it, and --rm removes it),
+        # or a pod's emptyDir. Told apart by what Linux says is mounted there; where it says nothing, a mount it is.
+        mount = _mount_of(key.parent)
+        if mount is None:
+            return None
+        root, kind = mount
+        if kind in ("tmpfs", "ramfs"):
+            what = f"a {kind}, which holds nothing past the container"
+        elif re.search(r"/volumes/[0-9a-f]{64}/_data$", root):
+            what = "an anonymous volume, which no later container is given"
+        elif "/kubernetes.io~empty-dir/" in root:
+            what = "an emptyDir, which goes with the pod"
+        else:
+            return None
+    return (
+        f"qkvm: the server storage key would be made in {key.parent}, which is {what}: it would be lost with "
+        "the container, and with it everything the settings hold. Mount a named volume there and run this again, for "
+        "example: -v qkvm-keys:/keys . Keep a separate private backup of the key."
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -869,13 +1178,18 @@ def main(argv: list[str] | None = None) -> int:
         "--locked-start",
         action="store_true",
         help="keep no key that opens the saved device passwords: after every restart nothing is watched until somebody signs in, "
-        "and a copy of the data folder is worth nothing without an account's password",
+        "with the separate server storage key still required to load settings",
     )
     parser.add_argument(
         "--setup-code",
         action="store_true",
         help="ask whoever sets qKVM up from another computer for a code that is printed here at start (where others could reach a new wall before you do)",
     )
+    parser.add_argument("--vault-key-file", metavar="FILE", help="private server storage key outside the data folder (or QKVM_VAULT_KEY_FILE); back it up separately")
+    migration = parser.add_mutually_exclusive_group()
+    migration.add_argument("--migrate-vault", action="store_true", help="offline: protect an existing legacy vault with a separate server key, preserving accounts and credentials")
+    migration.add_argument("--verify-vault", action="store_true", help="offline: verify the protected settings, backup and matching storage key without contacting devices")
+    migration.add_argument("--configure-server", metavar="FILE", help="offline: apply allowed_hosts/history_days/history_mb/activity_mb from a JSON object; other vault fields cannot be edited")
     parser.add_argument("--version", action="version", version=f"qkvm {__version__}")
     args = parser.parse_args(argv)
 
@@ -884,9 +1198,16 @@ def main(argv: list[str] | None = None) -> int:
         # else and is open to more: the settings with the accounts in them, the logs, the activity log.
         os.umask(0o077)
     data_dir = Path(args.data_dir) if args.data_dir else default_data_dir()
-    lock = InstanceLock(data_dir)
     if command != "start":
         return ask(command, data_dir, bool(args.data_dir))
+    try:
+        check_startup_requirements(Path(__file__).resolve().parent, __version__)
+    except UpdateError as ex:
+        say(f"qkvm: {ex}", error=True)
+        # A trial update installed by an older updater must fail before any settings migration. Status 1
+        # lets even the original supervisor roll it back; status 2 is reserved for configuration errors.
+        return 1
+    lock = InstanceLock(data_dir)
     try:
         # A folder made here is its owner's alone: what is in it is not for the others who use this computer.
         data_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -915,7 +1236,7 @@ def main(argv: list[str] | None = None) -> int:
                 readable = [name for name in (unlock.OWN, "qkvm.json", "qkvm.bak") if _others_read(data_dir / name)]
                 if readable and stat.S_IMODE(data_dir.stat().st_mode) & 0o055:
                     say(f"qkvm: in {_in_full(data_dir)}, {', '.join(readable)} can be read by other users of this computer.", error=True)
-                    say("      Together they open every saved device password (chmod -R go-rwx on the folder makes it yours alone).", error=True)
+                    say("      Restrict data-folder access and keep its separate server storage key private (chmod -R go-rwx on the folder makes it yours alone).", error=True)
         except OSError:
             pass
         try:
@@ -923,6 +1244,32 @@ def main(argv: list[str] | None = None) -> int:
         except OSError:
             pass
         setup_logging(data_dir, args.log_level)
+        vault_key = args.vault_key_file or os.environ.get("QKVM_VAULT_KEY_FILE") or None
+        # A key is made by a migration, and by the start of a wall that has no settings yet.
+        # (Not beside files sealed with a key: the key that is not found there is asked for, never made. See sealed_beside.)
+        makes_key = (args.migrate_vault or not ((data_dir / "qkvm.json").exists() or (data_dir / "qkvm.bak").exists())) and not sealed_beside(data_dir)
+        if vault_key and makes_key and not args.verify_vault and not args.configure_server and (refusal := _key_would_go_with_the_container(Path(vault_key))):
+            say(refusal, error=True)
+            return 2
+        if args.migrate_vault or args.verify_vault or args.configure_server:
+            if not vault_key:
+                say("qkvm: specify --vault-key-file outside the data directory; keep a separate private backup of that key", error=True)
+                return 2
+            if args.reset_password or args.disable_2fa or args.roll_back:
+                say("qkvm: offline vault operations cannot be combined with account reset or rollback", error=True)
+                return 2
+            try:
+                if args.configure_server:
+                    result = vault_migration.configure(data_dir, Path(vault_key), Path(args.configure_server))
+                else:
+                    result = (vault_migration.migrate if args.migrate_vault else vault_migration.verify)(data_dir, Path(vault_key))
+            except (OSError, StoreError, ValueError) as ex:
+                say(f"qkvm: vault operation did not complete: {ex}", error=True)
+                return 2
+            say(f"qkvm: protected vault verified ({result['accounts']} accounts, {result['devices']} devices); no devices were contacted")
+            say(f"      The server storage key is {Path(vault_key).absolute()}: keep a separate private backup of it.")  # (its place, never its contents)
+            say("      Keep the server storage key backed up separately. Account recovery codes cannot replace a lost storage key.")
+            return 0
         try:
             bind = normalize(args.bind.split(",")) if args.bind else None
             unlock_file = args.unlock_file or os.environ.get("QKVM_UNLOCK_FILE") or None
@@ -955,7 +1302,14 @@ def main(argv: list[str] | None = None) -> int:
                 audit_syslog=args.audit_syslog,
                 setup_code=args.setup_code,
                 locked_start=args.locked_start,
+                vault_key_file=Path(vault_key) if vault_key else None,
             )
+        except MigrationRequired as ex:
+            say(f"qkvm: {ex}", error=True)
+            if _legacy_vault_update_trial(data_dir):
+                say("      This trial update requires an offline vault migration. Returning to the previous version with the legacy data unchanged; follow SECURITY.md before upgrading.", error=True)
+                return 1  # understood by the original supervisor; never used with protected migration state
+            return 2
         except (BindError, StoreError, ValueError) as ex:
             say(f"qkvm: {'--audit-syslog: ' if args.audit_syslog is not None and 'collector' in str(ex) else ''}{ex}", error=True)
             return 2
@@ -965,6 +1319,7 @@ def main(argv: list[str] | None = None) -> int:
             # that had just been installed would be taken back for it.
             say(f"qkvm: the data folder {data_dir} could not be read or written ({ex.strerror or ex}{f': {ex.filename}' if ex.filename else ''}); qKVM was not started", error=True)
             return 2
+        say(f"qkvm: server storage key: {core.store.key_file}; back it up separately from the data folder")
         # Started by `python -m qkvm`, which can start us again; a bare `python -m qkvm.cli` cannot.
         core.supervised = os.environ.get("QKVM_CHILD") == "1"
         if core.supervised and not (args.reset_password or args.disable_2fa):
@@ -989,6 +1344,10 @@ def main(argv: list[str] | None = None) -> int:
                 say(f"qkvm: the data folder {data_dir} could not be written ({ex.strerror or ex}); nothing was changed", error=True)
                 return 2
             log.warning("two-factor sign-in switched off for %s from the command line", account.name)
+            # ...and in the activity log, where whoever looks into what happened looks: an account's second step taken away is
+            # one of the first things asked after an incident. (Written before the program ends: the log's writer is a thread.)
+            core.audit.write("totp_disabled", "", account=account.name, note="from the command line where qKVM runs")
+            core.audit.flush()
             say(f"Two-factor sign-in is off for {account.name}. Their password is unchanged.")
             return 0
         if args.reset_password:
@@ -998,6 +1357,8 @@ def main(argv: list[str] | None = None) -> int:
                 say(f"qkvm: the data folder {data_dir} could not be written ({ex.strerror or ex}); nothing was changed", error=True)
                 return 2
             log.warning("accounts reset from the command line")
+            core.audit.write("accounts_reset", "", note="from the command line where qKVM runs: every account and every saved password erased")
+            core.audit.flush()
             say("Accounts cleared. Start qKVM and open it to create the first one again, then re-enter the KVM passwords.")
             if left:
                 names = ", ".join(left)
@@ -1007,9 +1368,9 @@ def main(argv: list[str] | None = None) -> int:
         log.info("qkvm %s starting, data in %s", __version__, _in_full(data_dir))
         outdated = outdated_libraries()
         if outdated:
-            log.warning("libraries with known vulnerabilities: %s", "; ".join(outdated.values()), extra=SAID)
+            log.warning("libraries below the required minimum versions: %s", "; ".join(outdated.values()), extra=SAID)
             # By name: upgrading qKVM itself leaves a library alone that still meets what an older qKVM asked for.
-            say(f"qkvm: these libraries have known vulnerabilities - update them with: pip install --upgrade {' '.join(outdated)}", error=True)
+            say(f"qkvm: these libraries are below the required minimum versions - update them with: pip install --upgrade {' '.join(outdated)}", error=True)
             for line in outdated.values():
                 say(f"  {line}", error=True)
         raise_file_limit()

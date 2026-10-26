@@ -3,16 +3,20 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
+import logging
 import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 from websockets.exceptions import ConnectionClosedOK
 
 from qkvm import alerts, ami, discover, kvm, redfish, update, vault
+from qkvm import server as server_module
 from qkvm.redfish import link, locator, named
 from tests import fake_redfish
 from tests.aspeed_frames import Frame
@@ -102,8 +106,10 @@ def test_one_sign_in_serves_many_looks_and_is_given_back(tmp_path: Path, bmc: Fa
 
         wait_until(looked_often, "the status was not read again")
         assert bmc.state.logins == 1  # the sign-in that checked the password is the one the tile goes on using
-        # Where things are, and what rarely changes, is asked once and not with every look.
-        assert (asked("/Systems"), asked("/Chassis/Self"), asked("/Managers/Self")) == (1, 1, 1)
+        # Where things are, and what rarely changes, is asked once and not with every look. (The controller's own resource
+        # twice when the tile is added: once for the service it hosts, which binds its number to the session, see
+        # redfish.RedfishDevice._controller_under, and once for what it is.)
+        assert (asked("/Systems"), asked("/Chassis/Self"), asked("/Managers/Self")) == (1, 1, 2)
         assert client.delete(f"/api/v1/devices/{device}").status_code == 200
         assert bmc.state.signed_out == 1 and bmc.state.tokens == {}  # no session is left behind on the controller
         # A login that was only tried out, and not kept, is given back as well.
@@ -164,6 +170,498 @@ def test_the_power_buttons_mean_what_they_mean_on_a_server(tmp_path: Path, bmc: 
             assert (reply.status_code, reply.json()["code"]) == (422, "invalid"), other
         entries = [e for e in client.get("/api/v1/audit").json()["entries"] if e["event"] == "action"]
         assert [e["action"] for e in entries][::-1] == ["atx_power", "atx_power", "atx_reset", "atx_power_long", "reboot"]
+
+
+def test_start_into_bios_setup_sets_the_boot_override_then_restarts_or_powers_on(tmp_path: Path, bmc: FakeBmc) -> None:
+    with wall(tmp_path) as client:
+        device = add(client, bmc.url)
+        act = f"/api/v1/devices/{device}/actions"
+        status = status_of(client, device, state="online")
+        assert "bios_setup" in status["can"]  # the board allows the BiosSetup boot override
+        # On: the boot override is set (once), then the server is restarted.
+        assert client.post(act, json={"action": "bios_setup"}).status_code == 200
+        assert bmc.state.changes[-1]["Boot"] == {"BootSourceOverrideEnabled": "Once", "BootSourceOverrideTarget": "BiosSetup"}
+        assert bmc.state.actions == ["system ForceRestart"]
+        # A restart (becoming "On") clears a one-time override, as a real board does.
+        assert bmc.state.boot_override == ("Disabled", "None")
+        # Off: the boot override is set, then the server is switched on.
+        bmc.state.power = "Off"
+        status_of(client, device, state="no_signal")
+        assert client.post(act, json={"action": "bios_setup"}).status_code == 200
+        assert bmc.state.actions == ["system ForceRestart", "system On"]
+        entries = [e["action"] for e in client.get("/api/v1/audit").json()["entries"] if e["event"] == "action"]
+        assert entries[::-1] == ["bios_setup", "bios_setup"]
+
+
+def test_a_change_answered_204_is_taken_as_made_and_the_restart_follows_at_once(tmp_path: Path, bmc: FakeBmc, monkeypatch: pytest.MonkeyPatch) -> None:
+    # The real AMI board answered the change of its boot override 204, and then left reads of the computer unanswered for about
+    # a minute while it took the restart sent right after. A 204 is the standard's word that the change was made: no read goes
+    # between it and the restart (one would have run out, and the button with it).
+    monkeypatch.setattr(redfish.RedfishDevice, "WAITS", httpx.Timeout(1.0, connect=1.0))
+    bmc.state.busy_after_boot_change = 2.5
+    with wall(tmp_path) as client:
+        device = add(client, bmc.url)
+        status_of(client, device, state="online")
+        before = len(bmc.state.requests)
+        assert client.post(f"/api/v1/devices/{device}/actions", json={"action": "bios_setup"}).status_code == 200
+        assert bmc.state.actions == ["system ForceRestart"]
+        asked = bmc.state.requests[before:]
+        changed = asked.index("PATCH /redfish/v1/Systems/Self")
+        restarted = asked.index("POST /redfish/v1/Systems/Self/Actions/ComputerSystem.Reset")
+        assert changed < restarted and "GET /redfish/v1/Systems/Self" not in asked[changed:restarted]
+
+
+def test_a_board_that_does_not_allow_a_bios_setup_boot_is_not_offered_it(tmp_path: Path, bmc: FakeBmc) -> None:
+    bmc.state.boot_targets = ["None", "Pxe", "Hdd"]  # no "BiosSetup" among the allowed boot overrides
+    with wall(tmp_path) as client:
+        device = add(client, bmc.url)
+        act = f"/api/v1/devices/{device}/actions"
+        status = status_of(client, device, state="online")
+        assert "bios_setup" not in status["can"]
+        reply = client.post(act, json={"action": "bios_setup"})
+        assert (reply.status_code, reply.json()["code"]) == (422, "invalid") and "BiosSetup" in reply.json()["message"]
+        assert bmc.state.actions == [] and "Boot" not in dict(enumerate(bmc.state.changes)).get(0, {})
+
+
+def test_a_bios_setup_whose_restart_is_refused_clears_the_override_again(tmp_path: Path, bmc: FakeBmc) -> None:
+    # The override is set, then the controller refuses the restart it offered: the override is set back to Disabled, so the
+    # server's next boot of any kind (patching at night, a crash) does not stop in its BIOS setup; and the answer says so.
+    bmc.state.reset_refused = True
+    with wall(tmp_path) as client:
+        device = add(client, bmc.url)
+        status_of(client, device, state="online")
+        reply = client.post(f"/api/v1/devices/{device}/actions", json={"action": "bios_setup"})
+        assert reply.status_code == 502 and "cleared again" in reply.json()["message"]
+        assert bmc.state.boot_override[0] == "Disabled"
+        assert [change["Boot"]["BootSourceOverrideEnabled"] for change in bmc.state.changes if "Boot" in change] == ["Once", "Disabled"]
+
+
+def test_start_into_bios_setup_does_not_replace_another_tools_boot_override(tmp_path: Path, bmc: FakeBmc) -> None:
+    bmc.state.boot_override = ("Once", "Pxe")  # (a provisioning tool's network boot, say)
+    with wall(tmp_path) as client:
+        device = add(client, bmc.url)
+        status_of(client, device, state="online")
+        reply = client.post(f"/api/v1/devices/{device}/actions", json={"action": "bios_setup"})
+        assert (reply.status_code, reply.json()["code"]) == (409, "action_failed") and "override" in reply.json()["message"]
+        assert bmc.state.boot_override == ("Once", "Pxe") and bmc.state.actions == [] and not any("Boot" in change for change in bmc.state.changes)
+
+
+def test_start_into_bios_setup_is_for_one_machine_not_a_bulk_run(tmp_path: Path, bmc: FakeBmc) -> None:
+    with wall(tmp_path) as client:
+        device = add(client, bmc.url)
+        status_of(client, device, state="online")
+        reply = client.post(f"/api/v1/devices/{device}/actions", json={"action": "bios_setup", "batch": "a-run"})
+        assert (reply.status_code, reply.json()["code"]) == (422, "invalid") and "one machine at a time" in reply.json()["message"]
+        assert bmc.state.actions == []
+
+
+def boot_changes(bmc: FakeBmc) -> list[str]:
+    """BootSourceOverrideEnabled of every change of the boot override the controller took, in order."""
+    return [change["Boot"]["BootSourceOverrideEnabled"] for change in bmc.state.changes if "Boot" in change]
+
+
+def test_a_bios_setup_whose_change_gets_no_answer_restarts_nothing_and_clears_it(tmp_path: Path, bmc: FakeBmc, monkeypatch: pytest.MonkeyPatch) -> None:
+    # The change went out and its answer did not come back (the real board took 20 s over one): the override may be set. No
+    # restart goes out, and the override is cleared again where the controller can be reached; where clearing gets no answer
+    # either, the answer says that it may be set, never "nothing was done".
+    monkeypatch.setattr(redfish.RedfishDevice, "WAITS", httpx.Timeout(1.0, connect=1.0))
+    monkeypatch.setattr(redfish, "BOOT_WAITS", httpx.Timeout(1.0, connect=1.0))
+    bmc.state.slow_boot_changes, bmc.state.slow_boot_by = 1, 1.6
+    with wall(tmp_path) as client:
+        device = add(client, bmc.url)
+        act = f"/api/v1/devices/{device}/actions"
+        status_of(client, device, state="online")
+        reply = client.post(act, json={"action": "bios_setup"})
+        assert (reply.status_code, reply.json()["code"]) == (502, "action_failed") and "cleared again" in reply.json()["message"]
+        assert bmc.state.actions == [] and bmc.state.boot_override[0] == "Disabled" and boot_changes(bmc) == ["Once", "Disabled"]
+        bmc.state.slow_boot_changes = 2  # (the change, and the clearing after it)
+        reply = client.post(act, json={"action": "bios_setup"})
+        assert (reply.status_code, reply.json()["code"]) == (504, "timeout") and "may be set" in reply.json()["message"]
+        assert bmc.state.actions == []
+
+
+def test_a_bios_setup_whose_restart_gets_an_error_of_the_controllers_own_leaves_the_override_and_says_so(tmp_path: Path, bmc: FakeBmc) -> None:
+    # A 5xx is no refusal for certain: the restart may have been done, and the override may be what the server starts into.
+    bmc.state.reset_status = 500
+    with wall(tmp_path) as client:
+        device = add(client, bmc.url)
+        status_of(client, device, state="online")
+        reply = client.post(f"/api/v1/devices/{device}/actions", json={"action": "bios_setup"})
+        assert (reply.status_code, reply.json()["code"]) == (504, "timeout") and "may or may not" in reply.json()["message"]
+        assert bmc.state.boot_override == ("Once", "BiosSetup") and boot_changes(bmc) == ["Once"]
+
+
+def test_another_tools_override_set_meanwhile_is_not_replaced_either(tmp_path: Path, bmc: FakeBmc) -> None:
+    # Another tool sets its override between the wall's look and its change: the controller refuses the change (the mark it was
+    # decided on is old), the wall reads again, sees the override, and does not replace it with "meant whatever the state".
+    bmc.state.override_meanwhile = ("Once", "Pxe")
+    with wall(tmp_path) as client:
+        device = add(client, bmc.url)
+        act = f"/api/v1/devices/{device}/actions"
+        status_of(client, device, state="online")
+        reply = client.post(act, json={"action": "bios_setup"})
+        assert (reply.status_code, reply.json()["code"]) == (409, "action_failed") and "override" in reply.json()["message"]
+        assert bmc.state.boot_override == ("Once", "Pxe") and bmc.state.actions == [] and boot_changes(bmc) == []
+        # A controller that does not take back the marks it hands out: read again, looked at again, and sent with "*".
+        bmc.state.boot_override, bmc.state.strict_marks = ("Disabled", "None"), True
+        assert client.post(act, json={"action": "bios_setup"}).status_code == 200
+        assert boot_changes(bmc) == ["Once"] and bmc.state.actions == ["system ForceRestart"]
+
+
+def test_a_refused_mark_and_no_second_read_is_nothing_done(bmc: FakeBmc) -> None:
+    # The change was refused for its mark (412: nothing set), and the controller then could not be read again: said as
+    # nothing done, not as a timeout (which the page reads as "it may have been done").
+    bmc.state.strict_marks = True
+
+    async def run() -> None:
+        device = redfish.RedfishDevice(kvm.DeviceSpec(id="t4", name="server", base_url=bmc.url, username="admin", password="secret", kind="redfish"))
+        try:
+            refused_once = False
+            reading, requesting = device._read, device._request
+
+            async def noting(method: str, path: str, **kwargs: Any) -> httpx.Response:
+                nonlocal refused_once
+                reply = await requesting(method, path, **kwargs)
+                refused_once = refused_once or (method == "PATCH" and reply.status_code == 412)
+                return reply
+
+            async def read_fails_after_it(path: str, urgent: bool = False, vital: bool = True, waits: Any = None) -> tuple[dict[str, Any], str | None]:
+                if refused_once and path.endswith("/Systems/Self"):
+                    raise kvm.KvmError("timeout", "Device did not respond in time", 504)
+                return await reading(path, urgent, vital, waits)
+
+            device._request = noting  # type: ignore[method-assign]
+            device._read = read_fails_after_it  # type: ignore[method-assign]
+            with pytest.raises(kvm.KvmError) as refused:
+                await device.act("bios_setup")
+            assert refused.value.code == "action_failed" and refused.value.message.startswith("Nothing was done")
+            assert bmc.state.actions == [] and boot_changes(bmc) == []
+        finally:
+            await device.close()
+
+    asyncio.run(run())
+
+
+def test_a_bios_setup_the_controller_takes_and_does_not_show_restarts_nothing(tmp_path: Path, bmc: FakeBmc, monkeypatch: pytest.MonkeyPatch) -> None:
+    # "Accepted" (202) and the override does not show: a restart would not land in the setup. Nothing is restarted, and the
+    # override is cleared, in case it is made later. One that answers 202 and shows it goes on to the restart.
+    monkeypatch.setattr(redfish, "CONFIRM_WITHIN", 0.5)
+    bmc.state.boot_status, bmc.state.boot_kept = 202, False
+    with wall(tmp_path) as client:
+        device = add(client, bmc.url)
+        act = f"/api/v1/devices/{device}/actions"
+        status_of(client, device, state="online")
+        reply = client.post(act, json={"action": "bios_setup"})
+        # (The seventh review's 1.) It showed off when it was cleared: the clearing went out before a change the controller
+        # accepted and may yet make, and cannot undo it. A "maybe", said so.
+        said = reply.json()["message"]
+        assert (reply.status_code, reply.json()["code"]) == (504, "timeout") and "does not show it set" in said
+        assert "should the controller still make the change it accepted" in said
+        assert bmc.state.actions == [] and boot_changes(bmc) == ["Once", "Disabled"]
+        bmc.state.boot_kept = True
+        assert client.post(act, json={"action": "bios_setup"}).status_code == 200
+        assert bmc.state.actions == ["system ForceRestart"]
+
+
+def test_a_boot_override_is_compared_without_regard_to_case(tmp_path: Path, bmc: FakeBmc) -> None:
+    bmc.state.boot_override = ("CONTINUOUS", "biossetup")  # an override for every boot, in a controller's own letters: not replaced
+    with wall(tmp_path) as client:
+        device = add(client, bmc.url)
+        act = f"/api/v1/devices/{device}/actions"
+        status_of(client, device, state="online")
+        reply = client.post(act, json={"action": "bios_setup"})
+        assert (reply.status_code, reply.json()["code"]) == (409, "action_failed") and boot_changes(bmc) == []
+        bmc.state.boot_override = ("once", "biossetup")  # this action's own, from an earlier press, not booted since: set again
+        assert client.post(act, json={"action": "bios_setup"}).status_code == 200
+        assert boot_changes(bmc) == ["Once"] and bmc.state.actions == ["system ForceRestart"]
+
+
+def test_a_bios_setup_whose_switching_on_is_not_seen_says_the_override_stays(tmp_path: Path, bmc: FakeBmc, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(redfish, "CONFIRM_WITHIN", 0.5)
+    bmc.state.power, bmc.state.drops = "Off", ["On"]  # "accepted", and the server stays off
+    with wall(tmp_path) as client:
+        device = add(client, bmc.url)
+        status_of(client, device, state="no_signal")
+        reply = client.post(f"/api/v1/devices/{device}/actions", json={"action": "bios_setup"})
+        assert reply.status_code == 502 and "still off" in reply.json()["message"] and "stays set" in reply.json()["message"]
+        assert bmc.state.boot_override == ("Once", "BiosSetup")
+
+
+def test_a_change_of_the_boot_override_is_waited_for_longer_than_a_look(tmp_path: Path, bmc: FakeBmc, monkeypatch: pytest.MonkeyPatch) -> None:
+    # (The fourth review's 2.) The real board answered the change after 19.8 s, all but the 20 s a look is given: the change,
+    # the restart and the clearing wait BOOT_WAITS (a minute) instead, so a slow answer is no "may be set".
+    monkeypatch.setattr(redfish.RedfishDevice, "WAITS", httpx.Timeout(1.0, connect=1.0))
+    monkeypatch.setattr(redfish, "BOOT_WAITS", httpx.Timeout(4.0, connect=1.0))
+    bmc.state.slow_boot_changes, bmc.state.slow_boot_by = 1, 1.6
+    with wall(tmp_path) as client:
+        device = add(client, bmc.url)
+        status_of(client, device, state="online")
+        assert client.post(f"/api/v1/devices/{device}/actions", json={"action": "bios_setup"}).status_code == 200
+        assert boot_changes(bmc) == ["Once"] and bmc.state.actions == ["system ForceRestart"]
+
+
+def test_a_power_change_seen_on_the_second_read_is_not_gone_over(tmp_path: Path, bmc: FakeBmc) -> None:
+    # (The fourth review's 3.) The server begins to shut down as the change comes: the controller refuses the change for its
+    # old mark, the wall reads again, and the power is looked at again too, not only the override: nothing is restarted.
+    bmc.state.power_meanwhile = "PoweringOff"
+    with wall(tmp_path) as client:
+        device = add(client, bmc.url)
+        status_of(client, device, state="online")
+        reply = client.post(f"/api/v1/devices/{device}/actions", json={"action": "bios_setup"})
+        assert reply.status_code == 502 and "changing its state" in reply.json()["message"]
+        assert bmc.state.actions == [] and boot_changes(bmc) == []
+
+
+def test_clearing_leaves_another_tools_override_set_meanwhile(tmp_path: Path, bmc: FakeBmc, monkeypatch: pytest.MonkeyPatch) -> None:
+    # (The fourth review's 4.) Accepted (202), and right after it another tool sets its network boot: the wall's override does
+    # not show, nothing is restarted, and the clearing does not wipe the other tool's override.
+    monkeypatch.setattr(redfish, "CONFIRM_WITHIN", 0.5)
+    bmc.state.boot_status, bmc.state.override_after = 202, ("Once", "Pxe")
+    with wall(tmp_path) as client:
+        device = add(client, bmc.url)
+        status_of(client, device, state="online")
+        reply = client.post(f"/api/v1/devices/{device}/actions", json={"action": "bios_setup"})
+        # (The wall's change, accepted for later, may still come: a "maybe", as the history keeps it.)
+        assert reply.status_code == 504 and "another tool's now (Pxe, Once)" in reply.json()["message"]
+        assert "may yet be made late" in reply.json()["message"]
+        assert bmc.state.boot_override == ("Once", "Pxe") and boot_changes(bmc) == ["Once"] and bmc.state.actions == []
+
+
+def test_a_clearing_accepted_for_later_is_read_back_until_it_shows(tmp_path: Path, bmc: FakeBmc, monkeypatch: pytest.MonkeyPatch) -> None:
+    # (The fifth review's M1.) The restart is refused, and the clearing is answered 202 and not made: it is not said to be
+    # cleared, but that the override may be set. One answered 202 and made shows Disabled, and is "cleared again".
+    monkeypatch.setattr(redfish, "CONFIRM_WITHIN", 0.5)
+    bmc.state.reset_refused, bmc.state.clear_status, bmc.state.clear_kept = True, 202, False
+    with wall(tmp_path) as client:
+        device = add(client, bmc.url)
+        act = f"/api/v1/devices/{device}/actions"
+        status_of(client, device, state="online")
+        reply = client.post(act, json={"action": "bios_setup"})
+        assert reply.status_code == 504 and "could not be cleared" in reply.json()["message"]  # (a "maybe", in the history too)
+        assert bmc.state.boot_override == ("Once", "BiosSetup")
+        bmc.state.boot_override, bmc.state.clear_kept = ("Disabled", "None"), True
+        reply = client.post(act, json={"action": "bios_setup"})
+        assert reply.status_code == 502 and "cleared again" in reply.json()["message"] and bmc.state.boot_override[0] == "Disabled"
+
+
+def test_a_press_that_comes_late_to_its_restart_goes_no_further_and_its_clearing_is_not_cut(tmp_path: Path, bmc: FakeBmc, monkeypatch: pytest.MonkeyPatch) -> None:
+    # (The fifth review's M2, and the sixth's M1.) A controller that takes longer than SETUP_WITHIN over the change: no
+    # restart goes out that late (whoever pressed may have stopped waiting), and the override is cleared again; the
+    # clearing, slow too, is not cut off by that time (cut, it left the override set for the next boot).
+    monkeypatch.setattr(redfish, "SETUP_WITHIN", 1.0)
+    monkeypatch.setattr(redfish, "BOOT_WAITS", httpx.Timeout(10.0, connect=1.0))
+    bmc.state.slow_boot_changes, bmc.state.slow_boot_by = 2, 1.6  # (the change, and the clearing)
+    with wall(tmp_path) as client:
+        device = add(client, bmc.url)
+        status_of(client, device, state="online")
+        reply = client.post(f"/api/v1/devices/{device}/actions", json={"action": "bios_setup"})
+        assert (reply.status_code, reply.json()["code"]) == (502, "action_failed")
+        assert "took more than" in reply.json()["message"] and "cleared again" in reply.json()["message"]
+        assert bmc.state.actions == [] and boot_changes(bmc) == ["Once", "Disabled"] and bmc.state.boot_override[0] == "Disabled"
+
+
+def test_no_restart_goes_out_past_the_press_time_also_after_a_new_sign_in(tmp_path: Path, bmc: FakeBmc, monkeypatch: pytest.MonkeyPatch) -> None:
+    # (The seventh review's 3.) The restart is answered "sign in first" (the controller forgot its sessions) after the press's
+    # time ran out: it is not sent again after the new sign-in; nothing is restarted, and the override is cleared.
+    monkeypatch.setattr(redfish, "SETUP_WITHIN", 1.0)
+    bmc.state.reset_signs_out_once, bmc.state.reset_answer_takes = True, 1.5
+    with wall(tmp_path) as client:
+        device = add(client, bmc.url)
+        status_of(client, device, state="online")
+        reply = client.post(f"/api/v1/devices/{device}/actions", json={"action": "bios_setup"})
+        assert reply.status_code == 502 and "took more than" in reply.json()["message"] and "cleared again" in reply.json()["message"]
+        assert bmc.state.actions == [] and bmc.state.boot_override[0] == "Disabled"
+
+
+def test_an_answer_to_the_change_that_cannot_be_read_is_a_maybe(tmp_path: Path, bmc: FakeBmc) -> None:
+    # (The seventh review's 4.) The change was made and answered "moved" to an address that is none: no answer that can be
+    # read, so it may be set. Nothing is restarted, and it is cleared again (it was left set, unsaid).
+    bmc.state.boot_moved_once = True
+    with wall(tmp_path) as client:
+        device = add(client, bmc.url)
+        status_of(client, device, state="online")
+        reply = client.post(f"/api/v1/devices/{device}/actions", json={"action": "bios_setup"})
+        assert reply.status_code == 502 and "cleared again" in reply.json()["message"]
+        assert bmc.state.actions == [] and boot_changes(bmc) == ["Once", "Disabled"] and bmc.state.boot_override[0] == "Disabled"
+
+
+def test_a_refused_restart_while_the_change_may_yet_come_and_another_override_shows_is_a_maybe(tmp_path: Path, bmc: FakeBmc, monkeypatch: pytest.MonkeyPatch) -> None:
+    # (The seventh review's 5.) The change accepted for later (202), not readable back in time (the controller busy), another
+    # tool's network boot showing when the restart is refused: left as it is, and a "maybe" (504), as every other.
+    monkeypatch.setattr(redfish.RedfishDevice, "WAITS", httpx.Timeout(1.0, connect=1.0))
+    monkeypatch.setattr(redfish, "BOOT_WAITS", httpx.Timeout(4.0, connect=1.0))
+    monkeypatch.setattr(redfish, "CONFIRM_WITHIN", 0.5)
+    with wall(tmp_path) as client:
+        device = add(client, bmc.url)
+        status_of(client, device, state="online")
+        bmc.state.boot_status, bmc.state.override_after, bmc.state.busy_after_boot_change = 202, ("Once", "Pxe"), 2.0
+        bmc.state.reset_refused = True
+        reply = client.post(f"/api/v1/devices/{device}/actions", json={"action": "bios_setup"})
+        said = reply.json()["message"]
+        assert (reply.status_code, reply.json()["code"]) == (504, "timeout")
+        assert "another tool's now (Pxe, Once)" in said and "may yet be made late" in said
+        assert bmc.state.boot_override == ("Once", "Pxe") and boot_changes(bmc) == ["Once"]
+
+
+def test_a_change_seen_whole_does_not_make_another_tools_override_the_press_own(tmp_path: Path, bmc: FakeBmc) -> None:
+    # (The sixth review's L1.) Disabled with Pxe before (as many controllers keep it after a network boot); the change is
+    # answered 204 (made whole), another tool sets Once/Pxe right after, and the restart is refused: that override is not
+    # taken for a change of the press's made in part, and is left.
+    bmc.state.boot_override, bmc.state.override_after, bmc.state.reset_refused = ("Disabled", "Pxe"), ("Once", "Pxe"), True
+    with wall(tmp_path) as client:
+        device = add(client, bmc.url)
+        status_of(client, device, state="online")
+        reply = client.post(f"/api/v1/devices/{device}/actions", json={"action": "bios_setup"})
+        assert reply.status_code == 502 and "another tool's now (Pxe, Once)" in reply.json()["message"]
+        assert bmc.state.boot_override == ("Once", "Pxe") and boot_changes(bmc) == ["Once"]
+
+
+def test_set_before_the_press_is_said_only_while_it_shows(tmp_path: Path, bmc: FakeBmc, monkeypatch: pytest.MonkeyPatch) -> None:
+    # (The sixth review's L2.) Once/BiosSetup before the press; the change is accepted for later and not made, and another
+    # tool sets Continuous/Pxe: what is said is that override, not "set already before this press".
+    monkeypatch.setattr(redfish, "CONFIRM_WITHIN", 0.5)
+    bmc.state.boot_override, bmc.state.boot_status, bmc.state.boot_kept = ("Once", "BiosSetup"), 202, False
+    bmc.state.override_after = ("Continuous", "Pxe")
+    with wall(tmp_path) as client:
+        device = add(client, bmc.url)
+        status_of(client, device, state="online")
+        reply = client.post(f"/api/v1/devices/{device}/actions", json={"action": "bios_setup"})
+        said = reply.json()["message"]
+        assert reply.status_code == 504 and "another tool's now (Pxe, Continuous)" in said and "set already before" not in said
+        assert bmc.state.boot_override == ("Continuous", "Pxe") and bmc.state.actions == []
+
+
+def test_a_setup_boot_set_before_the_press_is_left_as_it_was(tmp_path: Path, bmc: FakeBmc) -> None:
+    # (The fifth review's L2.) Set already before the press (an earlier press, not booted since): a press whose restart is
+    # refused leaves it as it found it, and says so, not "nothing was done" over a clearing of it.
+    bmc.state.boot_override, bmc.state.reset_refused = ("Once", "BiosSetup"), True
+    with wall(tmp_path) as client:
+        device = add(client, bmc.url)
+        status_of(client, device, state="online")
+        reply = client.post(f"/api/v1/devices/{device}/actions", json={"action": "bios_setup"})
+        assert reply.status_code == 502 and "set already before this press" in reply.json()["message"]
+        assert bmc.state.boot_override == ("Once", "BiosSetup") and boot_changes(bmc) == ["Once"]
+
+
+def test_a_change_made_in_part_is_cleared_as_the_press_own(tmp_path: Path, bmc: FakeBmc, monkeypatch: pytest.MonkeyPatch) -> None:
+    # (The fifth review's L3.) A controller that takes Once and not the target, and answers 200: the override does not show,
+    # nothing is restarted, and what it made (Once, with the target there was before) is the press's own: cleared, not taken
+    # for another tool's.
+    monkeypatch.setattr(redfish, "CONFIRM_WITHIN", 0.5)
+    bmc.state.boot_override, bmc.state.boot_status, bmc.state.boot_partial = ("Disabled", "Pxe"), 200, True
+    with wall(tmp_path) as client:
+        device = add(client, bmc.url)
+        status_of(client, device, state="online")
+        reply = client.post(f"/api/v1/devices/{device}/actions", json={"action": "bios_setup"})
+        assert reply.status_code == 502 and "cleared again" in reply.json()["message"]
+        assert bmc.state.boot_override == ("Disabled", "Pxe") and bmc.state.actions == []
+
+
+def test_a_first_look_that_gets_no_answer_is_nothing_done(bmc: FakeBmc) -> None:
+    # (The fifth review's L4.) Only a look had gone out: said as nothing done, not as a timeout ("it may have been done").
+    async def run() -> None:
+        device = redfish.RedfishDevice(kvm.DeviceSpec(id="t5", name="server", base_url=bmc.url, username="admin", password="secret", kind="redfish"))
+        try:
+
+            async def no_answer(path: str, urgent: bool = False, vital: bool = True, waits: Any = None) -> tuple[dict[str, Any], str | None]:
+                raise kvm.KvmError("timeout", "Device did not respond in time", 504)
+
+            device._read = no_answer  # type: ignore[method-assign]
+            with pytest.raises(kvm.KvmError) as refused:
+                await device.act("bios_setup")
+            assert refused.value.code == "action_failed" and refused.value.message.startswith("Nothing was done")
+            assert bmc.state.actions == [] and boot_changes(bmc) == []
+        finally:
+            await device.close()
+
+    asyncio.run(run())
+
+
+def test_the_clearing_reads_and_looks_again_on_a_refused_mark(tmp_path: Path, bmc: FakeBmc) -> None:
+    # (The fifth review's L5.) A controller that does not take back its marks, and refuses the restart: the clearing is
+    # refused for its mark, reads again, and is sent with "*".
+    bmc.state.strict_marks, bmc.state.reset_refused = True, True
+    with wall(tmp_path) as client:
+        device = add(client, bmc.url)
+        status_of(client, device, state="online")
+        reply = client.post(f"/api/v1/devices/{device}/actions", json={"action": "bios_setup"})
+        assert reply.status_code == 502 and "cleared again" in reply.json()["message"]
+        assert boot_changes(bmc) == ["Once", "Disabled"] and bmc.state.boot_override[0] == "Disabled"
+
+
+def test_the_restart_and_the_clearing_wait_longer_than_a_look(tmp_path: Path, bmc: FakeBmc, monkeypatch: pytest.MonkeyPatch) -> None:
+    # (The fifth review's L5.) Not only the change: the restart, and the clearing, wait BOOT_WAITS for their answer too.
+    monkeypatch.setattr(redfish.RedfishDevice, "WAITS", httpx.Timeout(1.0, connect=1.0))
+    monkeypatch.setattr(redfish, "BOOT_WAITS", httpx.Timeout(4.0, connect=1.0))
+    bmc.state.reset_answer_takes = 1.6
+    with wall(tmp_path) as client:
+        device = add(client, bmc.url)
+        act = f"/api/v1/devices/{device}/actions"
+        status_of(client, device, state="online")
+        assert client.post(act, json={"action": "bios_setup"}).status_code == 200
+        assert bmc.state.actions == ["system ForceRestart"]
+        bmc.state.reset_answer_takes, bmc.state.reset_refused = 0.0, True
+        bmc.state.slow_boot_changes, bmc.state.slow_boot_by = 2, 1.6  # (the change, and the clearing after the refusal)
+        reply = client.post(act, json={"action": "bios_setup"})
+        assert reply.status_code == 502 and "cleared again" in reply.json()["message"]
+        assert boot_changes(bmc) == ["Once", "Once", "Disabled"] and bmc.state.boot_override[0] == "Disabled"
+
+
+def test_a_stop_while_starting_into_setup_is_logged(bmc: FakeBmc) -> None:
+    # (The fifth review's L5.) qKVM stopped while the change is under way: nothing is awaited, and the log says what may be left.
+    bmc.state.slow_boot_changes, bmc.state.slow_boot_by = 1, 3.0
+
+    async def run() -> None:
+        device = redfish.RedfishDevice(kvm.DeviceSpec(id="t6", name="server", base_url=bmc.url, username="admin", password="secret", kind="redfish"))
+        try:
+            pressing = asyncio.create_task(device.act("bios_setup"))
+            deadline = time.monotonic() + 5
+            while not any(asked.startswith("PATCH") for asked in bmc.state.requests):
+                assert time.monotonic() < deadline
+                await asyncio.sleep(0.02)
+            pressing.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await pressing
+        finally:
+            await device.close()
+
+    heard: list[str] = []
+    listener = logging.Handler(logging.WARNING)
+    listener.emit = lambda record: heard.append(record.getMessage())  # type: ignore[method-assign]
+    logging.getLogger("qkvm").addHandler(listener)  # (heard on qKVM's own logger, whatever an earlier test set up)
+    try:
+        asyncio.run(run())
+    finally:
+        logging.getLogger("qkvm").removeHandler(listener)
+    assert any("may be set for the next boot" in line for line in heard), heard
+
+
+def test_an_answer_no_change_or_command_has_is_a_maybe(tmp_path: Path, bmc: FakeBmc) -> None:
+    # (The fourth review's 5.) Only a 4xx is a no for certain. A change answered 201: it may be set, nothing is restarted, and
+    # it is cleared (here the clearing is answered 201 as well, so that it may be set is what is said). A restart answered
+    # 201: it may have gone through, and the override is left set, and said so.
+    bmc.state.boot_status = 201
+    with wall(tmp_path) as client:
+        device = add(client, bmc.url)
+        act = f"/api/v1/devices/{device}/actions"
+        status_of(client, device, state="online")
+        reply = client.post(act, json={"action": "bios_setup"})
+        assert (reply.status_code, reply.json()["code"]) == (504, "timeout") and "may be set" in reply.json()["message"]
+        assert bmc.state.actions == [] and boot_changes(bmc) == ["Once", "Disabled"]
+        bmc.state.boot_status, bmc.state.reset_status = 204, 201
+        reply = client.post(act, json={"action": "bios_setup"})
+        assert (reply.status_code, reply.json()["code"]) == (504, "timeout") and "may or may not" in reply.json()["message"]
+        assert bmc.state.boot_override == ("Once", "BiosSetup")
+
+
+def test_a_server_between_states_is_not_started_into_its_setup(tmp_path: Path, bmc: FakeBmc) -> None:
+    with wall(tmp_path) as client:
+        device = add(client, bmc.url)
+        status_of(client, device, state="online")
+        bmc.state.power = "PoweringOn"
+        reply = client.post(f"/api/v1/devices/{device}/actions", json={"action": "bios_setup"})
+        assert reply.status_code == 502 and "changing its state" in reply.json()["message"]
+        assert bmc.state.actions == [] and boot_changes(bmc) == []
 
 
 def test_a_button_the_controller_does_not_offer_is_not_pressed_some_other_way(tmp_path: Path, bmc: FakeBmc) -> None:
@@ -741,7 +1239,9 @@ def picture_of(client: object, device: str) -> bytes:
             found.append(reply.content)
         return bool(found)
 
-    wait_until(there, "no picture of the server's screen came")
+    # (As long as the program gives a console to open, and a little: a busy computer took more than five seconds to sign
+    # in, open the console and read its first picture, and the program waits CONSOLE_OPENING for the opening alone.)
+    wait_until(there, "no picture of the server's screen came", timeout=redfish.CONSOLE_OPENING + 5)
     return found[0]
 
 
@@ -775,15 +1275,35 @@ def test_a_servers_tile_shows_the_servers_screen(tmp_path: Path, with_screen: Fa
         assert bmc.state.heard[-1][0] == ami.STOP and {kind for kind, _, _ in bmc.state.heard} <= LOOKING
 
 
+def test_a_controller_whose_own_resource_cannot_be_read_still_shows_its_screen_where_its_root_says_it_is_amis(tmp_path: Path) -> None:
+    # What the controller is, is read from its own resource; where that read fails, its console is not asked for until it
+    # is known (an OpenBMC controller answers AMI's console's door as AMI's does). A root that names AMI as its maker says
+    # enough: its screen comes at once, as it did before.
+    bmc = FakeBmc(BmcState(own_console=True, screen=a_screen(), piece=50, manager_fails=10**6)).start()
+    try:
+        with wall(tmp_path) as client:
+            device = add(client, bmc.url)
+            status_of(client, device, state="online")
+            assert bmc.state.manager_reads >= 1  # (asked, and refused every time)
+            jpeg = picture_of(client, device)
+            assert min(pixel(jpeg, 8, 8)) > 225
+            assert bmc.state.web_logins == 1
+    finally:
+        bmc.stop()
+
+
 def test_the_console_is_given_back_when_nobody_looks(tmp_path: Path, with_screen: FakeBmc, monkeypatch: pytest.MonkeyPatch) -> None:
     # A controller has two console seats. The wall takes one while somebody looks at it, and not for good.
-    monkeypatch.setattr(redfish, "CONSOLE_IDLE", 0.4)
+    normal_idle = redfish.CONSOLE_IDLE
     bmc = with_screen
     with wall(tmp_path) as client:
         device = add(client, bmc.url)
         picture_of(client, device)
         assert bmc.state.watching == 1
+        # Shorten only the idle phase; isolated encoder startup is not inactivity.
+        monkeypatch.setattr(redfish, "CONSOLE_IDLE", 0.4)
         wait_until(lambda: (bmc.state.watching, bmc.state.web_sessions) == (0, {}), "the console stayed open with nobody looking")
+        monkeypatch.setattr(redfish, "CONSOLE_IDLE", normal_idle)
         # ...and whoever looks again gets it again. (Looked at until it is open: a look in the moment the old one
         # is still being put away is answered with the picture that is kept, and the look after it opens the
         # console. A wall looks every second; this looked once, and on a slow machine once was that moment.)
@@ -1142,7 +1662,7 @@ def test_a_picture_that_cannot_be_made_this_moment_is_asked_for_again_and_is_no_
     # failed inside the library that makes it, and the browser was answered with an error 500 and the log with
     # a traceback, each time; a controller that wanted to could have had that all day.
     made: list[bool] = []
-    really = redfish._jpeg
+    really = redfish.screen_jpeg
 
     def fails_the_first_time(*given: Any) -> bytes:
         made.append(True)
@@ -1150,7 +1670,7 @@ def test_a_picture_that_cannot_be_made_this_moment_is_asked_for_again_and_is_no_
             raise ValueError("got 13824 bytes; need 12288 bytes")
         return really(*given)
 
-    monkeypatch.setattr(redfish, "_jpeg", fails_the_first_time)
+    monkeypatch.setattr(redfish, "screen_jpeg", fails_the_first_time)
     with wall(tmp_path) as client:
         device = add(client, with_screen.url)
         assert kvm.picture_size(picture_of(client, device)) == (64, 32)  # asked for again, as a picture that is not there yet is
@@ -1236,3 +1756,320 @@ def test_the_console_is_not_hung_up_on_for_not_answering_a_ping(tmp_path: Path, 
     with wall(tmp_path) as client:
         picture_of(client, add(client, with_screen.url))
     assert "ping_interval" in asked and asked["ping_interval"] is None
+
+
+# --- keys, typed text and Ctrl+Alt+Del, over AMI's console (as a KVM takes them) -----------------------------
+
+
+def test_keys_typed_text_and_ctrl_alt_del_reach_the_servers_console(tmp_path: Path, with_screen: FakeBmc) -> None:
+    # A server whose controller is AMI's takes keyboard over the same console the screen comes on. Each report is
+    # the whole keyboard; a combination goes down together, a typed character is pressed and released, and nothing
+    # is left down. None of it touches Redfish: no power command, no change to the server.
+    bmc = with_screen
+    with wall(tmp_path) as client:
+        device = add(client, bmc.url)
+        # Keys are offered once the console is known to be AMI's (opened by the tile's first picture), not before.
+        picture_of(client, device)
+        can = status_of(client, device, state="online")["can"]
+        assert "keys" in can and "text" in can and "control" in can
+        act = f"/api/v1/devices/{device}/actions"
+        assert client.post(act, json={"action": "ctrl_alt_del"}).status_code == 200
+        assert client.post(act, json={"action": "keys", "keys": "ControlLeft,KeyC"}).status_code == 200
+        assert client.post(act, json={"action": "text", "text": "Hi"}).status_code == 200
+        # (The last letting go is read by the stand-in, in a thread of its own, a moment after the answer came.)
+        wait_until(lambda: ("key", 0, [0x0C]) in bmc.state.hid and bmc.state.hid[-1] == ("key", 0, []), f"the typed text never arrived: {bmc.state.hid}")
+        assert bmc.state.bad_hid == []  # every packet checked out
+        assert ("key", 0x05, [0x4C]) in bmc.state.hid  # Ctrl+Alt+Del: left Ctrl and left Alt held, Delete down
+        assert ("key", 0x01, [0x06]) in bmc.state.hid  # Ctrl held, C down
+        assert ("key", 0x02, [0x0B]) in bmc.state.hid  # Shift held, H down (a capital)
+        assert bmc.state.hid[-1] == ("key", 0, [])  # and the keyboard is left with nothing down
+        assert bmc.state.actions == [] and bmc.state.changes == []
+
+
+def test_a_controller_with_no_console_qkvm_reads_cannot_take_keys(tmp_path: Path, bmc: FakeBmc) -> None:
+    # The default controller here has no console qKVM reads. Keys are not an action it can do; attempted, it is
+    # told so, and once that is known the tile stops offering them.
+    with wall(tmp_path) as client:
+        device = add(client, bmc.url)
+        reply = client.post(f"/api/v1/devices/{device}/actions", json={"action": "keys", "keys": "KeyA"})
+        assert (reply.status_code, reply.json()["code"]) == (422, "invalid")
+        assert bmc.state.web_logins == 0  # (no web page was signed in to for a controller that cannot do this)
+        assert "keys" not in status_of(client, device, screen=False)["can"]
+
+
+def test_keys_wait_for_the_console_to_be_this_programs_and_go_nowhere_else(tmp_path: Path, with_screen: FakeBmc, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Found by a review: keys went once the pass was taken, before the controller said "the console is yours". A
+    # console whose last holder may come back is shown, and its holder is another session: nothing is typed into it.
+    monkeypatch.setattr(redfish, "MASTER_WAIT", 0.5)
+    bmc = with_screen
+    bmc.state.holder_returning = True
+    with wall(tmp_path) as client:
+        device = add(client, bmc.url)
+        picture_of(client, device)
+        reply = client.post(f"/api/v1/devices/{device}/actions", json={"action": "keys", "keys": "KeyA"})
+        assert (reply.status_code, reply.json()["code"]) == (409, "in_use"), reply.text
+        assert bmc.state.hid == [] and ami.HID not in {kind for kind, _, _ in bmc.state.heard}
+        # Nor are keys offered meanwhile (found by the second review): a look with that console open leaves them out.
+        monkeypatch.setattr(redfish, "LOOK_EVERY", 0.3)
+        looked: list[dict[str, Any]] = []
+
+        def a_look_with_the_console_open() -> bool:
+            looked[:] = [client.get("/api/v1/status").json()[device]]
+            return bool(looked[0]["video"]["width"] == 64)
+
+        wait_until(a_look_with_the_console_open, "no look was had with the console open")
+        assert "keys" not in looked[0]["can"]
+
+
+def test_keys_wait_for_the_keyboard_of_a_first_session_to_be_attached(tmp_path: Path, with_screen: FakeBmc, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Seen on a real board: a letter typed the moment a first console session was the wall's never arrived, the virtual
+    # keyboard not being attached to the server yet (its own viewer takes no key for five seconds then). They wait.
+    monkeypatch.setattr(redfish, "HID_SETTLE", 1.2, raising=False)
+    bmc = with_screen
+    bmc.state.first_session, bmc.state.hid_settles = True, 1.0
+    with wall(tmp_path) as client:
+        device = add(client, bmc.url)
+        assert client.post(f"/api/v1/devices/{device}/actions", json={"action": "keys", "keys": "KeyA"}).status_code == 200
+        # (Sent by the time the answer comes; read by the stand-in, in a thread of its own, a moment later.)
+        wait_until(lambda: len(bmc.state.hid) + bmc.state.hid_lost >= 2, f"the key and its letting go never came: {bmc.state.hid}")
+        assert (bmc.state.hid_lost, bmc.state.hid) == (0, [("key", 0, [0x04]), ("key", 0, [])])
+
+
+def test_a_typing_stopped_with_a_key_down_lets_it_go(with_screen: FakeBmc, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Found by a review: stopped between a key's press and its release (the request cut off as qKVM stops), the key
+    # stayed down on the server, and a key held down repeats. It is let go of, in a task of its own.
+    monkeypatch.setattr(redfish, "HOLD", 2.0)  # (long enough to be stopped in)
+    bmc = with_screen
+
+    async def run() -> None:
+        device = redfish.RedfishDevice(kvm.DeviceSpec(id="t1", name="server", base_url=bmc.url, username="admin", password="secret", kind="redfish"))
+        try:
+            typing = asyncio.ensure_future(device.act("keys", keys="ControlLeft,KeyC"))
+            for _ in range(400):
+                if ("key", 0x01, [0x06]) in bmc.state.hid:
+                    break
+                await asyncio.sleep(0.05)
+            assert ("key", 0x01, [0x06]) in bmc.state.hid, f"Ctrl+C never went down: {bmc.state.hid}"
+            typing.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await typing
+            for _ in range(100):
+                if bmc.state.hid[-1] == ("key", 0, []):
+                    break
+                await asyncio.sleep(0.05)
+            assert bmc.state.hid[-1] == ("key", 0, []), f"Ctrl+C stayed down: {bmc.state.hid}"
+        finally:
+            await device.close()
+
+    asyncio.run(run())
+
+
+def test_a_server_taken_off_the_wall_in_the_middle_of_a_typing_has_its_key_let_go_of(with_screen: FakeBmc, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Found by the second review: the device closed while a typing held a key (a tile edited, the last person signed
+    # out), the console said goodbye with the key still down. It is let go of before the goodbye.
+    monkeypatch.setattr(redfish, "HOLD", 6.0)  # (the typing's own letting go must not come first, on a slow machine either)
+    bmc = with_screen
+
+    async def run() -> None:
+        device = redfish.RedfishDevice(kvm.DeviceSpec(id="t2", name="server", base_url=bmc.url, username="admin", password="secret", kind="redfish"))
+        typing = asyncio.ensure_future(device.act("ctrl_alt_del"))
+        for _ in range(400):
+            if ("key", 0x05, [0x4C]) in bmc.state.hid:
+                break
+            await asyncio.sleep(0.05)
+        assert ("key", 0x05, [0x4C]) in bmc.state.hid, f"Ctrl+Alt+Del never went down: {bmc.state.hid}"
+        await device.close()
+        with pytest.raises(kvm.KvmError):
+            await typing
+        for _ in range(100):  # (the stand-in reads in a thread of its own)
+            if bmc.state.heard and bmc.state.heard[-1][0] == ami.STOP:
+                break
+            await asyncio.sleep(0.05)
+        heard = [kind for kind, _, _ in bmc.state.heard]
+        assert heard[-1] == ami.STOP and bmc.state.hid[-1] == ("key", 0, []), f"the keys went with the session: {bmc.state.hid}"
+        assert max(i for i, kind in enumerate(heard) if kind == ami.HID) < len(heard) - 1
+
+    asyncio.run(run())
+
+
+class StallingConsole:
+    """A console connection with nothing behind it: what is said to it is kept (as messages), what it says is put in by
+    the test, and a send can be made to wait once its data is written, as a WebSocket's does while the far end reads nothing."""
+
+    subprotocol = "binary"
+
+    def __init__(self) -> None:
+        self.incoming: asyncio.Queue[bytes] = asyncio.Queue()
+        self.sent: list[ami.Message] = []
+        self.stall: asyncio.Event | None = None  # the next send waits for this, after its data is written
+        self.stalled = asyncio.Event()
+        self.transport = type("Transport", (), {"abort": lambda self: None})()
+
+    async def recv_streaming(self) -> Any:
+        yield await self.incoming.get()
+
+    async def send(self, data: Any) -> None:
+        self.sent.extend(ami.Messages().feed(bytes(data)))
+        stall, self.stall = self.stall, None
+        if stall is not None:
+            self.stalled.set()
+            await stall.wait()
+
+    async def close(self) -> None:
+        pass
+
+
+def test_a_press_on_its_way_behind_a_letting_go_is_let_go_of_before_the_console_is_given(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Found by the fourth review: a letting go that finished late said "nothing is down" of a press that was already on
+    # its way behind it (the controller not reading just then), and a person let in at that moment was given the
+    # console with the press down. Only the report noted last says what is down.
+    conn = StallingConsole()
+
+    async def connect(*args: Any, **kwargs: Any) -> Any:
+        return conn
+
+    monkeypatch.setattr(redfish, "ws_connect", connect)
+
+    async def run() -> None:
+        device = redfish.RedfishDevice(kvm.DeviceSpec(id="t3", name="server", base_url="http://127.0.0.1:9", username="admin", password="x", kind="redfish"))
+        console = device._console = redfish._Console()
+        device._console_wanted_at = time.monotonic()
+        watching = asyncio.ensure_future(device._watch_console(console, "c=1", "pass", "127.0.0.1", "127.0.0.1", "s"))
+
+        async def looked_at() -> None:
+            while True:
+                device._console_wanted_at = time.monotonic()
+                await asyncio.sleep(0.05)
+
+        looking = asyncio.ensure_future(looked_at())
+        try:
+            for said in (ami.message(ami.ALLOWED, 2), ami.message(ami.PASS_SEEN, 0, bytes([1, 0])), ami.message(ami.NEXT_HOLDER, ami.BECAME_MASTER)):
+                await conn.incoming.put(said)
+            for _ in range(200):
+                if device._live_send is not None:
+                    break
+                await asyncio.sleep(0.01)
+            era = device._input_era
+            await device.send_keyboard(0x01, [], era)  # Ctrl down
+            conn.stall = letting_go = asyncio.Event()
+            first = asyncio.ensure_future(device.send_keyboard(0, [], era))  # Ctrl let go of, waiting for room
+            await conn.stalled.wait()
+            conn.stalled.clear()
+            second = asyncio.ensure_future(device.send_keyboard(0, [0x04], era))  # 'a' pressed, behind it
+            for _ in range(5):
+                await asyncio.sleep(0)
+            conn.stall = pressing = asyncio.Event()
+            letting_go.set()
+            await first
+            await conn.stalled.wait()  # 'a' is on its way, waiting for room
+            await conn.incoming.put(ami.message(ami.SHARING, ami.ASKED, SOMEBODY))  # somebody asks for the console now
+            for _ in range(50):
+                await asyncio.sleep(0)
+            pressing.set()
+            await second
+            for _ in range(200):
+                if any(one.kind == ami.SHARING for one in conn.sent):
+                    break
+                await asyncio.sleep(0.01)
+            given = next(at for at, one in enumerate(conn.sent) if one.kind == ami.SHARING)
+            keys = [one.body[33:41] for one in conn.sent[:given] if one.kind == ami.HID]
+            assert keys[-1] == bytes(8), f"the console was given with a key down: {[report.hex() for report in keys]}"
+        finally:
+            looking.cancel()
+            watching.cancel()
+            with contextlib.suppress(asyncio.CancelledError, kvm.KvmError):
+                await watching
+
+    asyncio.run(run())
+
+
+class LoseKeys:
+    """A console connection that is closed for keys and the mouse: what goes up as a HID report finds it closed."""
+
+    def __init__(self, real: Any) -> None:
+        self._real = real
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._real, name)
+
+    async def send(self, data: Any) -> None:
+        if isinstance(data, bytes) and data[:2] == ami.HID.to_bytes(2, "little"):
+            raise ConnectionClosedOK(None, None)
+        await self._real.send(data)
+
+
+def test_a_key_into_a_console_that_has_closed_is_not_said_to_be_sent(tmp_path: Path, with_screen: FakeBmc, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Found by a review: a key sent over a connection that had closed was taken for delivered, its letting go too.
+    really = redfish.ws_connect
+
+    async def closed_for_keys(url: str, **options: Any) -> Any:
+        return LoseKeys(await really(url, **options))
+
+    monkeypatch.setattr(redfish, "ws_connect", closed_for_keys)
+    with wall(tmp_path) as client:
+        device = add(client, with_screen.url)
+        picture_of(client, device)
+        reply = client.post(f"/api/v1/devices/{device}/actions", json={"action": "keys", "keys": "KeyA"})
+        assert reply.status_code != 200 and reply.json()["code"] == "dropped", reply.text
+
+
+def test_an_openbmc_controller_is_not_offered_the_password_for_keys(tmp_path: Path) -> None:
+    # Found by a review: asked for keys before its first look, a controller under OpenBMC was taken down AMI's road:
+    # its web page was asked for a console pass, and would have been offered the password.
+    bmc = FakeBmc(BmcState(layout="openbmc")).start()
+    try:
+        with wall(tmp_path) as client:
+            device = add(client, bmc.url, kind="redfish")
+            reply = client.post(f"/api/v1/devices/{device}/actions", json={"action": "keys", "keys": "KeyA"})
+            assert reply.status_code in (409, 422, 503), reply.text
+            assert bmc.state.token_asks == 0 and bmc.state.web_logins == 0
+    finally:
+        bmc.stop()
+
+
+def test_a_text_that_cannot_be_typed_is_not_quoted_back(tmp_path: Path, with_screen: FakeBmc) -> None:
+    # Found by a review: the character that could not be typed was quoted in the answer, and so in the activity log.
+    # The text may be a saved secret: where it went wrong is said, and not what is there.
+    with wall(tmp_path) as client:
+        device = add(client, with_screen.url)
+        odd = chr(0xE9)
+        reply = client.post(f"/api/v1/devices/{device}/actions", json={"action": "text", "text": "secret" + odd + "x"})
+        assert (reply.status_code, reply.json()["code"]) == (422, "invalid")
+        assert "Character 7" in reply.json()["message"] and odd not in reply.json()["message"]
+        assert odd not in client.get("/api/v1/audit").text
+
+
+def test_an_invalid_key_combination_is_refused(tmp_path: Path, with_screen: FakeBmc) -> None:
+    with wall(tmp_path) as client:
+        device = add(client, with_screen.url)
+        reply = client.post(f"/api/v1/devices/{device}/actions", json={"action": "keys", "keys": "NoSuchKey"})
+        assert (reply.status_code, reply.json()["code"]) == (422, "invalid")
+        assert "JetKVM" not in reply.json()["message"]  # (the key table is shared with a JetKVM; the console is the server's)
+
+
+def test_a_slow_controller_is_given_longer_to_answer_than_a_kvm(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # An older board (a Gigabyte, AMI's firmware) took nine to twelve seconds to show the root of its Redfish
+    # service, and four to seven to show its computer, after a quiet period as at any other time. With the read a
+    # KVM is given (eight seconds) those timed out, the tile fell offline and came back by turns, and the one who
+    # added it was once told "did not respond in time". A controller is given longer. (The read, not the connect:
+    # one that is simply not there is still found at once.) Here the two patiences are shortened to keep the test quick.
+    monkeypatch.setattr(kvm, "WAITS", httpx.Timeout(0.4, connect=0.5))  # what a KVM is given
+    monkeypatch.setattr(redfish.RedfishDevice, "WAITS", httpx.Timeout(2.0, connect=0.5))  # what a controller is given
+    bmc = FakeBmc(BmcState(root_takes=0.9)).start()  # slower than a KVM's read, within a controller's
+    try:
+        with wall(tmp_path) as client:
+            device = add(client, bmc.url)
+            assert status_of(client, device, state="online")["server"]["health"] == "OK"
+    finally:
+        bmc.stop()
+
+
+def test_a_controller_whose_redfish_root_is_slow_is_still_known_for_one_when_it_is_added() -> None:
+    # A real older AMI firmware took 3.2 s to show the root of its Redfish service. Asked with less patience
+    # than that, the wall did not know it for a server's controller, took it for a KVM, and said "did not
+    # respond in time" to the one adding it, whose login was right.
+    server = FakeBmc(BmcState(root_takes=3.5)).start()
+    try:
+        assert asyncio.run(server_module.detect_kind(server.url, True)) == ("redfish", server.url)
+    finally:
+        server.stop()

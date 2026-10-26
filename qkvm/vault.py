@@ -1,9 +1,9 @@
-"""Password-derived encryption for the secrets the wall stores.
+"""The inner password/recovery credential layer.
 
-The admin password is never stored. scrypt turns it into a key that wraps a
-random data key, and the data key encrypts each KVM password. Unwrapping the
-data key doubles as the password check, so the file on disk is useless without
-the password.
+Password-derived keys wrap an inner data key, preserving account and recovery
+semantics. Those records and encrypted secrets are themselves protected by the
+independent external server-key envelope in vault_storage.py. An account password
+alone cannot open the protected settings file.
 """
 
 from __future__ import annotations

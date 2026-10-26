@@ -16,6 +16,7 @@ import pytest
 
 from qkvm.core import Core
 from qkvm.store import Store, StoreError
+from qkvm.vault_storage import key_path
 from tests.test_wall import wall
 
 HALF = "\\ud800"  # as JSON spells half a character out
@@ -44,7 +45,7 @@ def test_a_zone_of_half_a_character_is_not_saved_as_where_the_wall_listens(tmp_p
         alone.mkdir()
         shutil.copy2(folder / name, alone / "qkvm.json")
         try:
-            Store(alone / "qkvm.json")
+            Store(alone / "qkvm.json", vault_key_file=key_path(folder), protected=True)
         except StoreError as ex:
             pytest.fail(f"the form answered {answered}, and {name} is refused at the next start: {str(ex)[-230:]}")
     # ...and the wall itself starts on its folder again.

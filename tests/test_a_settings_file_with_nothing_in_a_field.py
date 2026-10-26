@@ -33,6 +33,7 @@ import qkvm
 from qkvm import kvm, update, vault
 from qkvm.store import Store, StoreError
 from tests.test_wall import PASSWORD, add, closed_port, wall
+from tests.settings_file import settings_text, write_settings_text
 
 EDITS: dict[str, Any] = {
     "allowed_hosts that is null": lambda saved: saved["server"].__setitem__("allowed_hosts", None),
@@ -57,9 +58,9 @@ def a_wall(folder: Path) -> None:
 
 def edit(folder: Path, change: Any, both: bool) -> None:
     for name in ("qkvm.json", "qkvm.bak") if both else ("qkvm.json",):
-        saved = json.loads((folder / name).read_text(encoding="utf-8"))
+        saved = json.loads(settings_text(folder / name, encoding="utf-8"))
         change(saved)
-        (folder / name).write_text(json.dumps(saved, indent=2), encoding="utf-8")
+        write_settings_text(folder / name, json.dumps(saved, indent=2), encoding="utf-8")
 
 
 @pytest.mark.parametrize("what", list(EDITS))

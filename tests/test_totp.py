@@ -11,6 +11,7 @@ from qkvm import kvm, totp, update, vault
 from qkvm.cli import main as run_cli
 from tests.test_users import OTHER, account, visitor
 from tests.test_wall import PASSWORD, wall
+from tests.settings_file import settings_text
 
 
 @pytest.fixture(autouse=True)
@@ -63,7 +64,7 @@ def test_signing_in_then_needs_the_code_as_well(tmp_path: Path) -> None:
         assert admin.post("/api/v1/totp/enable", json={"code": code_for(begun["secret"])}).json()["user"]["totp"] is True
         assert admin.post("/api/v1/totp/begin", json={"password": PASSWORD}).status_code == 409
         secret = begun["secret"]
-        assert secret.replace(" ", "") not in (tmp_path / "qkvm.json").read_text()  # the key is stored encrypted
+        assert secret.replace(" ", "") not in settings_text(tmp_path / "qkvm.json")  # the key is stored encrypted
 
     with wall(tmp_path, sign_in=False, locked_start=True) as client:  # restarted, and started locked: nothing is open until somebody is let in
         first = client.post("/api/v1/login", json={"password": PASSWORD})
@@ -121,7 +122,7 @@ def test_one_time_codes_stand_in_for_a_phone_that_is_not_at_hand(tmp_path: Path)
         codes = enabled["recovery_codes"]
         assert len(codes) == len(set(codes)) == 10 and all(len(code) == 11 and code[5] == "-" for code in codes)
         assert enabled["user"]["recovery_codes"] == 10
-        saved = (tmp_path / "qkvm.json").read_text()
+        saved = settings_text(tmp_path / "qkvm.json")
         assert not any(code in saved or code.replace("-", "") in saved for code in codes)  # only what recognises them is kept
 
     with wall(tmp_path, sign_in=False) as client:  # restarted, and the phone is in a taxi
@@ -230,7 +231,7 @@ def test_what_is_kept_of_a_one_time_code_is_of_no_use_without_the_data_key(tmp_p
         begun = admin.post("/api/v1/totp/begin", json={"password": PASSWORD}).json()
         codes = admin.post("/api/v1/totp/enable", json={"code": code_for(begun["secret"])}).json()["recovery_codes"]
         me = admin.get("/api/v1/session").json()["user"]["id"]
-    saved = (tmp_path / "qkvm.json").read_text()
+    saved = settings_text(tmp_path / "qkvm.json")
     # Forty random bits can be tried through in minutes by whoever has the file, if all it takes is a hash.
     for code in codes:
         assert hashlib.sha256(f"{me}:{code.replace('-', '')}".encode()).hexdigest() not in saved
@@ -251,7 +252,14 @@ def test_an_admin_changes_their_own_password_where_the_current_one_is_asked_for(
 
 
 def codes_around_now(spaced_secret: str) -> tuple[str, str, str]:
-    """The code of the time step before this one, of this one and of the next: all three count as "now" (clocks differ)."""
+    """The code of the time step before this one, of this one and of the next: all three count as "now" (clocks differ).
+
+    Taken where at least three seconds of this step are left, or else just after the next one has begun: where a step
+    ended between taking the codes and the wall checking one, the one before was two steps old by then and refused,
+    rightly (Windows with Python 3.11, loaded, on 2026-10-15: switching the second step on was answered 401)."""
+    left = totp.STEP - time.time() % totp.STEP
+    if left < 3:
+        time.sleep(left + 0.05)
     key, step = spaced_secret.replace(" ", ""), int(time.time() // totp.STEP)
     return totp.code_at(key, step - 1), totp.code_at(key, step), totp.code_at(key, step + 1)
 

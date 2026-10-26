@@ -12,3 +12,7 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+
+# Encrypted migration recovery still contains private account/credential records.
+vault-migration.recovery
+*.migration-*

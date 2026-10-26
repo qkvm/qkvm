@@ -23,23 +23,25 @@ import qkvm.__main__ as starter
 pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="on Windows a folder cannot be removed while a program is in it, and a link needs a right most accounts have not got")
 
 
-def typed(folder: Path, shell: str, *words: str) -> subprocess.CompletedProcess[str]:
+def typed(folder: Path, setup: str, *words: str) -> subprocess.CompletedProcess[str]:
     env = {**os.environ, "PYTHONPATH": str(Path(starter.__file__).resolve().parent.parent), "HOME": str(folder / "home")}
     env.pop(starter.CHILD, None)
-    return subprocess.run(["sh", "-c", shell, "sh", str(folder / "here"), sys.executable, *words], env=env, capture_output=True, text=True, timeout=120)
+    # Prepare the same filesystem state without requiring a shell in the image.
+    script = "import os, sys; os.chdir(sys.argv[1]); " + setup + "; os.execv(sys.executable, [sys.executable, *sys.argv[2:]])"
+    return subprocess.run([sys.executable, "-P", "-c", script, str(folder / "here"), *words], env=env, capture_output=True, text=True, timeout=120)
 
 
 @pytest.mark.parametrize("command", ["status", "stop", "restart"])
 def test_asked_from_a_folder_that_is_gone_about_a_data_folder_named_from_there_it_says_so(tmp_path: Path, command: str) -> None:
     (tmp_path / "here").mkdir()
-    done = typed(tmp_path, 'cd "$1" && rmdir "$1" && shift && exec "$@"', "-P", "-m", "qkvm", command, "--data-dir", "data")
+    done = typed(tmp_path, 'os.rmdir(sys.argv[1])', "-P", "-m", "qkvm", command, "--data-dir", "data")
     print(f">>> qkvm {command} --data-dir data, typed in a folder that is gone: status {done.returncode}; {done.stderr.strip().splitlines()[-1:]}")
     assert "Traceback" not in done.stderr, done.stderr[-600:]
 
 
 def test_started_with_a_data_folder_behind_a_link_to_itself_it_says_so(tmp_path: Path) -> None:
     (tmp_path / "here").mkdir()
-    done = typed(tmp_path, 'cd "$1" && ln -s loop loop && shift && exec "$@"', "-P", "-m", "qkvm", "--data-dir", "loop/data", "--port", "1", "--bind", "local")
+    done = typed(tmp_path, 'os.symlink("loop", "loop")', "-P", "-m", "qkvm", "--data-dir", "loop/data", "--port", "1", "--bind", "local")
     print(f">>> qkvm --data-dir loop/data on Python {sys.version_info.major}.{sys.version_info.minor}: status {done.returncode}; {done.stderr.strip().splitlines()[-1:]}")
     assert "Traceback" not in done.stderr, done.stderr[-600:]
     assert done.returncode == 2, "not 'could not start' to the starter, which takes any other status for a version that does not work"

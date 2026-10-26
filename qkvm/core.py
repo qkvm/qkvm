@@ -11,15 +11,18 @@ import secrets
 import time
 from collections.abc import Awaitable, Callable, Iterable
 from pathlib import Path
+from typing import Any
 
 
-from . import unlock
+from . import activity, unlock
 from .alerts import Watcher
 from .forward import Syslog
+from .history import FILE as HISTORY_FILE
+from .history import History
 from .kvm import Device, DeviceSpec, KvmDevice, saved_mark
 from .netbind import lan_ip, tailscale_ip
 from .security import Limiter, Sessions, proxy_networks
-from .store import AuditLog, DeviceRecord, Store, UserRecord
+from .store import FINGERBOT_STRENGTHS, AuditLog, DeviceRecord, Store, UserRecord, activity_file_bytes
 from .tlscert import certificate_fingerprint, ensure_certificate
 from .update import GITHUB_API, Updater
 from .vault import NoMemory, Vault
@@ -47,8 +50,12 @@ class Core:
         audit_syslog: str | None = None,
         setup_code: bool = False,
         locked_start: bool = False,
+        vault_key_file: Path | None = None,
     ) -> None:
         data_dir.mkdir(parents=True, exist_ok=True)
+        # Validate the external storage key before touching automatic-unlock keys or sessions.
+        # A missing key or an unmigrated legacy vault must never become a fresh setup.
+        self.store = Store(data_dir / "qkvm.json", vault_key_file=vault_key_file, protected=True)
         # The only addresses that are answered at all, if any were named (see security.client_allowed).
         self.allowed_clients = proxy_networks(allow_from)
         # HTTPS because it was said at start, whatever the settings say; and with whose certificate.
@@ -80,9 +87,17 @@ class Core:
         self.sso_header = sso_header
         self.data_dir = data_dir
         self.started = time.time()
-        self.store = Store(data_dir / "qkvm.json")
         # The activity log, and where a copy of each entry is sent as it is written (--audit-syslog); ValueError for no such place.
-        self.audit = AuditLog(data_dir / "audit.log", forward=Syslog(audit_syslog).send if audit_syslog is not None else None)
+        self.audit = AuditLog(
+            data_dir / "audit.log",
+            max_bytes=activity_file_bytes(self.store.server.activity_mb),
+            forward=Syslog(audit_syslog).send if audit_syslog is not None else None,
+        )
+        # ...and its index for the page's filters and search (see activity.py), made from those files and from nothing else,
+        # told by the log's writer that there is more and never waited for; its thread is started with the wall.
+        self.activity = activity.Index(data_dir / activity.FILE, self.audit)
+        self.audit.on_written = self.activity.wake
+        activity.leftover_downloads(data_dir)  # (what a power cut left of a download in the making)
         self.vault = Vault()
         # Browsers that asked to be kept signed in outlast a restart, where the saved passwords open by
         # themselves after one. Where they do not, a sign-in that outlasted it would be one to a wall that shows
@@ -97,6 +112,8 @@ class Core:
         self.limiter = Limiter()
         # What each machine was last seen as, for alerts: kept over a restart, and over the listeners being reopened.
         self.watcher = Watcher(data_dir / "watch.json")
+        # What the wall saw of each machine, kept for a while (see history.py): opened by its own thread once the wall serves.
+        self.history = History(data_dir / HISTORY_FILE, limits=lambda: (self.store.server.history_days, self.store.server.history_mb))
         # Where qKVM was started with --setup-code: printed where it runs, and asked of whoever sets the first
         # password from another computer, as proof that they can see that. None: nothing is asked but the
         # password, and whoever opens a new wall first chooses it.
@@ -289,11 +306,12 @@ def identity(record: DeviceRecord) -> str | None:
 
     Not so for a server's management controller, whose maker may have put the same certificate on every
     board: a server is known by the number it gives for itself. Nor for a device behind somebody's front
-    door, where the certificate is the door's.
+    door, where the certificate is the door's. Nor for a guest of Proxmox: every guest of one Proxmox shows
+    its certificate, and a guest is known by the number it gives for itself too.
     """
     if record.ident:
         return record.ident
-    if record.kind != "redfish" and record.tls == "pinned" and record.cert_pem:
+    if record.kind not in ("redfish", "proxmox") and record.tls == "pinned" and record.cert_pem:
         return saved_mark(record.cert_pem)  # (None where what is remembered is no certificate: it is known by nothing then)
     return None
 
@@ -323,6 +341,18 @@ def driver_for(kind: str) -> type[Device]:
         from .redfish import RedfishDevice
 
         return RedfishDevice
+    if kind == "amt":
+        from .amt import AmtDevice  # a business PC with Intel AMT
+
+        return AmtDevice
+    if kind == "vnc":
+        from .vncdevice import VncDevice
+
+        return VncDevice
+    if kind == "proxmox":
+        from .proxmox import ProxmoxGuest  # a virtual machine on Proxmox VE
+
+        return ProxmoxGuest
     return KvmDevice
 
 
@@ -333,10 +363,19 @@ class DeviceManager:
         self.core = core
         self.save = save  # writes the settings to disk: the server's way, off the event loop, when its turn among the changes has come
         self.devices: dict[str, Device] = {}
-        self._saving: set[asyncio.Future[None]] = set()  # certificates seen for the first time, on their way to disk
+        self._saving: set[asyncio.Future[None]] = set()  # certificates (and machines' numbers) seen for the first time, on their way to disk
+        self._closing: set[asyncio.Future[None]] = set()  # the rest of retirements whose callers were stopped (`_retire`)
         # Told when a device answers at its other address from now on (device id, the address it has, the one
         # it answers at). Whoever changes what is saved does so in one place, one change at a time: the server.
         self.moved: Callable[[str, str, str], Awaitable[None]] | None = None
+        # Told when a driver takes a number its machine gives for itself (device id, the address it has, the number kept
+        # until now, the one to keep): kept by whoever changes what is saved, one change at a time (see `_known`).
+        self.known: Callable[[str, str, str, str], Awaitable[None]] | None = None
+        # Told what the wall sees of a device at every look (device id, its status): the history keeps it. Must not wait.
+        self.observed: Callable[[str, dict[str, Any]], None] | None = None
+        # Told before a client is closed, with it still open: what a live line has down on the device is let go of
+        # through it then (live.py); once the connection is gone there is no way to.
+        self.retiring: Callable[[Device], Awaitable[None]] | None = None
 
     def spec(self, record: DeviceRecord, password: str | None = None) -> DeviceSpec:
         if password is None:
@@ -354,7 +393,27 @@ class DeviceManager:
             tls=record.tls,
             cert_pem=record.cert_pem,
             kind=record.kind,
+            machine=record.machine,
+            fingerbot_strength=record.fingerbot_strength if record.fingerbot_strength in FINGERBOT_STRENGTHS else FINGERBOT_STRENGTHS[0],
         )
+
+    async def _known(self, device_id: str, url: str, was: str, mark: str) -> None:
+        """A driver took a number its machine gives for itself (DeviceSpec.machine): the first one, where none was kept; or a
+        server's controller's beside its computer's. Kept with the tile only where what is kept is still `was`, at the address
+        it was seen at; by the server (`known`), as every change of what is saved is made: in its turn among the changes, with
+        a new record in the old one's place, so that an edit under way notices. Not waited for: the driver is in the middle
+        of a look or a command, which whoever holds that turn may be waiting for."""
+        if self.known is not None:
+            saving = asyncio.ensure_future(self.known(device_id, url, was, mark))
+        else:
+            # (No server: the record changed where it is, and saved in its turn, as a first certificate is.)
+            record = self.core.store.device(device_id)
+            if record is None or record.url != url or record.machine != was:
+                return
+            record.machine = mark
+            saving = asyncio.ensure_future(self._save_certificate(record.name, "the number its machine gives for itself"))
+        self._saving.add(saving)
+        saving.add_done_callback(self._saving.discard)
 
     async def _pinned(self, device_id: str, url: str, cert_pem: str) -> None:
         record = self.core.store.device(device_id)
@@ -371,12 +430,12 @@ class DeviceManager:
         self._saving.add(saving)
         saving.add_done_callback(self._saving.discard)
 
-    async def _save_certificate(self, name: str) -> None:
+    async def _save_certificate(self, name: str, what: str = "its certificate") -> None:
         try:
             await self.save()
         except OSError as ex:
             # Trusted for as long as the program runs, and written with the next change that is saved.
-            log.error("%s: its certificate could not be saved: %s", name, ex)
+            log.error("%s: %s could not be saved: %s", name, what, ex)
 
     async def _moved(self, device_id: str, url: str, to: str) -> None:
         if self.moved is not None:
@@ -394,7 +453,13 @@ class DeviceManager:
         device_id, url = device.spec.id, device.spec.base_url
         device.on_pin = lambda pem: self._pinned(device_id, url, pem)
         device.on_move = lambda to: self._moved(device_id, url, to)
+        device.on_status = lambda status: self._observed(device_id, status)
+        device.on_known = lambda was, mark: self._known(device_id, url, was, mark)
         self.devices[device_id] = device
+
+    def _observed(self, device_id: str, status: dict[str, Any]) -> None:
+        if self.observed is not None and self.devices.get(device_id) is not None:
+            self.observed(device_id, status)
 
     def load(self) -> None:
         """Create clients for saved devices that don't have one yet."""
@@ -418,7 +483,36 @@ class DeviceManager:
 
         Closing signs out of a device that has sessions, and so asks it something once more. An answer to that
         which nobody foresaw ended the removal of a tile halfway: gone from the wall, and still in the file.
+
+        In the caller's own task (a client's close leaves the task that asks it alone: a JetKVM followed to HTTPS asks
+        from a task of the old client's). A caller stopped while the live lines' letting go is waited for (a request cut
+        off, the wall locking itself as the program stops) hands the rest to a task of its own, which waits for that
+        letting go once more and then closes the client: cut off there, the client was never closed, and a KVM's session
+        or a console seat was kept until the device timed it out. (`close` waits for what is left of these.)
         """
+        if self.retiring is not None:
+            try:
+                await self.retiring(device)
+            except asyncio.CancelledError:
+                rest = asyncio.ensure_future(self._retire_after_all(device))
+                self._closing.add(rest)
+                rest.add_done_callback(self._closing.discard)
+                raise
+            except Exception:
+                log.exception("%s: what was held on it could not be let go of before it was closed", device.label)
+        await self._close(device)
+
+    async def _retire_after_all(self, device: Device) -> None:
+        """The rest of a retirement whose caller was stopped (`_retire`)."""
+        if self.retiring is not None:
+            try:
+                await self.retiring(device)
+            except Exception:
+                log.exception("%s: what was held on it could not be let go of before it was closed", device.label)
+        await self._close(device)
+
+    @staticmethod
+    async def _close(device: Device) -> None:
         try:
             await device.close()
         except Exception:
@@ -432,6 +526,15 @@ class DeviceManager:
         if device is not None:
             await self._retire(device)
 
+    def take(self, device_ids: Iterable[str]) -> list[Device]:
+        """Take the live clients of these off the wall, all at once, to be closed together (retire_all)."""
+        return [device for device in (self.devices.pop(device_id, None) for device_id in device_ids) if device is not None]
+
+    async def retire_all(self, devices: Iterable[Device]) -> None:
+        """Close clients that `take` took, side by side, as at the end. (One after the other, each sign-out and each live
+        line's goodbye waited for the one before.)"""
+        await asyncio.gather(*(self._retire(device) for device in devices))
+
     def tidy(self) -> None:
         for device in self.devices.values():
             device.tidy()
@@ -439,5 +542,7 @@ class DeviceManager:
     async def close(self) -> None:
         devices, self.devices = list(self.devices.values()), {}
         await asyncio.gather(*(self._retire(d) for d in devices))
-        if self._saving:  # a certificate seen a moment ago is written down before the program ends, not learned anew after it
-            await asyncio.wait(self._saving, timeout=5)
+        # A certificate seen a moment ago is written down before the program ends, not learned anew after it; and a client
+        # whose retirement was begun by a request that was cut off is closed to the end.
+        if self._saving or self._closing:
+            await asyncio.wait(self._saving | self._closing, timeout=5)

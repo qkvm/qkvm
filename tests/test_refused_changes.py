@@ -25,6 +25,7 @@ from tests.fake_kvm import FakeKvm
 from tests.test_unlock import fits
 from tests.test_users import OTHER, account, browser, visitor
 from tests.test_wall import CSRF, PASSWORD, add, closed_port, wait_until, wall
+from tests.settings_file import settings_text, write_settings_text
 
 
 @pytest.fixture(autouse=True)
@@ -71,7 +72,7 @@ def test_a_change_that_is_answered_as_failed_is_not_kept_until_the_restart(tmp_p
     # The settings file as a later version might leave it (or a backup that somebody could write to before it
     # was restored): one more setting, which this version has not heard of and carries along. It is nested deep.
     path = data / "qkvm.json"
-    path.write_text(path.read_text(encoding="utf-8").replace("{", '{"later": ' + "[" * 600 + "]" * 600 + ",", 1), encoding="utf-8")
+    write_settings_text(path, settings_text(path, encoding="utf-8").replace("{", '{"later": ' + "[" * 600 + "]" * 600 + ",", 1), encoding="utf-8")
     bearer = {"Authorization": f"Bearer {token['token']}"}
     with wall(data, sign_in=False) as old:
         assert old.post("/api/v1/login", json={"name": "admin", "password": PASSWORD}).status_code == 200
@@ -92,7 +93,7 @@ def test_a_settings_file_nested_too_deep_to_read_is_a_damaged_file_like_any_othe
     data = tmp_path / "data"
     with wall(data) as admin:
         wait_until(lambda: fits(admin), "never made to fit")
-    (data / "qkvm.json").write_text("[" * 100_000, encoding="utf-8")
+    write_settings_text(data / "qkvm.json", "[" * 100_000, encoding="utf-8")
     try:
         core = Core(data)
     except StoreError as ex:
@@ -111,7 +112,7 @@ def test_reset_password_leaves_nothing_in_the_folder_that_the_key_in_the_folder_
         wait_until(lambda: fits(admin), "never made to fit")
         assert admin.put("/api/v1/alerts", json={"enabled": False}).status_code == 200
     path = data / "qkvm.json"
-    path.write_text(path.read_text(encoding="utf-8") + "}", encoding="utf-8")  # a hand edit that left one brace too many
+    write_settings_text(path, settings_text(path, encoding="utf-8") + "}", encoding="utf-8")  # a hand edit that left one brace too many
     with wall(data, sign_in=False) as later:
         assert later.core.store.restored  # type: ignore[attr-defined]
     assert cli.main(["--data-dir", str(data), "--reset-password"]) == 0  # "Accounts cleared."
@@ -223,7 +224,7 @@ def test_a_change_that_was_refused_is_not_what_the_next_start_finds(tmp_path: Pa
         # In that moment the KVM answers for the first time, and its certificate is saved (DeviceManager._pinned,
         # which waits for nobody's turn).
         admin.portal.call(manager._pinned, device, url, pem)  # type: ignore[union-attr]
-        on_disk = next(u for u in json.loads((data / "qkvm.json").read_text(encoding="utf-8"))["users"] if u["name"] == "sam")
+        on_disk = next(u for u in json.loads(settings_text(data / "qkvm.json", encoding="utf-8"))["users"] if u["name"] == "sam")
         print("\nwritten by the certificate's save, while the admin's change was half made: sam is", on_disk["role"], "| suspended:", on_disk["suspended"])
         disk["full"] = True  # ...and the admin's own save, a moment later, is refused
         go_on.set()
@@ -342,6 +343,6 @@ def test_a_leftover_second_copy_in_the_making_is_not_left_with_what_was_erased(t
     held["new"] = True  # at the reset, it is the copy in the making that cannot be written
     status = cli.main(["--data-dir", str(data), "--reset-password"])
     copies = [data / name for name in ("qkvm.json", "qkvm.bak", "qkvm.bak.new", "qkvm.tmp") if (data / name).exists()]
-    still = {p.name: [u["name"] for u in json.loads(p.read_text(encoding="utf-8")).get("users", [])] for p in copies}
+    still = {p.name: [u["name"] for u in json.loads(settings_text(p, encoding="utf-8")).get("users", [])] for p in copies}
     print("\nleft by the run before:", left, "| --reset-password ended in:", status, "| accounts in each file after it:", still)
     assert status != 0 or not any(still.values()), "'Accounts cleared', status 0, and a file in the folder that still holds them"

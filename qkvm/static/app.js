@@ -36,6 +36,7 @@ function h(tag, props, ...children) {
 
 // Line icons on a 24x24 grid (Feather set). Each is a list of [shape, attributes].
 const ICONS = {
+  keyboard: [['rect', { x: 2, y: 5, width: 20, height: 14, rx: 2 }], ['path', { d: 'M6 9h.01M10 9h.01M14 9h.01M18 9h.01M6 12h.01M10 12h.01M14 12h.01M18 12h.01M7 16h10' }]],
   sun: [['circle', { cx: 12, cy: 12, r: 4 }],
     ['path', { d: 'M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41' }]],
   moon: [['path', { d: 'M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z' }]],
@@ -146,6 +147,29 @@ class ApiError extends Error {
 // An action is over when the KVM says so, and typing a long text takes it more than a minute.
 // Giving up on it sooner would invite a second click, and the text typed twice.
 const ACTION_PATIENCE = 150000;  // ms
+// Start into BIOS setup over a slow controller: two minutes to come to its restart (SETUP_WITHIN), and what is under way
+// then (a request, a clearing of the boot override) is finished before it answers, so that the answer can say what is left.
+const SETUP_PATIENCE = 240000;  // ms
+
+// The words the wall shows for a state, a device's trouble or a kind of device, what a tile can be asked
+// (`can`), and every code the wall answers with: read from one file, static/words.json, which the other
+// programs that talk to a wall are built from, so that none of them says a thing another way. Filled once,
+// before anything is drawn (boot); until then each part is empty.
+const WORDS = { states: {}, server_states: {}, codes: {}, refusals: {}, kinds: {}, can: {} };
+
+async function loadWords() {
+  let reply;
+  try {
+    // (Asked afresh of the server each time the page starts: a page kept for hours by a browser shows the words of the program that runs.)
+    reply = await fetch('static/words.json', { cache: 'no-cache', signal: AbortSignal.timeout(30000) });
+  } catch (ex) {
+    if (ex.name === 'TimeoutError') throw new ApiError('qKVM took too long to answer', 'timeout', 0);
+    throw new ApiError('qKVM is not responding', 'network', 0);
+  }
+  if (!reply.ok) throw new ApiError(`The page's words could not be read (HTTP ${reply.status})`, 'error', reply.status);
+  const words = await reply.json();
+  for (const part of Object.keys(WORDS)) Object.assign(WORDS[part], words[part] || {});
+}
 
 async function api(method, path, body, patience = 30000) {
   let res;
@@ -163,7 +187,11 @@ async function api(method, path, body, patience = 30000) {
     throw new ApiError('qKVM is not responding', 'network', 0);
   }
   let data = null;
-  try { data = await res.json(); } catch { /* empty or not JSON */ }
+  try { data = await res.json(); } catch {
+    // A successful status does not make an interrupted or malformed body a usable answer.
+    // 204 is the API's intentional empty response; other successes must contain JSON.
+    if (res.ok && res.status !== 204) throw new ApiError('qKVM returned an unreadable response', 'invalid_response', res.status);
+  }
   if (!res.ok) {
     if (res.status === 401 && data?.code === 'unauthorized') sessionExpired();
     if (res.status === 403 && data?.code === 'totp_required') mustEnroll();
@@ -820,8 +848,27 @@ function addDevicesForm(onAdded) {
   const username = h('input', { type: 'text', value: 'admin', autocomplete: 'off', required: true });
   // new-password: stops the browser from filling in the wall's own password here.
   const { el: passwordBox, input: password } = passwordField('Password', { autocomplete: 'new-password' },
-    'Leave empty only for a JetKVM that has no password.');
+    'Leave empty only for a JetKVM or a VNC server that has no password.');
   const groupName = groupInput('');
+  // What the addresses name. A KVM or a server is asked what it is; a VNC server speaks no HTTP and is not asked.
+  const what = h('select', { 'aria-label': 'What to add' },
+    h('option', { value: 'auto' }, 'KVMs, servers and Intel AMT PCs (told apart automatically)'),
+    h('option', { value: 'vnc' }, 'VNC servers'),
+    h('option', { value: 'proxmox' }, 'Virtual machines on Proxmox VE'));
+  const HINTS = {
+    auto: 'One per line: IP address or name of each KVM, of a server\'s management controller (BMC), or of a PC with Intel AMT. GL.iNet Comet, PiKVM, JetKVM, Redfish controllers and Intel AMT PCs are told apart automatically. They are all added with the login below; you can rename them later.',
+    vnc: 'One per line: IP address or name of each VNC server, with its port after a colon where it is not 5900 (192.168.1.20:5901). The password below is the VNC password; the user name is not used.',
+    proxmox: 'One per line: the address of a Proxmox VE host (its port after a colon where it is not 8006). The virtual machines the API token may see are listed to pick from; to add one at once, put its ID after the address (192.168.1.5/100). The user name below is the token\'s ID (user@realm!token), the password its secret.',
+  };
+  const addressHint = h('span', {}, HINTS.auto);
+  what.addEventListener('change', () => {
+    addressHint.textContent = HINTS[what.value];
+    username.disabled = what.value === 'vnc';
+    // A Proxmox is signed in to with an API token: its ID where a user name goes, its secret where the password goes.
+    username.placeholder = what.value === 'proxmox' ? 'user@pve!wall' : '';
+    if (what.value === 'proxmox' && username.value === 'admin') username.value = '';
+    if (what.value !== 'proxmox' && !username.value) username.value = 'admin';
+  });
   const results = h('ul', { class: 'results' });
   const submit = h('button', { type: 'submit', class: 'primary' }, 'Check and add');
 
@@ -932,7 +979,7 @@ function addDevicesForm(onAdded) {
     for (const button of row.querySelectorAll('button')) button.remove();
     try {
       const { device, about } = await api('POST', 'api/v1/devices', {
-        url, username: username.value, password: password.value, group: groupName.value, force, keep_both: keepBoth,
+        url, username: username.value, password: password.value, group: groupName.value, force, keep_both: keepBoth, kind: what.value,
       });
       const model = [about.model, about.version].filter(Boolean).join(' ');
       row.className = 'ok';
@@ -964,6 +1011,50 @@ function addDevicesForm(onAdded) {
     }
   }
 
+  // A Proxmox: the virtual machines its token may see, to tick and add; or, where the address names one, that one at once.
+  async function fromProxmox(address, row) {
+    const text = $('span', row);
+    text.textContent = `${address}: asking for its virtual machines...`;
+    let said;
+    try {
+      said = await api('POST', 'api/v1/proxmox/guests', { url: address, username: username.value, password: password.value });
+    } catch (ex) {
+      row.className = 'bad';
+      text.textContent = `${address}: ${ex.message}`;
+      return false;
+    }
+    if (said.named) return add(said.named, row, false);
+    row.className = 'ask';
+    const count = said.guests.length;
+    text.textContent = count
+      ? `${address}: ${count} virtual machine${count === 1 ? '' : 's'} the token may see. Tick the ones to put on the wall:`
+      : `${address}: the token may see no virtual machine there. It needs VM.Audit on them (on their pool, say).`;
+    const picks = said.guests.map(guest => {
+      const box = h('input', { type: 'checkbox', disabled: Boolean(guest.known_as) });
+      const how = guest.known_as ? `on the wall as ${guest.known_as}` : `${guest.node}${guest.status ? ` · ${guest.status}` : ''}`;
+      return { guest, box, row: check(box, `${guest.vmid} · ${guest.name}`, how) };
+    });
+    const added = h('ul', { class: 'results' });
+    const go = h('button', { type: 'button', class: 'primary' }, 'Add the ticked ones');
+    go.addEventListener('click', () => busy(go, async () => {
+      for (const pick of picks) {
+        if (!pick.box.checked || pick.box.disabled) continue;
+        const one = h('li', {}, h('span', {}));
+        added.append(one);
+        if (await add(pick.guest.url, one, false)) {
+          pick.box.checked = false;
+          pick.box.disabled = true;
+        }
+      }
+    }));
+    row.append(h('div', { class: 'pick-guests' },
+      count > 0 && h('div', { class: 'picklist' }, picks.map(pick => pick.row)),
+      said.containers > 0 && h('p', { class: 'muted' }, `${said.containers} container${said.containers === 1 ? ' is' : 's are'} not listed: the wall shows virtual machines only.`),
+      count > 0 && h('div', { class: 'actions left' }, go),
+      added));
+    return true;
+  }
+
   return h('form', {
     onsubmit: event => {
       event.preventDefault();
@@ -971,21 +1062,24 @@ function addDevicesForm(onAdded) {
       busy(submit, async () => {
         const failed = [];
         for (const url of list) {
+          // What an earlier try said of this address goes: only this try's answer is true now.
+          for (const earlier of results.querySelectorAll('li')) if (earlier.dataset.url === url) earlier.remove();
           const row = h('li', {}, h('span', {}));
+          row.dataset.url = url;
           results.append(row);
-          if (!(await add(url, row, false))) failed.push(url);
+          if (!(await (what.value === 'proxmox' ? fromProxmox(url, row) : add(url, row, false)))) failed.push(url);
         }
         addresses.value = failed.join('\n');
         addresses.required = failed.length > 0;
       });
     },
   },
-    field('Addresses', addresses,
-      'One per line: IP address or name of each KVM, or of a server\'s management controller (BMC). GL.iNet Comet, PiKVM, JetKVM and Redfish controllers are told apart automatically. They are all added with the login below; you can rename them later.'),
+    field('What to add', what),
+    field('Addresses', addresses, addressHint),
     h('div', { class: 'actions left' }, find),
     found,
     h('div', { class: 'row' },
-      field('User name', username, 'A JetKVM has none; it is ignored there.'),
+      field('User name', username, 'A JetKVM and a VNC server have none; it is ignored there. For Proxmox: the API token\'s ID, and its secret as the password.'),
       passwordBox),
     field('Group', groupName, 'Optional: a rack, a room, a customer. The wall can show one group at a time.'),
     h('p', { class: 'muted' },
@@ -999,7 +1093,10 @@ function addDevicesDialog() {
   openDialog('Add KVMs', body => body.append(addDevicesForm(reloadWall)));
 }
 
-const KINDS = { kvmd: 'GL.iNet Comet / PiKVM', jetkvm: 'JetKVM', redfish: 'Server (Redfish)' };
+const KINDS = WORDS.kinds;  // what each kind of device is called, by the word a tile carries (words.json)
+const NO_USER_NAME = ['jetkvm', 'vnc'];  // kinds that sign in with a password alone, or with nothing
+// Whether a device shows a certificate that qKVM checks: over https://, and a VNC server over vncs:// (TLS from the first byte).
+const showsCertificate = device => /^(https|vncs):/.test(device.url);
 
 // A text box for a KVM's group that suggests the groups already in use.
 function groupInput(value) {
@@ -1016,10 +1113,11 @@ function editDeviceDialog(device, onDone) {
     const name = h('input', { type: 'text', value: device.name, maxLength: 80, required: true });
     const url = h('input', { type: 'text', value: device.url, required: true, spellcheck: false });
     const username = h('input', { type: 'text', value: device.username, autocomplete: 'off', required: true });
-    const { el: passwordBox, input: password } = passwordField('Password', {
+    const token = device.kind === 'proxmox';  // (signed in to with an API token: its ID and its secret)
+    const { el: passwordBox, input: password } = passwordField(token ? 'API token secret' : 'Password', {
       autocomplete: 'new-password', placeholder: device.has_password ? 'Unchanged' : 'Not saved yet',
     }, 'Leave empty to keep the saved one.');
-    const openUrl = h('input', { type: 'text', value: device.custom_open_url, spellcheck: false, placeholder: `${device.url}/` });
+    const openUrl = h('input', { type: 'text', value: device.custom_open_url, spellcheck: false, placeholder: token ? device.open_url : `${device.url}/` });
     const groupName = groupInput(device.group || '');
     const tls = h('select', {},
       h('option', { value: 'pinned' }, 'Remember the certificate (recommended)'),
@@ -1027,6 +1125,13 @@ function editDeviceDialog(device, onDone) {
       h('option', { value: 'insecure' }, 'Do not check (unsafe)'));
     tls.value = device.tls;
     const tell = h('input', { type: 'checkbox', checked: device.alerts !== false });
+    // How hard a Fingerbot paired with the KVM presses: offered where the KVM said it has one (or one was set before).
+    const tile = tiles.get(device.id);
+    const hasBot = device.kind === 'kvmd' && ((tile && canDo(tile, 'fingerbot')) || device.fingerbot_strength === 'light');
+    const strength = h('select', {},
+      h('option', { value: 'firm' }, 'Press firmly'),
+      h('option', { value: 'light' }, 'Press lightly'));
+    strength.value = device.fingerbot_strength || 'firm';
     const error = h('p', { class: 'error', hidden: true });
     const save = h('button', { type: 'submit', class: 'primary' }, 'Save');
     const saveAnyway = h('button', { type: 'button', hidden: true }, 'Save without checking');
@@ -1038,6 +1143,7 @@ function editDeviceDialog(device, onDone) {
         await api('PUT', `api/v1/devices/${device.id}`, {
           name: name.value, url: url.value, username: username.value, password: password.value,
           open_url: openUrl.value, tls: tls.value, group: groupName.value, alerts: tell.checked, force,
+          fingerbot_strength: hasBot ? strength.value : undefined,
         });
       } catch (ex) {
         error.textContent = ex.message;
@@ -1061,18 +1167,20 @@ function editDeviceDialog(device, onDone) {
       field('Name', name),
       field('Address', url, `Type: ${KINDS[device.kind] || device.kind}`),
       h('div', { class: 'row' },
-        device.kind !== 'jetkvm' && field('User name', username),
+        !NO_USER_NAME.includes(device.kind) && field(token ? 'API token ID' : 'User name', username),
         passwordBox),
       field('Group', groupName, 'Optional: a rack, a room, a customer. The wall can show one group at a time.'),
       field('Console link', openUrl,
         'Where "Open console" goes. Set it if you view the wall from somewhere the address above is not reachable.'),
-      device.url.startsWith('https') && field('Certificate', tls,
+      showsCertificate(device) && field('Certificate', tls,
         device.fingerprint ? `Remembered SHA-256: ${device.fingerprint}` : 'No certificate remembered yet.'),
       check(tell, 'Send alerts about this one', 'Off for a machine that is switched on and off all day, or sleeps: its changes are nobody\'s news.'),
+      hasBot && field('Fingerbot', strength,
+        'How hard the Fingerbot paired with this KVM presses the power button. A light press may not move a stiff button.'),
       error,
       h('div', { class: 'actions' },
         h('button', { type: 'button', class: 'danger left', onclick: () => removeDevice(device, () => { close(); onDone(); }) }, 'Remove'),
-        device.url.startsWith('https') && h('button', { type: 'button', onclick: () => certificateDialog(device, () => { close(); onDone(); }) }, 'Review certificate'),
+        showsCertificate(device) && h('button', { type: 'button', onclick: () => certificateDialog(device, () => { close(); onDone(); }) }, 'Review certificate'),
         h('button', { type: 'button', onclick: close }, 'Cancel'),
         saveAnyway,
         save),
@@ -1129,6 +1237,89 @@ async function removeDevice(device, onDone) {
   }
   toast(`${device.name} removed`, 'ok');
   onDone();
+}
+
+// Takes the KVMs ticked in select mode off the wall: in one request, every one of them or none. Asked first, with each
+// one named and what goes with them said; several want the same tick as what can cost somebody their work (confirmRun).
+// The question then shows how it went, the wall is fetched again, and select mode is left once they are gone.
+let removing = false;  // a removal is on its way: no second one until it is answered (its question may have been closed meanwhile)
+
+function removeSelected(ids) {
+  const targets = ids.map(id => tiles.get(id)).filter(Boolean);
+  if (!targets.length || removing) return;
+  const many = targets.length > 1;
+  const what = many ? `${targets.length} KVMs` : targets[0].device.name;
+  const dialog = openDialog(`Remove ${what}?`, (body, close) => {
+    const agree = h('input', { type: 'checkbox' });
+    const go = h('button', { type: 'button', class: 'danger fill', disabled: many }, many ? `Remove ${targets.length} KVMs` : 'Remove');
+    agree.addEventListener('change', () => { go.disabled = !agree.checked; });
+    const cancel = h('button', { type: 'button', onclick: close }, 'Cancel');
+    const done = h('button', { type: 'button', class: 'primary', hidden: true, onclick: close }, 'Close');
+    const summary = h('p', { role: 'status' }, many ? `These ${targets.length} KVMs are taken off the wall:` : 'This KVM is taken off the wall:');
+    const asked = [
+      h('ul', { class: 'targets' }, targets.map(tile =>
+        h('li', { dataset: { state: tile.state } },
+          h('span', { class: 'dot' }), tile.device.name, h('span', { class: 'muted' }, tile.device.host),
+          h('span', { class: 'muted' }, stateLabel(tile.state, tile.status) || tile.state)))),
+      h('div', { class: 'note warn' }, many
+        ? 'Their saved passwords and their history go with them, for good: this cannot be undone. The machines themselves are not touched.'
+        : 'Its saved password and its history go with it, for good: this cannot be undone. The machine itself is not touched.'),
+      h('p', { class: 'muted' }, 'To keep a copy, export the wall first: Settings > Export and import.'),
+      many && check(agree, `Yes, remove all ${targets.length} machines`),
+    ].filter(Boolean);
+    const rows = new Map(targets.map(tile => [tile.device.id,
+      h('li', {}, h('span', { class: 'spinner' }), h('strong', {}, tile.device.name), h('span', { class: 'muted' }, 'Removing...'))]));
+    const progress = h('ul', { class: 'progress', hidden: true }, [...rows.values()]);
+    const mark = (id, kind, text) => {
+      const row = rows.get(id);
+      row.className = kind;
+      row.firstChild.replaceWith(icon(ROW_ICONS[kind]));
+      row.lastChild.textContent = text;
+    };
+    body.append(h('div', {}, summary, ...asked, progress, h('div', { class: 'actions' }, cancel, go, done)));
+
+    go.addEventListener('click', () => busy(go, async () => {
+      // What is sent cannot be called back: from here on the question is what happened.
+      for (const part of [...asked, cancel]) part.hidden = true;
+      dialog.querySelector('.dialog-head h2').textContent = `Remove ${what}`;  // (asked no more)
+      progress.hidden = false;
+      summary.textContent = `Removing ${what}...`;
+      let told;
+      let ok = false;
+      removing = true;
+      renderSelection();
+      try {
+        await api('POST', 'api/v1/devices/remove', { ids: targets.map(tile => tile.device.id) });
+        for (const tile of targets) mark(tile.device.id, 'ok', 'Removed');
+        told = `${many ? `${targets.length} KVMs` : what} removed.`;
+        ok = true;
+        setSelecting(false);  // what was ticked is gone
+      } catch (ex) {
+        const gone = new Set(ex.code === 'not_found' && Array.isArray(ex.data?.unknown) ? ex.data.unknown : []);
+        if (unanswered(ex)) {
+          for (const tile of targets) mark(tile.device.id, 'unknown', 'No answer');
+          told = `No full answer came from qKVM, so whether ${many ? 'they were' : 'it was'} removed is not known: the wall shows what is there now.`;
+        } else if (gone.size) {
+          // Taken off by somebody else meanwhile: what is left of the selection is looked at again before anything goes.
+          for (const tile of targets) mark(tile.device.id, gone.has(tile.device.id) ? 'bad' : 'skipped', gone.has(tile.device.id) ? 'No longer on the wall' : 'Not removed');
+          const names = targets.filter(tile => gone.has(tile.device.id)).map(tile => tile.device.name);
+          told = `${names.join(', ')} ${names.length === 1 ? 'is' : 'are'} no longer on the wall, so nothing was removed. Look at the selection again.`;
+        } else {
+          for (const tile of targets) mark(tile.device.id, 'bad', 'Not removed');
+          told = ex.message;
+        }
+      } finally {
+        removing = false;
+        renderSelection();
+      }
+      summary.textContent = told;
+      go.hidden = true;
+      done.hidden = false;
+      done.focus();
+      if (!dialog.open) toast(told, ok ? 'ok' : 'error');  // closed while it was under way: said where it can still be seen
+      reloadWall();
+    }));
+  });
 }
 
 async function certificateDialog(device, onDone) {
@@ -1308,8 +1499,11 @@ const acting = new Map();
 // What a device is saved in spite of: it could not be reached just now, which says nothing about what was typed.
 const CANNOT_BE_REACHED = ['unreachable', 'timeout', 'dropped'];
 
-// No answer is not a refusal: the request may have arrived, and been carried out.
-const unanswered = ex => ex.code === 'timeout' || ex.code === 'network';
+// No answer is not a refusal: the request may have arrived, and been carried out. So is an answer broken on its way
+// (`dropped`), a slip of the wall's own (`internal`), and an error that is no answer of the wall's at all (a 500 of the
+// web server when qKVM was stopped while a power button was held; a proxy's 502): a power button pressed again is not a
+// retry.
+const unanswered = ex => ['timeout', 'network', 'dropped', 'internal'].includes(ex.code) || (ex.status >= 500 && ex.code === 'error');
 const ROW_ICONS = { ok: 'check', bad: 'alert', unknown: 'info', skipped: 'x' };
 
 // Runs `spec` on every target, a few at a time, and shows how each one went.
@@ -1447,8 +1641,20 @@ async function perform(ids, spec, onStarted) {
   acting.set(tile.device.id, spec.title);
   const finished = working(`${tile.device.name}: ${spec.title}...`);
   let result;
+  let releasedLine = null;
   try {
-    result = await api('POST', `api/v1/devices/${tile.device.id}/actions`, spec.body, ACTION_PATIENCE);
+    // Text actions use the device action channel. Release only this page's ownership
+    // after confirmation, and wait for the server acknowledgement before sending.
+    if (spec.body.action === 'text' && focus?.id === tile.device.id && focus.control?.on) {
+      releasedLine = focus.live;
+      giveBack();
+      const deadline = performance.now() + 3000;
+      while (releasedLine.open && !releasedLine.ended && releasedLine.owed.length && performance.now() < deadline) await sleep(25);
+      if (performance.now() >= deadline || !releasedLine.open || releasedLine.ended || releasedLine.owed.length || focus?.live !== releasedLine) throw new Error('Control release was not confirmed; no text was sent.');
+    }
+    // From this machine's large view: the server is told so (a PC with Intel AMT then opens a session before switching on).
+    const body = focus?.id === tile.device.id ? { ...spec.body, watching: true } : spec.body;
+    result = await api('POST', `api/v1/devices/${tile.device.id}/actions`, body, ACTION_PATIENCE);
   } catch (ex) {
     toast(unanswered(ex)
       ? `${tile.device.name}: no answer to "${spec.title}". It may have been done all the same: look before sending it again.`
@@ -1462,6 +1668,7 @@ async function perform(ids, spec, onStarted) {
     acting.delete(tile.device.id);
     finished();
   }
+  if (releasedLine && focus?.live === releasedLine && releasedLine.open && !releasedLine.ended) askControl();
   toast(`${tile.device.name}: ${result?.note || spec.done}`, 'ok');
   afterAction(tile, spec);
   if (spec.body.action === 'reboot') onStarted?.();
@@ -1483,11 +1690,12 @@ function typeTextDialog(ids) {
           tick: true,
           question: who => `Type this on ${who}?`,
           detail: text.value + (enter.checked ? ' ⏎' : ''),
+          warning: ids.length === 1 && focus?.id === ids[0] && focus.control?.on ? 'Control is briefly released to type this text, then requested again. Another session holding control will still block this action.' : '',
         });
       },
     },
       field('Text', text,
-        'Typed on the connected computer as if on its keyboard (US layout). It is not saved, and its content is not written to the activity log.'),
+        'Typed on the connected computer as if on its keyboard (US layout; on a JetKVM, the layout set on its own page). It is not saved, and its content is not written to the activity log.'),
       check(enter, 'Press Enter afterwards'),
       h('div', { class: 'actions' },
         h('button', { type: 'button', onclick: close }, 'Cancel'),
@@ -1596,9 +1804,13 @@ function actionsDialog(target) {
       title: label, body: { action }, done, warning, danger, tick: true, confirm: true,
     });
 
+    // What the picked machines can be asked, by the server's word for each (`can`): with one picked, what
+    // that one can; with several, what any of them can, and each answers for itself when it is sent.
+    const able = what => picked.some(tile => canDo(tile, what));
     const saved = h('div', { class: 'action-grid' });
     const fillSaved = () => saved.replaceChildren(...[
-      ...savedActions.map(action => quick(action.kind === 'text' ? 'type' : 'star', action.name, savedSpec(action),
+      // (A saved action presses keys or types a text: offered where one of the picked can take that.)
+      ...savedActions.filter(action => able(action.kind)).map(action => quick(action.kind === 'text' ? 'type' : 'star', action.name, savedSpec(action),
         action.kind === 'keys' ? keysLabel(action.keys) : null)),
       h('button', { type: 'button', class: 'admin-only', onclick: () => { close(); settingsDialog('actions'); } },
         icon('plus'), h('span', {}, savedActions.length ? 'Manage...' : 'Add your own...')),
@@ -1607,16 +1819,21 @@ function actionsDialog(target) {
     fillSaved();
     loadSavedActions().then(fillSaved);
 
-    const hasAtx = picked.some(tile => tile.status?.atx?.enabled);
-    // A server's management controller has a power button and no keyboard. With nothing but servers
-    // picked, what only a KVM can do is left out; in a mixed pick each machine answers for itself.
-    const servers = picked.every(tile => tile.device.picture === false);
-    const anyServer = picked.some(tile => tile.device.picture === false);
-    const kvmAtx = picked.some(tile => tile.device.picture !== false && tile.status?.atx?.enabled);
-    const serverOn = single && servers ? single.status?.atx?.power : null;
+    // A server's management controller has a power button and no keyboard, and a KVM without a power board
+    // has no power button: what none of the picked can do is left out.
+    const hasAtx = able('power') || able('reset');
+    // A Fingerbot paired with a KVM presses its power button with an arm: offered under its own name, beside a power
+    // board's buttons where the KVM has both (the board's stay the power buttons).
+    const bot = able('fingerbot');
+    const servers = picked.every(tile => tile.device.picture === false);  // (for the words only: a controller is restarted, a KVM rebooted)
+    // Switching on, or asking to shut down, by what is wanted: a server, which knows whether it is on. The
+    // power button, which does not know: a KVM with a power board (a server is offered the other two).
+    const anyServer = able('power_state');
+    const kvmAtx = picked.some(tile => canDo(tile, 'power') && !canDo(tile, 'power_state'));
+    const serverOn = single && canDo(single, 'power_state') ? single.status?.atx?.power : null;
     const itself = servers ? 'controller' : 'KVM';
-    const lights = picked.filter(tile => tile.status?.server?.locator != null);  // the machines that have a light to find them by
-    const ports = single?.status?.ports;
+    const lights = picked.filter(tile => canDo(tile, 'locator'));  // the machines that have a light to find them by
+    const ports = single && canDo(single, 'ports') ? single.status?.ports : null;
     const wol = h('div', { class: 'action-grid' });
     const head = [];
     if (single) {
@@ -1626,8 +1843,10 @@ function actionsDialog(target) {
       head.push(
         h('p', { class: 'muted' }, [device.host, status?.about?.model, status?.about?.version].filter(Boolean).join(' · ')),
         state !== 'online' && h('div', { class: 'note warn' }, message || stateLabel(state, status)),
+        canDo(single, 'fingerbot') && status?.fingerbot?.low && h('div', { class: 'note warn' },
+          `The battery of its Fingerbot is low (${status.fingerbot.battery} %). A press may fail: charge it.`),
         device.kind === 'jetkvm' && h('p', { class: 'muted' },
-          'A JetKVM shows its picture to one viewer at a time. Opening its console takes the picture from this wall until you choose Show here on the tile. Text is typed with a US keyboard layout.'),
+          'A JetKVM shows its picture to one viewer at a time. Opening its console takes the picture from this wall until you choose Show here on the tile. Text is typed in the keyboard layout set on its own page.'),
         sharesOurName(device) && h('div', { class: 'note warn' },
           `No link to its console is offered here: its page is at ${location.hostname}, the same name qKVM is looked at under, and a browser would hand that page your sign-in to qKVM. Look at one of the two under another name or address.`),
         h('div', { class: 'action-grid' },
@@ -1639,8 +1858,12 @@ function actionsDialog(target) {
           h('button', { type: 'button', class: 'admin-only', onclick: () => { close(); editDeviceDialog(device, reloadWall); } }, icon('edit'), h('span', {}, 'Edit...')),
           certProblem && h('button', {
             type: 'button', class: 'danger admin-only', onclick: () => certificateDialog(device, () => { close(); reloadWall(); }),
-          }, icon('shield'), h('span', {}, 'Review certificate'))));
-      if (!servers) api('GET', `api/v1/devices/${device.id}/wol`).then(({ targets }) => {
+          }, icon('shield'), h('span', {}, 'Review certificate')),
+          // A PC with Intel AMT whose KVM is on (switched on from its tile, or elsewhere): an admin's way back, as plainly.
+          device.kind === 'amt' && status?.server?.amt?.kvm === 'enabled' && h('button', {
+            type: 'button', class: 'admin-only', onclick: () => switchKvmOff(device, close),
+          }, icon('power'), h('span', {}, 'Switch off its KVM'))));
+      if (canDo(single, 'wol')) api('GET', `api/v1/devices/${device.id}/wol`).then(({ targets }) => {
         wol.replaceChildren(...targets.map(entry => quick('activity', `Wake ${entry.name || entry.mac}`, {
           title: `Wake ${entry.name || entry.mac}`, body: { action: 'wol', mac: entry.mac }, done: 'Wake-on-LAN sent', confirm: true,
         })));
@@ -1661,20 +1884,20 @@ function actionsDialog(target) {
           h('kbd', {}, ports.active === index ? 'on screen' : port.signal === false ? 'empty' : port.name ? `port ${index + 1}` : 'switch')))),
         h('p', { class: 'muted' }, 'This KVM shows one computer at a time. Switching takes a few seconds and also changes a monitor plugged into the KVM. Keys and text go to the computer on screen.'),
       ],
-      !servers && [
+      (able('keys') || able('text')) && [
         h('h3', {}, 'Keyboard'),
         h('div', { class: 'action-grid' },
           // The keys are shown next to the name, unless the name already is the keys.
-          QUICK_KEYS.map(key => quick(key.icon, key.label, keySpec(key.label, key.keys, { confirm: key.confirm, danger: key.danger }),
+          able('keys') && QUICK_KEYS.map(key => quick(key.icon, key.label, keySpec(key.label, key.keys, { confirm: key.confirm, danger: key.danger }),
             keysLabel(key.keys) === key.label ? null : keysLabel(key.keys))),
-          h('button', { type: 'button', onclick: () => { close(); sendKeysDialog(ids); } }, icon('command'), h('span', {}, 'Send keys...')),
-          h('button', { type: 'button', onclick: () => { close(); typeTextDialog(ids); } }, icon('type'), h('span', {}, 'Type text...'))),
+          able('keys') && h('button', { type: 'button', onclick: () => { close(); sendKeysDialog(ids); } }, icon('command'), h('span', {}, 'Send keys...')),
+          able('text') && h('button', { type: 'button', onclick: () => { close(); typeTextDialog(ids); } }, icon('type'), h('span', {}, 'Type text...'))),
         h('h3', {}, 'Your actions'),
         saved,
       ],
       h('h3', {}, 'Power'),
       h('div', { class: 'action-grid' },
-        !servers && [
+        able('jiggler') && [
           quick('coffee', 'Keep awake', { title: 'Keep awake', body: { action: 'jiggler_on' }, done: 'mouse jiggler on' }),
           quick('moon', 'Allow sleep', { title: 'Allow sleep', body: { action: 'jiggler_off' }, done: 'mouse jiggler off' }),
         ],
@@ -1688,14 +1911,26 @@ function actionsDialog(target) {
           // A KVM presses a button, and what that does depends on whether the computer is on, which it cannot vouch for.
           kvmAtx && power('power', 'Press power button', 'atx_power', 'power button pressed',
             'A short press turns the computer on, or asks a running system to shut down.'),
-          power('power', 'Hold power button', 'atx_power_long', 'power button held',
+          able('power') && power('power', 'Hold power button', 'atx_power_long', 'power button held',
             'A long press cuts the power. Unsaved work is lost.', true),
-          power('rotate', 'Press reset button', 'atx_reset', 'reset button pressed',
+          able('reset') && power('rotate', 'Press reset button', 'atx_reset', 'reset button pressed',
             'A hard reset. Unsaved work is lost.', true),
+          // Start into the BIOS setup, once: one machine at a time (it opens the large view to show the setup screen).
+          single && canDo(single, 'bios_setup') && h('button', {
+            type: 'button', class: 'danger', onclick: () => { close(); bootIntoSetup(single); },
+          }, icon('sliders'), h('span', {}, 'Start into BIOS setup'),
+            h('kbd', {}, single.status?.atx?.power === false ? 'power on' : 'restart')),
+        ],
+        // (Nothing of the computer's power comes from a Fingerbot: it presses, and the tile shows what follows.)
+        bot && [
+          power('power', 'Press with Fingerbot', 'fingerbot_power', 'pressed by the Fingerbot',
+            'The Fingerbot presses the power button for half a second: a computer that is off comes on, a running system is asked to shut down.'),
+          power('power', 'Hold with Fingerbot', 'fingerbot_power_long', 'held by the Fingerbot',
+            'The Fingerbot holds the power button for 8 seconds, which cuts the power. Unsaved work is lost.', true),
         ]),
-      !hasAtx && h('p', { class: 'muted' }, single
-        ? 'Power and reset buttons appear here when the KVM has an ATX power board.'
-        : 'None of the selected KVMs has an ATX power board, so there are no power buttons.'),
+      !hasAtx && !bot && h('p', { class: 'muted' }, single
+        ? 'Power and reset buttons appear here when the KVM has an ATX power board, or a Fingerbot paired with it.'
+        : 'None of the selected KVMs has an ATX power board or a Fingerbot, so there are no power buttons.'),
       wol,
       lights.length > 0 && [
         h('h3', {}, 'Find it in the rack'),
@@ -1707,8 +1942,8 @@ function actionsDialog(target) {
             { title: 'Locator light off', body: { action: 'locate_off' }, done: 'locator light off' })),
         h('p', { class: 'muted' }, 'The light on the machine itself, front and back, for whoever is standing in front of the rack.'),
       ],
-      h('h3', {}, single ? `This ${itself}` : `The ${itself}s themselves`),
-      h('div', { class: 'action-grid' },
+      able('reboot') && h('h3', {}, single ? `This ${itself}` : `The ${itself}s themselves`),
+      able('reboot') && h('div', { class: 'action-grid' },
         quick('rotate', servers ? 'Restart controller' : 'Reboot KVM', {
           title: servers ? 'Restart controller' : 'Reboot KVM',
           body: { action: 'reboot' },
@@ -2549,7 +2784,7 @@ const SITE = 'https://qkvm.com';
 const REPO = 'https://github.com/qkvm/qkvm';
 const DOCS = 'https://docs.qkvm.com';
 const PYPV = 'https://pypv.com';
-const COPYRIGHT = '© 2026 qKVM';
+const COPYRIGHT = '© 2026 qKVM, part of ';
 const LICENCE = 'https://www.gnu.org/licenses/agpl-3.0.html';
 
 async function aboutTab() {
@@ -2587,7 +2822,7 @@ async function aboutTab() {
         h('thead', {}, h('tr', {}, h('th', {}, 'Library'), h('th', {}, 'Version'), h('th', {}, 'Licence'))),
         h('tbody', {}, running.libraries.map(library => h('tr', {},
           h('td', {}, library.name), h('td', {}, library.version), h('td', { class: 'wrap' }, library.licence))))))),
-    h('p', { class: 'footnote' }, COPYRIGHT, '. qKVM is part of ', h('strong', {}, outside(PYPV, 'PyPV, Python Platform Ventures')), '. ',
+    h('p', { class: 'footnote' }, COPYRIGHT, h('strong', {}, outside(PYPV, 'PyPV Python Platform Ventures')), '. ',
       'qKVM is not affiliated with GL.iNet, PiKVM or JetKVM, or with the makers of the servers it talks to; those names belong to their owners.'),
   ];
 }
@@ -2600,6 +2835,8 @@ const EVENTS = {
   device_moved: 'KVM followed to its other address',
   device_removed: 'KVM removed', certificate_trusted: 'Certificate trusted', action: 'Action',
   action_failed: 'Action failed', console_opened: 'Console opened', settings_changed: 'Network settings changed',
+  live_control: 'Keyboard and mouse', export_refused: 'Export refused: wrong password',
+  kvm_switched: 'Intel AMT KVM switched', kvm_switch_failed: 'Intel AMT KVM not switched',
   saved_action_added: 'Action saved', saved_action_changed: 'Saved action changed', saved_action_removed: 'Saved action removed',
   update_installed: 'Update installed', update_failed: 'Update failed',
   user_added: 'Account added', user_changed: 'Account changed', user_removed: 'Account removed',
@@ -2618,10 +2855,13 @@ const EVENTS = {
   token_created: 'Token made', token_removed: 'Token taken back', display_opened: 'Wall screen opened with its link',
   wall_arranged: 'Order of the tiles set',
   user_suspended: 'Account suspended', user_resumed: 'Account no longer suspended', user_signed_out: 'Account signed out everywhere',
+  live_opened: 'Live view opened', live_closed: 'Live view closed', console_failed: 'Console not opened',
+  activity_exported: 'Activity log downloaded', accounts_reset: 'Accounts and saved passwords erased',
 };
 const ACTION_NAMES = {
   reboot: 'Reboot KVM', ctrl_alt_del: 'Ctrl+Alt+Del', atx_power: 'Power button', power_on: 'Power on', power_off: 'Shut down',
-  atx_power_long: 'Power button held', atx_reset: 'Reset button', wol: 'Wake-on-LAN',
+  atx_power_long: 'Power button held', atx_reset: 'Reset button', bios_setup: 'Start into BIOS setup', wol: 'Wake-on-LAN',
+  fingerbot_power: 'Pressed by the Fingerbot', fingerbot_power_long: 'Held by the Fingerbot',
   keys: 'Keys', text: 'Typed text', custom: 'Saved action', jiggler_on: 'Keep awake', jiggler_off: 'Allow sleep',
   port: 'Port switched', resume: 'Picture taken back',
 };
@@ -2910,8 +3150,9 @@ async function devicesTab(refresh, does) {
         h('td', { class: 'wrap' }, device.name,
           device.same_as?.length > 0 && h('div', { class: 'error' }, `Same device as ${device.same_as.map(twin => twin.name).join(', ')}`)),
         h('td', { class: 'wrap' }, device.host, h('div', { class: 'muted' }, KINDS[device.kind] || device.kind)),
-        h('td', {}, device.url.startsWith('https') ? modes[device.tls] : 'Unencrypted (http)',
-          !device.has_password && device.kind !== 'jetkvm' && h('div', { class: 'error' }, 'No password saved')),
+        // (A console over vncs:// is encrypted, and its certificate checked as one over https:// is; over vnc:// it is not.)
+        h('td', {}, /^(https|vncs):/.test(device.url) ? modes[device.tls] : device.url.startsWith('vnc:') ? 'Unencrypted (vnc)' : 'Unencrypted (http)',
+          !device.has_password && !NO_USER_NAME.includes(device.kind) && h('div', { class: 'error' }, 'No password saved')),
         h('td', {},
           h('button', { type: 'button', onclick: () => editDeviceDialog(device, changed) }, 'Edit'),
           h('button', { type: 'button', class: 'danger', onclick: () => removeDevice(device, changed) }, 'Remove')))))),
@@ -2972,7 +3213,7 @@ function editActionDialog(action, onDone) {
     const keysPane = h('div', {}, h('p', { class: 'muted' }, 'Pressed together on the connected computer, then released.'), picker.el);
     const textPane = h('div', {},
       field('Text to type', text,
-        "Typed as if on the computer's keyboard (US layout). Stored encrypted; it is never shown again or written to the activity log."),
+        "Typed as if on the computer's keyboard (US layout; on a JetKVM, the layout set on its own page). Stored encrypted; it is never shown again or written to the activity log."),
       check(enter, 'Press Enter afterwards'));
     const error = h('p', { class: 'error', hidden: true });
     const save = h('button', { type: 'submit', class: 'primary' }, 'Save');
@@ -3169,6 +3410,11 @@ async function updatesTab(refresh, does) {
       'see "Publishing releases" in the README.');
   } else if (status.installed && !status.supervised) {
     notice = h('div', { class: 'note' }, `Version ${status.installed} is installed. Restart qKVM to start using it.`);
+  } else if (status.installed) {
+    // Under a starter the page that installed it follows the restart that comes a second later, and other pages see this
+    // for that second; it stays where that restart was not made: whoever asked for it lost the right while it was written.
+    notice = h('div', { class: 'note' }, `Version ${status.installed} is installed and is used from the next start of qKVM. `,
+      h('code', {}, 'qkvm restart'), ' on its computer starts it now.');
   } else if (status.available) {
     state = 'A newer version is available.';
   } else if (status.checked_ago == null) {
@@ -3319,14 +3565,71 @@ function eventLabel(entry) {
   if (entry.event === 'settings_changed' && 'update_check' in entry) {
     return entry.update_check ? 'Daily update check switched on' : 'Daily update check switched off';
   }
+  if (entry.event === 'live_control') {
+    if (entry.on) return entry.from ? 'Keyboard and mouse taken over' : 'Keyboard and mouse taken';
+    return !entry.why || entry.why === 'closed' || entry.why === 'idle' ? 'Keyboard and mouse given back' : 'Keyboard and mouse taken away';
+  }
   return EVENTS[entry.event] || entry.event;
 }
 
+// Why a live line's keyboard and mouse were taken away (`why` of `live_control`, the line's own words: live.py).
+const TAKEN_AWAY = {
+  signed_out: 'the sign-in ended', unconfirmed: 'the identity proxy had not confirmed the sign-in for a while', not_allowed: 'the account may no longer act on it', not_found: 'no longer on the wall of this account',
+  gone: 'the machine was changed or taken off the wall', dropped: 'the machine stopped taking them', closing: 'qKVM stopped',
+  flooding: 'the line sent far more than a viewer would', bad_message: 'the line sent a message longer than any it carries',
+};
+
+// What the activity log says of keyboard and mouse: taken over from whom, taken away and why, given back for want of input.
+function liveControlDetail(entry) {
+  if (entry.event !== 'live_control') return '';
+  if (entry.on) return entry.from ? `from ${entry.from}` : '';
+  if (entry.why === 'taken') return entry.by ? `taken over by ${entry.by}` : 'taken over';
+  if (entry.why === 'idle') return entry.minutes ? `after ${entry.minutes} minutes without input` : 'after a time without input';
+  return entry.why && entry.why !== 'closed' ? TAKEN_AWAY[entry.why] || entry.why : '';
+}
+
+// The machine the activity log is to show when it is opened from that machine's enlarged view (its id): taken once.
+let activityFor = null;
+
+// What a download of the activity log was of (`asked` of `activity_exported`), in the page's words.
+function exportedOf(entry, names) {
+  if (entry.event !== 'activity_exported') return '';
+  const asked = entry.asked && typeof entry.asked === 'object' ? entry.asked : {};
+  const when = at => (typeof at === 'number' ? new Date(at * 1000).toLocaleString() : '');
+  return [
+    entry.format === 'jsonl' ? 'JSON lines' : 'CSV',
+    asked.device && `of ${names.get(asked.device) || asked.device}`, asked.user && `by ${asked.user}`,
+    asked.kind && { signin: 'signing in', action: 'actions on machines', change: 'changes', alert: 'alerts' }[asked.kind],
+    asked.since != null && `from ${when(asked.since)}`, asked.until != null && `to ${when(asked.until)}`,
+    Array.isArray(asked.q) && asked.q.length && `with "${asked.q[0]}"`,
+  ].filter(Boolean).join(' ');
+}
+
+// What the activity log says of a live view: how long it was open, why it ended where that was not its viewer's doing,
+// and how many entries of the same account's live views were left out before it (more than are written in an hour).
+function liveViewDetail(entry) {
+  if (entry.event !== 'live_opened' && entry.event !== 'live_closed') return [];
+  return [
+    entry.event === 'live_closed' && typeof entry.seconds === 'number' && `open ${spanText(entry.seconds)}`,
+    entry.event === 'live_closed' && entry.why && entry.why !== 'closed' && (TAKEN_AWAY[entry.why] || entry.why),
+    entry.unsaid && `${entry.unsaid} earlier ${entry.unsaid === 1 ? 'entry' : 'entries'} of this account's live views not written: more than are kept an hour`,
+  ];
+}
+
+function consoleDetail(entry) {
+  if (entry.event !== 'console_opened' && entry.event !== 'console_failed') return [];
+  return [entry.unsaid && `${entry.unsaid} earlier ${entry.unsaid === 1 ? 'entry' : 'entries'} of this account's consoles not written: more than are kept an hour`];
+}
+
 async function activityTab(refresh, does) {
+  // What can be narrowed to: the machines on the wall, the accounts and the tokens (a token acts under its name and "(token)").
+  const [{ devices }, { users }, { tokens }] = await Promise.all([api('GET', 'api/v1/wall'), api('GET', 'api/v1/users'), api('GET', 'api/v1/tokens')]);
+  const names = new Map(devices.map(device => [device.id, device.name]));
   const detail = entry => [
     entry.device, entry.account, ROLE_NAMES[entry.role], entry.name || ACTION_NAMES[entry.action] || entry.action,
+    entry.strength && (entry.strength === 'light' ? 'pressing lightly' : 'pressing firmly'),
     entry.event === 'alert' && `${LABELS[entry.was] || entry.was} to ${LABELS[entry.state] || entry.state}`,
-    entry.held && 'not sent: alerts were paused', entry.minutes && `${entry.minutes} minutes`,
+    entry.held && 'not sent: alerts were paused', entry.event !== 'live_control' && entry.minutes && `${entry.minutes} minutes`,
     entry.recovery_code && `with a one-time code (${entry.codes_left} left)`,
     entry.event === 'login_failed' && entry.suspended && 'the account is suspended',
     entry.event === 'login_failed' && entry.no_second_step && 'the key of its second step does not open',
@@ -3341,8 +3644,10 @@ async function activityTab(refresh, does) {
     entry.event === 'login' && entry.sso && 'by the identity provider', entry.sessions != null && `${entry.sessions} browsers`,
     entry.require_totp && `required of: ${{ admin: 'admins', operator: 'admins and operators', viewer: 'everybody' }[entry.require_totp] || 'nobody'}`,
     entry.action === 'port' && entry.port && `port ${entry.port}`,
+    liveControlDetail(entry),
     entry.keys && keysLabel(entry.keys), entry.chars && `${entry.chars} characters`, entry.mac,
     entry.batch && 'bulk run', entry.version && `version ${entry.version}`, entry.note, entry.error, entry.url,
+    ...liveViewDetail(entry), ...consoleDetail(entry), exportedOf(entry, names),
   ].filter(Boolean).join(' · ');
   const line = entry => h('tr', {},
     h('td', { class: 'when' }, new Date(entry.time * 1000).toLocaleString()),
@@ -3356,36 +3661,132 @@ async function activityTab(refresh, does) {
   const kind = h('select', { 'aria-label': 'What kind' }, [
     ['', 'Everything'], ['signin', 'Signing in'], ['action', 'Actions on machines'], ['change', 'Changes'], ['alert', 'Alerts'],
   ].map(([value, label]) => h('option', { value }, label)));
+  const byName = (a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' });
+  const machine = h('select', { 'aria-label': 'Which machine' },
+    h('option', { value: '' }, 'Every machine'),
+    [...devices].sort((a, b) => byName(a.name, b.name)).map(device => h('option', { value: device.id }, device.name)));
+  // Whose, by the name it is written under: typed, with the accounts and tokens of today offered. (An account that was
+  // removed is in the log all the same, and is often the one looked for.)
+  const offered = h('datalist', { id: 'activity-accounts' },
+    [...users.map(user => user.name), ...tokens.map(token => `${token.name} (token)`)].sort(byName).map(name => h('option', { value: name })));
+  const who = h('input', {
+    type: 'text', class: 'who', placeholder: 'Anybody', 'aria-label': 'Whose: an account or a token, by its name',
+    spellcheck: false, autocomplete: 'off', maxLength: 100,
+  });
+  who.setAttribute('list', 'activity-accounts');  // (an attribute only: the property of that name cannot be set)
+  if (activityFor && names.has(activityFor)) machine.value = activityFor;
+  activityFor = null;
+  // From and to, to the minute: "to 10:30" is to the end of that minute.
+  const from = h('input', { type: 'datetime-local', 'aria-label': 'From' });
+  const to = h('input', { type: 'datetime-local', 'aria-label': 'To' });
+  const moment = (input, end) => {
+    const at = input.value ? new Date(input.value).getTime() / 1000 : NaN;
+    return Number.isFinite(at) && at >= 0 ? at + (end ? 59.999 : 0) : null;
+  };
   const rows = h('tbody', {});
   const none = h('p', { class: 'nothing', hidden: true }, 'Nothing found.');
   // A log that could not be written for a while has a hole in it, and says so: what was done then was done all the same.
   const hole = h('div', { class: 'note bad', hidden: true });
   const older = h('button', { type: 'button', class: 'link' }, 'Show older');
   const foot = h('div', { class: 'lines-foot', hidden: true }, older);  // the list's last line, while there is more of it
-  const asked = () => {
+  // `upTo`: the time of the oldest entry shown, for the next page (what is that old or older; "To" is later than it).
+  const asked = (upTo = null) => {
     const typed = find.value.trim();
     const lower = typed.toLowerCase();
     // What is shown here ("Keep awake", "Wrong password") is not what the log is written with (jiggler_on,
     // login_failed). Somebody looks for what they see: it is asked for under both names.
     const also = typed.length < 3 ? [] : Object.entries({ ...EVENTS, ...ACTION_NAMES, ...LABELS })
       .filter(([, label]) => label.toLowerCase().includes(lower)).map(([key]) => key).slice(0, 15);
-    return [...new Set([typed, ...also])].filter(Boolean).map(word => `q=${encodeURIComponent(word)}`).join('&') + `&kind=${kind.value}`;
+    const since = moment(from, false);
+    const until = upTo != null ? upTo : moment(to, true);
+    return [...new Set([typed, ...also])].filter(Boolean).map(word => `q=${encodeURIComponent(word)}`).join('&') + `&kind=${kind.value}`
+      + (machine.value ? `&device=${encodeURIComponent(machine.value)}` : '') + (who.value.trim() ? `&user=${encodeURIComponent(who.value.trim())}` : '')
+      + (since != null ? `&since=${since}` : '') + (until != null ? `&until=${until}` : '');
   };
-  let last = null;  // the time of the oldest entry shown: what comes next is older than that
+  // The next page is what is as old as the oldest entry shown, or older, with the entries of that very moment that are shown
+  // already asked for again and left out, by what they are. (Asked for as what is older than it, "Show older" never came to
+  // the rest of a moment that a page's edge cut through: on Windows before Python 3.13, whose clock ticks every 15.6 ms, a
+  // removal of many machines or a file taken in writes hundreds of entries of one time. Left out by their count, entries of
+  // that moment written since came first and pushed as many shown ones onto the page again: the reviewer of FX-C.)
+  const PAGE = 200;
+  const MOST = 500;  // (the most the route gives at once)
+  let last = null;  // the time of the oldest entry shown
+  let atLast = new Map();  // the entries shown of that time, as JSON, and how often each (two alike are two)
+  let tied = 0;  // how many those are
+  // What the list shown answers (asked()): "Show older" goes on with that question only. (A narrowing typed and "Show older"
+  // clicked without Enter: the click came after the box's change, went on from the old list's oldest entry with the new
+  // question, and the list held what the box left out: the second reviewer of FX-C.)
+  let shownFor = null;
   let turn = 0;
   const load = async more => {
     const mine = ++turn;  // an answer that comes after a newer question was asked is not shown
+    const since = moment(from, false);
+    const until = moment(to, true);
+    if (since != null && until != null && since > until) {
+      toast('"From" has to be before "To"', 'error');
+      return;
+    }
+    const question = asked();
+    const paging = more && last != null && question === shownFor;
+    const ask = async path => {
+      try {
+        return await api('GET', path);
+      } catch (ex) {
+        // The log is read one question at a time of each account: one asked while the last was still being answered (a
+        // search typed on, a click from the enlarged view) is told to come back in a moment, and is, once.
+        if (ex.code !== 'busy' || mine !== turn) throw ex;
+        await sleep(2000);
+        if (mine !== turn) return null;
+        return api('GET', path);
+      }
+    };
     let found;
+    let entries;
     try {
-      found = await api('GET', `api/v1/audit?limit=200&${asked()}${more && last ? `&before=${last}` : ''}`);
+      found = await ask(paging ? `api/v1/audit?limit=${Math.min(MOST, PAGE + tied)}&${asked(last)}` : `api/v1/audit?limit=${PAGE}&${question}`);
+      if (found == null || mine !== turn) return;
+      entries = found.entries;
+      if (paging) {
+        const unmet = new Map(atLast);  // (what of the shown is still to be met in the answer)
+        entries = entries.filter(entry => {
+          if (entry.time !== last) return true;
+          const said = JSON.stringify(entry);
+          const left = unmet.get(said) || 0;
+          if (!left) return true;
+          unmet.set(said, left - 1);
+          return false;
+        });
+        if (!entries.length && found.more) {
+          // More of one moment than the route gives at once: the rest of it cannot be asked for by time, and the page goes on
+          // to what is older, as it did before.
+          found = await ask(`api/v1/audit?limit=${PAGE}&${question}&before=${last}`);
+          if (found == null || mine !== turn) return;
+          entries = found.entries;
+        }
+      }
     } catch (ex) {
-      toast(ex.message, 'error');
+      if (mine === turn) toast(ex.message, 'error');  // (a question asked since then has the say)
       return;
     }
     if (mine !== turn) return;
-    if (!more) rows.replaceChildren();
-    rows.append(...found.entries.map(line));
-    if (found.entries.length) last = found.entries[found.entries.length - 1].time;
+    if (!paging) {
+      rows.replaceChildren();
+      last = null;
+      atLast = new Map();
+      tied = 0;
+      shownFor = question;
+    }
+    rows.append(...entries.map(line));
+    for (const entry of entries) {
+      if (entry.time !== last) {
+        last = entry.time;
+        atLast = new Map();
+        tied = 0;
+      }
+      const said = JSON.stringify(entry);
+      atLast.set(said, (atLast.get(said) || 0) + 1);
+      tied += 1;
+    }
     foot.hidden = !found.more;
     none.hidden = rows.childElementCount > 0;
     const lost = found.missing;
@@ -3400,13 +3801,21 @@ async function activityTab(refresh, does) {
     clearTimeout(typing);
     typing = setTimeout(() => load(false), 300);
   });
-  kind.addEventListener('change', () => load(false));
+  for (const narrowing of [kind, machine, who, from, to]) narrowing.addEventListener('change', () => load(false));
   older.addEventListener('click', () => busy(older, () => load(true)));
   // What is shown, or all of it when nothing is being looked for, as a file to keep or to hand on.
   const take = format => async () => {
     try {
-      const reply = await fetch(`api/v1/audit/export?format=${format}&${asked()}`, { headers: { 'X-QKVM': '1' } });
-      if (!reply.ok) throw new Error(`The log could not be fetched (HTTP ${reply.status})`);
+      const path = `api/v1/audit/export?format=${format}&${asked()}`;
+      let reply = await fetch(path, { headers: { 'X-QKVM': '1' } });
+      if (reply.status === 503 && (await reply.clone().json().catch(() => ({}))).code === 'busy') {
+        await sleep(2000);  // (this account's last question to the log was still being answered: asked again, once)
+        reply = await fetch(path, { headers: { 'X-QKVM': '1' } });
+      }
+      if (!reply.ok) {
+        const said = await reply.json().catch(() => ({}));
+        throw new Error(said.message || `The log could not be fetched (HTTP ${reply.status})`);
+      }
       const url = URL.createObjectURL(await reply.blob());
       const link = h('a', { href: url, download: `qkvm-activity.${format}` });
       document.body.append(link);
@@ -3425,7 +3834,8 @@ async function activityTab(refresh, does) {
   await load(false);
   return [
     hole,
-    h('div', { class: 'toolbar' }, find, kind),
+    h('div', { class: 'toolbar' }, find, kind, machine, who, offered,
+      h('label', { class: 'when' }, h('span', {}, 'From'), from), h('label', { class: 'when' }, h('span', {}, 'To'), to)),
     h('section', { class: 'block' }, h('div', { class: 'lines' },
       h('table', { class: 'rows' },
         h('thead', {}, h('tr', {}, h('th', {}, 'When'), h('th', {}, 'Who'), h('th', {}, 'What'), h('th', {}, 'Details'), h('th', {}, 'From'))),
@@ -3437,20 +3847,29 @@ async function activityTab(refresh, does) {
 
 // --- the wall --------------------------------------------------------------------------------------
 
-const LABELS = {
-  connecting: 'Connecting...', online: 'Online', no_signal: 'No signal',
-  offline: 'Offline', auth: 'Login failed', error: 'Problem', busy: 'In use elsewhere',
-};
+// Tile state -> what the tile says for it (words.json, read at boot).
+const LABELS = WORDS.states;
 // A server that is switched off is not a computer without a picture: it is called what it is.
 function stateLabel(state, status) {
-  return state === 'no_signal' && status?.picture === false ? 'Powered off' : LABELS[state];
+  return (status?.picture === false && WORDS.server_states[state]) || LABELS[state];
 }
 
-// Snapshot error code -> tile state.
-const FEED_STATES = {
-  unreachable: 'offline', timeout: 'offline', dropped: 'offline',
-  auth_failed: 'auth', no_password: 'auth', no_stream: 'connecting', in_use: 'busy',
-};
+// A KVM whose power board says the computer behind it is off: its power light is out. That is a computer off, or one
+// asleep whose light goes out then (a real PC did, and its Comet said "off" of it), and not one unplugged from the KVM.
+// (Without a board, a KVM cannot tell those apart; and a light that says "off" beside a picture is not wired up.)
+function switchedOff(status) {
+  return status?.picture !== false && status?.atx?.enabled === true && status.atx.power === false && status.video?.signal !== true;
+}
+
+// A device's trouble, by its code -> the tile state it is shown under (words.json); a code not in there is "error".
+const FEED_STATES = WORDS.codes;
+
+// What a tile can do, by the server's word: the status's list once there is one, the wall's until then
+// (both `can`, of the same words). Never by the kind of device: a client that guessed by kind offered a
+// keyboard to a server, and power buttons to a KVM without a power board.
+function canDo(tile, what) {
+  return (tile.status?.can || tile.device.can || []).includes(what);
+}
 // Tile state -> the filter it is counted under ("connecting" tiles only show under All).
 const GROUPS = { online: 'online', no_signal: 'no_signal', offline: 'attention', auth: 'attention', error: 'attention', busy: 'attention' };
 const FILTERS = [['all', 'All', null], ['online', 'Online', 'online'], ['no_signal', 'No signal', 'no_signal'], ['attention', 'Attention', 'offline']];
@@ -3462,6 +3881,7 @@ let period = 1000;  // ms between tile refreshes, 0 = paused
 let wallDown = false;
 let wallRun = 0;    // bumped whenever the wall is torn down, so old loops notice and stop
 let focus = null;   // { id, feed, view } while a tile is enlarged
+let focusRequest = 0, focusOpening = null;  // newest requested view, including one waiting for a transition
 let filter = 'all'; // which group of tiles is shown
 let query = '';     // text typed into the search box
 let selecting = false;       // picking KVMs for a bulk action
@@ -3504,10 +3924,8 @@ async function paintSharp(canvas, box, blob, stillWanted) {
   const frame = await createImageBitmap(blob);
   let sized = frame;
   try {
-    const scale = Math.min(boxW / frame.width, boxH / frame.height);
-    const w = Math.max(1, Math.round(frame.width * scale));
-    const h = Math.max(1, Math.round(frame.height * scale));
-    if (scale < 1) sized = await createImageBitmap(frame, { resizeWidth: w, resizeHeight: h, resizeQuality: 'high' });
+    const { x, y, w, h } = fitted(boxW, boxH, frame.width, frame.height);
+    if (w < frame.width) sized = await createImageBitmap(frame, { resizeWidth: w, resizeHeight: h, resizeQuality: 'high' });
     if (stillWanted()) {
       if (canvas.width !== boxW || canvas.height !== boxH) {
         canvas.width = boxW;
@@ -3517,7 +3935,7 @@ async function paintSharp(canvas, box, blob, stillWanted) {
       context.fillStyle = '#000';
       context.fillRect(0, 0, boxW, boxH);
       context.imageSmoothingQuality = 'high';
-      context.drawImage(sized, Math.floor((boxW - w) / 2), Math.floor((boxH - h) / 2), w, h);
+      context.drawImage(sized, x, y, w, h);
     }
   } finally {
     // Whatever happened above: a decoded picture is memory the browser does not take back by itself in time.
@@ -3634,7 +4052,10 @@ class Feed {
       return;
     }
     this.failing = this.waking = false;
-    this.onResult({ signal: res.headers.get('X-KVM-Signal') !== '0' });
+    // A still kept between sessions (a PC with Intel AMT whose tile is only shown): its age, so the tile can say it.
+    const still = res.headers.get('X-KVM-Still') === '1';
+    const age = still ? Number(res.headers.get('X-KVM-Age') || 0) : null;
+    this.onResult({ signal: res.headers.get('X-KVM-Signal') !== '0', still, age });
   }
 }
 
@@ -3649,9 +4070,11 @@ function sharpWidth(box) {
 
 // `shared`: ms between refreshes of a view that can do with a picture another browser fetched a
 // moment ago. Several people on one wall then cost each KVM little more than one of them would.
-function snapshotUrl(id, box, shared = 0) {
+// `big`: this is the enlarged (large) view, so a PC with Intel AMT holds a session open for it (and opens one before a
+// power-on to show the start), where a tile that is only shown gets a still now and then.
+function snapshotUrl(id, box, shared = 0, big = false) {
   const age = shared ? `&age=${(shared * 0.8 / 1000).toFixed(2)}` : '';
-  return `api/v1/devices/${encodeURIComponent(id)}/snapshot?w=${sharpWidth(box)}${age}`;
+  return `api/v1/devices/${encodeURIComponent(id)}/snapshot?w=${sharpWidth(box)}${age}${big ? '&big=1' : ''}`;
 }
 
 // A view is what one feed knows about a device: { hasFrame, frameAt, signal, error }.
@@ -3669,8 +4092,16 @@ function applyResult(view, result) {
       && performance.now() - view.frameAt < PICTURE_KEPT;
     if (!slow) view.error = result.error;
   } else {
-    Object.assign(view, { error: null, hasFrame: true, frameAt: performance.now(), signal: result.signal });
+    Object.assign(view, { error: null, hasFrame: true, frameAt: performance.now(), signal: result.signal,
+      still: Boolean(result.still), stillAge: result.still ? result.age : null });
   }
+}
+
+// What a tile says it shows between stills (a PC with Intel AMT whose tile is only shown): the age of the still.
+function stillNote(view) {
+  if (!view?.still) return '';
+  const age = Math.max(0, Math.round(view.stillAge || 0));
+  return `still, ${age < 60 ? `${age} s` : `${Math.round(age / 60)} min`} ago`;
 }
 
 // A server is seen through its management controller. Where that has a console qKVM reads (the status says
@@ -3684,7 +4115,7 @@ function showsScreen(device, status) {
 // says the rest. Switched off, what its controller says of it is what there is to see, and not "no signal:
 // not plugged into the KVM", which is a KVM's story.
 function pictured(device, view, state) {
-  return device.picture === false && view.hasFrame && !view.error && (state === 'online' || state === 'error');
+  return Boolean(device.picture === false && view.hasFrame && !view.error && (state === 'online' || state === 'error'));
 }
 
 function stateOf(status, view) {
@@ -3695,6 +4126,9 @@ function stateOf(status, view) {
   if (status && status.state !== 'online' && status.state !== 'no_signal' && !live) {
     return [status.state, status.error?.message];
   }
+  // A KVM that says its computer sends no picture has none to give, also while it takes its time to say so for each
+  // picture asked of it: a Comet whose computer is off answers every request for one with nothing, five seconds later.
+  if (view.error?.code === 'no_stream' && status?.state === 'no_signal') return ['no_signal', null];
   if (view.error) return [FEED_STATES[view.error.code] || 'error', view.error.message];
   if (!view.hasFrame) return ['connecting', null];
   if (!view.signal || status?.state === 'no_signal') return ['no_signal', null];
@@ -3721,7 +4155,10 @@ function metaText(status) {
     if (status.atx.power) parts.push('Power on');
     else if (status.atx.power === false && !status.video.signal) parts.push('Power off');
   }
-  if (status.usb?.keyboard === false) parts.push('USB not connected');
+  // A Fingerbot paired with the KVM, and its battery where that is low.
+  if (status.fingerbot) parts.push(status.fingerbot.low ? `Fingerbot battery low (${status.fingerbot.battery}%)` : 'Fingerbot');
+  // (A computer that is off has no USB for the KVM to be plugged into: that is not a cable that is out.)
+  if (status.usb?.keyboard === false && !switchedOff(status)) parts.push('USB not connected');
   if (status.health?.temp != null) parts.push(`${Math.round(status.health.temp)}°C`);
   return parts.join(' · ');
 }
@@ -3731,10 +4168,11 @@ function metaText(status) {
 const HEALTH_TONES = { OK: 'ok', Warning: 'warn', Critical: 'bad' };
 
 // Fills what a server's tile shows where a KVM's shows the screen: power, health, heat, fans, and what
-// the machine is. `full`: with every temperature, for the enlarged view. Returns whether there is anything to show.
-function fillPanel(panel, status, full = false) {
+// the machine is. `full`: with every temperature, for the enlarged view (of the machine `id`). Returns whether there is
+// anything to show.
+function fillPanel(panel, status, full = false, id = null) {
   const server = status?.server;
-  const key = server ? JSON.stringify([server, status.health?.temp, full]) : '';
+  const key = server ? JSON.stringify([server, status.health?.temp, full, id, me?.role]) : '';
   if (panel.dataset.key === key) return Boolean(server);  // unchanged: leave the DOM alone
   panel.dataset.key = key;
   if (!server) {
@@ -3753,17 +4191,22 @@ function fillPanel(panel, status, full = false) {
   ].filter(Boolean).join(' · ');
   panel.dataset.power = on ? 'on' : 'off';
   panel.dataset.tone = HEALTH_TONES[server.health] || '';
+  // A PC with Intel AMT, or a guest of Proxmox, is said as a server is, and is no server: its tile says what it is (the
+  // kind's word, words.json).
+  const what = status.kind !== 'redfish' && KINDS[status.kind] ? KINDS[status.kind] : 'Server';
   panel.replaceChildren(...[
     h('div', { class: 'panel-power' }, h('span', { class: 'led' }), h('strong', {}, on ? 'On' : 'Off'),
       // Somebody is looking for this machine: the tile says so as plainly as the light on it does.
-      server.locator ? h('span', { class: 'locating' }, h('i', {}), 'Locator light on') : h('span', {}, 'Server')),
+      server.locator ? h('span', { class: 'locating' }, h('i', {}), 'Locator light on') : h('span', {}, what)),
     h('div', { class: 'readings' },
       reading('Health', server.health || 'Not reported', HEALTH_TONES[server.health]),
       temp != null && reading('Temp', `${Math.round(temp)} °C`),
       server.fans.length > 0 && reading(failing ? `Fans · ${failing} not well` : 'Fans', `${running} running`, failing ? 'warn' : null)),
     hardware && h('p', { class: 'panel-hardware' }, hardware),
     full && server.unwell.length > 0 && h('p', { class: 'panel-unwell' }, `Not well: ${server.unwell.join(', ')}`),
-    full && server.no_screen && h('p', { class: 'panel-hardware' }, `Its screen is not shown: ${server.no_screen}`),
+    // Why there is no picture, where there could be one: on the tile as well, in as many lines as it has room for.
+    server.no_screen && h('p', { class: 'panel-why', title: full ? null : server.no_screen }, `Its screen is not shown: ${server.no_screen}`),
+    full && kvmSwitch(status, id),
     full && server.temperatures.length + server.fans.length > 0 && h('div', { class: 'sensors' },
       server.temperatures.map(sensor => h('div', { dataset: sensor.ok ? {} : { tone: 'warn' } },
         h('span', {}, sensor.name), h('b', {}, `${Math.round(sensor.celsius)} °C`))),
@@ -3771,6 +4214,90 @@ function fillPanel(panel, status, full = false) {
         h('span', {}, fan.name), h('b', {}, fan.reading == null ? '-' : `${Math.round(fan.reading)} ${fan.unit}`)))),
   ].filter(Boolean));
   return true;
+}
+
+// A PC with Intel AMT whose KVM is switched off on its engine (as an engine set up by hand comes): an admin may switch it
+// on from here. It is a setting of the PC's, kept by its engine, and it is said so before anything is changed.
+function kvmSwitch(status, id) {
+  const amt = status.server?.amt;
+  if (!amt || !id || !can('admin') || !(amt.kvm === 'disabled' || (amt.kvm === 'enabled' && amt.listener === false))) return null;
+  const button = h('button', {
+    type: 'button',
+    onclick: async () => {
+      const yes = await confirmBox({
+        title: 'Switch on its KVM',
+        message: 'This changes a setting of the PC: its management engine will let whoever has its password see its screen and use its keyboard and mouse, from the network. Its redirection listener is switched on with it, which the engine\'s serial console and remote storage use as well. The KVM stays on until it is switched off again: under Actions here (the listener is then left on), or in the PC\'s MEBx. Intel AMT draws a red and yellow border on the PC\'s own screen while somebody looks.',
+        action: 'Switch on',
+        danger: false,
+      });
+      if (!yes) return;
+      button.disabled = true;
+      try {
+        await api('POST', `api/v1/devices/${encodeURIComponent(id)}/kvm`, { on: true });
+        toast('Its KVM is on. Its screen comes with the next look.', 'ok');
+        lookAgainSoon();
+      } catch (ex) {
+        toast(ex.message, 'error');
+        button.disabled = false;
+      }
+    },
+  }, 'Switch on its KVM');
+  return h('div', { class: 'panel-actions' }, button);
+}
+
+// "Start into BIOS setup" for a PC with Intel AMT or a server over Redfish: the machine is told to boot into its
+// firmware setup once, then switched on (if off) or restarted (if on). Its large view opens first, so the setup screen
+// shows from the start. One machine at a time (not offered in a bulk run).
+async function bootIntoSetup(tile) {
+  const name = tile.device.name;
+  const on = tile.status?.atx?.power !== false;
+  const yes = await confirmBox({
+    title: 'Start into BIOS setup',
+    message: `${name} will ${on ? 'restart now' : 'be switched on'} and start straight into its BIOS setup screen, once.`
+      + (on ? ' Any unsaved work on it is lost.' : '') + ' Its large view opens so you can watch the setup.',
+    action: on ? 'Restart into setup' : 'Switch on into setup',
+    danger: on,
+  });
+  if (!yes) return;
+  // The large view, so the setup screen shows (and the server opens a session before the press: `watching`). Not opened
+  // again where it is open already: that would end its live line and give its keyboard back.
+  if (focus?.id !== tile.device.id) openFocus(tile.device.id);
+  if (acting.has(tile.device.id)) {
+    toast(`${name}: "${acting.get(tile.device.id)}" is still under way. Wait for its answer.`, 'info');
+    return;
+  }
+  acting.set(tile.device.id, 'Start into BIOS setup');
+  const finished = working(`${name}: starting into BIOS setup...`);
+  try {
+    await api('POST', `api/v1/devices/${tile.device.id}/actions`, { action: 'bios_setup', watching: true }, SETUP_PATIENCE);
+    toast(`${name}: starting into BIOS setup`, 'ok');
+    lookAgainSoon();
+  } catch (ex) {
+    // The server's own words where it answered (whether the boot is armed, or was cleared again); else "no answer".
+    toast(ex.data?.message || !unanswered(ex)
+      ? `${name}: ${ex.message}`
+      : `${name}: no answer to "Start into BIOS setup". It may have been done, and its setup boot may be set for the next boot: look at the machine before sending it again (an admin finds how it ended in the activity log).`, 'error');
+  } finally {
+    acting.delete(tile.device.id);
+    finished();
+  }
+}
+
+async function switchKvmOff(device, close) {
+  const yes = await confirmBox({
+    title: 'Switch off its KVM',
+    message: `This changes a setting of the PC: its management engine will no longer show its screen or take keys and the mouse from the network, from qKVM or anybody else, until its KVM is switched on again. ${device.name} stays on the wall with its power buttons and how it is.`,
+    action: 'Switch off',
+  });
+  if (!yes) return;
+  try {
+    await api('POST', `api/v1/devices/${encodeURIComponent(device.id)}/kvm`, { on: false });
+    toast('Its KVM is off.', 'ok');
+    close();
+    lookAgainSoon();
+  } catch (ex) {
+    toast(ex.message, 'error');
+  }
 }
 
 // --- multi-port KVMs: one KVM, several computers, one of them on screen ----------------------------
@@ -3918,6 +4445,8 @@ function veilContent(device, status, view, state, message) {
   const now = () => tiles.get(device.id)?.device || device;
   if (message === 'Rebooting...') {
     Object.assign(content, { title: 'Rebooting...', text: device.picture === false ? 'Back in a minute or two.' : 'Back in about a minute.' });
+  } else if (state === 'no_signal' && switchedOff(status)) {
+    content.text = 'Its power board says the computer is off or asleep.';
   } else if (state === 'no_signal') {
     content.text = 'The computer is off, asleep or not plugged into the KVM.';
   } else if (state === 'offline' && status?.last_seen_ago != null) {
@@ -4048,11 +4577,11 @@ function render(tile) {
   }
   tile.el.dataset.state = state;
   const screen = pictured(tile.device, tile.view, state);
-  tile.el.classList.toggle('has-frame', tile.view.hasFrame);
-  tile.el.classList.toggle('has-panel', tile.device.picture === false && !screen && state !== 'connecting' && fillPanel(tile.panel, tile.status));
+  tile.el.classList.toggle('has-frame', Boolean(tile.view.hasFrame));
+  tile.el.classList.toggle('has-panel', Boolean(tile.device.picture === false && !screen && state !== 'connecting' && fillPanel(tile.panel, tile.status)));
   tile.el.classList.toggle('pictured', screen);
   if (state !== 'online') fillVeil(tile.veil, state, veilContent(tile.device, tile.status, tile.view, state, message));
-  $('.meta', tile.el).textContent = metaText(tile.status);
+  $('.meta', tile.el).textContent = [metaText(tile.status), screen ? stillNote(tile.view) : ''].filter(Boolean).join(' · ');
   fillPorts(tile.ports, tile);
   if (state !== tile.state) {
     tile.state = state;
@@ -4091,6 +4620,7 @@ function renderSelection() {
   $('#bulkbar').hidden = !selecting;
   $('#bulk-count').textContent = `${selected.size} selected`;
   $('#bulk-run').disabled = selected.size === 0;
+  $('#bulk-remove').disabled = selected.size === 0 || removing;
   $('#bulk-none').disabled = selected.size === 0;
 }
 
@@ -4206,6 +4736,939 @@ function layout() {
   wall.style.setProperty('--tile-w', tileWidth);
 }
 
+// --- live picture and control -----------------------------------------------------------------------
+// The enlarged view over a qKVM server's live line (desktop/SPEC.md section 6.2, draft 2): one WebSocket
+// per machine that is looked at, pictures down it as H.264 or JPEG, keys and the mouse up it once the
+// server has said that this page holds them. A wall that has no such line is looked at as before, by
+// snapshots; so is a machine the server has no live picture of.
+
+const LIVE_FORM = 2;             // the form of the live connection this page speaks
+const LIVE_OPEN_WITHIN = 10000;  // ms the server has to take the line
+// ms the server has to answer an asking for keyboard and mouse: a little more than its longest way in to a machine
+// (live.py WAY_IN_WITHIN, a minute: a JetKVM connected anew took some forty-seven seconds). Given up on after five, a
+// take-over went on at the server, the holder lost them, and this page gave them back: nobody held the machine.
+const CONTROL_ANSWER = 65000;
+const OWED_FOR = 5000;           // ms a word the server still owes is waited for before Control is offered again
+const POINTER_EVERY = 10;        // ms between the places the pointer is said to be at
+const FARTHEST = 32767;          // the pointer's place is said as 0 to this, each way over the picture
+const HIDDEN_FPS = 1;            // pictures a second asked for while nobody sees the tab
+const MOST_UNSENT = 1024 * 1024; // bytes waiting to go to a server that takes nothing: then it is gone
+const MOST_NOTCHES = 16;         // the most clicks of the wheel one turn is said as
+let wallLive = false;            // the wall said that its server speaks the live connection
+// (What a tile can do is asked with canDo, above: "live" is a live picture over the line, "control" its keyboard and mouse.)
+
+// A key as the browser names its place on the keyboard (KeyboardEvent.code, the W3C list) to its USB HID
+// usage (the Keyboard/Keypad page, 0x07, of the USB HID Usage Tables). Typed from the two standards: the
+// usage is the number the standard gives the key, the name is the one the W3C gives the same key. A key
+// the browser names and the standard does not number as a key of this page (Fn, the media keys) is not
+// here, and goes nowhere.
+const USAGES = {
+  KeyA: 0x04, KeyB: 0x05, KeyC: 0x06, KeyD: 0x07, KeyE: 0x08, KeyF: 0x09, KeyG: 0x0A, KeyH: 0x0B, KeyI: 0x0C,
+  KeyJ: 0x0D, KeyK: 0x0E, KeyL: 0x0F, KeyM: 0x10, KeyN: 0x11, KeyO: 0x12, KeyP: 0x13, KeyQ: 0x14, KeyR: 0x15,
+  KeyS: 0x16, KeyT: 0x17, KeyU: 0x18, KeyV: 0x19, KeyW: 0x1A, KeyX: 0x1B, KeyY: 0x1C, KeyZ: 0x1D,
+  Digit1: 0x1E, Digit2: 0x1F, Digit3: 0x20, Digit4: 0x21, Digit5: 0x22, Digit6: 0x23, Digit7: 0x24, Digit8: 0x25,
+  Digit9: 0x26, Digit0: 0x27,
+  Enter: 0x28, Escape: 0x29, Backspace: 0x2A, Tab: 0x2B, Space: 0x2C, Minus: 0x2D, Equal: 0x2E, BracketLeft: 0x2F,
+  BracketRight: 0x30, Backslash: 0x31, Semicolon: 0x33, Quote: 0x34, Backquote: 0x35, Comma: 0x36, Period: 0x37,
+  Slash: 0x38, CapsLock: 0x39,
+  F1: 0x3A, F2: 0x3B, F3: 0x3C, F4: 0x3D, F5: 0x3E, F6: 0x3F, F7: 0x40, F8: 0x41, F9: 0x42, F10: 0x43, F11: 0x44, F12: 0x45,
+  PrintScreen: 0x46, ScrollLock: 0x47, Pause: 0x48, Insert: 0x49, Home: 0x4A, PageUp: 0x4B, Delete: 0x4C, End: 0x4D,
+  PageDown: 0x4E, ArrowRight: 0x4F, ArrowLeft: 0x50, ArrowDown: 0x51, ArrowUp: 0x52,
+  NumLock: 0x53, NumpadDivide: 0x54, NumpadMultiply: 0x55, NumpadSubtract: 0x56, NumpadAdd: 0x57, NumpadEnter: 0x58,
+  Numpad1: 0x59, Numpad2: 0x5A, Numpad3: 0x5B, Numpad4: 0x5C, Numpad5: 0x5D, Numpad6: 0x5E, Numpad7: 0x5F, Numpad8: 0x60,
+  Numpad9: 0x61, Numpad0: 0x62, NumpadDecimal: 0x63,
+  IntlBackslash: 0x64, ContextMenu: 0x65, NumpadEqual: 0x67,  // (0x66, Power, is not sent: it shuts a machine down)
+  F13: 0x68, F14: 0x69, F15: 0x6A, F16: 0x6B, F17: 0x6C, F18: 0x6D, F19: 0x6E, F20: 0x6F, F21: 0x70, F22: 0x71, F23: 0x72, F24: 0x73,
+  Open: 0x74, Help: 0x75, Select: 0x77, Again: 0x79, Undo: 0x7A, Cut: 0x7B, Copy: 0x7C, Paste: 0x7D, Find: 0x7E,
+  AudioVolumeMute: 0x7F, AudioVolumeUp: 0x80, AudioVolumeDown: 0x81,
+  NumpadComma: 0x85, IntlRo: 0x87, KanaMode: 0x88, IntlYen: 0x89, Convert: 0x8A, NonConvert: 0x8B,
+  Lang1: 0x90, Lang2: 0x91, Lang3: 0x92, Lang4: 0x93, Lang5: 0x94,
+  NumpadParenLeft: 0xB6, NumpadParenRight: 0xB7, NumpadBackspace: 0xBB,
+  NumpadMemoryStore: 0xD0, NumpadMemoryRecall: 0xD1, NumpadMemoryClear: 0xD2, NumpadMemoryAdd: 0xD3, NumpadMemorySubtract: 0xD4,
+  NumpadClear: 0xD8, NumpadClearEntry: 0xD9,
+  ControlLeft: 0xE0, ShiftLeft: 0xE1, AltLeft: 0xE2, MetaLeft: 0xE3, ControlRight: 0xE4, ShiftRight: 0xE5, AltRight: 0xE6, MetaRight: 0xE7,
+};
+const LEAVE_KEY = USAGES.ControlRight;  // pressed and let go by itself, it gives keyboard and mouse back (as the desktop has it)
+// A mouse button as the browser numbers it to the button the line names: 1 left, 2 right, 3 middle, 4 back, 5 forward.
+const BUTTONS = { 0: 1, 2: 2, 1: 3, 3: 4, 4: 5 };
+
+// What this browser can show over the line. H.264 needs WebCodecs, which a browser gives only to a page it
+// takes for secure (HTTPS, or this computer's own address); JPEG every browser can show.
+function codecsHere() {
+  return typeof VideoDecoder !== 'undefined' && isSecureContext ? ['h264', 'jpeg'] : ['jpeg'];
+}
+
+// The profile of an H.264 picture, from its sequence parameter set: what WebCodecs is told as `avc1.` and
+// six hex digits (profile, constraints, level). Every key frame carries its parameter sets (the draft's rule).
+function h264Profile(data) {
+  for (let at = 0; at + 4 < data.length; at++) {
+    if (data[at] === 0 && data[at + 1] === 0 && data[at + 2] === 1) {
+      if ((data[at + 3] & 0x1F) === 7 && at + 6 < data.length) {
+        return 'avc1.' + [data[at + 4], data[at + 5], data[at + 6]].map(byte => byte.toString(16).padStart(2, '0')).join('').toUpperCase();
+      }
+      at += 2;
+    }
+  }
+  return '';
+}
+
+// A text a server sent where a text belongs, cut to one line; anything else is nothing.
+function serverText(value, most = 200) {
+  return typeof value === 'string' ? value.replace(/[\0-\x1f\x7f]+/g, ' ').slice(0, most) : '';
+}
+
+// Where a picture of w by h lands in a box of boxW by boxH: as large as it goes, keeping its shape, centred.
+function fitted(boxW, boxH, w, h) {
+  const scale = Math.min(boxW / w, boxH / h);
+  const dw = Math.max(1, Math.round(w * scale));
+  const dh = Math.max(1, Math.round(h * scale));
+  return { x: Math.floor((boxW - dw) / 2), y: Math.floor((boxH - dh) / 2), w: dw, h: dh };
+}
+
+// One live line to one machine. `told` hears what comes: opened(), video(codec, w, h), h264(data, key,
+// counter), jpeg(data, counter), skipped(), state(state, error, pointer), control(on, code, message, by, from), owed(),
+// closed(code, message). Pictures are handed over as they come, none kept here; where H.264 begins (the
+// first picture, the first after a JPEG, a new `video`) and after a gap in the counter nothing is handed over
+// until a key frame, which is asked for once.
+class LiveLine {
+  constructor(id, told) {
+    Object.assign(this, {
+      id, told, socket: null, open: false, ended: false, control: false, asking: null, owed: [],
+      lastCounter: 0, needsKey: true, askedKey: false, skipped: 0, byeCode: '', byeMessage: '', need: null,
+    });
+  }
+
+  async start(need) {
+    this.need = need;
+    let pass;
+    try {
+      pass = await api('POST', `api/v1/devices/${encodeURIComponent(this.id)}/live`, {});
+    } catch (ex) {
+      this.end(ex.code, ex.message);
+      return;
+    }
+    if (this.ended) return;
+    // Only a pass of the draft's shape is handed on: a few letters, digits, dashes and underscores.
+    if (pass?.v !== LIVE_FORM || typeof pass.ticket !== 'string' || !/^[A-Za-z0-9_-]{16,200}$/.test(pass.ticket)) {
+      this.end('bad_response', 'qKVM gave no pass for the live picture');
+      return;
+    }
+    const url = new URL(`api/v1/devices/${encodeURIComponent(this.id)}/live`, location.href);
+    url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
+    let socket;
+    try {
+      socket = new WebSocket(url);
+    } catch {
+      this.end('network', 'qKVM could not be reached for the live picture');
+      return;
+    }
+    socket.binaryType = 'arraybuffer';
+    this.socket = socket;
+    this.opening = setTimeout(() => this.end('timeout', 'qKVM did not answer for the live picture'), LIVE_OPEN_WITHIN);
+    socket.addEventListener('open', () => {
+      clearTimeout(this.opening);
+      this.open = true;
+      // The line's first word: the pass, what this browser can show, and how much of it this view needs.
+      this.say({ t: 'hello', v: LIVE_FORM, ticket: pass.ticket, video: codecsHere(), max_w: this.need.maxW, max_fps: this.need.maxFps });
+      // A server that takes nothing off the line leaves what is said to it waiting here. Not without end.
+      this.watching = setInterval(() => {
+        if (this.socket.bufferedAmount > MOST_UNSENT) this.end('dropped', 'qKVM stopped taking what is sent on the live picture\'s line');
+      }, 3000);
+      this.told.opened();
+    });
+    socket.addEventListener('message', event => {
+      if (typeof event.data === 'string') this.takeText(event.data);
+      else this.takePicture(event.data);
+    });
+    socket.addEventListener('close', () => {
+      if (this.byeCode) this.end(this.byeCode, this.byeMessage);
+      else this.end('dropped', this.open ? 'The live picture\'s line to qKVM was closed' : 'qKVM could not be reached for the live picture');
+    });
+  }
+
+  say(word) {
+    if (this.open && !this.ended && this.socket?.readyState === WebSocket.OPEN) this.socket.send(JSON.stringify(word));
+  }
+
+  // The line ended, or is ended here: said once, after everything that was held has been let go.
+  end(code, message) {
+    if (this.ended) return;
+    this.ended = true;
+    this.open = false;
+    clearTimeout(this.opening);
+    clearInterval(this.watching);
+    clearTimeout(this.asking?.timer);
+    const held = this.control || this.asking;
+    this.control = false;
+    this.asking = null;
+    this.owed = [];
+    try { this.socket?.close(); } catch { /* already gone */ }
+    if (held) this.told.control(false, code, message, '');
+    this.told.closed(code, message);
+  }
+
+  // Ended from here: what is down on the machine is let go first, while the line can still say so.
+  close() {
+    if (this.ended) return;
+    if (this.control) {
+      this.say({ t: 'up' });
+      this.say({ t: 'control', on: false });
+    }
+    this.ended = true;
+    this.open = false;
+    clearTimeout(this.opening);
+    clearInterval(this.watching);
+    clearTimeout(this.asking?.timer);
+    this.control = false;
+    this.asking = null;
+    try { this.socket?.close(); } catch { /* already gone */ }
+  }
+
+  // The view is another size, or nobody sees the tab: the server is told how much is wanted now.
+  shape(need) {
+    if (!this.need || (need.maxW === this.need.maxW && need.maxFps === this.need.maxFps)) return;
+    this.need = need;
+    this.say({ t: 'shape', max_w: need.maxW, max_fps: need.maxFps });
+  }
+
+  askKeyFrame() {
+    this.say({ t: 'key_frame' });
+  }
+
+  // Whether a word is still owed by the server (an answer to an asking that is over, or to a giving back):
+  // keyboard and mouse are not asked for while one is, and each is waited for a few seconds at the most.
+  owes() {
+    const now = performance.now();
+    this.owed = this.owed.filter(word => word.until > now);
+    return this.owed.length > 0;
+  }
+
+  // Keyboard and mouse asked for. Answered through `told.control`; the server has a few seconds. `from`: taken
+  // over from the observed grant, as an admin may (`from`, or `by` for an older server).
+  askControl(from = null) {
+    if (!this.open || this.ended || this.control || this.asking || this.owes()) return false;
+    this.asking = {
+      timer: setTimeout(() => {
+        // Not answered in time: the asking is over, and its answer is owed. Whatever comes of it later is
+        // given back at once (below).
+        this.asking = null;
+        this.say({ t: 'control', on: false });
+        const until = performance.now() + OWED_FOR;
+        this.owed.push({ answer: true, until }, { answer: false, until });
+        this.told.control(false, 'timeout', 'The machine did not answer when its keyboard and mouse were asked for', '');
+        this.told.owed();
+      }, CONTROL_ANSWER),
+    };
+    this.say(from === null ? { t: 'control', on: true } : { t: 'control', on: true, take: true, from });
+    return true;
+  }
+
+  // Given back: everything that is down on the machine is let go first.
+  giveBack() {
+    if (this.asking) {
+      clearTimeout(this.asking.timer);
+      this.asking = null;
+      this.say({ t: 'control', on: false });
+      const until = performance.now() + OWED_FOR;
+      this.owed.push({ answer: true, until }, { answer: false, until });
+      this.told.control(false, '', '', '');
+      this.told.owed();
+      return;
+    }
+    if (!this.control) return;
+    this.say({ t: 'up' });
+    this.control = false;
+    this.say({ t: 'control', on: false });
+    this.owed.push({ answer: false, until: performance.now() + OWED_FOR });
+    this.told.control(false, '', '', '');
+    this.told.owed();
+  }
+
+  key(usage, down) {
+    if (this.control && usage > 0 && usage <= 0xFFFF) this.say({ t: 'k', u: usage, d: down });
+  }
+  pointerAt(x, y) {
+    if (this.control) this.say({ t: 'm', x: Math.max(0, Math.min(FARTHEST, Math.round(x))), y: Math.max(0, Math.min(FARTHEST, Math.round(y))) });
+  }
+  pointerBy(dx, dy) {
+    if (this.control && (dx || dy)) this.say({ t: 'mr', dx: Math.round(dx), dy: Math.round(dy) });
+  }
+  button(number, down) {
+    if (this.control && number >= 1 && number <= 5) this.say({ t: 'mb', b: number, d: down });
+  }
+  wheel(dx, dy) {
+    if (this.control && (dx || dy)) this.say({ t: 'mw', dx, dy });
+  }
+  releaseAll() {
+    if (this.control) this.say({ t: 'up' });
+  }
+
+  takeText(text) {
+    if (this.ended || text.length > 65536) return;
+    let said;
+    try { said = JSON.parse(text); } catch { return; }
+    if (!said || typeof said !== 'object') return;
+    const kind = said.t;
+    if (kind === 'video') {
+      if (said.codec !== 'h264' && said.codec !== 'jpeg') return;
+      const side = value => (Number.isInteger(value) && value >= 1 && value <= 16384 ? value : 0);
+      // What follows a new `video` is a key frame; until it has come nothing is shown.
+      this.needsKey = true;
+      this.askedKey = false;
+      this.told.video(said.codec, side(said.w), side(said.h));
+    } else if (kind === 'state') {
+      const error = said.error && typeof said.error === 'object' ? said.error : {};
+      // How the machine's pointer is moved: to a place, by steps, or both; a KVM drops a move of the other kind.
+      const pointer = ['absolute', 'relative', 'both'].includes(said.pointer) ? said.pointer : '';
+      this.told.state(serverText(said.state, 40), { code: serverText(error.code, 40), message: serverText(error.message) }, pointer);
+    } else if (kind === 'control') {
+      // Keep display text separate from the exact grant reference. Only older servers that omit
+      // `from` use their name as the reference; an invalid supplied reference must not fall back.
+      const reference = Object.hasOwn(said, 'from') ? said.from : said.by;
+      this.answered(said.on === true, serverText(said.code, 40), serverText(said.message), serverText(said.by, 64),
+        typeof reference === 'string' && reference.length > 0 && reference.length <= 200 ? reference : '');
+    } else if (kind === 'bye') {
+      // A code with a ':' in it is this program's own and no server's to say.
+      const code = serverText(said.code, 40);
+      this.byeCode = !code || code.includes(':') ? 'closed' : code;
+      this.byeMessage = serverText(said.message) || 'qKVM closed the live picture\'s line';
+    }
+  }
+
+  // The server's word about keyboard and mouse. It answers each asking and each giving back with one word
+  // of its own, in the order they came: a yes or a refusal with a sentence to an asking, a bare no to a
+  // giving back. Nothing carries a number, so which answer is whose is told by that order.
+  answered(on, code, message, by, from = '') {
+    if (this.control) {
+      // Held: a no takes them away. (Nothing is owed while they are held.)
+      if (!on) {
+        this.control = false;
+        this.told.control(false, code || 'taken', message || 'Keyboard and mouse of this machine were taken away', by, from);
+      }
+      return;
+    }
+    if (this.asking) {
+      clearTimeout(this.asking.timer);
+      this.asking = null;
+      if (on) {
+        this.control = true;
+        this.told.control(true, '', '', '');
+      } else {
+        this.told.control(false, code || 'refused', message || 'Keyboard and mouse of this machine were not given', by, from);
+      }
+      return;
+    }
+    // Nobody waits: the word is held against what is owed.
+    this.owes();
+    if (!on && !message) {
+      this.owed.shift();  // a giving back's answer: the first of what is owed, whichever that is
+    } else {
+      // A yes, or a refusal with its sentence: the first answer that is owed, and whatever is owed before it.
+      const at = this.owed.findIndex(word => word.answer);
+      this.owed.splice(0, at >= 0 ? at + 1 : this.owed.length);
+      if (on) {
+        // Given, and nobody waits for them: given back at once, and the server's word for that is owed.
+        this.say({ t: 'up' });
+        this.say({ t: 'control', on: false });
+        this.owed.push({ answer: false, until: performance.now() + OWED_FOR });
+      }
+    }
+    this.told.owed();
+  }
+
+  takePicture(buffer) {
+    if (this.ended || !(buffer instanceof ArrayBuffer) || buffer.byteLength <= 16) return;
+    const head = new DataView(buffer, 0, 16);
+    const kind = head.getUint8(0);
+    if (kind !== 1 && kind !== 2) return;
+    const key = kind === 2 || (head.getUint8(1) & 1) !== 0;
+    const counter = head.getUint32(4, true);
+    const gap = counter !== ((this.lastCounter + 1) >>> 0);
+    this.lastCounter = counter;
+    if (kind === 2) {
+      // A JPEG is a whole picture; H.264 that comes after one begins anew, as at the start.
+      this.needsKey = true;
+      this.askedKey = false;
+      this.told.jpeg(new Uint8Array(buffer, 16), counter);
+      return;
+    }
+    if (key) {
+      this.needsKey = false;
+      this.askedKey = false;
+    } else if (gap || this.needsKey) {
+      // It builds on a picture that never came. Asked for once; the server may be sending the key frame
+      // already, as it does for whoever fell behind.
+      this.needsKey = true;
+      if (!this.askedKey) {
+        this.askedKey = true;
+        this.askKeyFrame();
+      }
+      this.skipped += 1;
+      this.told.skipped();
+      return;
+    }
+    this.told.h264(new Uint8Array(buffer, 16), key, counter);
+  }
+}
+
+// Decodes and draws what the line hands over, on the enlarged view's canvas, one canvas pixel per screen
+// pixel, the picture as large as it goes and centred. Never more than one decoded picture waits to be
+// drawn: the newest wins, and the one it replaced is counted as dropped. The last picture is kept, drawn or
+// not, to be drawn when the view changes size: one that came while the view had no size yet (in the moment
+// it opens) is drawn as soon as it has one, for a still screen sends no other.
+class LivePicture {
+  constructor(canvas, box, line) {
+    Object.assign(this, {
+      canvas, box, line, decoder: null, codecString: '', pending: null, waiting: 0, behind: false, shown: null, shownCounter: 0,
+      jpegNewest: null, painting: false, drawn: 0, dropped: 0, counter: 0, size: { w: 0, h: 0 }, rect: null,
+      lastDrawnAt: 0, codec: '', failed: '', stopped: false, onDrawn: null,
+    });
+  }
+
+  configure(codec) {
+    this.decoder?.close();
+    this.codecString = codec;
+    const decoder = new VideoDecoder({
+      output: frame => this.show(frame),
+      error: error => {
+        // The browser gave up on this stream: said, and shown again from the next key frame.
+        if (this.decoder === decoder) {
+          this.decoder = null;
+          this.codecString = '';
+          this.failed = `The browser could not decode the picture (${serverText(error?.message, 80) || 'decoder error'})`;
+          this.line.askKeyFrame();
+        }
+      },
+    });
+    try {
+      decoder.configure({ codec, optimizeForLatency: true });
+    } catch {
+      this.failed = `This browser cannot show ${codec}`;
+      return;
+    }
+    this.decoder = decoder;
+    this.failed = '';
+  }
+
+  h264(data, key, counter) {
+    if (this.stopped) return;
+    this.codec = 'H.264';
+    if (key) {
+      const codec = h264Profile(data);
+      if (codec && (codec !== this.codecString || !this.decoder || this.decoder.state !== 'configured')) this.configure(codec);
+    }
+    if (!this.decoder || this.decoder.state !== 'configured') {
+      this.dropped += 1;
+      return;
+    }
+    // Falling behind the server: what is not decoded yet is not worth decoding either. The server brings a
+    // client that fell behind forward to the next key frame; this one does the same for itself.
+    if (!key && this.behind) {
+      this.dropped += 1;
+      return;
+    }
+    if (!key && this.decoder.decodeQueueSize > 6) {
+      this.behind = true;
+      this.dropped += 1;
+      this.line.askKeyFrame();
+      return;
+    }
+    this.behind = false;
+    try {
+      this.decoder.decode(new EncodedVideoChunk({ type: key ? 'key' : 'delta', timestamp: counter * 1000, data }));
+    } catch {
+      this.dropped += 1;
+    }
+  }
+
+  // A decoded picture: drawn at the next turn of the page's loop, so that where the browser is behind, the
+  // newest is drawn and the one it replaced is dropped. (A timer and not an animation frame: a browser that
+  // shows the page in a pane of another program paces animation frames down to a few a second, and a
+  // picture nobody sees is not drawn at all.)
+  show(frame) {
+    if (this.stopped || document.hidden) {
+      frame.close();
+      if (!this.stopped) this.dropped += 1;
+      return;
+    }
+    if (this.pending) {
+      this.pending.close();
+      this.dropped += 1;
+    }
+    this.pending = frame;
+    if (!this.waiting) this.waiting = setTimeout(() => this.paint(), 0);
+  }
+
+  paint() {
+    this.waiting = 0;
+    const frame = this.pending;
+    this.pending = null;
+    if (!frame || this.stopped) {
+      frame?.close();
+      return;
+    }
+    const counter = Math.round(frame.timestamp / 1000);
+    this.draw(frame, frame.displayWidth, frame.displayHeight, counter);
+    this.keep(frame, counter);
+  }
+
+  // The newest picture, drawn or not (see `again`); a decoded one it replaces is memory to be given back.
+  keep(source, counter) {
+    if (this.shown instanceof VideoFrame && this.shown !== source) this.shown.close();
+    this.shown = source;
+    this.shownCounter = counter;
+  }
+
+  jpeg(data, counter) {
+    if (this.stopped) return;
+    this.codec = 'JPEG';
+    const blob = new Blob([data], { type: 'image/jpeg' });
+    if (this.painting) {
+      if (this.jpegNewest) this.dropped += 1;
+      this.jpegNewest = { blob, counter };
+      return;
+    }
+    this.paintJpeg(blob, counter);
+  }
+
+  async paintJpeg(blob, counter) {
+    this.painting = true;
+    try {
+      const bitmap = await createImageBitmap(blob);
+      this.draw(bitmap, bitmap.width, bitmap.height, counter);
+      this.keep(blob, counter);
+      bitmap.close();
+    } catch {
+      this.dropped += 1;
+      this.failed = 'The server sent a picture that could not be shown';
+    } finally {
+      this.painting = false;
+    }
+    const next = this.jpegNewest;
+    this.jpegNewest = null;
+    if (next && !this.stopped) this.paintJpeg(next.blob, next.counter);
+  }
+
+  // The last picture, drawn again, or for the first time where the view had no size when it came (the view
+  // changed size).
+  again() {
+    if (this.stopped || !this.shown) return;
+    if (this.shown instanceof VideoFrame) this.draw(this.shown, this.shown.displayWidth, this.shown.displayHeight, this.shownCounter);
+    else if (!this.painting) this.paintJpeg(this.shown, this.shownCounter);
+  }
+
+  draw(source, w, h, counter) {
+    const { w: boxW, h: boxH } = pixelsOf(this.box);
+    if (boxW < 2 || boxH < 2 || !w || !h) return false;
+    const rect = fitted(boxW, boxH, w, h);
+    const context = this.canvas.getContext('2d');
+    if (this.canvas.width !== boxW || this.canvas.height !== boxH || this.size.w !== w || this.size.h !== h) {
+      this.canvas.width = boxW;
+      this.canvas.height = boxH;
+      context.fillStyle = '#000';
+      context.fillRect(0, 0, boxW, boxH);
+    }
+    context.imageSmoothingQuality = 'high';
+    context.drawImage(source, rect.x, rect.y, rect.w, rect.h);
+    Object.assign(this, { rect: { ...rect, boxW, boxH }, size: { w, h }, counter, lastDrawnAt: performance.now(), failed: '' });
+    this.drawn += 1;
+    this.onDrawn?.();
+    return true;
+  }
+
+  // The place of a pointer event over the picture, as 0 to FARTHEST each way; null outside the picture.
+  placeOf(event) {
+    if (!this.rect) return null;
+    const bounds = this.box.getBoundingClientRect();
+    if (!bounds.width || !bounds.height) return null;
+    const px = (event.clientX - bounds.left) * (this.rect.boxW / bounds.width) - this.rect.x;
+    const py = (event.clientY - bounds.top) * (this.rect.boxH / bounds.height) - this.rect.y;
+    if (px < 0 || py < 0 || px > this.rect.w || py > this.rect.h) return null;
+    return { x: (px / this.rect.w) * FARTHEST, y: (py / this.rect.h) * FARTHEST };
+  }
+
+  stop() {
+    this.stopped = true;
+    clearTimeout(this.waiting);
+    this.waiting = 0;
+    this.pending?.close();
+    this.pending = null;
+    if (this.shown instanceof VideoFrame) this.shown.close();
+    this.shown = null;
+    this.jpegNewest = null;
+    try { this.decoder?.close(); } catch { /* closed already */ }
+    this.decoder = null;
+  }
+}
+
+// Keyboard and mouse of the machine, while the line holds them. Keys go by where they are on the keyboard
+// (KeyboardEvent.code), repeats are dropped, and everything that is down is let go when the page loses
+// the keyboard (blur, pagehide, a hidden tab) and when they are given back. The pointer is absolute by
+// default, mapped to the picture's own pixels, said every 10 ms at the most; relative through pointer lock.
+// The one listener, where there is one, that lets go of a pointer lock granted after keyboard and mouse were given back
+// (see Control.end). Kept here, not in a Control: the picture's canvas is every view's, and a listener left by a view
+// that ended took the next view's lock away the moment it was granted.
+let lateLock = null;
+function forgetLateLock() {
+  if (!lateLock) return;
+  document.removeEventListener('pointerlockchange', lateLock);
+  document.removeEventListener('pointerlockerror', lateLock);
+  lateLock = null;
+}
+
+class Control {
+  constructor(line, picture, box, canvas, told) {
+    Object.assign(this, {
+      line, picture, box, canvas, told, on: false, down: new Set(), buttons: new Set(), under: new Set(), leave: null,
+      place: null, said: null, moveTimer: 0, moved: { dx: 0, dy: 0 }, turned: { x: 0, y: 0 }, relative: false, listeners: [],
+      pointer: '',  // how the machine's pointer is moved, as the line said: 'absolute', 'relative', 'both' or not said
+      handing: false,  // the button of the click that hands the pointer over is still held: it is no button of the machine's
+    });
+  }
+
+  begin() {
+    if (this.on) return;
+    forgetLateLock();  // (a lock asked for before keyboard and mouse were last given back is this holding's now)
+    this.on = true;
+    resetScreenKeyboard(true);
+    this.down.clear();
+    this.buttons.clear();
+    this.under.clear();
+    this.leave = null;
+    this.relative = document.pointerLockElement === this.canvas;
+    this.handing = false;
+    const on = (target, name, handler, options) => {
+      target.addEventListener(name, handler, options);
+      this.listeners.push(() => target.removeEventListener(name, handler, options));
+    };
+    on(document, 'keydown', event => this.keyDown(event), true);
+    on(document, 'keyup', event => this.keyUp(event), true);
+    on(window, 'blur', () => this.releaseAll());
+    on(window, 'pagehide', () => this.releaseAll());
+    on(document, 'visibilitychange', () => { if (document.hidden) this.releaseAll(); });
+    on(this.canvas, 'pointermove', event => this.pointerMove(event));
+    on(this.canvas, 'pointerdown', event => this.pointerDown(event));
+    on(this.canvas, 'pointerup', event => this.pointerUp(event));
+    on(this.canvas, 'pointercancel', () => this.releaseButtons());
+    on(this.canvas, 'lostpointercapture', () => this.releaseButtons());
+    on(this.canvas, 'contextmenu', event => event.preventDefault());
+    on(this.canvas, 'wheel', event => this.wheel(event), { passive: false });
+    on(document, 'pointerlockchange', () => this.lockChanged());
+    // Fullscreen left by holding Esc: the Esc went down on the machine, and its up may not come here.
+    on(document, 'fullscreenchange', () => { if (!document.fullscreenElement) this.releaseAll(); this.lockKeyboard(); });
+    this.box.classList.add('controlling');
+    this.box.focus({ preventScroll: true });
+    this.lockKeyboard();
+  }
+
+  // Everything that is down on the machine is let go (the page lost the keyboard, a dialog is opened, they are
+  // given back); the holding goes on where it was not ended.
+  releaseAll() {
+    resetScreenKeyboard();
+    for (const usage of [...this.down]) this.line.key(usage, false);
+    this.down.clear();
+    this.releaseButtons();
+    this.under.clear();
+    this.leave = null;
+    this.line.releaseAll();
+    this.told.changed();
+  }
+
+  releaseButtons() {
+    for (const number of [...this.buttons]) this.line.button(number, false);
+    this.buttons.clear();
+  }
+
+  // Over: the line has let go of everything (it said `up`), or is gone, and the server lets go then (the
+  // draft's rule). Nothing is sent from here; what was noted as down is forgotten.
+  end() {
+    if (!this.on) return;
+    this.on = false;
+    resetScreenKeyboard(true);
+    for (const off of this.listeners) off();
+    this.listeners = [];
+    this.down.clear();
+    this.buttons.clear();
+    this.under.clear();
+    this.leave = null;
+    clearTimeout(this.moveTimer);
+    this.moveTimer = 0;
+    this.place = this.said = null;
+    this.box.classList.remove('controlling');
+    // (Its listener for the lock is gone already: the pointer is this PC's again from here, whatever the browser says later.)
+    this.relative = this.handing = false;
+    this.moved = { dx: 0, dy: 0 };
+    if (document.pointerLockElement === this.canvas) document.exitPointerLock();
+    else {
+      // A lock asked for before (the click that hands the pointer over) may still be granted: Firefox and Safari say
+      // nothing of when (their request returns nothing), and one that came now stayed until Esc. Let go of as it comes,
+      // unless keyboard and mouse were taken again meanwhile, here or in a view opened since (`begin` forgets it).
+      forgetLateLock();
+      const canvas = this.canvas;
+      lateLock = () => {
+        forgetLateLock();
+        if (document.pointerLockElement === canvas) document.exitPointerLock();
+      };
+      document.addEventListener('pointerlockchange', lateLock);
+      document.addEventListener('pointerlockerror', lateLock);
+    }
+    navigator.keyboard?.unlock?.();
+  }
+
+  // In fullscreen a browser that can lock the keyboard hands over Alt+Tab, the Windows key and the rest.
+  lockKeyboard() {
+    if (!navigator.keyboard?.lock) return;
+    if (document.fullscreenElement && this.on) navigator.keyboard.lock().catch(() => {});
+    else navigator.keyboard.unlock();
+    this.told.changed();
+  }
+
+  // The page's own keys rest while keys go to the machine: a dialog on top, or a field, gets them as ever.
+  fromThePage(event) {
+    return !this.on || $('dialog[open]') || event.target.matches?.('input, textarea, select') || (event.code !== 'ControlRight' && event.target.closest?.('.focus-popover, .focus-control-panel, .screen-keyboard'));
+  }
+
+  keyDown(event) {
+    if (this.fromThePage(event)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    if (event.repeat) return;  // a key that is held is down on the machine already
+    const usage = USAGES[event.code];
+    if (usage === undefined) return;
+    if (usage === LEAVE_KEY) {
+      // Kept back: by itself it gives keyboard and mouse back; with Del it is Ctrl+Alt+Del.
+      if (!this.leave && !this.down.has(usage)) this.leave = { alone: true };
+      return;
+    }
+    if (this.leave) {
+      this.leave.alone = false;
+      this.under.add(usage);
+      if (usage === USAGES.Delete) this.ctrlAltDel();
+      return;
+    }
+    if (this.under.has(usage) || this.down.has(usage)) return;
+    this.down.add(usage);
+    this.line.key(usage, true);
+  }
+
+  keyUp(event) {
+    const usage = USAGES[event.code];
+    if (this.fromThePage(event)) {
+      // A key that went down on the machine and is let go while a dialog has the keyboard (held through a
+      // click on Actions, say) goes up on the machine all the same; the dialog gets the key as well. The
+      // leave-key, and a key that went down under it, let go there are let go here too.
+      if (usage !== undefined && this.down.delete(usage)) this.line.key(usage, false);
+      if (usage === LEAVE_KEY) this.leave = null;
+      this.under.delete(usage);
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    if (usage === undefined) return;
+    if (usage === LEAVE_KEY) {
+      const was = this.leave;
+      this.leave = null;
+      if (was?.alone) this.told.leave();
+      return;
+    }
+    if (this.under.delete(usage)) return;  // a key that went down under the leave-key is nothing, up as down
+    if (this.down.delete(usage)) this.line.key(usage, false);
+  }
+
+  // The keys are pressed in the order a hand presses them and let go the other way round. One that is down
+  // already is left as it is.
+  tap(usages) {
+    if (!this.on) return;
+    const pressed = usages.filter(usage => !this.down.has(usage));
+    for (const usage of pressed) this.line.key(usage, true);
+    for (const usage of [...pressed].reverse()) this.line.key(usage, false);
+  }
+
+  ctrlAltDel() {
+    this.tap([USAGES.ControlLeft, USAGES.AltLeft, USAGES.Delete]);
+  }
+
+  // A machine whose mouse moves by steps only (a KVM set to a relative mouse drops a place): nothing is said of where
+  // the pointer is over the picture until it is handed over (`stepsOnly`).
+  get stepsOnly() {
+    return this.pointer === 'relative' && !this.relative;
+  }
+
+  pointerMove(event) {
+    if (!this.on) return;
+    if (this.relative) {
+      // (A second button pressed or let go while one is held comes as a move here too: see below. The button of the click
+      // that handed the pointer over, granted while it was held, is not one of them.)
+      // Pointer-lock cursor warps can report buttons=0 on ordinary movement even while a button is
+      // held. Only a button transition (button != -1) changes the held set; primary transitions go
+      // through pointerDown/pointerUp. A movement cannot finish the click that requested the lock.
+      if (!this.handing && event.button !== -1 && this.buttonsDiffer(event)) this.syncButtons(event, null);
+      this.moved.dx += event.movementX || 0;
+      this.moved.dy += event.movementY || 0;
+      this.sayMoveSoon();
+      return;
+    }
+    if (this.stepsOnly) return;
+    const place = this.picture.placeOf(event);
+    // A second button pressed or let go while one is held comes as a move with `buttons` changed, not as a
+    // press or release of its own: looked at on every move.
+    if (this.buttonsDiffer(event)) {
+      if (place) this.sayPlaceNow(place);
+      this.syncButtons(event, place);
+      return;
+    }
+    if (!place) return;  // beside the picture: the machine's pointer stays where it was
+    this.place = place;
+    if (!this.moveTimer) this.sayPlace();
+  }
+
+  // The place said at once (a press or release lands where the pointer is, not where it was said to be last).
+  sayPlaceNow(place) {
+    this.place = null;
+    this.said = place;
+    this.line.pointerAt(place.x, place.y);
+  }
+
+  // Which buttons the browser says are held (`buttons`: 1 left, 2 right, 4 middle, 8 back, 16 forward), as the
+  // numbers the line names them by.
+  static heldIn(event) {
+    const held = new Set();
+    for (const [bit, number] of [[1, 1], [2, 2], [4, 3], [8, 4], [16, 5]]) {
+      if (event.buttons & bit) held.add(number);
+    }
+    return held;
+  }
+
+  buttonsDiffer(event) {
+    const held = Control.heldIn(event);
+    return held.size !== this.buttons.size || [...held].some(number => !this.buttons.has(number));
+  }
+
+  // What the browser says is held against what the line was told: each difference is said, a press only
+  // where the pointer is over the picture (or the mouse is relative), a release wherever it is.
+  syncButtons(event, place) {
+    const held = Control.heldIn(event);
+    for (const number of [...this.buttons]) {
+      if (!held.has(number)) {
+        this.buttons.delete(number);
+        this.line.button(number, false);
+      }
+    }
+    for (const number of held) {
+      if (!this.buttons.has(number) && (place || this.relative)) {
+        this.buttons.add(number);
+        this.line.button(number, true);
+      }
+    }
+  }
+
+  // The first place at once; while one was said a moment ago, the last of what follows, every 10 ms.
+  sayPlace() {
+    const place = this.place;
+    this.place = null;
+    if (!place) {
+      this.moveTimer = 0;
+      return;
+    }
+    this.said = place;
+    this.line.pointerAt(place.x, place.y);
+    this.moveTimer = setTimeout(() => this.sayPlace(), POINTER_EVERY);
+  }
+
+  sayMoveSoon() {
+    if (this.moveTimer) return;
+    this.moveTimer = setTimeout(() => {
+      this.moveTimer = 0;
+      const { dx, dy } = this.moved;
+      this.moved = { dx: 0, dy: 0 };
+      this.line.pointerBy(dx, dy);
+    }, POINTER_EVERY);
+  }
+
+  pointerDown(event) {
+    if (!this.on || !BUTTONS[event.button]) return;
+    event.preventDefault();
+    if (this.stepsOnly) {
+      // The click hands the pointer to the machine (the browser's pointer lock), and is no click there, also where the
+      // browser grants the lock before the button is let go.
+      this.handing = true;
+      this.setRelative(true);
+      return;
+    }
+    // (A press: no button was held before it, so none of a click that handed the pointer over is: the up of that one may
+    // have been let go beside the picture, or in another window, and never came here.)
+    this.handing = false;
+    // Held from here until let go, wherever the pointer goes: the release comes back to the canvas.
+    try { this.canvas.setPointerCapture(event.pointerId); } catch { /* a pointer that is gone already */ }
+    const place = this.relative ? null : this.picture.placeOf(event);
+    // A click lands where the pointer is, not where it was said to be last; beside the picture it is no click.
+    if (place) this.sayPlaceNow(place);
+    this.syncButtons(event, place);
+  }
+
+  pointerUp(event) {
+    if (!this.on || !BUTTONS[event.button]) return;
+    event.preventDefault();
+    if (this.handing) {  // (the up of the click that handed the pointer over)
+      if (!event.buttons) this.handing = false;
+      return;
+    }
+    // Let go where the pointer is by now: what is dragged is dropped there.
+    const place = this.relative ? null : this.picture.placeOf(event);
+    if (place && this.buttons.size) this.sayPlaceNow(place);
+    this.syncButtons(event, place);
+  }
+
+  wheel(event) {
+    if (!this.on) return;
+    event.preventDefault();
+    if (!this.relative && !this.picture.placeOf(event)) return;
+    // A notch of the wheel, in whatever the browser counts turns in: pixels, lines or pages.
+    const notch = event.deltaMode === 1 ? 3 : event.deltaMode === 2 ? 1 : 100;
+    this.turned.x += event.deltaX;
+    this.turned.y += event.deltaY;
+    const right = Math.max(-MOST_NOTCHES, Math.min(MOST_NOTCHES, Math.trunc(this.turned.x / notch)));
+    const away = Math.max(-MOST_NOTCHES, Math.min(MOST_NOTCHES, Math.trunc(-this.turned.y / notch)));
+    this.turned = { x: this.turned.x % notch, y: this.turned.y % notch };
+    // One click of the wheel per message, as a mouse sends them: up (away from the hand) is positive.
+    for (let said = 0; said < Math.abs(away); said++) this.line.wheel(0, away > 0 ? 1 : -1);
+    for (let said = 0; said < Math.abs(right); said++) this.line.wheel(right > 0 ? 1 : -1, 0);
+  }
+
+  // The mouse by how far it moves, through the browser's pointer lock, for games and some BIOS screens.
+  async setRelative(wanted) {
+    if (!this.on) return;
+    if (!wanted) {
+      if (document.pointerLockElement === this.canvas) document.exitPointerLock();
+      return;
+    }
+    try {
+      await (this.canvas.requestPointerLock({ unadjustedMovement: true }) ?? Promise.resolve());
+    } catch {
+      try { await (this.canvas.requestPointerLock() ?? Promise.resolve()); } catch { /* refused: the button stays off */ }
+    }
+    // Keyboard and mouse given back or taken away while the browser was being asked: the pointer is this PC's again.
+    if (!this.on && document.pointerLockElement === this.canvas) document.exitPointerLock();
+  }
+
+  lockChanged() {
+    const locked = document.pointerLockElement === this.canvas;
+    if (locked === this.relative) return;
+    this.relative = locked;
+    this.moved = { dx: 0, dy: 0 };
+    this.told.changed();
+  }
+}
+
+// What the bar says beside the buttons while keyboard and mouse are held: which keys this browser keeps.
+function keysKeptNote() {
+  if (document.fullscreenElement && navigator.keyboard?.lock) {
+    return 'Every key goes to the machine, Alt+Tab and Win too. Hold Esc to leave fullscreen (the machine gets that Esc). Right Ctrl alone gives back.';
+  }
+  const can = navigator.keyboard?.lock ? 'not in fullscreen' : 'in this browser';
+  return `Alt+Tab, Alt+F4, Win and Ctrl+W stay with the browser (${can}): the buttons send them. Right Ctrl alone gives back.`;
+}
+
 // --- enlarged view ----------------------------------------------------------------------------------
 
 // Runs `update` so that the picture appears to grow out of `from` into `to` (or shrink back).
@@ -4228,7 +5691,14 @@ function zoom(from, to, update) {
 function openFocus(id) {
   const tile = tiles.get(id);
   if (!tile) return;
+  const request = ++focusRequest;
+  focusOpening = id;
   const show = () => {
+    // A later open, Escape, sign-out or removed tile cancels this queued opening.
+    if (request !== focusRequest) return;
+    focusOpening = null;
+    if (tiles.get(id) !== tile || $('#shell').hidden) return;
+    stopLive();
     focus?.feed.stop();
     const canvas = $('#focus-canvas');
     const box = $('#focus-screen');
@@ -4236,7 +5706,7 @@ function openFocus(id) {
     const feed = new Feed(
       canvas,
       box,
-      () => snapshotUrl(id, box),
+      () => snapshotUrl(id, box, 0, true),  // the large view: a PC with Intel AMT holds a session for it, even while off
       () => (period ? Math.min(period, FOCUS_PERIOD) : 0),
       () => !document.hidden && showsScreen(tile.device, tile.status),
       result => { applyResult(view, result); renderFocus(); },
@@ -4250,12 +5720,19 @@ function openFocus(id) {
     }
     const opening = !focus;
     focus = { id, feed, view };
+    for (const menu of document.querySelectorAll('#focus .focus-popover')) menu.open = false;
+    if (opening) {
+      $('#focus-details').open = false;
+    }
     $('#focus').hidden = false;
     behindFocus(true);
     renderFocus();
+    historyOpened(id);  // what the wall saw of it, under the picture (see "history" below)
     if (opening) $('#focus-close').focus({ preventScroll: true });
     feed.paint().catch(() => {});
     feed.start();
+    // Where the server has a live line, the stills give way to it as soon as its first picture is drawn.
+    startLive(id);
   };
   // Switching between KVMs while enlarged is a plain swap; opening grows out of the tile.
   if (focus) show();
@@ -4268,12 +5745,21 @@ function behindFocus(covered) {
 }
 
 function closeFocus(instant = false) {
+  const request = ++focusRequest;
+  focusOpening = null;
   if (!focus) return;
   const tile = tiles.get(focus.id);
+  // What is closed is this view. Closed with a movement, the hiding runs a frame later; by then the view may
+  // have been closed a second time, or opened again (Esc twice and Enter at once): a hiding that finds another
+  // view, or none, is not this one's to do.
+  const closing = focus;
   const hide = () => {
+    if (request !== focusRequest || focus !== closing) return;
+    stopLive();
     focus?.feed.stop();
     focus = null;
     $('#focus').hidden = true;
+    historyClosed();
     behindFocus(false);
     tile?.el.focus({ preventScroll: true });
   };
@@ -4292,25 +5778,703 @@ function renderFocus() {
   if (!focus) return;
   const tile = tiles.get(focus.id);
   if (!tile) return;
-  const [state, message] = stateOf(tile.status, focus.view);
+  // What the live line said of the machine last is at least as fresh as the wall's own look at it.
+  const status = focus.said?.state ? { ...(tile.status || {}), state: focus.said.state, error: focus.said.error?.code ? focus.said.error : null } : tile.status;
+  const [state, message] = stateOf(status, focus.view);
   $('#focus-name').textContent = tile.device.name;
+  $('#focus-name').title = tile.device.name;
   const open = $('#focus-open');
   if (consoleLink(tile.device)) open.href = consoleLink(tile.device);
   else open.removeAttribute('href');
   $('#focus-bar').dataset.state = state;
+  $('#focus .focus-title').dataset.state = state;
   $('#focus').dataset.state = state;
   const screen = pictured(tile.device, focus.view, state);
-  $('#focus-screen').classList.toggle('has-frame', focus.view.hasFrame);
-  $('#focus').classList.toggle('has-panel', tile.device.picture === false && (!screen || focus.health) && state !== 'connecting'
-    && fillPanel($('#focus-panel'), tile.status, true));
-  $('#focus').classList.toggle('pictured', screen && !focus.health);
+  $('#focus-screen').classList.toggle('has-frame', Boolean(focus.view.hasFrame));
+  // (Boolean: a toggle given undefined flips the class at every render instead of setting it, and the panel blinked.)
+  $('#focus').classList.toggle('has-panel', Boolean(tile.device.picture === false && (!screen || focus.health) && state !== 'connecting'
+    && fillPanel($('#focus-panel'), tile.status, true, tile.device.id)));
+  $('#focus').classList.toggle('pictured', Boolean(screen && !focus.health));
   // With the server's screen up, how the server is (health, every temperature, every fan) is a button away.
   $('#focus-health').hidden = !screen;
   $('#focus-health').setAttribute('aria-pressed', String(Boolean(focus.health)));
   $('#focus-state').textContent = stateLabel(state, tile.status);
   if (state !== 'online') fillVeil($('#focus-veil'), state, veilContent(tile.device, tile.status, focus.view, state, message));
-  $('#focus-meta').textContent = [tile.device.host, metaText(tile.status)].filter(Boolean).join(' · ');
+  $('#focus-meta').textContent = [tile.device.host === tile.device.name ? '' : tile.device.host, metaText(tile.status), screen ? stillNote(focus.view) : ''].filter(Boolean).join(' · ');
   fillPorts($('#focus-ports'), tile);
+  renderLive();
+  renderControl();
+}
+
+// How much of the picture this view needs: its own width in screen pixels, and few pictures while nobody sees the tab.
+function liveNeed() {
+  const { w } = pixelsOf($('#focus-screen'));
+  return { maxW: Math.max(320, Math.min(16384, w || 1280)), maxFps: document.hidden ? HIDDEN_FPS : 60 };
+}
+
+// The live line for the machine that is enlarged, where the wall's server has one.
+function startLive(id) {
+  if (!focus || focus.id !== id || focus.live) return;
+  const tile = tiles.get(id);
+  if (!tile || !canDo(tile, 'live')) return;
+  const canvas = $('#focus-canvas');
+  const box = $('#focus-screen');
+  let line, picture, control;
+  const mine = () => focus?.live === line;
+  line = new LiveLine(id, {
+    opened: () => { if (mine()) { renderLive(); renderControl(); } },
+    video: (codec, w, h) => { if (mine()) { focus.liveVideo = { codec, w, h }; renderLive(); } },
+    h264: (data, key, counter) => picture.h264(data, key, counter),
+    jpeg: (data, counter) => picture.jpeg(data, counter),
+    skipped: () => { if (mine()) renderLive(); },
+    state: (state, error, pointer) => {
+      if (!mine()) return;
+      focus.said = { state, error };
+      control.pointer = pointer;
+      renderFocus();
+      renderControl();
+    },
+    control: (on, code, message, by, from) => { if (mine()) controlAnswered(on, code, message, by, from); },
+    owed: () => { if (mine()) renderControl(); },
+    closed: (code, message) => { if (mine()) liveEnded(code, message); },
+  });
+  picture = new LivePicture(canvas, box, line);
+  picture.onDrawn = () => {
+    if (!mine()) return;
+    if (!focus.liveShowing) {
+      focus.liveShowing = true;
+      focus.feed.stop();  // the stills give way; drawn over the live picture they would be a step back in time
+    }
+    applyResult(focus.view, { signal: true });
+    if (!focus.liveRendered) {
+      focus.liveRendered = true;
+      renderFocus();
+    }
+  };
+  control = new Control(line, picture, box, canvas, { changed: () => { renderControl(); renderLive(); }, leave: giveBack });
+  Object.assign(focus, { live: line, picture, control, liveShowing: false, liveRendered: false, liveVideo: null, said: null, refused: null, endedBy: null, fps: 0, drawnBefore: 0 });
+  clearInterval(focus.liveTick);
+  focus.liveTick = setInterval(() => {
+    if (!mine()) return;
+    focus.fps = picture.drawn - focus.drawnBefore;
+    focus.drawnBefore = picture.drawn;
+    renderFocus();
+  }, 1000);
+  line.start(liveNeed());
+  renderLive();
+  renderControl();
+}
+
+// The line is ended from here (the view closes, another machine is shown): what is held is let go first.
+function stopLive() {
+  if (!focus?.live) return;
+  clearInterval(focus.liveTick);
+  focus.control.end();
+  focus.live.close();
+  focus.picture.stop();
+  Object.assign(focus, { live: null, picture: null, control: null, liveShowing: false, said: null });
+}
+
+// The line ended by itself, or the server has no live picture of this machine: the stills come back, and the
+// bar says why. Everything this page had down on the machine is the server's to let go now (the draft's rule).
+function liveEnded(code, message) {
+  if (!focus?.live) return;
+  clearInterval(focus.liveTick);
+  focus.control.end();
+  focus.picture.stop();
+  Object.assign(focus, { live: null, picture: null, control: null, liveShowing: false, endedBy: { code, message } });
+  focus.feed.start();
+  renderLive();
+  renderControl();
+}
+
+function askControl() {
+  if (!focus?.live || !can('operator')) return;
+  focus.refused = null;
+  focus.live.askControl();
+  renderControl();
+}
+
+// Somebody else holds the keyboard and mouse, and this is an admin in person: they may be taken over (the server
+// asks again whether this account may, and whether they are still who it said).
+function mayTakeOver() {
+  return Boolean(focus?.refused?.code === 'taken' && focus.refused.by && focus.refused.from && can('admin') && !me?.token);
+}
+
+// Control, or the key C: taken over after a question that names whoever has them, where that is what is offered.
+function controlClicked() {
+  if (focus?.control?.on) giveBack();
+  else if (mayTakeOver()) takeOver();
+  else askControl();
+}
+
+async function takeOver() {
+  const live = focus?.live;
+  const refused = focus?.refused;
+  if (!live || !refused?.by || !refused.from || live.owes()) return;  // (as Control rests while the server still owes a word)
+  const name = tiles.get(focus.id)?.device.name || 'this machine';
+  const yes = await confirmBox({
+    title: 'Take over keyboard and mouse',
+    message: `${refused.by} has the keyboard and mouse of ${name}. Take them over? What they hold down is let go of first, and they are told that you took over.`,
+    action: 'Take over',
+  });
+  if (!yes || focus?.live !== live || focus.refused !== refused) return;
+  if (live.askControl(refused.from)) focus.refused = null;
+  renderControl();
+}
+
+function giveBack() {
+  if (!focus?.live) return;
+  focus.control.end();
+  focus.live.giveBack();
+  renderControl();
+}
+
+// The server's word about keyboard and mouse, for this page: given, refused, or taken away. Taken away while the
+// line goes on (taken over by an admin, given back after a time without input, the account lowered), it is said.
+function controlAnswered(on, code, message, by, from = '') {
+  if (!focus?.control) return;
+  const held = focus.control.on;
+  if (on) {
+    focus.refused = null;
+    focus.control.begin();
+  } else {
+    focus.control.end();
+    if (code || message) focus.refused = { code, message, by, from };
+    if (held && message && focus.live && !focus.live.ended) toast(message, code === 'idle' ? 'info' : 'error');
+  }
+  renderControl();
+}
+
+// The line's own state in the bar: what comes over it, how fast, and what was dropped. For the diagnostics
+// the same numbers are on the element as data.
+function renderLive() {
+  if (!focus) return;
+  const line = $('#focus-live');
+  const picture = focus.picture;
+  const tile = tiles.get(focus.id);
+  $('#focus-again').hidden = !(focus.endedBy && focus.endedBy.code !== 'no_live' && !focus.live && tile && canDo(tile, 'live'));
+  // Said only where the wall's server has live pictures at all: a wall without them is looked at as ever.
+  line.hidden = !wallLive;
+  let text = '';
+  let title = '';
+  if (focus.live && picture?.drawn) {
+    text = `Live · ${picture.codec} ${picture.size.w}×${picture.size.h} · ${focus.fps}/s · ${picture.dropped + focus.live.skipped} dropped`;
+    if (picture.failed) text += ` · ${picture.failed}`;
+  } else if (focus.live) {
+    text = focus.live.open ? (picture?.failed || 'Live · waiting for the first picture') : 'Live · connecting...';
+  } else if (focus.endedBy) {
+    text = 'No live picture: stills';
+    title = focus.endedBy.message;
+  } else if (tile && !canDo(tile, 'live')) {
+    text = 'No live picture: stills';
+    title = 'The server has no live picture of this machine';
+  }
+  if (line.textContent !== text) line.textContent = text;
+  line.title = title;
+  $('#focus-detail-stream').textContent = text;
+  const alert = $('#focus-live-alert');
+  alert.hidden = false;
+  alert.textContent = (focus.endedBy || picture?.failed) ? [text, title].filter(Boolean).join(' · ') : '';
+  $('#focus-status-meta').textContent = [$('#focus-state').textContent, $('#focus-meta').textContent].filter(Boolean).join(' · ');
+  alert.title = alert.textContent;
+  Object.assign(line.dataset, {
+    codec: picture?.codec || '', width: picture?.size.w || 0, height: picture?.size.h || 0, fps: focus.fps || 0,
+    dropped: picture ? picture.dropped + focus.live.skipped : 0, counter: picture?.counter || 0, drawn: picture?.drawn || 0,
+    control: focus.control?.on ? 'on' : 'off', down: focus.control ? focus.control.down.size + focus.control.buttons.size : 0,
+  });
+}
+
+// The Control button and the row of keys under the bar: as they are now.
+function renderControl() {
+  scheduleConsoleOverflow();
+  const button = $('#focus-control');
+  const keys = $('#focus-keys');
+  const live = focus?.live;
+  const control = focus?.control;
+  const tile = focus && tiles.get(focus.id);
+  const possible = Boolean(live && live.open && !live.ended && can('operator') && tile && canDo(tile, 'control'));
+  button.hidden = !possible;
+  keys.hidden = !control?.on;
+  button.setAttribute('aria-expanded', String(!keys.hidden));
+  $('#focus-control-state').textContent = control?.on ? 'Controlling' : 'Viewing';
+  $('#focus-release-hint').style.visibility = control?.on ? 'visible' : 'hidden';
+  for (const item of keys.querySelectorAll('button')) item.disabled = !control?.on;
+  if (!control?.on) {
+    $('#focus-keys .focus-input-help').open = false;
+    $('#focus-keys-more').open = false;
+    resetScreenKeyboard(true);
+  }
+  if (!possible) return;
+  const on = control.on;
+  const asking = Boolean(live.asking);
+  const owed = live.owes();
+  button.setAttribute('aria-pressed', String(on));
+  button.setAttribute('aria-busy', String(asking));
+  button.disabled = !on && owed;
+  let label = 'Control';
+  let title = on ? 'Release control (click again or press Right Ctrl)' : 'Take this machine\'s keyboard and mouse (C)';
+  if (!on && asking) {
+    label = 'Asking...';
+    title = 'Waiting for the machine to hand over its keyboard and mouse. Some take up to a minute.';
+  } else if (!on && mayTakeOver()) {
+    label = `Take over from ${focus.refused.by}`;
+    title = [focus.refused.message, 'As an admin you can take them over: you are asked first (C)'].filter(Boolean).join('. ');
+  } else if (!on && focus.refused?.code === 'idle') {
+    title = [focus.refused.message, 'Take them again (C)'].filter(Boolean).join('. ');
+  } else if (!on && focus.refused) {
+    label = focus.refused.by ? `Controlled by ${focus.refused.by}` : focus.refused.code === 'timeout' ? 'No answer' : 'Not given';
+    title = focus.refused.message;
+  } else if (!on && owed) {
+    title = 'The machine has still to confirm that its keyboard and mouse are no longer held or asked for here. Control can be clicked again once it has, or after a few seconds.';
+  }
+  if (button.dataset.label !== label) {
+    button.dataset.label = label;
+    button.replaceChildren(icon('command'), label);
+  }
+  button.title = title;
+  if (!on) return;
+  const relative = $('#focus-relative');
+  relative.setAttribute('aria-pressed', String(control.relative));
+  // A KVM whose mouse takes places only drops steps: nothing to hand over there.
+  relative.disabled = control.pointer === 'absolute' && !control.relative;
+  relative.title = relative.disabled
+    ? "This KVM's mouse goes to where the pointer is put, and takes no steps."
+    : 'The mouse by how far it moves, for games and some BIOS screens. Esc gives the pointer back to this PC.';
+  const steps = control.stepsOnly ? "This KVM's mouse moves by steps only: click the picture to hand it the pointer (Esc gives it back). " : '';
+  $('#focus-keys-note').textContent = steps + keysKeptNote();
+}
+
+// A button of the keys row: what is held is let go before a dialog takes the keyboard, and the picture has
+// the keyboard again afterwards.
+async function withControl(work) {
+  const control = focus?.control;
+  if (!control?.on) return;
+  control.releaseAll();
+  await work(control);
+  if (focus?.control === control && control.on) $('#focus-screen').focus({ preventScroll: true });
+}
+
+// Modifiers are armed locally for one chord, never held down between screen-key clicks.
+const screenModifiers = new Set();
+function resetScreenKeyboard(close = false) {
+  screenModifiers.clear();
+  for (const key of document.querySelectorAll('#focus-keyboard [data-modifier]')) key.setAttribute('aria-pressed', 'false');
+  if (close) {
+    $('#focus-keyboard').hidden = true;
+    $('#focus-keyboard-toggle').setAttribute('aria-expanded', 'false');
+  }
+}
+
+// Move the existing controls (and their handlers/state) into More only when they no longer fit.
+// A single layout pass measures the normal row. Routine status updates do not move focused controls.
+const consoleOverflow = [];
+let consoleOverflowFrame = 0;
+function scheduleConsoleOverflow() {
+  if (consoleOverflowFrame) return;
+  consoleOverflowFrame = requestAnimationFrame(() => {
+    consoleOverflowFrame = 0;
+    for (const fit of consoleOverflow) fit();
+  });
+}
+function setupConsoleOverflow() {
+  for (const [row, more, priorities] of [
+    [$('.focus-tools'), $('#focus-more'), {'focus-prev': 20, 'focus-next': 20, 'focus-again': 80, 'focus-health': 60, 'focus-open': 40, 'focus-fullscreen': 30}],
+    [$('#focus-keys'), $('#focus-keys-more'), {'focus-keyboard-toggle': 100, 'focus-cad': 70, 'focus-win': 20, 'focus-alt-tab': 40, 'focus-alt-f4': 10, 'focus-prtsc': 10, 'focus-type': 90, 'focus-relative': 60, 'focus-input-help': 0}],
+  ]) {
+    const items = [...row.children].filter(item => item !== more);
+    const panel = more.querySelector('.focus-overflow-content');
+    const summary = more.querySelector('summary');
+    let signature = '';
+    const fit = () => {
+      if (!row.getClientRects().length) return;
+      const header = row.classList.contains('focus-tools');
+      const parent = header ? $('#focus-bar') : row;
+      const css = getComputedStyle(parent);
+      const gap = parseFloat(getComputedStyle(row).gap) || 0;
+      const available = parent.clientWidth - parseFloat(css.paddingLeft) - parseFloat(css.paddingRight)
+        - (header ? parseFloat(getComputedStyle($('.focus-identity')).minWidth) + parseFloat(css.gap) : 0);
+      const visible = items.filter(item => !item.hidden && getComputedStyle(item).display !== 'none');
+      const next = [window.innerWidth, available, ...visible.map(item => item.id + item.textContent)].join('|');
+      if (signature === next) return;
+      signature = next;
+      const active = document.activeElement;
+      // Restore the original order before measuring intrinsic button widths; menu rows use different widths.
+      for (const item of items) row.insertBefore(item, more);
+      more.hidden = false;
+      const widths = new Map(visible.map(item => [item, item.getBoundingClientRect().width]));
+      let used = visible.reduce((sum, item) => sum + widths.get(item), 0) + Math.max(0, visible.length - 1) * gap;
+      const moved = new Set();
+      if (used > available) {
+        used += summary.getBoundingClientRect().width + gap;
+        const candidates = visible.filter(item => item.id in priorities).sort((a, b) => priorities[a.id] - priorities[b.id] || items.indexOf(b) - items.indexOf(a));
+        for (const item of candidates) {
+          if (used <= available) break;
+          moved.add(item);
+          used -= widths.get(item) + gap;
+        }
+      }
+      for (const item of items) if (moved.has(item)) panel.append(item);
+      more.hidden = !moved.size;
+      // Keep Close at the far right, after More, regardless of the fitted set.
+      if (header) row.append($('#focus-close'));
+      if (more.hidden) more.open = false;
+      if (items.some(item => item === active || item.contains(active))) {
+        (moved.has(items.find(item => item === active || item.contains(active))) && !more.open ? summary : active).focus({preventScroll: true});
+      } else if (active === summary && more.hidden) {
+        visible.find(item => !item.disabled)?.focus({preventScroll: true});
+      }
+    };
+    consoleOverflow.push(fit);
+    new ResizeObserver(scheduleConsoleOverflow).observe(row === $('#focus-keys') ? row : $('#focus-bar'));
+    more.addEventListener('toggle', () => { if (more.open) focus?.control?.releaseAll(); });
+    panel.addEventListener('click', event => {
+      if (!event.target.closest('button, a')) return;
+      more.open = false;
+      // Do not steal focus from a dialog or the picture after its action ran.
+      if (panel.contains(document.activeElement)) summary.focus({preventScroll: true});
+    });
+  }
+  window.addEventListener('resize', scheduleConsoleOverflow);
+}
+
+// Only panel geometry is retained, never typed text or remote modifiers.
+let keyboardGeometry = null;
+function placeScreenKeyboard(reset = false) {
+  const panel = $('#focus-keyboard');
+  if (panel.hidden) return;
+  const vw = document.documentElement.clientWidth, vh = window.innerHeight;
+  const footer = $('#focus-statusbar').getBoundingClientRect().height;
+  const g = reset || !keyboardGeometry ? {w: Math.min(900, vw - 16), h: Math.min(420, vh - footer - 24)} : {...keyboardGeometry};
+  g.w = Math.max(Math.min(300, vw - 16), Math.min(g.w, vw - 16));
+  g.h = Math.max(Math.min(180, vh - 16), Math.min(g.h, vh - 16));
+  g.x = Math.max(8, Math.min(g.x ?? (vw - g.w) / 2, vw - g.w - 8));
+  g.y = Math.max(8, Math.min(g.y ?? vh - footer - g.h - 8, vh - g.h - 8));
+  keyboardGeometry = g;
+  Object.assign(panel.style, {left: `${g.x}px`, top: `${g.y}px`, width: `${g.w}px`, height: `${g.h}px`});
+}
+function setupKeyboardGeometry() {
+  // The wall header remains the sizing reference at every responsive breakpoint.
+  new ResizeObserver(entries => {
+    const height = entries[0].target.getBoundingClientRect().height;
+    if (height > 0) document.documentElement.style.setProperty('--console-header-height', `${height}px`);
+  }).observe($('.top'));
+  $('#keyboard-close').addEventListener('click', () => { resetScreenKeyboard(true); $('#focus-keyboard-toggle').focus(); });
+  $('#keyboard-reset').addEventListener('click', () => placeScreenKeyboard(true));
+  for (const [id, resize] of [['keyboard-drag', false], ['keyboard-resize', true]]) {
+    const handle = $('#' + id);
+    let start = null;
+    const change = (dx, dy) => {
+      keyboardGeometry = resize ? {...start.g, w: start.g.w + dx, h: start.g.h + dy} : {...start.g, x: start.g.x + dx, y: start.g.y + dy};
+      placeScreenKeyboard();
+    };
+    handle.addEventListener('pointerdown', event => {
+      if (event.button !== 0 || (event.target.closest('button') && event.target !== handle)) return;
+      event.preventDefault();
+      focus?.control?.releaseAll();
+      start = {x: event.clientX, y: event.clientY, g: {...keyboardGeometry}};
+      handle.setPointerCapture(event.pointerId);
+    });
+    handle.addEventListener('pointermove', event => { if (start) change(event.clientX - start.x, event.clientY - start.y); });
+    for (const type of ['pointerup', 'pointercancel', 'lostpointercapture']) handle.addEventListener(type, () => { start = null; });
+    handle.addEventListener('keydown', event => {
+      if (event.target !== handle || !['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(event.key)) return;
+      event.preventDefault(); event.stopPropagation();
+      start = {g: {...keyboardGeometry}};
+      change(event.key === 'ArrowLeft' ? -20 : event.key === 'ArrowRight' ? 20 : 0, event.key === 'ArrowUp' ? -20 : event.key === 'ArrowDown' ? 20 : 0);
+      start = null;
+    });
+  }
+  window.addEventListener('resize', () => placeScreenKeyboard());
+  document.addEventListener('fullscreenchange', () => placeScreenKeyboard());
+}
+function makeScreenKeyboard() {
+  setupKeyboardGeometry();
+  const rows = [
+    [['Esc', 'Escape'], ...Array.from({ length: 12 }, (_, i) => [`F${i + 1}`, `F${i + 1}`])],
+    [['`', 'Backquote'], ...'1234567890'.split('').map(n => [n, `Digit${n}`]), ['-', 'Minus'], ['=', 'Equal'], ['Backspace', 'Backspace']],
+    [['Tab', 'Tab'], ...'QWERTYUIOP'.split('').map(k => [k, `Key${k}`]), ['[', 'BracketLeft'], [']', 'BracketRight'], ['Backslash', 'Backslash']],
+    [['Caps Lock', 'CapsLock'], ...'ASDFGHJKL'.split('').map(k => [k, `Key${k}`]), [';', 'Semicolon'], ["'", 'Quote'], ['Enter', 'Enter']],
+    [['Shift', 'ShiftLeft'], ...'ZXCVBNM'.split('').map(k => [k, `Key${k}`]), [',', 'Comma'], ['.', 'Period'], ['/', 'Slash'], ['Up', 'ArrowUp']],
+    [['Ctrl', 'ControlLeft'], ['Win', 'MetaLeft'], ['Alt', 'AltLeft'], ['Space', 'Space'], ['Left', 'ArrowLeft'], ['Down', 'ArrowDown'], ['Right', 'ArrowRight']],
+    [['Insert', 'Insert'], ['Delete', 'Delete'], ['Home', 'Home'], ['End', 'End'], ['Page Up', 'PageUp'], ['Page Down', 'PageDown'], ['PrtSc', 'PrintScreen']],
+  ];
+  const modifiers = new Set(['ShiftLeft', 'ControlLeft', 'AltLeft', 'MetaLeft']);
+  const container = $('#focus-keyboard .screen-keyboard-rows');
+  for (const row of rows) {
+    const line = document.createElement('div');
+    line.className = 'screen-keyboard-row';
+    for (const [label, keyCode] of row) {
+      const key = document.createElement('button');
+      key.type = 'button';
+      key.textContent = label;
+      key.dataset.code = keyCode;
+      if (keyCode === 'Space') key.className = 'space-key';
+      if (modifiers.has(keyCode)) {
+        key.dataset.modifier = keyCode;
+        key.setAttribute('aria-pressed', 'false');
+      }
+      key.addEventListener('click', () => {
+        const control = focus?.control;
+        if (!control?.on || $('#focus-keyboard').hidden) return;
+        if (modifiers.has(keyCode)) {
+          if (screenModifiers.has(keyCode)) screenModifiers.delete(keyCode);
+          else screenModifiers.add(keyCode);
+          key.setAttribute('aria-pressed', String(screenModifiers.has(keyCode)));
+          return;
+        }
+        const chord = [...screenModifiers, keyCode].map(name => USAGES[name]);
+        control.releaseAll();  // releases physical keys and clears the armed screen modifiers
+        control.tap(chord);   // balanced down/up events through the existing owned control channel
+      });
+      line.append(key);
+    }
+    container.append(line);
+  }
+  $('#focus-keyboard-toggle').addEventListener('click', () => {
+    if (!focus?.control?.on) return;
+    const open = $('#focus-keyboard').hidden;
+    resetScreenKeyboard();
+    $('#focus-keyboard').hidden = !open;
+    if (open) placeScreenKeyboard();
+    $('#focus-keyboard-toggle').setAttribute('aria-expanded', String(open));
+  });
+}
+
+// --- history: what the wall saw of this machine, under the enlarged picture ------------------------------------
+// Its own box, #focus-history, the last thing in the enlarged view; the picture and the bar above it are not
+// touched by any of this. Opened and closed with the view (historyOpened, historyClosed), looked at again once a
+// minute while it is open. One line: when the machine was last seen, and how much of this week it was online; and
+// where it reports sensors, a small plain graph of the last day for each kind of them, drawn as the tiles are drawn.
+
+const HISTORY_EVERY = 60000;  // ms between looks at the history while a tile is enlarged
+const HISTORY_LINES = 8;      // sensors one graph draws at the most: the warmest, the fastest
+// s each point of the day's graph stands for: 96 points a sensor, so that a controller's forty readings and a KVM's
+// own fit into one answer of the route (5000 points at the most, whole sensors at its end left out beyond that).
+const HISTORY_SPAN = 900;
+const HISTORY_POINTS = 5000;
+const HISTORY_KINDS = { C: ['Temperature', '°C'], RPM: ['Fans', 'RPM'], '%': ['Fans', '%'], W: ['Power', 'W'] };
+let historyRun = 0;
+let historyShown = null;  // { id, summary, samples } as drawn last: drawn again when the box changes size
+
+function historyOpened(id) {
+  const run = ++historyRun;
+  const box = $('#focus-history');
+  box.dataset.id = id;
+  box.hidden = false;
+  historyShown = null;
+  box.replaceChildren(h('p', { class: 'history-line muted' }, 'Looking at the history...'));
+  (async () => {
+    // A machine just added has no history yet, and is looked at again soon: in 5 s, then 10, 20 and so on up to the
+    // minute. So is a history that could not be read (the wall busy, say): asked again every 5 s, every enlarged view
+    // on every screen asked a wall that was busy already twelve times as often as one that was not.
+    let misses = 0;
+    while (run === historyRun) {
+      const known = await refreshHistory(id, run);
+      misses = known ? 0 : misses + 1;
+      await sleep(known ? HISTORY_EVERY : Math.min(HISTORY_EVERY, 5000 * 2 ** (misses - 1)));
+    }
+  })();
+}
+
+function historyClosed() {
+  historyRun += 1;
+  historyShown = null;
+  const box = $('#focus-history');
+  box.hidden = true;
+  box.replaceChildren();
+}
+
+async function refreshHistory(id, run) {
+  let summary = null;
+  let samples = null;
+  let problem = null;
+  // What was done to it, beside: for those who may read the activity log. Asked beside the history (each is read in turns
+  // of its own), and drawn when it comes: the history does not wait for it. (Live views left out: whoever has it enlarged
+  // has one open, and the three lines would soon be nothing but looks.)
+  const doing = can('admin')
+    ? api('GET', `api/v1/audit?device=${encodeURIComponent(id)}&limit=${DONE_ASKED}`).then(found => {
+      if (!Array.isArray(found?.entries)) return null;
+      return {
+        entries: found.entries.filter(entry => entry.event !== 'live_opened' && entry.event !== 'live_closed').slice(0, DONE_SHOWN),
+        looked: found.entries.length,
+      };
+    }).catch(() => null)  // includes an unreadable answer, before waiting for the history alongside it
+    : Promise.resolve(null);
+  try {
+    summary = await api('GET', `api/v1/devices/${id}/history`);
+    if (summary.sensors.length) samples = await api('GET', `api/v1/devices/${id}/history?what=samples&every=${HISTORY_SPAN}&limit=${HISTORY_POINTS}`);
+  } catch (ex) {
+    problem = ex.message;
+  }
+  if (run !== historyRun) return false;
+  // (Until it comes, or where it could not be read this time, the column shows what it showed: it does not come and go.)
+  const shown = problem ? { id, summary: null, samples: null, done: doneBefore(id), problem } : { id, summary, samples, done: doneBefore(id), problem: null };
+  renderHistory(shown);
+  doing.then(done => {
+    if (done != null && run === historyRun && historyShown === shown) renderHistory({ ...shown, done });
+  });
+  return problem ? false : summary.share != null;
+}
+
+// The last few entries of the activity log that are of this machine (who did what to it), beside its history.
+const DONE_SHOWN = 3;
+const DONE_ASKED = 100;  // entries asked for, of which live views are left out
+const doneBefore = id => (historyShown?.id === id ? historyShown.done : null);
+
+function doneSection(id, done) {
+  const list = h('ol', { class: 'done-list' });
+  if (!done.entries.length) {
+    list.append(h('li', { class: 'muted' }, done.looked ? `Nothing but live views in its last ${done.looked} entries` : 'Nothing done to it in the activity log yet'));
+  }
+  for (const entry of done.entries) {
+    // An action by its own name ("Reboot KVM", a saved one's), with the keys it pressed; anything else as the log's page says it.
+    const action = entry.name || ACTION_NAMES[entry.action] || entry.action;
+    const what = entry.event === 'action' ? [action, entry.keys && keysLabel(entry.keys)].filter(Boolean).join(' ')
+      : entry.event === 'action_failed' ? `${action} failed`
+        : entry.event === 'alert' ? `Alert: ${LABELS[entry.was] || entry.was} to ${LABELS[entry.state] || entry.state}`
+          : eventLabel(entry);
+    list.append(h('li', { title: new Date(entry.time * 1000).toLocaleString() },
+      h('span', { class: 'done-when' }, ago(Math.max(0, Date.now() / 1000 - entry.time))), ' ', h('b', {}, entry.user || 'qKVM'), ` ${what}`));
+  }
+  const all = h('button', { type: 'button', class: 'link', onclick: () => { activityFor = id; settingsDialog('activity'); } }, 'All of it');
+  return h('section', { class: 'history-done', 'aria-label': 'Done to this machine' }, h('p', { class: 'done-head' }, h('b', {}, 'Done to it'), all), list);
+}
+
+// "6 d 3 h", "2 h 10 min", "45 min", "30 s": how long something lasted.
+function spanText(seconds) {
+  if (seconds < 60) return `${Math.round(seconds)} s`;
+  if (seconds < 3600) return `${Math.round(seconds / 60)} min`;
+  const days = Math.floor(seconds / 86400);
+  const hours = Math.floor((seconds % 86400) / 3600);
+  if (days) return hours ? `${days} d ${hours} h` : `${days} d`;
+  const minutes = Math.round((seconds % 3600) / 60);
+  return minutes ? `${hours} h ${minutes} min` : `${hours} h`;
+}
+
+function renderHistory(shown) {
+  const box = $('#focus-history');
+  if (box.hidden || box.dataset.id !== shown.id) return;
+  historyShown = shown;
+  const { summary, samples, done, problem } = shown;
+  const line = h('p', { class: 'history-line' });
+  if (problem) {
+    line.classList.add('muted');
+    line.append(`The history could not be read: ${problem}`);
+    box.replaceChildren(line);
+    if (done) box.append(doneSection(shown.id, done));
+    return;
+  }
+  // When it was last seen: what the tile knows right now, or else what the history kept (after a restart the
+  // tile knows nothing yet of a machine that is away, and the history does).
+  const status = tiles.get(shown.id)?.status;
+  const seenAgo = status?.last_seen_ago != null ? status.last_seen_ago : summary.last_seen != null ? Date.now() / 1000 - summary.last_seen : null;
+  line.append(h('span', {}, h('b', {}, 'Last seen'), ` ${seenAgo == null ? 'never' : ago(seenAgo)}`));
+  if (summary.share == null) {
+    line.append(h('span', { class: 'muted' }, 'Nothing seen of it this week yet'));
+  } else if (summary.watched < 1) {
+    line.append(h('span', {}, h('b', {}, 'Online'), ' since just now'));
+  } else {
+    // "99.2 %", and 100 only where it is the whole of it: a machine that was down a minute in a week is not at 100.
+    const percent = summary.share >= 1 ? '100' : summary.share > 0.9995 ? '99.9' : (summary.share * 100).toFixed(1).replace(/\.0$/, '');
+    const whole = summary.watched >= (summary.until - summary.since) * 0.9;
+    line.append(h('span', {}, h('b', {}, 'Online'), ` ${percent} %${whole ? ' this week' : ` of the ${spanText(summary.watched)} it was watched this week`}`));
+  }
+  box.replaceChildren(line);
+  const graphs = historyGraphs(samples);
+  if (graphs.length) box.append(h('div', { class: 'history-graphs' }, graphs));
+  if (done) box.append(doneSection(shown.id, done));
+  if (graphs.length) redrawHistory();  // (drawn once they have a size: in the page)
+}
+
+// One graph per kind of reading (temperatures, fans, power) over the last day, as a figure with its caption.
+function historyGraphs(samples) {
+  if (!samples || !samples.series?.length) return [];
+  const { since, until } = samples;
+  const kinds = new Map();  // unit -> [{ sensor, points: [[t, value], ...] }, ...]
+  for (const series of samples.series) {
+    if (!HISTORY_KINDS[series.unit] || !series.points.length) continue;
+    (kinds.get(series.unit) || kinds.set(series.unit, []).get(series.unit)).push({ sensor: series.sensor, points: series.points.map(p => [p[0], p[1]]) });
+  }
+  const figures = [];
+  for (const [unit, sensors] of kinds) {
+    const [name, shown] = HISTORY_KINDS[unit];
+    // The lines that matter most: the highest readings. The rest of a controller's forty sensors would be a tangle.
+    const lines = sensors.map(({ sensor, points }) => ({ sensor, points, top: Math.max(...points.map(p => p[1])) }))
+      .sort((a, b) => b.top - a.top).slice(0, HISTORY_LINES);
+    const values = lines.flatMap(l => l.points.map(p => p[1]));
+    let low = Math.min(...values);
+    let high = Math.max(...values);
+    const range = `${Math.round(low)} to ${Math.round(high)} ${shown}`;
+    if (high - low < 1) {  // a reading that held still all day is a line through the middle, not along the floor
+      low -= 0.5;
+      high += 0.5;
+    }
+    // "8 of 23": the lines drawn, of the readings of this kind; "and more" where the route's page was cut.
+    const counted = lines.length < sensors.length || samples.more ? ` · ${lines.length} of ${sensors.length}${samples.more ? ' and more' : ''}` : '';
+    const canvas = h('canvas', { role: 'img', 'aria-label': `${name} over the last day: ${range}` });
+    const figure = h('figure', { class: 'history-graph', dataset: { unit } },
+      h('figcaption', {}, h('span', {}, `${name} · last 24 h${counted}`), h('span', {}, range)),
+      canvas);
+    figure.draw = () => drawHistory(canvas, lines, { low, high, since, until });
+    figures.push(figure);
+  }
+  return figures;
+}
+
+// A few lines on a canvas, one screen pixel per canvas pixel, as the tiles are drawn. Nothing is drawn across a
+// gap: where the wall was not looking, the line stops and starts again.
+function drawHistory(canvas, lines, { low, high, since, until }) {
+  const ratio = window.devicePixelRatio || 1;
+  const box = canvas.getBoundingClientRect();
+  const w = Math.max(1, Math.round(box.width * ratio));
+  const hgt = Math.max(1, Math.round(box.height * ratio));
+  if (canvas.width !== w || canvas.height !== hgt) {
+    canvas.width = w;
+    canvas.height = hgt;
+  }
+  const context = canvas.getContext('2d');
+  context.clearRect(0, 0, w, hgt);
+  const styles = getComputedStyle(document.documentElement);
+  const accent = styles.getPropertyValue('--accent-text').trim() || '#60a5fa';
+  const faint = styles.getPropertyValue('--line').trim() || 'rgba(128,128,128,.2)';
+  const pad = Math.round(3 * ratio);
+  const span = Math.max(1e-9, high - low);
+  const x = t => Math.round(((t - since) / (until - since)) * (w - 1));
+  const y = v => Math.round(pad + (1 - (v - low) / span) * (hgt - 1 - 2 * pad));
+  context.lineWidth = Math.max(1, Math.round(ratio));
+  context.strokeStyle = faint;
+  context.beginPath();
+  context.moveTo(0, hgt - 0.5);
+  context.lineTo(w, hgt - 0.5);
+  context.stroke();
+  context.strokeStyle = accent;
+  context.lineJoin = 'round';
+  context.lineCap = 'round';  // (a sensor with one sample so far is a dot, not nothing)
+  lines.forEach((line, at) => {
+    context.globalAlpha = at === 0 ? 1 : 0.45;
+    context.beginPath();
+    let last = null;
+    for (const [t, value] of line.points) {
+      if (last == null || t - last > HISTORY_SPAN * 1.5) {
+        // The first point, or one after a gap (nobody looked): a new stretch. A point on its own is a dot
+        // (a line of no length, with round ends), not nothing: a machine added an hour ago has one.
+        context.moveTo(x(t), y(value));
+        context.lineTo(x(t), y(value));
+      } else {
+        context.lineTo(x(t), y(value));
+      }
+      last = t;
+    }
+    context.stroke();
+  });
+  context.globalAlpha = 1;
+}
+
+function redrawHistory() {
+  const box = $('#focus-history');
+  if (box.hidden) return;
+  for (const figure of box.querySelectorAll('figure.history-graph')) figure.draw?.();
 }
 
 // --- wall lifecycle -----------------------------------------------------------------------------------
@@ -4384,7 +6548,7 @@ let arranging = null;  // while it is being done: how to leave it
 
 function arrangeTiles() {
   if (arranging || !tiles.size) return;
-  if (focus) closeFocus(true);
+  if (focus || focusOpening) closeFocus(true);
   setSelecting(false);
   // All of them, in the wall's own order: nobody arranges what is hidden by a search, or sorted some other way.
   const was = { order, filter, query, group };
@@ -4499,7 +6663,7 @@ function buildTiles(devices) {
   devices = inOrder(devices);
   const wall = $('#wall');
   const wanted = new Set(devices.map(device => device.id));
-  if (focus && !wanted.has(focus.id)) closeFocus(true);
+  if ((focus && !wanted.has(focus.id)) || (focusOpening && !wanted.has(focusOpening))) closeFocus(true);
   for (const tile of [...tiles.values()]) {
     if (!wanted.has(tile.device.id)) dropTile(tile);
   }
@@ -4560,7 +6724,9 @@ function buildTiles(devices) {
 async function reloadWall() {
   if (arranging) return;  // not under the hands of whoever is setting the order: it is fetched again when they are done
   try {
-    buildTiles((await api('GET', 'api/v1/wall')).devices);
+    const info = await api('GET', 'api/v1/wall');
+    wallLive = info.live === LIVE_FORM;
+    buildTiles(info.devices);
   } catch (ex) {
     if (ex.code !== 'unauthorized') toast(ex.message, 'error');
   }
@@ -4688,6 +6854,7 @@ async function startWall() {
   }
   if (run !== wallRun) return;
   setupRate(info.interval);
+  wallLive = info.live === LIVE_FORM;
   buildTiles(info.devices);
   loadSavedActions();
   refreshUpdateBadge();
@@ -4849,6 +7016,9 @@ function decorate() {
   $('#focus-prev').append(icon('chevronLeft'));
   $('#focus-next').append(icon('chevronRight'));
   $('#focus-actions').prepend(icon('zap'));
+  $('#focus-actions').setAttribute('aria-label', 'Actions');
+  $('#focus-actions').title = 'Actions';
+  $('#focus-keyboard-toggle').prepend(icon('keyboard'));
   $('#focus-health').prepend(icon('activity'));
   $('#focus-open').prepend(icon('external'));
   $('#focus-open').addEventListener('click', event => openSignedIn(event, focus && tiles.get(focus.id)));
@@ -4892,6 +7062,8 @@ document.addEventListener('keydown', event => {
 async function boot() {
   applyTheme();
   decorate();
+  makeScreenKeyboard();
+  setupConsoleOverflow();
   // The page states which version of the program it belongs to. A server from before that
   // existed sends the page with the placeholder still in it: the files were updated, but the
   // old program is still running and does not know the newer page's requests.
@@ -4931,6 +7103,7 @@ async function boot() {
   $('#bulk-none').addEventListener('click', () => { selected.clear(); renderSelection(); });
   $('#bulk-done').addEventListener('click', () => setSelecting(false));
   $('#bulk-run').addEventListener('click', () => actionsDialog([...selected]));
+  $('#bulk-remove').addEventListener('click', () => removeSelected([...selected]));
   $('#sign-out').addEventListener('click', signOut);
   $('#my-security').addEventListener('click', () => settingsDialog('security'));
   $('#arrange').addEventListener('click', arrangeTiles);
@@ -4949,29 +7122,81 @@ async function boot() {
   // The server looks for a new release shortly after it starts and then once a day; ask it now and then.
   setInterval(() => { if (!$('#shell').hidden && !document.hidden) refreshUpdateBadge(); }, 10 * 60 * 1000);
   setTimeout(refreshUpdateBadge, 45 * 1000);
-  // The enlarged view repaints when its size changes, like the tiles do.
+  // The enlarged view repaints when its size changes, like the tiles do; a live line is told the new size.
   watchPixels($('#focus-screen'));
-  $('#focus-screen').addEventListener('pixelsize', () => focus?.feed.paint().catch(() => {}));
+  $('#focus-screen').addEventListener('pixelsize', () => {
+    if (!focus) return;
+    // (A live picture that came while the view had no size yet is drawn now, in place of the stills: a still
+    // screen sends no other.)
+    if (focus.liveShowing || focus.picture?.shown) focus.picture.again();
+    else focus.feed.paint().catch(() => {});
+    focus.live?.shape(liveNeed());
+  });
+  // A tab nobody sees is sent few pictures; a page that is left ends its line, letting go of what it held first.
+  document.addEventListener('visibilitychange', () => focus?.live?.shape(liveNeed()));
+  window.addEventListener('pagehide', () => focus?.live?.close());
+  // Back from the browser's own cache of a page that was left: the line it had is gone, and a new one is opened.
+  window.addEventListener('pageshow', event => {
+    if (!event.persisted || !focus?.live) return;
+    liveEnded('closed', 'The page was left and came back');
+    startLive(focus.id);
+  });
+  // ...and so do the history's graphs under it (drawn pixel for pixel: they are drawn anew at every size).
+  watchPixels($('#focus-history'));
+  $('#focus-history').addEventListener('pixelsize', redrawHistory);
   $('#open-settings').addEventListener('click', () => settingsDialog());
   $('#fullscreen').addEventListener('click', toggleFullscreen);
   $('#focus-close').addEventListener('click', () => closeFocus());
   $('#focus-prev').addEventListener('click', () => stepFocus(-1));
   $('#focus-next').addEventListener('click', () => stepFocus(1));
   $('#focus-actions').addEventListener('click', () => focus && actionsDialog(focus.id));
+  $('#focus-control').addEventListener('click', controlClicked);
+  $('#focus').addEventListener('pointerdown', event => {
+    for (const menu of document.querySelectorAll('.focus-popover[open]')) {
+      if (!menu.contains(event.target)) menu.open = false;
+    }
+  });
+  $('#focus').addEventListener('keydown', event => {
+    const menu = event.target.closest('.focus-popover[open]');
+    if (event.key !== 'Escape' || !menu) return;
+    event.preventDefault();
+    event.stopPropagation();
+    menu.open = false;
+    menu.querySelector('summary').focus();
+  }, true);
+
+  $('#focus-details').addEventListener('toggle', () => { if ($('#focus-details').open) redrawHistory(); });
+  $('#focus-again').addEventListener('click', () => focus && startLive(focus.id));
+  $('#focus-cad').addEventListener('click', () => withControl(async control => {
+    const name = tiles.get(focus.id)?.device.name || 'this machine';
+    if (await confirmBox({ title: 'Ctrl+Alt+Del', message: `Ctrl+Alt+Del on ${name}?`, action: 'Ctrl+Alt+Del', danger: false })) control.ctrlAltDel();
+  }));
+  $('#focus-win').addEventListener('click', () => withControl(control => control.tap([USAGES.MetaLeft])));
+  $('#focus-alt-tab').addEventListener('click', () => withControl(control => control.tap([USAGES.AltLeft, USAGES.Tab])));
+  $('#focus-alt-f4').addEventListener('click', () => withControl(async control => {
+    const name = tiles.get(focus.id)?.device.name || 'this machine';
+    if (await confirmBox({ title: 'Alt+F4', message: `Alt+F4 on ${name}? It closes the window that is in front there.`, action: 'Alt+F4' })) control.tap([USAGES.AltLeft, USAGES.F4]);
+  }));
+  $('#focus-prtsc').addEventListener('click', () => withControl(control => control.tap([USAGES.PrintScreen])));
+  // The text goes the way the wall types text already (the action), never through the clipboard.
+  $('#focus-type').addEventListener('click', () => withControl(() => { typeTextDialog([focus.id]); }));
+  $('#focus-relative').addEventListener('click', () => focus?.control?.setRelative(!focus.control.relative));
+  $('#focus-fullscreen').addEventListener('click', toggleFullscreen);
   $('#focus-health').addEventListener('click', () => {
     if (!focus) return;
     focus.health = !focus.health;
     renderFocus();
   });
   document.addEventListener('keydown', event => {
-    if (event.ctrlKey || event.metaKey || event.altKey) return;
     if ($('dialog[open]') || $('#shell').hidden) return;
+    if (focus?.control?.on) return;  // every key is the machine's while keyboard and mouse are held
+    if (event.ctrlKey || event.metaKey || event.altKey) return;
     if (arranging) {
       // The wall's own keys rest while its order is being set. Esc leaves it, also from the box a place is typed in.
       if (event.key === 'Escape') arranging();
       return;
     }
-    if (event.target.matches?.('select, input, textarea')) return;
+    if (event.target.matches?.('select, input, textarea') || (event.target.closest?.('.focus-popover, .focus-control-panel, .screen-keyboard') && !event.target.closest?.('#focus-control'))) return;
     if (event.key === 'f' || event.key === 'F') {
       toggleFullscreen();
     } else if (event.key === '/' && !focus) {
@@ -4981,12 +7206,15 @@ async function boot() {
       setSelecting(!selecting);
     } else if ((event.key === 'd' || event.key === 'D') && !focus) {
       setDisplay(!displayMode);
+    } else if (event.key === 'Escape' && (focus || focusOpening)) {
+      closeFocus();
     } else if (event.key === 'Escape' && !focus && selecting) {
       setSelecting(false);
     } else if (event.key === 'Escape' && !focus && displayMode) {
       setDisplay(false);
-    } else if (focus && event.key === 'Escape') {
-      closeFocus();
+
+    } else if (focus && (event.key === 'c' || event.key === 'C') && !$('#focus-control').hidden) {
+      controlClicked();
     } else if (focus && event.key === 'ArrowLeft') {
       stepFocus(-1);
     } else if (focus && event.key === 'ArrowRight') {
@@ -5003,7 +7231,8 @@ async function boot() {
   const offered = takeDisplayKey();
   let session;
   try {
-    session = await api('GET', 'api/v1/session');
+    // (And the words the wall is drawn with, from the same server, before the first tile.)
+    [session] = await Promise.all([api('GET', 'api/v1/session'), loadWords()]);
   } catch (ex) {
     showAuth('plain', h('p', { class: 'error' }, ex.message),
       h('div', { class: 'actions' }, h('button', { type: 'button', onclick: () => location.reload() }, 'Try again')));

@@ -1,0 +1,45 @@
+{
+  "schema": 1,
+  "components": {
+    "cpython": {
+      "minimum": "3.13.16",
+      "source": "The base image (python:3.13-slim, pinned by digest in the Dockerfile) builds CPython from source; it is no Debian package.",
+      "reason": "What the image of 0.2.0 ships (read 2026-10-26). No advisory against 3.13.16 was known then. When python.org publishes a security release of 3.13, raise this to it and move the Dockerfile's base image to a digest that has it."
+    },
+    "ffmpeg": {
+      "minimum": "8.1.1",
+      "source": "PyAV (av 17.1.0) bundles FFmpeg's libraries in its wheel (av.libs).",
+      "reason": "What the image of 0.2.0 ships (read 2026-10-26). FFmpeg decodes what devices send: the video worker's H.264 and JPEG decoders are FFmpeg's own, in a process of their own. No advisory against 8.1.1 was known then; an FFmpeg security release means a PyAV that bundles it, and this raised to it."
+    },
+    "libvpx": {
+      "minimum": "1.16.0",
+      "source": "PyAV (av 17.1.0) bundles libvpx in its wheel (av.libs).",
+      "reason": "What the image of 0.2.0 ships (read 2026-10-26). aiortc decodes VP8 with it; qKVM asks a JetKVM for H.264 only, so no device's video reaches it today. Gated all the same, so that an older one cannot come back unseen."
+    },
+    "libopus": {
+      "minimum": "1.6.1",
+      "source": "PyAV (av 17.1.0) bundles libopus in its wheel (av.libs).",
+      "reason": "What the image of 0.2.0 ships (read 2026-10-26). aiortc decodes Opus audio with it; qKVM takes no audio from a device today. Gated all the same, so that an older one cannot come back unseen."
+    },
+    "libdav1d": {
+      "minimum": "1.5.3",
+      "source": "PyAV (av 17.1.0) bundles dav1d, FFmpeg's AV1 decoder, in its wheel (av.libs).",
+      "reason": "What the image of 0.2.0 ships (read 2026-10-26). qKVM decodes no AV1 today. Gated all the same, so that an older one cannot come back unseen."
+    },
+    "cryptography-openssl": {
+      "minimum": "4.0.3",
+      "source": "cryptography (50.0.2) links its own OpenSSL into its wheel; it is not Debian's libssl, which the scan sees.",
+      "reason": "What the image of 0.2.0 ships (read 2026-10-26). It makes the wall's certificates, seals the vault and checks the signatures of updates. No advisory against 4.0.3 was known then."
+    },
+    "pylibsrtp-libsrtp": {
+      "minimum": "2.7.0",
+      "source": "pylibsrtp (1.0.0) links libsrtp into its extension.",
+      "reason": "What the image of 0.2.0 ships (read 2026-10-26). It decrypts a JetKVM's media (SRTP). No advisory against 2.7.0 was known then."
+    },
+    "pylibsrtp-openssl": {
+      "minimum": "3.5.4",
+      "source": "pylibsrtp (1.0.0) links an OpenSSL of its own into its extension, beside libsrtp; it is neither Debian's libssl nor cryptography's.",
+      "reason": "What the image of 0.2.0 ships (read 2026-10-26), used for libsrtp's ciphers (AES counter mode and GCM, HMAC-SHA1). OpenSSL releases after 3.5.4 fix advisories in other parts of the library (CMS, PKCS#12, QUIC and TLS among them); none in the ciphers libsrtp calls was known then, and no pylibsrtp with a newer OpenSSL was in the image. When one is, raise this to it."
+    }
+  }
+}

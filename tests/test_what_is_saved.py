@@ -23,6 +23,7 @@ from qkvm.store import AuditLog, Store, StoreError
 from tests.test_unlock import fits
 from tests.test_users import OTHER, account, visitor
 from tests.test_wall import PASSWORD, closed_port, wait_until, wall
+from tests.settings_file import settings_text, write_settings_text
 
 
 @pytest.fixture(autouse=True)
@@ -219,7 +220,7 @@ def test_https_that_could_not_be_switched_on_does_not_keep_the_next_start_from_s
         (data / "tls").write_text("", encoding="utf-8")  # something lies where the certificate's folder goes (as test_refused_changes has it)
         answer = admin.put("/api/v1/settings", json={"bind": ["local"], "port": 8787, "https": True, "interval": 1})
         shown = admin.get("/api/v1/settings").json()
-    saved = json.loads((data / "qkvm.json").read_text(encoding="utf-8"))["server"]["https"]
+    saved = json.loads(settings_text(data / "qkvm.json", encoding="utf-8"))["server"]["https"]
     monkeypatch.setattr(uvicorn.Server, "run", lambda self, sockets=None: None)  # (if it gets as far as serving, it has started)
     core = Core(data, bind_override=["local"], port_override=closed_port())
     core.unlock_at_start()
@@ -242,7 +243,7 @@ def test_a_certificate_that_cannot_be_made_for_another_reason_than_the_disk(tmp_
     with wall(data) as admin:
         wait_until(lambda: fits(admin), "never made to fit")
         answer = admin.put("/api/v1/settings", json={"bind": ["local"], "port": 8787, "https": True, "interval": 1})
-    saved = json.loads((data / "qkvm.json").read_text(encoding="utf-8"))["server"]["https"]
+    saved = json.loads(settings_text(data / "qkvm.json", encoding="utf-8"))["server"]["https"]
     print(f"\n[https] on a computer called 'büro-pc': {answer.status_code} {answer.json()}; saved https={saved}")
     monkeypatch.setattr(uvicorn.Server, "run", lambda self, sockets=None: None)
     core = Core(data, bind_override=["local"], port_override=closed_port())
@@ -301,19 +302,19 @@ def test_every_id_this_program_gives_is_one_it_takes_back(tmp_path: Path) -> Non
             assert admin.post("/api/v1/tokens", json={"name": "a screen", "kind": "display"}).status_code == 201
     finally:
         server.stop()
-    said = json.loads((tmp_path / "qkvm.json").read_text(encoding="utf-8"))
+    said = json.loads(settings_text(tmp_path / "qkvm.json", encoding="utf-8"))
     ids = {part: [thing["id"] for thing in said[part]] for part in ("users", "devices", "actions", "tokens")}
     print("\n[ids] as written:", ids)
     assert not Store(tmp_path / "qkvm.json").restored
     # The demo's own, and the owner's older "admin".
     for odd in ("demo", "demo12", "admin", "A-b_9"):
         said["users"][0]["id"] = odd
-        (tmp_path / "qkvm.json").write_text(json.dumps(said), encoding="utf-8")
+        write_settings_text(tmp_path / "qkvm.json", json.dumps(said), encoding="utf-8")
         (tmp_path / "qkvm.bak").unlink(missing_ok=True)
         assert Store(tmp_path / "qkvm.json").users[0].id == odd
     for refused in ("kvm.1", "a b", "own:1", "é"):
         said["users"][0]["id"] = refused
-        (tmp_path / "qkvm.json").write_text(json.dumps(said), encoding="utf-8")
+        write_settings_text(tmp_path / "qkvm.json", json.dumps(said), encoding="utf-8")
         (tmp_path / "qkvm.bak").unlink(missing_ok=True)
         with pytest.raises(StoreError):
             Store(tmp_path / "qkvm.json")
@@ -330,10 +331,10 @@ def test_clear_out_removes_what_is_qkvms_and_says_what_it_could_not(tmp_path: Pa
         assert admin.put("/api/v1/alerts", json={"enabled": False}).status_code == 200
     elsewhere = tmp_path / "elsewhere.json"
     elsewhere.write_text("somebody else's", encoding="utf-8")
-    (data / "qkvm.damaged-1700000000.json").write_text((data / "qkvm.json").read_text(encoding="utf-8"), encoding="utf-8")
+    write_settings_text(data / "qkvm.damaged-1700000000.json", settings_text(data / "qkvm.json", encoding="utf-8"), encoding="utf-8")
     (data / "qkvm.damaged-folder.json").mkdir()
-    (data / "qkvm.bak.new").write_text("{}", encoding="utf-8")
-    (data / "qkvm.tmp").write_text("{}", encoding="utf-8")
+    write_settings_text(data / "qkvm.bak.new", "{}", encoding="utf-8")
+    write_settings_text(data / "qkvm.tmp", "{}", encoding="utf-8")
     (data / "notes about qkvm.damaged-1.json.txt").write_text("mine", encoding="utf-8")
     (data / "qkvm.json.orig").write_text("mine", encoding="utf-8")
     linked = True
@@ -342,7 +343,7 @@ def test_clear_out_removes_what_is_qkvms_and_says_what_it_could_not(tmp_path: Pa
     except OSError:
         linked = False  # (Windows without the right to make links)
     path = data / "qkvm.json"
-    path.write_text(path.read_text(encoding="utf-8") + "}", encoding="utf-8")  # the current file is damaged as well: this start sets one more aside
+    write_settings_text(path, settings_text(path, encoding="utf-8") + "}", encoding="utf-8")  # the current file is damaged as well: this start sets one more aside
     status = cli.main(["--data-dir", str(data), "--reset-password"])
     said = capsys.readouterr()
     left = sorted(p.name for p in data.iterdir())

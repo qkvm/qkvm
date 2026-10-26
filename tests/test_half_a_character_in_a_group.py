@@ -21,6 +21,7 @@ import pytest
 from qkvm import kvm, update, vault
 from qkvm.store import Store
 from tests.test_wall import PASSWORD, wall
+from tests.settings_file import settings_text
 
 JSON = {"Content-Type": "application/json"}
 
@@ -49,7 +50,7 @@ def test_half_a_character_in_a_group_name_does_not_take_the_list_away(tmp_path: 
     with wall(tmp_path) as admin:
         made = admin.post(make, content=sent(body), headers=JSON)
         look = admin.get(listed)
-        in_file = "\\ud800" in (tmp_path / "qkvm.json").read_text(encoding="utf-8")
+        in_file = "\\ud800" in settings_text(tmp_path / "qkvm.json", encoding="utf-8")
     again = Store(tmp_path / "qkvm.json")  # (a start reads it: it is a list of texts)
     with wall(tmp_path, sign_in=False) as admin:
         assert admin.post("/api/v1/login", json={"name": "admin", "password": PASSWORD}).status_code == 200

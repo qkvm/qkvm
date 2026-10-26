@@ -13,6 +13,7 @@ from qkvm import kvm, store, update, vault
 from qkvm.store import ActionRecord, AlertSettings, DeviceRecord, UserRecord
 from tests.fake_kvm import FakeKvm
 from tests.test_wall import add, wall
+from tests.settings_file import settings_text, write_settings_text
 
 
 @pytest.fixture(autouse=True)
@@ -50,9 +51,9 @@ def test_an_action_whose_text_is_not_there_types_nothing_and_presses_nothing(tmp
         ran = admin.post(f"/api/v1/devices/{device}/actions", json={"action": "custom", "custom_id": action})
         assert ran.status_code == 200 and fake.state.actions == ["type 'net stop spooler\\n'"], (ran.text, fake.state.actions)
     for name in ("qkvm.json", "qkvm.bak"):
-        saved = json.loads((folder / name).read_text(encoding="utf-8"))
+        saved = json.loads(settings_text(folder / name, encoding="utf-8"))
         saved["actions"][0]["secret"] = value
-        (folder / name).write_text(json.dumps(saved), encoding="utf-8")
+        write_settings_text(folder / name, json.dumps(saved), encoding="utf-8")
     fake.state.actions.clear()
     with wall(folder) as admin:
         assert not admin.core.store.restored  # type: ignore[attr-defined]  # (no reason not to start, or to go back a copy)
@@ -93,9 +94,9 @@ def test_a_devices_password_that_is_neither_is_not_no_password(tmp_path: Path, f
     with wall(folder) as admin:
         device = add(admin, fake.url)
     for name in ("qkvm.json", "qkvm.bak"):
-        saved = json.loads((folder / name).read_text(encoding="utf-8"))
+        saved = json.loads(settings_text(folder / name, encoding="utf-8"))
         saved["devices"][0]["secret"] = False
-        (folder / name).write_text(json.dumps(saved), encoding="utf-8")
+        write_settings_text(folder / name, json.dumps(saved), encoding="utf-8")
     with wall(folder) as admin:
         shown = next(each for each in admin.get("/api/v1/wall").json()["devices"] if each["id"] == device)
         assert shown["has_password"] is True

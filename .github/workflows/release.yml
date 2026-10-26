@@ -1,50 +1,204 @@
 # Publishes a version: to the GitHub release (what the in-app updater looks for), to PyPI
-# (`pip install qkvm`) and as a container image (`docker pull`).
+# (`pip install qkvm`) and as a container image (`docker pull`). Draft first: a release is made as a draft with
+# every file attached and checked, a person reviews it and publishes it, and only its publication sends anything to
+# PyPI and the registries. (GitHub's immutable releases refuse any change to a release's files once it is published:
+# nothing here changes a published release.)
 #
-# To publish version 1.2.3: set __version__ = "1.2.3" in qkvm/_version.py, commit, then create a
-# GitHub release with the tag v1.2.3. This workflow then
+# To publish version 1.2.3: set __version__ = "1.2.3" in qkvm/_version.py and write its chapter in CHANGELOG.md, get
+# that commit onto main, then push the tag v1.2.3 on it (only the organisation's admins may make v* tags). On the
+# tag, this workflow
 #
-#   attaches to the release      qkvm-1.2.3-py3-none-any.whl, SHA256SUMS,
-#                                SHA256SUMS.sig (made with the RELEASE_SIGNING_KEY secret: a version that has
-#                                a release key built in is not published without it, anywhere)
-#   uploads to PyPI              the same wheel, and the source archive
-#   pushes the image             ghcr.io/<owner>/<name>, for amd64 and arm64, tagged 1.2.3, 1.2 and latest;
-#                                and to Docker Hub as well when that is set up (see below)
+#   refuses a tag whose commit is not on main, or whose Tests run was not green in every job
+#   builds with tools pinned by hash and checksums the packages at once, then runs the test suite against the built
+#   wheel, installed by itself, checks the source archive and audits, all on a copy held to that checksum
+#   audits the installed wheel and both final container archives against fresh vulnerability data, and records
+#   and gates the native libraries inside the image that the scan cannot see
+#   signs SHA256SUMS            of qkvm-1.2.3-py3-none-any.whl, qkvm-1.2.3.tar.gz and qkvm-1.2.3-image.json
+#                               (what each architecture's scan saw, and the run that keeps those archives), with
+#                               the RELEASE_SIGNING_KEY secret: a version that has a release key built in is not
+#                               published without it, anywhere. The runner's openssl signs, in a job that does only
+#                               that; the cryptography library, which every installed copy checks with, checks the
+#                               signature in a job with no secret before any draft exists
+#   makes a DRAFT release       of the tag with those files, SHA256SUMS and SHA256SUMS.sig attached, then reads
+#                               every file back from the draft and checks it against the signature
 #
-# What has to be set up once, outside this file:
+# Then a person reviews the draft (its files, its text) and publishes it before the date its text gives. On that
+# publication, this workflow
 #
-#   PyPI         On pypi.org, add a "trusted publisher" for the project qkvm: this repository, the
-#                workflow release.yml, the environment pypi. No password or token is stored anywhere:
-#                PyPI is told by GitHub which repository and workflow is asking.
-#   Docker Hub   The repository variable DOCKERHUB_IMAGE (for example qkvm/qkvm) and the secrets
-#                DOCKERHUB_USERNAME and DOCKERHUB_TOKEN (an access token that may write to it).
-#                Without the variable the image goes to ghcr.io only.
-#   Signing      The secret RELEASE_SIGNING_KEY of the environment "release" (Settings, Environments), and
-#                not of the repository: a repository's secrets can be read by any workflow on any branch
-#                that is pushed. Limit that environment to tags (and, if you like, to your own approval).
-#                See "Publishing releases" in the README.
+#   checks first                every file of the published release against the signature (a file the signed list
+#                               does not name stops it), and the archives its image record names against what the
+#                               scan saw, in a job with no secret; nothing goes anywhere unless all of it holds
+#   pushes the image            those archives: ghcr.io/<owner>/<name>, for amd64 and arm64, tagged 1.2.3, and 1.2 and
+#                               latest only where it is the newest released version of its line and of all; and to
+#                               Docker Hub as well when that is set up (see below); every tag read back
+#   uploads to PyPI             the wheel and the source archive, taken from the published release and held to
+#                               its signed SHA256SUMS first; last, as an upload to PyPI cannot be undone
 #
-# What is built is built in a job that can write nothing and reaches no secret: the tools that do the
-# building come from PyPI, with whatever they bring along, and run there. The key is used in a job of
-# its own that installs nothing from PyPI.
+# A release published by this workflow's own token would start nothing: a person publishes it. The image archives
+# are kept by the tag's run for 90 days; a draft published later than that has no image to push (make the version
+# anew). A published release is not changed: a mistake is mended by the next version.
+#
+# What has to be set up once, outside this file. Three environments (Settings, Environments), each holding what one
+# job needs and named by that job only, so that no job can reach another's secret:
+#
+#   release      RELEASE_SIGNING_KEY only; named by the job sign
+#   registries   DOCKERHUB_USERNAME and DOCKERHUB_TOKEN only; named by the job image
+#   pypi         no secret (PyPI trusts this workflow in this environment); named by the job pypi
+#
+# Every one of the three environments, release, registries and pypi: deployment branches and tags set to tags matching
+# v* only (no branch), and a required reviewer, the project's maintainer, who approves each job that names it, with
+# Prevent self-review off on all three (the maintainer both pushes the tag and approves, and would otherwise be
+# refused). Both are required, not a choice: no job reaches a secret, or publishes, unless a person let it in that run
+# (GitHub may or may not ask again when a job of it runs again), on a version tag. From the state of 2026-10-26 (release and pypi made so, the Docker Hub secrets still in release), in
+# this order:
+#
+#   1. Create the environment registries: deployment branches and tags "Selected branches and tags" with one rule of
+#      type Tag, pattern v*, and no branch rule; required reviewer pypv, with Prevent self-review off (pypv both pushes
+#      the tag and approves, and would otherwise be refused).
+#   2. Add the secrets DOCKERHUB_USERNAME and DOCKERHUB_TOKEN to registries: a token that may push to the image's
+#      repository, and the name it signs in with. Either a personal access token, with Read & Write, of an account that
+#      may push to that repository, with that account's name as DOCKERHUB_USERNAME: such a token reaches everything its
+#      account may, so make it an account kept for this alone, with write access to that repository only (where the
+#      repository belongs to an organization, a member of it given write access to that repository and to nothing
+#      else); or, where the repository belongs to an organization whose Docker plan has them, an organization access
+#      token that may push to and pull from that repository only, with the organization's name as DOCKERHUB_USERNAME.
+#   3. Delete DOCKERHUB_USERNAME and DOCKERHUB_TOKEN from release, leaving only RELEASE_SIGNING_KEY there.
+#   4. Keep no repository- or organization-level copy of any of the three secrets: those can be read by any workflow
+#      on any branch that is pushed.
+#   5. DOCKERHUB_IMAGE stays a repository variable (for example qkvm/qkvm); without it the image goes to ghcr.io only.
+#   6. The ghcr.io package qkvm/qkvm gives this repository write access (the package's settings, "Manage Actions
+#      access", role Write), unless this repository's workflow made the package, which then has it already.
+#   7. Turn on immutable releases before the first draft is published (Settings, General).
+#   8. Then push the tag (see "Publishing releases" in the README).
+#
+# Set up already, and to be kept so: on pypi.org a "trusted publisher" for the project qkvm (this repository, the
+# workflow release.yml, the environment pypi; no password or token is stored anywhere, as PyPI is told by GitHub which
+# repository and workflow is asking), and a ruleset that lets only the organisation's admins make v* tags, and nobody
+# move or delete them.
+#
+# Nothing that builds or tries the release can write to the repository or reach a secret. The tools that make the
+# packages are pinned by hash. What still comes unpinned is of two kinds. The image's own build (the Dockerfile's
+# `apt-get upgrade` and `pip install .`, in the image jobs, in BuildKit's containers) takes three things as they are at
+# that hour: Debian's updates, the wheel's dependencies from PyPI, and its own build backend (hatchling and what it
+# needs, which `pip install .` fetches for an isolated build of qKVM from the tagged source: the image's qKVM is built
+# there, by that hatchling, and is not the hash-pinned and checked wheel of the packages). They decide what the image
+# holds, and so what is signed (the signed record vouches that what is published is the image that was then scanned,
+# gated and tested, not for the versions it holds). The tools that try the packages (twine, pytest, pip-audit, the
+# wheel's dependencies, in the job packages) can change an artifact at most, never have it signed. Every file a job of
+# the tag run takes from another's artifact and uses is held to a hash its maker hands on as a job output: the packages
+# and their list, each scan's scanned-image.json (which names its image archive's checksum) and native-versions.json,
+# the two that go into the signed record, and what sign signed; the rest of the scan's evidence (the scanner's report
+# and version, its database's date, the SBOM, the policy outputs) is kept for a person to read and is not held, nor is
+# the dependency audit, which no job reads. An output is written only by the job that made the artifact (another job's
+# code cannot set it), and that job takes the hash before anything runs on its runner, outside a container, that is
+# neither pinned (by hash, digest or commit) nor from Ubuntu's own archive (the build right after the build; the image
+# jobs right after the scan and the native step, before the suite's test tools, themselves pinned wheels, are installed:
+# until then that runner has installed only skopeo, from Ubuntu's own archive, and run BuildKit and Trivy, named by
+# digest and held to a hash, and the image's code only in containers with every capability dropped). sign holds
+# everything it signs to those hashes and refuses anything else. The key is used in a job of its own that installs
+# nothing.
 #
 # Actions are named by the commit they are at, with the version it is in a comment: a tag can be
 # moved to other code afterwards, a commit cannot.
 name: Release
 
 on:
+  push:
+    tags: ["v*"]
   release:
     types: [published]
 
 permissions:
   contents: read
 
-env:
-  TAG: ${{ github.event.release.tag_name }}
+# The run that makes a tag's draft and the run its publication starts never overlap.
+concurrency:
+  group: release-${{ github.event.release.tag_name || github.ref_name }}
+  cancel-in-progress: false
 
+env:
+  TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || github.ref_name }}
+
+# Every job names its runner, ubuntu-24.04 (and ubuntu-24.04-arm), not ubuntu-latest: a draft is published up to 88
+# days after its tag's run, and both runs are to use the Ubuntu release (its openssl, Python, skopeo of that release)
+# they were written and tried for. It fixes the Ubuntu release, not the runner image: GitHub still updates that every
+# week, with the fixes of that release. Moving to a newer Ubuntu release is a change made on purpose, here.
 jobs:
+  # ---- On the tag: everything is checked, built, tested, scanned and signed, and made a draft release. ----
+
+  # A release is of a commit on main, and cannot bypass browser, lint/type, platform-matrix and required integration CI.
+  tested_commit:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 100
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      # A version is three numbers (vX.Y.Z), as the publication, the image record and the updater's wheel name take
+      # it: any other tag stops here, first of all, and not after a person has published an immutable release of it.
+      # (No leading zeros either: the build names the files of v0.2.01 as 0.2.1, and nothing would match.)
+      - name: The tag is a version of three numbers
+        run: |
+          version='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          [[ "$TAG" =~ $version ]] || { echo "$TAG is not a version tag vX.Y.Z: nothing is released of it." >&2; exit 1; }
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Only a commit on the protected branch main is released: a v* tag may be made on any commit. main is asked
+      # for by the branch's full name (a tag called main is not main), and the tagged commit must lie in its history.
+      - name: Require the commit to be on main
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" > "$RUNNER_TEMP/main.json"
+          main=$(jq --raw-output '.object.sha' "$RUNNER_TEMP/main.json")
+          gh api "repos/$GITHUB_REPOSITORY/compare/$main...$GITHUB_SHA" > "$RUNNER_TEMP/compare.json"
+          python3 .github/security/check-required-ci.py --on-main "$RUNNER_TEMP/main.json" "$RUNNER_TEMP/compare.json" "$GITHUB_SHA"
+      - name: Require successful Tests for this exact commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 380); do
+            runs=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow tests.yml \
+              --commit "$GITHUB_SHA" --limit 100 --json databaseId,createdAt,headSha,status,conclusion,event)
+            latest=$(jq --arg sha "$GITHUB_SHA" \
+              '[.[] | select(.headSha == $sha and (.event == "push" or .event == "workflow_dispatch"))] | sort_by(.createdAt, .databaseId) | last' <<< "$runs")
+            if jq --exit-status '.status == "completed" and .conclusion == "success"' <<< "$latest" > /dev/null; then
+              run_id=$(jq --raw-output '.databaseId' <<< "$latest")
+              gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id" > "$RUNNER_TEMP/required-ci-before.json"
+              gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/jobs?filter=latest&per_page=100" \
+                --paginate --slurp > "$RUNNER_TEMP/required-ci-jobs.json"
+              # Read the run again after its jobs: a concurrent rerun must not reuse a stale success.
+              gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id" > "$RUNNER_TEMP/required-ci-run.json"
+              jq --exit-status --slurp '.[0].run_attempt == .[1].run_attempt' \
+                "$RUNNER_TEMP/required-ci-before.json" "$RUNNER_TEMP/required-ci-run.json" > /dev/null
+              python3 .github/security/check-required-ci.py \
+                "$RUNNER_TEMP/required-ci-run.json" "$RUNNER_TEMP/required-ci-jobs.json" "$GITHUB_SHA"
+              exit 0
+            fi
+            if [ "$attempt" -gt 4 ] && ! jq --exit-status '. != null and .status != "completed"' <<< "$latest" > /dev/null; then
+              echo 'No successful Tests run for this commit. Run/retry Tests at the release tag, then retry the release.' >&2
+              exit 1
+            fi
+            sleep 15
+          done
+          echo 'Timed out waiting for required CI; no release artifacts were published.' >&2
+          exit 1
+
+  # Makes the packages and nothing else: the tools that make them are pinned by hash, no build environment is fetched,
+  # and the packages are checksummed and handed on right after they are made (the checksum list's own hash as a job
+  # output, beside the artifact). Others' code that tries them (twine, pytest, pip-audit, and what the wheel pulls
+  # in) runs in the next job, on a copy held to that hash; were it to change the artifact itself, sign, which holds
+  # what it signs to the same hash, refuses.
   build:
-    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    needs: tested_commit
+    runs-on: ubuntu-24.04
+    outputs:
+      sums: ${{ steps.sums.outputs.sums }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -58,16 +212,69 @@ jobs:
           version=$(python -c "import runpy; print(runpy.run_path('qkvm/_version.py')['__version__'])")
           test "v$version" = "$TAG" || { echo "tag $TAG does not match version $version"; exit 1; }
 
-      # What is published has passed its own tests, as tagged: not "it passed on another day".
-      - name: Tests
+      # (python -m build makes the source archive, and the wheel from it, with the hatchling pinned here.)
+      - name: Build, with the tools pinned by hash
         run: |
-          python -m pip install . pytest
-          python -m pytest -q
+          python -m pip install --require-hashes --no-deps --only-binary :all: -r .github/security/build-requirements.txt
+          python -m build --no-isolation
+      # In a folder of their own: what goes to PyPI is the packages and nothing else. Both are in the checksums
+      # that are signed, and PyPI gets neither unless it is the one listed there.
+      - id: sums
+        name: Checksums, right after the build
+        run: |
+          set -euo pipefail
+          mkdir release
+          cp dist/*.whl dist/*.tar.gz release/
+          cd release && sha256sum -- *.whl *.tar.gz > SHA256SUMS
+          # (Into a variable first: a failing substitution in an argument of echo passes set -e unseen.)
+          sums=$(sha256sum SHA256SUMS | cut -d ' ' -f 1)
+          [[ "$sums" =~ ^[0-9a-f]{64}$ ]]
+          echo "sums=$sums" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release
+          path: release/
+          if-no-files-found: error
+          overwrite: true
 
-      - name: Build
+  # The packages as built, tried: on a copy held first to the checksum the build job handed on. What runs here (twine,
+  # pytest, pip-audit, the wheel's dependencies, all from PyPI) can at most change an artifact, never have that
+  # signed: sign holds the packages to the build's hash and the image evidence to the image jobs', and refuses.
+  packages:
+    if: github.event_name == 'push'
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release
+          path: release/
+      - name: The packages are the ones the build checksummed
+        env:
+          SUMS: ${{ needs.build.outputs.sums }}
         run: |
-          python -m pip install build twine
-          python -m build
+          set -euo pipefail
+          [[ "$SUMS" =~ ^[0-9a-f]{64}$ ]]
+          test "$(sha256sum release/SHA256SUMS | cut -d ' ' -f 1)" = "$SUMS"
+          (cd release && sha256sum --check --strict SHA256SUMS)
+          test "$(ls release | wc -l)" -eq 3
+          mkdir dist
+          cp release/*.whl release/*.tar.gz dist/
+      # Before anything is installed beside it, and with Python's own library only (-I -S): the source archive holds,
+      # file for file, the code of the wheel and declares the same dependencies; the wheel holds nothing but qkvm/ and
+      # its own dist-info, every name in either plain.
+      - name: The source archive is the wheel's source, and the wheel holds nothing else
+        run: python -I -S .github/security/check-sdist.py dist/*.whl dist/*.tar.gz
+
+      - name: The packages are well formed
+        run: |
+          python -m pip install twine
           python -m twine check --strict dist/*
 
       - name: The package installs, and is the version the tag says
@@ -76,32 +283,116 @@ jobs:
           /tmp/installed/bin/pip install dist/*.whl
           cd /tmp && test "$(/tmp/installed/bin/qkvm --version)" = "qkvm ${TAG#v}"
 
-      # In a folder of their own: what goes to PyPI is the packages and nothing else.
-      - name: Checksums
+      # What is published has passed its own tests, as built: not "it passed on another day", and not the source
+      # tree (python -m pytest in the checkout imports ./qkvm). The suite runs from outside the tree against the wheel
+      # installed above, and refuses to start on any other copy of qkvm.
+      - name: Tests, against the installed wheel
         run: |
-          mkdir release
-          cp dist/*.whl release/
-          cd release && sha256sum -- *.whl > SHA256SUMS
+          /tmp/installed/bin/pip install pytest
+          cd /tmp
+          /tmp/installed/bin/python -P -c 'import sys, qkvm, pytest; assert qkvm.__file__.startswith(sys.prefix + "/lib/"), qkvm.__file__; raise SystemExit(pytest.main(["--import-mode=importlib", "-q", "-p", "no:cacheprovider", sys.argv[1]]))' "$GITHUB_WORKSPACE/tests"
 
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: packages
-          path: dist/
-          if-no-files-found: error
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: release
-          path: release/
-          if-no-files-found: error
+      # The source archive goes to PyPI too: checked above to hold the code of the wheel that was tested, it also
+      # installs by itself as the tag's version.
+      - name: The source archive installs by itself
+        run: |
+          python -m venv /tmp/from-source
+          /tmp/from-source/bin/pip install dist/*.tar.gz
+          cd /tmp && test "$(/tmp/from-source/bin/qkvm --version)" = "qkvm ${TAG#v}"
 
-  # Signs what was built, and attaches it to the release. Nothing from PyPI is installed or run here: the
-  # system's own Python, its packaged cryptography library, and qkvm/release.py as it is at the tag.
-  attach:
+      - name: Fresh dependency audit of the built wheel
+        run: bash .github/security/audit-wheel.sh dist/*.whl dependency-audit
+      - name: Retain dependency audit evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dependency-security
+          path: dependency-audit/
+          if-no-files-found: warn
+          retention-days: 90
+          overwrite: true
+
+  # Both architectures are built, exercised and scanned without write permissions or secrets.
+  # The resulting OCI archives (including SBOM/provenance) are the only images allowed to publish. They are kept until
+  # the draft can have been published: the image job of the publication takes them from this run.
+  # (One job for each architecture, not a matrix: a matrix's legs share one set of job outputs and overwrite each
+  # other's, and each hands on the hashes of what it made.) Kernel sandbox checks must execute natively, not through
+  # syscall emulation.
+  images_amd64:
+    if: github.event_name == 'push'
     needs: build
-    runs-on: ubuntu-latest
-    environment: release  # where the signing key is kept
+    runs-on: ubuntu-24.04
+    outputs:
+      archive: ${{ steps.image.outputs.archive }}
+      scan: ${{ steps.image.outputs.scan }}
+      native: ${{ steps.image.outputs.native }}
+      artifact: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # (The action takes the hashes of the archive and its evidence right after the scan and the native step,
+      # before it installs anything on this runner; sign holds the evidence to them.)
+      - id: image
+        uses: ./.github/security
+        with:
+          arch: amd64
+      # (The ID this upload gets is handed on: the draft is made only while no archive of this name newer than this one
+      # is listed. It replaces one of its name, as every upload of this run does: a run again uploads anew.)
+      - id: upload
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-image-amd64
+          path: image-amd64/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 90
+          overwrite: true
+
+  images_arm64:
+    if: github.event_name == 'push'
+    needs: build
+    runs-on: ubuntu-24.04-arm
+    outputs:
+      archive: ${{ steps.image.outputs.archive }}
+      scan: ${{ steps.image.outputs.scan }}
+      native: ${{ steps.image.outputs.native }}
+      artifact: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # (The action takes the hashes of the archive and its evidence right after the scan and the native step,
+      # before it installs anything on this runner; sign holds the evidence to them.)
+      - id: image
+        uses: ./.github/security
+        with:
+          arch: arm64
+      # (The ID this upload gets is handed on: the draft is made only while no archive of this name newer than this one
+      # is listed. It replaces one of its name, as every upload of this run does: a run again uploads anew.)
+      - id: upload
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-image-arm64
+          path: image-arm64/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 90
+          overwrite: true
+
+  # Signs what was built and checked, and nothing else: the only job that has the key, and it makes no release.
+  # Nothing is installed or run here but the runner's own tools: its Python (no library beyond Python's own), its
+  # openssl, and qkvm/release.py and image-digests.py as they are at the tag. What it signed goes on as an artifact.
+  sign:
+    if: github.event_name == 'push'
+    needs: [build, packages, images_amd64, images_arm64]
+    runs-on: ubuntu-24.04
+    environment: release  # the signing key, and nothing else (see the top of this file)
     permissions:
-      contents: write  # to attach files to the release
+      contents: read
+    outputs:
+      sums: ${{ steps.signed.outputs.sums }}
+      sig: ${{ steps.signed.outputs.sig }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -110,54 +401,437 @@ jobs:
         with:
           name: release
           path: release/
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: container-security-amd64
+          path: evidence/container-security-amd64/
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: container-security-arm64
+          path: evidence/container-security-arm64/
+
+      - name: The packages are the ones the build checksummed and the next job tried
+        env:
+          SUMS: ${{ needs.build.outputs.sums }}
+        run: |
+          set -euo pipefail
+          [[ "$SUMS" =~ ^[0-9a-f]{64}$ ]]
+          test "$(sha256sum release/SHA256SUMS | cut -d ' ' -f 1)" = "$SUMS"
+          (cd release && sha256sum --check --strict SHA256SUMS)
+
+      # The scans and native versions are the ones the image jobs made (their hashes handed on as job outputs, not
+      # taken from the artifacts), and each scan's record names the archive its job made.
+      - name: The scans are the ones the image jobs made
+        env:
+          AMD64_ARCHIVE: ${{ needs.images_amd64.outputs.archive }}
+          AMD64_SCAN: ${{ needs.images_amd64.outputs.scan }}
+          AMD64_NATIVE: ${{ needs.images_amd64.outputs.native }}
+          ARM64_ARCHIVE: ${{ needs.images_arm64.outputs.archive }}
+          ARM64_SCAN: ${{ needs.images_arm64.outputs.scan }}
+          ARM64_NATIVE: ${{ needs.images_arm64.outputs.native }}
+        run: |
+          set -euo pipefail
+          for arch in amd64 arm64; do
+            archive="${arch^^}_ARCHIVE"
+            scan="${arch^^}_SCAN"
+            native="${arch^^}_NATIVE"
+            for value in "${!archive}" "${!scan}" "${!native}"; do [[ "$value" =~ ^[0-9a-f]{64}$ ]]; done
+            test "$(sha256sum "evidence/container-security-$arch/scanned-image.json" | cut -d ' ' -f 1)" = "${!scan}"
+            test "$(sha256sum "evidence/container-security-$arch/native-versions.json" | cut -d ' ' -f 1)" = "${!native}"
+            test "$(jq --raw-output .archive.sha256 "evidence/container-security-$arch/scanned-image.json")" = "${!archive}"
+          done
+
+      # What each architecture's scan saw, what each image said of the native code the scanner cannot see, the commit,
+      # and the run that keeps the archives: signed with the packages, so that the publication pushes those archives
+      # and nothing else, and kept with the release, after the artifacts have expired.
+      - name: The image record, in the checksums that are signed
+        run: |
+          set -euo pipefail
+          python3 .github/security/image-digests.py release-record --version "${TAG#v}" --commit "$GITHUB_SHA" \
+            --run-id "$GITHUB_RUN_ID" --output "release/qkvm-${TAG#v}-image.json" \
+            --native evidence/container-security-amd64/native-versions.json --native evidence/container-security-arm64/native-versions.json \
+            evidence/container-security-amd64/scanned-image.json evidence/container-security-arm64/scanned-image.json
+          (cd release && sha256sum -- "qkvm-${TAG#v}-image.json" >> SHA256SUMS)
 
       # Refuses to go on where the result would be a release that no copy installs (not signed although
-      # this version takes only signed ones, or signed with another key than the ones built into it).
-      - name: Sign
+      # this version takes only signed ones, or signed with another key than the ones built into it). Nothing is
+      # installed beside the key: the runner's own openssl signs (the very bytes the cryptography library would make),
+      # and an openssl that does not sign as RFC 8032 says is refused.
+      - name: Sign, with the runner's own openssl
         env:
           RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+        run: /usr/bin/python3 -m qkvm.release publish --openssl release/SHA256SUMS
+      # What was signed, by hash, handed on as job outputs: signature and draft hold their copies to them.
+      - id: signed
+        name: The hashes of what was signed
         run: |
-          /usr/bin/python3 -c "import cryptography" 2>/dev/null || { sudo apt-get update --quiet && sudo apt-get install --yes --quiet python3-cryptography; }
-          /usr/bin/python3 -m qkvm.release publish release/SHA256SUMS
+          set -euo pipefail
+          # (Into variables first: a failing substitution in an argument of echo passes set -e unseen.)
+          sums=$(sha256sum release/SHA256SUMS | cut -d ' ' -f 1)
+          sig=$(sha256sum release/SHA256SUMS.sig | cut -d ' ' -f 1)
+          [[ "$sums" =~ ^[0-9a-f]{64}$ && "$sig" =~ ^[0-9a-f]{64}$ ]]
+          echo "sums=$sums" >> "$GITHUB_OUTPUT"
+          echo "sig=$sig" >> "$GITHUB_OUTPUT"
+      # (Kept one day: a valid signature over a build nobody has published yet, which anyone can download from a public
+      # repository's run while it is kept; only this run reads it.)
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: signed
+          path: release/
+          if-no-files-found: error
+          retention-days: 1
+          overwrite: true
 
-      # (Not replacing what is there: run a second time for one tag, this stops, and what copies have
-      # already downloaded stays what the release holds. Remove the files by hand to publish them anew.)
-      - name: Attach to the release
+  # The signature openssl made, checked by another implementation, the cryptography library every installed copy
+  # checks with, before any draft exists: an openssl that is wrong but agrees with itself would otherwise make a
+  # release that no copy installs. No secret here (and so the library may be installed where the runner lacks it).
+  signature:
+    if: github.event_name == 'push'
+    needs: sign
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: signed
+          path: signed/
+      - name: The signed files are the ones sign made
+        env:
+          SUMS: ${{ needs.sign.outputs.sums }}
+          SIG: ${{ needs.sign.outputs.sig }}
+        run: |
+          set -euo pipefail
+          [[ "$SUMS" =~ ^[0-9a-f]{64}$ && "$SIG" =~ ^[0-9a-f]{64}$ ]]
+          test "$(sha256sum signed/SHA256SUMS | cut -d ' ' -f 1)" = "$SUMS"
+          test "$(sha256sum signed/SHA256SUMS.sig | cut -d ' ' -f 1)" = "$SIG"
+          (cd signed && sha256sum --check --strict SHA256SUMS)
+      - name: The signature, checked by the cryptography library
+        run: |
+          set -euo pipefail
+          files=()
+          for path in signed/*; do
+            case "${path##*/}" in SHA256SUMS|SHA256SUMS.sig) ;; *) files+=("$path") ;; esac
+          done
+          /usr/bin/python3 -c "import cryptography" 2>/dev/null || { sudo apt-get update --quiet && sudo apt-get install --yes --quiet python3-cryptography; }
+          /usr/bin/python3 -m qkvm.release verify --all --signed signed/SHA256SUMS "${files[@]}"
+
+  # Makes the draft release of what was signed and checked, with every file attached, then reads every file back
+  # from the draft and checks it against the signature. No key here; nothing is installed.
+  draft:
+    if: github.event_name == 'push'
+    needs: [sign, signature, images_amd64, images_arm64]
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read  # when the run's image archives expire
+      contents: write  # to make the draft release
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: signed
+          path: release/
+      - name: The signed files are the ones sign made
+        env:
+          SUMS: ${{ needs.sign.outputs.sums }}
+          SIG: ${{ needs.sign.outputs.sig }}
+        run: |
+          set -euo pipefail
+          [[ "$SUMS" =~ ^[0-9a-f]{64}$ && "$SIG" =~ ^[0-9a-f]{64}$ ]]
+          test "$(sha256sum release/SHA256SUMS | cut -d ' ' -f 1)" = "$SUMS"
+          test "$(sha256sum release/SHA256SUMS.sig | cut -d ' ' -f 1)" = "$SIG"
+          (cd release && sha256sum --check --strict SHA256SUMS)
+
+      # (Not replacing what is there: a tag that has a release, draft or published, stops here. Remove a draft by hand
+      # to make it anew; a published release stays what it is.)
+      - name: No release of this tag yet
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "$TAG" release/*
+        run: |
+          set -euo pipefail
+          # (jq is handed the tag as a value, never a program made of it.)
+          found=$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" --paginate | jq --arg tag "$TAG" '.[] | select(.tag_name == $tag) | .id')
+          if [ -n "$found" ]; then
+            echo "$TAG has a release already (draft or published); nothing was made." >&2
+            exit 1
+          fi
 
-  # The same files that were built and checked above, not built again.
+      # The signed list names the three files of this version and nothing else, before a draft of it exists; and the
+      # folder whose every file the draft is made with holds those three, the list and its signature, and nothing
+      # else (each a plain file): a sixth would go onto the draft unchecked.
+      - name: The signed list is this version's three files, and the folder holds those, the list and its signature only
+        run: |
+          set -euo pipefail
+          listed=$(awk '{print $2}' release/SHA256SUMS | LC_ALL=C sort | tr '\n' ' ')
+          test "$listed" = "qkvm-${TAG#v}-image.json qkvm-${TAG#v}-py3-none-any.whl qkvm-${TAG#v}.tar.gz "
+          test -z "$(find release -mindepth 1 ! -type f)"
+          held=$(ls -A release | LC_ALL=C sort | tr '\n' ' ')
+          test "$held" = "SHA256SUMS SHA256SUMS.sig qkvm-${TAG#v}-image.json qkvm-${TAG#v}-py3-none-any.whl qkvm-${TAG#v}.tar.gz "
+
+      - name: Make the draft release, then check every file it holds against the signature
+        env:
+          GH_TOKEN: ${{ github.token }}
+          AMD64_ARTIFACT: ${{ needs.images_amd64.outputs.artifact }}
+          ARM64_ARTIFACT: ${{ needs.images_arm64.outputs.artifact }}
+        run: |
+          set -euo pipefail
+          # The last day to publish on: when the first of the run's image archives expires (as GitHub says, whatever the
+          # repository's retention and however long this run waited), less two days. No day left: no draft. And the
+          # archive of each architecture is the very one its image job uploaded (the ID it handed on): one of that name
+          # uploaded after it, by whatever else got at the run's artifacts, stops the draft here, as does its absence;
+          # an earlier one (a lower ID, an earlier attempt's where GitHub keeps it beside a run again's) is let be.
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100" --paginate --slurp > "$RUNNER_TEMP/artifacts.json"
+          until=$(python3 .github/security/image-digests.py publish-before "$RUNNER_TEMP/artifacts.json" --margin-days 2 --artifact-id "amd64=$AMD64_ARTIFACT" --artifact-id "arm64=$ARM64_ARTIFACT")
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft --verify-tag --title "qKVM ${TAG#v}" \
+            --notes "qKVM ${TAG#v}. What changed is in CHANGELOG.md. Publish this draft before $until: the image archives it sends to the registries are kept until then." release/*
+          id=$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" --paginate | jq --arg tag "$TAG" '.[] | select(.tag_name == $tag) | .id')
+          test "$(wc -w <<< "$id")" -eq 1
+          gh api "repos/$GITHUB_REPOSITORY/releases/$id" --jq '.draft' | grep --quiet --line-regexp true
+          drafted="$RUNNER_TEMP/drafted"
+          mkdir "$drafted"
+          gh api "repos/$GITHUB_REPOSITORY/releases/$id/assets?per_page=100" --paginate --jq '.[] | "\(.id) \(.name)"' |
+            while read -r asset name; do
+              case "$name" in ""|.*|*/*) echo "The draft holds a file named '$name'" >&2; exit 1 ;; esac
+              gh api -H "Accept: application/octet-stream" "repos/$GITHUB_REPOSITORY/releases/assets/$asset" > "$drafted/$name"
+            done
+          files=()
+          for path in "$drafted"/*; do
+            case "${path##*/}" in SHA256SUMS|SHA256SUMS.sig) ;; *) files+=("$path") ;; esac
+          done
+          # Signed with a key built in, every file it holds listed with its checksum, every file listed held.
+          /usr/bin/python3 -m qkvm.release verify --all --signed --openssl "$drafted/SHA256SUMS" "${files[@]}"
+          # And the list names the three files of this version and nothing else, as the publication will require.
+          listed=$(awk '{print $2}' "$drafted/SHA256SUMS" | LC_ALL=C sort | tr '\n' ' ')
+          test "$listed" = "qkvm-${TAG#v}-image.json qkvm-${TAG#v}-py3-none-any.whl qkvm-${TAG#v}.tar.gz "
+          # The very files the cryptography library checked in the job before (and openssl here).
+          cmp "$drafted/SHA256SUMS" release/SHA256SUMS
+          cmp "$drafted/SHA256SUMS.sig" release/SHA256SUMS.sig
+          echo "Draft release of $TAG made and checked. Review it, then publish it to send it to PyPI and the registries."
+
+  # ---- On publication of the draft (by a person): what it holds goes to PyPI and the registries. ----
+
+  # Before anything goes anywhere: every file of the published release, held to its signature (a file added to the
+  # draft after it was checked, or one the signed list does not name, stops the publication), and the image archives
+  # its signed record names, fetched from the tag's run and held to what the scan saw (archives that expired or were
+  # made anew by a later run of the tag stop it too). No secret and no environment here; both publishing jobs wait
+  # for this one, and PyPI waits for the registries: an image can be pushed again, an upload to PyPI is for good.
+  published:
+    if: github.event_name == 'release'
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read  # the image archives of the tag's run
+      contents: read  # the tagged code that checks, and the published release's files
+    outputs:
+      run: ${{ steps.checked.outputs.run }}
+      sums: ${{ steps.checked.outputs.sums }}
+    steps:
+      # The draft is made as a final release; one ticked "pre-release" when it is published would go to PyPI as the
+      # version and could take the image tags. It goes nowhere.
+      - name: Not a pre-release
+        env:
+          PRERELEASE: ${{ github.event.release.prerelease }}
+        run: |
+          if [ "$PRERELEASE" != "false" ]; then
+            echo "$TAG was published as a pre-release: this workflow publishes final releases only, and nothing went out." >&2
+            exit 1
+          fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: checked
+        name: Every file of the published release, held to its signature
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir "$RUNNER_TEMP/published"
+          files=()
+          for path in "$RUNNER_TEMP/published"/*; do
+            case "${path##*/}" in SHA256SUMS|SHA256SUMS.sig) ;; *) files+=("$path") ;; esac
+          done
+          /usr/bin/python3 -c "import cryptography" 2>/dev/null || { sudo apt-get update --quiet && sudo apt-get install --yes --quiet python3-cryptography; }
+          # Signed with a key built in, every file it holds listed with its checksum, every file listed held.
+          /usr/bin/python3 -m qkvm.release verify --all --signed "$RUNNER_TEMP/published/SHA256SUMS" "${files[@]}"
+          # And the list names the three files of this version and nothing else: the wheel the updater takes by this
+          # name, the source archive, the image record.
+          listed=$(awk '{print $2}' "$RUNNER_TEMP/published/SHA256SUMS" | LC_ALL=C sort | tr '\n' ' ')
+          test "$listed" = "qkvm-${TAG#v}-image.json qkvm-${TAG#v}-py3-none-any.whl qkvm-${TAG#v}.tar.gz "
+          mkdir "$RUNNER_TEMP/records"
+          run=$(python3 .github/security/image-digests.py from-release --version "${TAG#v}" --commit "$GITHUB_SHA" "$RUNNER_TEMP/published/qkvm-${TAG#v}-image.json" "$RUNNER_TEMP/records")
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+          # The publishing jobs check no signature (that would mean installing a library where their secrets are):
+          # they are handed the hash of the list whose signature was checked here, and hold their files to that list.
+          sums=$(sha256sum "$RUNNER_TEMP/published/SHA256SUMS" | cut -d ' ' -f 1)
+          [[ "$sums" =~ ^[0-9a-f]{64}$ ]]
+          echo "sums=$sums" >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-image-amd64
+          path: images/release-image-amd64/
+          run-id: ${{ steps.checked.outputs.run }}
+          github-token: ${{ github.token }}
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-image-arm64
+          path: images/release-image-arm64/
+          run-id: ${{ steps.checked.outputs.run }}
+          github-token: ${{ github.token }}
+      - name: Both archives are the ones the scan saw
+        run: |
+          set -euo pipefail
+          for arch in amd64 arm64; do
+            (cd "images/release-image-$arch" && sha256sum --check --strict SHA256SUMS)
+            python3 .github/security/image-digests.py check-archive --arch "$arch" "$RUNNER_TEMP/records/scanned-image-$arch.json" "images/release-image-$arch/image.tar"
+          done
+
+  # The packages of the published release, each held to the SHA256SUMS whose signature the first job checked, before
+  # PyPI gets it. Nothing is installed or run here before the upload but the runner's own tools (gh, sha256sum, awk).
   pypi:
-    needs: [build, attach]
-    runs-on: ubuntu-latest
+    if: github.event_name == 'release'
+    needs: [published, image]
+    runs-on: ubuntu-24.04
     environment:
       name: pypi
       url: https://pypi.org/project/qkvm/
     permissions:
+      contents: read  # the published release's files
       id-token: write  # how GitHub vouches to PyPI for this workflow; there is no token to steal
     steps:
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          name: packages
-          path: dist/
+      - name: Every file to upload is the one the checked list names (the list names exactly these two packages)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUMS: ${{ needs.published.outputs.sums }}
+        run: |
+          set -euo pipefail
+          [[ "$SUMS" =~ ^[0-9a-f]{64}$ ]]
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern SHA256SUMS --dir "$RUNNER_TEMP/signed"
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "qkvm-${TAG#v}-py3-none-any.whl" --pattern "qkvm-${TAG#v}.tar.gz" --dir dist
+          test "$(ls dist | wc -l)" -eq 2
+          test "$(sha256sum "$RUNNER_TEMP/signed/SHA256SUMS" | cut -d ' ' -f 1)" = "$SUMS"
+          awk -v wheel="qkvm-${TAG#v}-py3-none-any.whl" -v source="qkvm-${TAG#v}.tar.gz" '$2 == wheel || $2 == source' "$RUNNER_TEMP/signed/SHA256SUMS" > "$RUNNER_TEMP/packages.sums"
+          test "$(wc -l < "$RUNNER_TEMP/packages.sums")" -eq 2
+          (cd dist && sha256sum --check --strict "$RUNNER_TEMP/packages.sums")
       - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
 
+  # Transfer the scanned bytes; no Dockerfile, dependency installation or image rebuild runs here. The archives are the
+  # ones the published release's signed image record names (kept by the tag's run), held to what the scan saw before
+  # anything is pushed, and every tag is read back from the registries after.
   image:
-    needs: [build, attach]  # only once the tag is known to match the code, and the release has its files
-    runs-on: ubuntu-latest
+    if: github.event_name == 'release'
+    needs: published
+    # One image job at a time, whatever the tag: which version `latest` and `X.Y` name is decided in here, right
+    # before they move, and no other publication moves them meanwhile. (GitHub keeps one waiting job per group: when
+    # another image job queues while one runs and one waits, the one that was waiting is cancelled, before it started,
+    # and the new one waits in its place. Look for an image job cancelled that way; Re-run all jobs of that
+    # publication's run mends it.)
+    concurrency:
+      group: image-tags-of-every-release
+      cancel-in-progress: false
+    runs-on: ubuntu-24.04
+    environment: registries  # the registries' credentials, and nothing else (see the top of this file)
     permissions:
+      actions: read  # the image archives of the tag's run
       contents: read
-      packages: write  # to push to ghcr.io
+      packages: write
     env:
       DOCKERHUB_IMAGE: ${{ vars.DOCKERHUB_IMAGE }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
-      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-
+      # The image record is believed only as the list the first job checked names it, and only if it was made for this
+      # version and this commit and names the run the first job checked. (Python here runs image-digests.py, which
+      # needs nothing but Python's own library.)
+      - name: The published release's image record, as the checked list names it
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUMS: ${{ needs.published.outputs.sums }}
+          RUN: ${{ needs.published.outputs.run }}
+        run: |
+          set -euo pipefail
+          [[ "$SUMS" =~ ^[0-9a-f]{64}$ ]]
+          command -v skopeo > /dev/null || { echo "This runner has no skopeo; nothing is installed in a job that holds the registries' credentials." >&2; exit 1; }
+          # (imagetools create, below, is buildx of the runner's own docker: no builder is set up, nothing is installed.)
+          docker buildx version > /dev/null || { echo "This runner's docker has no buildx; nothing is installed in a job that holds the registries' credentials." >&2; exit 1; }
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern SHA256SUMS --pattern "qkvm-${TAG#v}-image.json" --dir "$RUNNER_TEMP/signed"
+          test "$(sha256sum "$RUNNER_TEMP/signed/SHA256SUMS" | cut -d ' ' -f 1)" = "$SUMS"
+          awk -v record="qkvm-${TAG#v}-image.json" '$2 == record' "$RUNNER_TEMP/signed/SHA256SUMS" > "$RUNNER_TEMP/record.sums"
+          test "$(wc -l < "$RUNNER_TEMP/record.sums")" -eq 1
+          (cd "$RUNNER_TEMP/signed" && sha256sum --check --strict "$RUNNER_TEMP/record.sums")
+          run=$(python3 .github/security/image-digests.py from-release --version "${TAG#v}" --commit "$GITHUB_SHA" "$RUNNER_TEMP/signed/qkvm-${TAG#v}-image.json" "$RUNNER_TEMP/signed")
+          test "$run" = "$RUN"
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-image-amd64
+          path: images/release-image-amd64/
+          run-id: ${{ needs.published.outputs.run }}
+          github-token: ${{ github.token }}
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-image-arm64
+          path: images/release-image-arm64/
+          run-id: ${{ needs.published.outputs.run }}
+          github-token: ${{ github.token }}
+      - name: Verify both archives against the signed record of what the scan saw
+        run: |
+          set -euo pipefail
+          for arch in amd64 arm64; do
+            (cd "images/release-image-$arch" && sha256sum --check --strict SHA256SUMS)
+            python3 .github/security/image-digests.py check-archive --arch "$arch" "$RUNNER_TEMP/signed/scanned-image-$arch.json" "images/release-image-$arch/image.tar"
+          done
+      - id: where
+        name: Where the image goes
+        run: |
+          {
+            echo "images<<END"
+            echo "ghcr.io/${GITHUB_REPOSITORY,,}"
+            if [ -n "$DOCKERHUB_IMAGE" ]; then echo "docker.io/$DOCKERHUB_IMAGE"; fi
+            echo "END"
+          } >> "$GITHUB_OUTPUT"
+      # The image tags that move go to the newest version only: latest to the newest of all, X.Y to the newest of its
+      # line (a fix to an older line published after a newer version moves neither back). Read here, at the last step
+      # before the tags are named, in the one image job that runs: not taken from an earlier job, nor from an earlier
+      # run of this one. GitHub's own "Latest" label is set by whoever publishes, and is what the in-app updater asks
+      # for: a warning says where it is elsewhere.
+      - id: newest
+        name: Whether this is the newest released version, of all and of its line
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" --paginate --slurp > "$RUNNER_TEMP/releases.json"
+          github_latest=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" | jq --raw-output .tag_name) || github_latest=""
+          python3 .github/security/newest-release.py "$RUNNER_TEMP/releases.json" "$TAG" --github-latest "$github_latest" >> "$GITHUB_OUTPUT"
+      # The tags each registry gets, named here, before any login: the full version always; X.Y and latest only where
+      # the step before says this is the newest of its line and of all. (Plain shell, no action of others' code.)
+      - id: names
+        name: The tags, named before any login
+        env:
+          IMAGES: ${{ steps.where.outputs.images }}
+          MINOR: ${{ steps.newest.outputs.minor }}
+          LATEST: ${{ steps.newest.outputs.latest }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          shape='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          [[ "$version" =~ $shape ]]
+          [[ "$MINOR" == true || "$MINOR" == false ]]
+          [[ "$LATEST" == true || "$LATEST" == false ]]
+          line="${version%.*}"
+          {
+            echo "tags<<END"
+            while IFS= read -r image; do
+              echo "$image:$version"
+              if [ "$MINOR" = true ]; then echo "$image:$line"; fi
+              if [ "$LATEST" = true ]; then echo "$image:latest"; fi
+            done <<< "$IMAGES"
+            echo "END"
+          } >> "$GITHUB_OUTPUT"
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
@@ -168,32 +842,43 @@ jobs:
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - id: where
-        name: Where the image goes
+      - name: Publish the scanned archives and their multiarchitecture index, and read back what the registries hold
+        env:
+          IMAGES: ${{ steps.where.outputs.images }}
+          TAGS: ${{ steps.names.outputs.tags }}
         run: |
-          {
-            echo "images<<END"
-            echo "ghcr.io/${GITHUB_REPOSITORY,,}"
-            if [ -n "$DOCKERHUB_IMAGE" ]; then echo "docker.io/$DOCKERHUB_IMAGE"; fi
-            echo "END"
-          } >> "$GITHUB_OUTPUT"
-
-      - id: names
-        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
-        with:
-          images: ${{ steps.where.outputs.images }}
-          tags: |
-            type=semver,pattern={{version}},value=${{ env.TAG }}
-            type=semver,pattern={{major}}.{{minor}},value=${{ env.TAG }}
-
-      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
-        with:
-          context: .
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.names.outputs.tags }}
-          labels: ${{ steps.names.outputs.labels }}
-          # Recorded with the image: what it was built from, and what is in it.
-          provenance: true
-          sbom: true
+          set -euo pipefail
+          auth="${DOCKER_CONFIG:-$HOME/.docker}/config.json"
+          records=("$RUNNER_TEMP/signed/scanned-image-amd64.json" "$RUNNER_TEMP/signed/scanned-image-arm64.json")
+          while IFS= read -r image; do
+            sources=()
+            for arch in amd64 arm64; do
+              archive="images/release-image-$arch/image.tar"
+              record="$RUNNER_TEMP/signed/scanned-image-$arch.json"
+              # The digest the scan saw, not one the archive says of itself; and the archive must say the same.
+              expected=$(python3 .github/security/image-digests.py digest "$record")
+              test "sha256:$(skopeo inspect --raw "oci-archive:$archive" | sha256sum | cut -d ' ' -f 1)" = "$expected"
+              skopeo copy --all --preserve-digests --authfile "$auth" \
+                --digestfile "digest-$arch.txt" "oci-archive:$archive" "docker://$image:${TAG#v}-$arch"
+              test "$(cat "digest-$arch.txt")" = "$expected"
+              # Read back: the registry serves the scanned bytes under that tag.
+              test "sha256:$(skopeo inspect --raw --authfile "$auth" "docker://$image:${TAG#v}-$arch" | sha256sum | cut -d ' ' -f 1)" \
+                = "$expected"
+              sources+=("$image@$expected")
+            done
+            tag_args=()
+            tags=()
+            while IFS= read -r tag; do
+              if [[ "$tag" == "$image:"* ]]; then tag_args+=(--tag "$tag"); tags+=("$tag"); fi
+            done <<< "$TAGS"
+            test "${#tag_args[@]}" -gt 0
+            # Flatten the two single-platform indexes; preserve their image and attestation manifests. What the version
+            # tags are to name is checked before any of them is moved to it, and read back from the registry after.
+            docker buildx imagetools create --dry-run "${tag_args[@]}" "${sources[@]}" > planned-index.json
+            python3 .github/security/image-digests.py check-index planned-index.json "${records[@]}"
+            docker buildx imagetools create "${tag_args[@]}" "${sources[@]}"
+            for tag in "${tags[@]}"; do
+              skopeo inspect --raw --authfile "$auth" "docker://$tag" > published-index.json
+              python3 .github/security/image-digests.py check-index published-index.json "${records[@]}"
+            done
+          done <<< "$IMAGES"

@@ -21,6 +21,7 @@ import pytest
 from qkvm import exchange, kvm, update, vault
 from tests.test_largest_file import rsa_certificate
 from tests.test_wall import PASSWORD, add, closed_port, wall
+from tests.settings_file import settings_text, write_settings_text
 
 F = {"format": exchange.FORMAT, "version": 1}
 
@@ -49,9 +50,9 @@ def a_wall_with_three_devices(folder: Path) -> None:
 @pytest.mark.parametrize("how", list(DAMAGED))
 def test_with_one_remembered_certificate_damaged_the_rest_of_the_wall_is_there(tmp_path: Path, how: str) -> None:
     a_wall_with_three_devices(tmp_path)
-    saved = json.loads((tmp_path / "qkvm.json").read_text(encoding="utf-8"))
+    saved = json.loads(settings_text(tmp_path / "qkvm.json", encoding="utf-8"))
     saved["devices"][0]["cert_pem"] = DAMAGED[how](saved["devices"][0]["cert_pem"])
-    (tmp_path / "qkvm.json").write_text(json.dumps(saved), encoding="utf-8")
+    write_settings_text(tmp_path / "qkvm.json", json.dumps(saved), encoding="utf-8")
     (tmp_path / "qkvm.bak").unlink(missing_ok=True)
     with wall(tmp_path, sign_in=False) as visitor:  # it starts,
         assert visitor.post("/api/v1/login", json={"password": PASSWORD}).status_code == 200  # and is signed in to
@@ -68,9 +69,9 @@ def test_with_one_remembered_certificate_damaged_the_rest_of_the_wall_is_there(t
 
 
 def _edited(folder: Path, change: Any) -> None:
-    saved = json.loads((folder / "qkvm.json").read_text(encoding="utf-8"))
+    saved = json.loads(settings_text(folder / "qkvm.json", encoding="utf-8"))
     change(saved)
-    (folder / "qkvm.json").write_text(json.dumps(saved), encoding="utf-8")
+    write_settings_text(folder / "qkvm.json", json.dumps(saved), encoding="utf-8")
 
 
 @pytest.mark.parametrize(

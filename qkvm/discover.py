@@ -15,11 +15,16 @@ from typing import Any
 
 import httpx
 
-from .kvm import MAX_PROBE, KvmError, bounded, certificate_mark, fetch_certificate, other_way, plain, read_json
+from . import amt
+from .kvm import MAX_PROBE, KvmError, bounded, certificate_mark, fetch_certificate, listens, other_way, plain, read_json
 from .netbind import NO_WINDOW, lan_ip, tailscale_command
+from .rfb import greeting
+from .vncdevice import vnc_url
 
 AT_ONCE = 64  # addresses asked at the same time
 ANSWER_WITHIN = 4.0  # seconds an address has to answer in full; a search must not hang on one that dawdles
+AMT_PORTS = amt.PORTS  # where a PC with Intel AMT would answer on an address: (scheme, port), the preferred way first
+VNC_PORTS = (5900, 5901)  # where a VNC server listens as a rule: the first display, and the second
 TAILNET = ipaddress.ip_network("100.64.0.0/10")  # Tailscale addresses: only peers are asked, not the whole range
 
 
@@ -153,8 +158,37 @@ async def _what_is(client: httpx.AsyncClient, target: Target) -> dict[str, Any] 
             return {"address": target.host, "kind": "redfish", "url": target.kvmd, "name": target.name}
         return None
 
-    first, second, third = await asyncio.gather(kvmd(), jetkvm(), redfish())
-    return first or second or third
+    async def intel_amt() -> dict[str, Any] | None:
+        # A PC with Intel AMT answers on ports of its own, and says what it is to anybody: asked both ways at
+        # once, and taken over TLS where it answers that way. Listed at its plain address only where nothing
+        # listens on its TLS port (as amt.detect decides it): where something there is slow (a scan waits less
+        # than a second), or fails the TLS handshake, it is listed at its TLS address, and adding it says what
+        # is wrong there; the plain way is the person's to type. Where something that is no engine answers
+        # there, it is not listed at all: offered at either address, the password would go to one of two things.
+        host = f"[{target.host}]" if ":" in target.host else target.host
+        candidates = [f"{scheme}://{host}:{port}" for scheme, port in AMT_PORTS]
+        answers = dict(zip(candidates, await asyncio.gather(*(amt.what_answers(client, candidate, ANSWER_WITHIN) for candidate in candidates)), strict=True))
+        secure = next((candidate for candidate in candidates if candidate.startswith("https://")), None)
+        found = next((candidate for candidate, answered in answers.items() if answered == "amt"), None)
+        if found is None:
+            return None
+        if found.startswith("http://") and secure is not None:
+            if answers[secure] == "other":
+                return None
+            # (Asked with a bare connection, and longer than the scan waits: on Windows a refusal takes two seconds.)
+            if await listens(secure):
+                found = secure
+        return {"address": target.host, "kind": "amt", "url": found, "name": target.name}
+
+    async def vnc() -> dict[str, Any] | None:
+        """A VNC server greets whoever connects with its protocol version before a byte is sent to it: that is the whole question."""
+        for port in VNC_PORTS:
+            if await greeting(target.host, port, ANSWER_WITHIN) is not None:
+                return {"address": target.host, "kind": "vnc", "url": vnc_url(f"{target.host}:{port}"), "name": target.name}
+        return None
+
+    first, second, third, fourth, fifth = await asyncio.gather(kvmd(), jetkvm(), redfish(), intel_amt(), vnc())
+    return first or second or third or fourth or fifth
 
 
 async def scan() -> dict[str, Any]:
