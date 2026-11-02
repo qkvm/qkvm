@@ -50,6 +50,7 @@ import struct
 import time
 from collections.abc import Callable
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -508,6 +509,37 @@ def test_d1_a_connection_the_wall_ends_lets_go_first_of_what_it_has_down(hidrpc:
     run(jet, test)
 
 
+@ROADS
+def test_d1_a_connection_the_wall_makes_anew_lets_go_at_once_and_ends_at_once(hidrpc: bool) -> None:
+    # (Register row 16, W14d's open point.) An end the wall decides (keys it was late with: the connection made anew) took effect
+    # only at the next look of the connection's loop, up to a second later: a modifier or a button the live line held stayed
+    # down on the computer until then. The letting go goes as the end is decided, and the connection ends at once.
+    jet = FakeJetKvm(JetState(hidrpc=hidrpc, width=640, height=360)).start()
+
+    async def test(wall: jetkvm.JetKvmDevice) -> None:
+        held = await wall.input_ready()
+        assert isinstance(held, jetkvm._Session)
+        wall.say("keyboardReport", {"modifier": 0x02, "keys": []}, on=held)
+        wall.say("absMouseReport", {"x": 300, "y": 400, "buttons": 1}, on=held)
+        await settled(lambda: jet.state.buttons == 1 and jet.state.modifier == 0x02)
+        await asyncio.sleep(0.2)  # (into the loop's second-long wait)
+        began = time.monotonic()
+        wall._make_anew(held, "a test made it anew")
+        # Let go of as the end is decided: what the wall says it has down is nothing, before anything else runs.
+        assert held.abs_sent is not None and held.abs_sent[2] == 0, held.abs_sent
+        if hidrpc:
+            assert held.kb_sent == jetkvm.NOTHING_DOWN, held.kb_sent  # (over JSON-RPC the JetKVM lets go of the keyboard as it ends)
+        while not held.done.is_set() and time.monotonic() - began < 5:
+            await asyncio.sleep(0.01)
+        ended = time.monotonic() - began
+        # (Ended once the letting go has left, LET_GO_WAIT at the most, not at the loop's next look a second later.)
+        assert held.done.is_set() and ended < jetkvm.LET_GO_WAIT + 0.4, ended
+        await settled(lambda: nothing_down(jet))
+        assert nothing_down(jet), f"down: {jet.state.down} {jet.state.modifier} {jet.state.buttons}"
+
+    run(jet, test)
+
+
 def test_d2_when_the_wall_vanishes_the_jetkvm_lets_go_of_a_held_key_within_a_tenth_of_a_second() -> None:
     # The wall's keep-alives stop as if it were killed, the connection staying open (a JetKVM notices a connection gone
     # only some seconds later). A key that is no modifier: let go of by the JetKVM ~0.1 s after the last keep-alive; a
@@ -675,6 +707,199 @@ def test_e3_a_mouse_button_held_at_the_hand_over_is_let_go_of(hidrpc: bool) -> N
         await settled(lambda: held.taken and jet.state.buttons == 0)
         assert jet.state.done_after_hand_over == [("absMouseReport", {"x": 10, "y": 20, "buttons": 0})], jet.state.done_after_hand_over
         assert nothing_down(jet), f"a button down for whoever took the viewer: {jet.state.buttons}"
+
+    run(jet, test)
+
+
+@ROADS
+def test_e3_a_mouse_button_held_is_let_go_of_where_the_connection_closed_before_the_hand_over_was_heard(monkeypatch: pytest.MonkeyPatch, hidrpc: bool) -> None:
+    # (The 0.2.0 requalification: under load the end of the video stream, which the JetKVM sends as it closes the connection
+    # a second after a hand-over, was taken in before the word of the hand-over, and said "Secure video processing stopped".)
+    # Here the word of the hand-over is held back until the channel it comes over has closed: the order a busy wall can meet.
+    # Nothing can go over a connection that is closed, and the JetKVM keeps a mouse button down across both: the hand-over is
+    # still heard as one (the wall steps aside), the stream's end is not said to be the decoder's, and what was held is owed
+    # to the wall's next connection, which "Show here" makes and which lets go before anything else.
+    jet = FakeJetKvm(JetState(hidrpc=hidrpc, width=640, height=360, hand_over_close=0.3)).start()
+    held_back: list[tuple[Any, str]] = []
+    real_on_message, real_no_more = jetkvm.JetKvmDevice._on_message, jetkvm.JetKvmDevice._no_more_asking
+
+    def on_message(self: Any, session: Any, message: Any) -> None:
+        if isinstance(message, str) and "otherSessionConnected" in message and session.rpc.readyState == "open":
+            held_back.append((session, message))
+            return
+        real_on_message(self, session, message)
+
+    def no_more_asking(self: Any, session: Any) -> None:
+        for waited, message in held_back:  # (heard only now that the channel it came over has closed)
+            real_on_message(self, waited, message)
+        held_back.clear()
+        real_no_more(self, session)
+
+    monkeypatch.setattr(jetkvm.JetKvmDevice, "_on_message", on_message)
+    monkeypatch.setattr(jetkvm.JetKvmDevice, "_no_more_asking", no_more_asking)
+
+    async def test(wall: jetkvm.JetKvmDevice) -> None:
+        held = await wall.input_ready()
+        assert isinstance(held, jetkvm._Session)
+        wall.say("absMouseReport", {"x": 10, "y": 20, "buttons": 1}, on=held)
+        await settled(lambda: jet.state.buttons == 1)
+        jet.hand_over()
+        await settled(lambda: held.done.is_set(), within=10)
+        assert held.done.is_set() and held.taken and wall._displaced, (held.done.is_set(), held.taken)
+        said = " ".join(str(error) for error in (held.error, held.lost) if error is not None)
+        assert "Secure video processing" not in said, said
+        # (Nothing could go over the connection, closed by now: the button is down for whoever took the viewer, until...)
+        # "Show here": the wall's next connection lets go of what the last one could not, before anything else.
+        await wall.act("resume")
+        await settled(lambda: jet.state.buttons == 0)
+        assert nothing_down(jet), f"a button down: {jet.state.buttons}"
+
+    run(jet, test)
+
+
+@pytest.mark.parametrize("why", ["ended", "too_large", "failed"])
+def test_e3_the_end_of_a_video_stream_is_told_from_a_decoder_that_stopped(why: str) -> None:
+    from aiortc.mediastreams import MediaStreamError
+
+    from qkvm import video
+
+    async def check() -> jetkvm._Session:
+        device = jetkvm.JetKvmDevice(kvm.DeviceSpec("j", "jet", "http://127.0.0.1:18901", "", "", kind="jetkvm"))
+        session = jetkvm._Session()
+        session.ready.set()
+        session.decoding = video.BoundedDecoderQueue()
+        session.decoding.ended = why  # (as the queue notes it: the receiver ended the stream, a unit too large came, or decoding failed)
+
+        class Track:
+            async def recv(self) -> object:
+                raise MediaStreamError
+
+        await device._watch(session, Track())
+        return session
+
+    session = asyncio.run(check())
+    if why == "ended":
+        # The JetKVM ended its stream, or the connection ended: the connection is not ended for the decoder's sake; the
+        # hand-over, the channel's close or the connection's end says what it is, and a JetKVM that only ended its video
+        # is taken for one that stopped sending it HAND_OVER_GRACE later (see _hold).
+        assert session.lost is None and not session.done.is_set() and session.video_ended_at is not None
+    else:
+        assert session.lost is not None and session.lost.code == "no_stream" and session.done.is_set()
+        assert ("too large" in session.lost.message) == (why == "too_large"), session.lost.message
+        assert "fell behind" not in session.lost.message, session.lost.message  # (falling behind ends nothing: see below)
+
+
+H264 = SimpleNamespace(mimeType="video/h264")
+# Units of H.264 as the WebRTC library puts them together (Annex B): a picture that needs those before it (a slice of type
+# 1, with an access unit delimiter before it or not), and key frames (parameter sets and an IDR slice; with three-byte start
+# codes and an SEI before them; an IDR slice alone).
+P_FRAME = b"\x00\x00\x00\x01\x41\x9a\x02"
+P_FRAME_AFTER_AUD = b"\x00\x00\x00\x01\x09\xf0\x00\x00\x00\x01\x41\x9a"
+KEY_FRAME = b"\x00\x00\x00\x01\x67\x42\xc0\x1f\x00\x00\x00\x01\x68\xce\x3c\x80\x00\x00\x00\x01\x65\x88\x84"
+KEY_FRAME_SHORT_CODES = b"\x00\x00\x01\x09\xf0\x00\x00\x01\x06\x05\x00\x00\x01\x67\x42\x00\x00\x01\x65\x88"
+IDR_ALONE = b"\x00\x00\x00\x01\x65\x88\x84"
+
+
+def unit(data: bytes) -> tuple[Any, Any]:
+    return (H264, SimpleNamespace(data=data))
+
+
+def test_e3_the_decoders_queue_says_why_decoding_stopped() -> None:
+    from qkvm import video
+
+    ended = video.BoundedDecoderQueue()
+    ended.put(unit(KEY_FRAME))
+    ended.put(None)  # (what the receiver puts as it stops: the sender ended the stream, or the connection ended)
+    too_large = video.BoundedDecoderQueue()
+    too_large.put(unit(bytes(video.MAX_COMPRESSED + 1)))
+    assert (ended.ended, too_large.ended) == ("ended", "too_large")
+    assert ended.stopped and too_large.stopped
+
+
+def test_e3_a_decoder_behind_lets_go_of_what_waits_up_to_the_next_key_frame_and_asks_for_one(monkeypatch: pytest.MonkeyPatch) -> None:
+    # (Pulled back from 0.3.0.) Four units waiting to be decoded (a busy computer) ended decoding, and with it the connection:
+    # the keys, the buttons held and the JetKVM's one viewer, made anew. What waits is let go of instead, and what comes
+    # after it, up to the next key frame (each picture between needs the ones before it), and the JetKVM is asked for one
+    # (at most once a second, while none has come); decoding goes on from it.
+    from qkvm import video
+
+    asked: list[int] = []
+    behind = video.BoundedDecoderQueue(ask_key_frame=lambda: asked.append(behind.qsize()))
+    for data in (KEY_FRAME, P_FRAME, P_FRAME, P_FRAME):
+        behind.put(unit(data))
+    assert behind.qsize() == 4 and behind.let_go == 0 and asked == []
+    for data in (P_FRAME, P_FRAME_AFTER_AUD, P_FRAME, P_FRAME):  # (the decoder still behind)
+        behind.put(unit(data))
+    assert not behind.stopped and behind.ended is None, (behind.stopped, behind.ended)
+    assert behind.qsize() == 0 and behind.let_go == 8 and asked == [0], (behind.qsize(), behind.let_go, asked)
+    behind.put(unit(KEY_FRAME_SHORT_CODES))
+    behind.put(unit(P_FRAME))
+    assert behind.qsize() == 2 and behind.let_go == 8 and asked == [0]
+    assert [task[1].data for task in list(behind.queue)] == [KEY_FRAME_SHORT_CODES, P_FRAME]
+    # Behind again, and no key frame for a while: asked again once a second (here, at every unit), and an IDR slice alone
+    # (no parameter sets before it) is one too.
+    monkeypatch.setattr(video, "KEY_FRAME_ASK_EVERY", 0.0)
+    for data in (P_FRAME, P_FRAME, P_FRAME, P_FRAME):
+        behind.put(unit(data))
+    assert behind.qsize() == 0 and len(asked) == 3, (behind.qsize(), asked)
+    behind.put(unit(IDR_ALONE))
+    assert behind.qsize() == 1 and not behind.stopped
+
+
+def test_e3_a_decoder_that_falls_behind_keeps_the_connection_and_a_button_held_and_its_picture_goes_on(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The same with the stand-in's video, decoded by the wall's own decoder, made slow on purpose for three seconds (as a
+    # busy computer makes it): the connection stays, and with it the button held and the JetKVM's one viewer (the 0.2.0
+    # requalification saw e3 fail under load for this: the connection made anew under the hand-over); the JetKVM is asked
+    # for a key frame (the stand-in, as aiortc does, sends one when asked; by itself, one in twenty-five seconds), and the
+    # picture goes on.
+    from aiortc import rtcrtpsender
+
+    from qkvm import video
+
+    asked: list[float] = []
+    real_keyframe = rtcrtpsender.RTCRtpSender._send_keyframe
+
+    def send_keyframe(self: Any) -> None:
+        asked.append(time.monotonic())
+        real_keyframe(self)
+
+    monkeypatch.setattr(rtcrtpsender.RTCRtpSender, "_send_keyframe", send_keyframe)
+    slow_until = [0.0]
+    real_decode = video.H264Decoder.decode
+
+    def decode(self: Any, encoded: Any) -> Any:
+        if time.monotonic() < slow_until[0]:
+            time.sleep(0.3)  # (ten frames a second come; three of them while one is decoded)
+        return real_decode(self, encoded)
+
+    monkeypatch.setattr(video.H264Decoder, "decode", decode)
+    jet = FakeJetKvm(JetState(width=640, height=360)).start()
+
+    async def test(wall: jetkvm.JetKvmDevice) -> None:
+        held = await wall.input_ready()
+        assert isinstance(held, jetkvm._Session)
+        until = time.monotonic() + 20
+        while held.frame is None:
+            assert time.monotonic() < until and not held.done.is_set(), "no first picture"
+            await asyncio.sleep(0.05)
+        wall.say("absMouseReport", {"x": 10, "y": 20, "buttons": 1}, on=held)
+        await settled(lambda: jet.state.buttons == 1)
+        asked.clear()
+        slow_until[0] = time.monotonic() + 3.0
+        await asyncio.sleep(3.0)
+        assert not held.done.is_set() and held.lost is None, held.lost
+        assert getattr(held.decoding, "let_go", 0) > 0, "decoding never fell behind: the decoder was not made slow enough"
+        then = time.monotonic()
+        while held.frame_at <= then:
+            assert time.monotonic() < then + 8 and not held.done.is_set(), (held.lost, held.decoding.ended)
+            await asyncio.sleep(0.05)
+        assert wall._session is held and not held.done.is_set() and held.lost is None, held.lost
+        assert len(jet.state.video_offers) == 1, f"offers: {len(jet.state.video_offers)}"
+        assert asked, "no key frame was asked for"
+        assert jet.state.buttons == 1, f"the button held was let go of: {jet.state.buttons}"
+        wall.say("absMouseReport", {"x": 10, "y": 20, "buttons": 0}, on=held)
+        await settled(lambda: jet.state.buttons == 0)
+        assert nothing_down(jet)
 
     run(jet, test)
 
@@ -1111,7 +1336,8 @@ def test_r12_an_actions_key_down_as_its_connection_is_marked_to_end_is_let_go_of
 
 def test_r13_a_live_lines_key_is_not_kept_alive_once_its_connection_is_marked_to_end(monkeypatch: pytest.MonkeyPatch) -> None:
     # (The keep-alive went on until the connection was looked at, the line's letting go being refused meanwhile: the key
-    # held up to a second. Stopped, the JetKVM lets go of it itself within a tenth of a second.)
+    # held up to a second. Stopped, the JetKVM lets go of it itself within a tenth of a second. Since the letting go goes as
+    # the end is decided (register row 16), it is let go of by that, sooner still: the keep-alive stops all the same.)
     slow_letting_go_at_the_end(monkeypatch)
     jet = FakeJetKvm(JetState(width=640, height=360)).start()
 
@@ -1121,10 +1347,12 @@ def test_r13_a_live_lines_key_is_not_kept_alive_once_its_connection_is_marked_to
         wall.say("keyboardReport", dict(PRESS_A), on=held)
         await asyncio.sleep(0.15)  # (longer than the JetKVM keeps a key nothing keeps alive)
         assert jet.state.down == [0x04], "the key was not held"
+        kept_alive = jet.state.keep_alives
         wall._make_anew(held, "a test")
         took = await down_for(jet)
         assert took < 0.3, f"the key was kept down {took:.2f} s after the connection was marked to end"
-        assert 0x04 in jet.state.auto_released
+        await asyncio.sleep(0.2)
+        assert jet.state.keep_alives <= kept_alive + 1, "kept alive after the connection was marked to end"  # (one on its way)
 
     run(jet, test)
 
@@ -1267,3 +1495,115 @@ def test_reconnect_waits_for_an_ended_sessions_decoder_cleanup(monkeypatch: pyte
             await device.close()
 
     asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("end", ["made anew", "the outbox overflowing", "the tile closed"])
+def test_r16_over_json_rpc_the_letting_go_on_an_end_the_wall_decides_waits_for_the_press_in_flight(end: str) -> None:
+    # The JetKVM/Proxmox review (R16, review-jet2\probes\probe_r16_let_go_overtakes_a_press_in_flight.py): over JSON-RPC a
+    # JetKVM does every call in a task of its own, and two that arrive together are done in either order (the stand-in's
+    # `together`: the opposite one). The letting go sent at once as the wall decided an end overtook a press still in its
+    # hands, and the button, which a JetKVM never lets go of by itself, stayed down. The press's answer is waited for first
+    # (HAND_OVER_GRACE at the most), as at a hand-over (`_let_go_at_hand_over`).
+    jet = FakeJetKvm(JetState(hidrpc=False, width=640, height=360, together=0.4)).start()
+    down: list[int] = []
+
+    async def test(wall: jetkvm.JetKvmDevice) -> None:
+        held = await wall.input_ready()
+        assert isinstance(held, jetkvm._Session) and held.road == "rpc", held.road
+        await asyncio.sleep(0.3)
+        wall.say("absMouseReport", {"x": 300, "y": 400, "buttons": 1}, on=held)
+        await asyncio.sleep(0.05)  # (the press is out, in the JetKVM's hands: answered 0.4 s after it came)
+        assert held.mouse_calls == 1, held.mouse_calls
+        if end == "made anew":
+            wall._make_anew(held, "made anew by the test")
+        elif end == "the tile closed":
+            await wall.close()
+        else:
+            with pytest.raises(kvm.KvmError):
+                for n in range(jetkvm.MOST_WAITING + 1):
+                    wall.say("absMouseReport", {"x": 301 + n, "y": 400, "buttons": n % 2}, on=held)
+        await settled(lambda: held.done.is_set(), within=5)
+        await asyncio.sleep(1.0)  # (whatever was handed over is done by now)
+        down.append(jet.state.buttons)
+
+    run(jet, test)
+    assert down == [0], "a mouse button left down at the JetKVM"
+
+def test_p1_a_jetkvm_deaf_to_key_frame_requests_is_not_said_to_have_stopped_sending_video_nor_counted_as_down(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The JetKVM/Proxmox review (P1, a LOW; review-jet2\probes\probe_p1_jetkvm_that_never_answers_a_key_frame_request.py):
+    # decoding fell behind, what came was let go of up to a key frame and one was asked for, and the JetKVM never answered
+    # the request (a firmware that reads it and throws it away; the stand-in sends one by itself in twenty-five seconds).
+    # The connection ended "The JetKVM stopped sending video", counted as the JetKVM being down. Its video came all along:
+    # the connection is made anew (a new one begins with a key frame), which is not counted.
+    from aiortc import rtcrtpsender
+    from aiortc.codecs import h264
+
+    from qkvm import video
+
+    monkeypatch.setattr(rtcrtpsender.RTCRtpSender, "_send_keyframe", lambda self: None)
+    # (Held at one rate: aiortc's encoder also starts afresh, with a key frame, where the bitrate estimate moves.)
+    monkeypatch.setattr(h264.H264Encoder, "target_bitrate", property(lambda self: h264.DEFAULT_BITRATE, lambda self, value: None))
+    slow_until = [0.0]
+    real_decode = video.H264Decoder.decode
+
+    def decode(self: Any, encoded: Any) -> Any:
+        if time.monotonic() < slow_until[0]:
+            time.sleep(0.3)
+        return real_decode(self, encoded)
+
+    monkeypatch.setattr(video.H264Decoder, "decode", decode)
+    jet = FakeJetKvm(JetState(width=640, height=360)).start()
+
+    async def test(wall: jetkvm.JetKvmDevice) -> None:
+        held = await wall.input_ready()
+        assert isinstance(held, jetkvm._Session)
+        until = time.monotonic() + 20
+        while held.frame is None:
+            assert time.monotonic() < until and not held.done.is_set(), "no first picture"
+            await asyncio.sleep(0.05)
+        failures = wall._failures
+        slow_until[0] = time.monotonic() + 3.0
+        await settled(lambda: held.done.is_set(), within=15)
+        assert held.done.is_set() and getattr(held.decoding, "let_go", 0) > 0, "decoding never fell behind"
+        said = " ".join(str(error) for error in (held.error, held.lost) if error is not None)
+        assert "stopped sending video" not in said and wall._failures == failures, (said, wall._failures - failures)
+
+    run(jet, test)
+
+@pytest.mark.parametrize("end", ["an oversized message", "the decoder failed"])
+def test_r16_on_the_other_ends_the_wall_decides_what_is_down_is_let_go_of_at_once(end: str) -> None:
+    # The JetKVM/Proxmox review (R16, a LOW; review-jet2\probes\probe_r16_other_ends_the_wall_decides.py): `_make_anew` wakes
+    # the connection's loop, and the letting go is at once. The other ends the wall decides (a message larger than any a
+    # JetKVM sends, a decoder that failed, the status's "stopped answering") woke nothing: a modifier and a button stayed down
+    # until the loop looked, up to a second later. They wake it.
+    from aiortc.mediastreams import MediaStreamError
+
+    jet = FakeJetKvm(JetState(width=640, height=360)).start()
+    took: list[float] = []
+
+    class Ended:
+        async def recv(self) -> object:
+            raise MediaStreamError
+
+    async def test(wall: jetkvm.JetKvmDevice) -> None:
+        held = await wall.input_ready()
+        for _ in range(3):
+            assert isinstance(held, jetkvm._Session)
+            wall.say("keyboardReport", {"modifier": 0x02, "keys": []}, on=held)
+            wall.say("absMouseReport", {"x": 300, "y": 400, "buttons": 1}, on=held)
+            await settled(lambda: jet.state.buttons == 1 and jet.state.modifier == 0x02, within=1.0)
+            await asyncio.sleep(0.1)  # (into the loop's second-long wait)
+            began = time.monotonic()
+            if end == "an oversized message":
+                wall._on_message(held, "x" * (jetkvm.MOST_RPC_MESSAGE + 1))
+            else:
+                held.decoding.ended = "failed"  # (as the queue notes a decoder that failed, and its track then ends)
+                await wall._watch(held, Ended())
+            while (jet.state.buttons or jet.state.modifier) and time.monotonic() - began < 3:
+                await asyncio.sleep(0.005)
+            took.append(round(time.monotonic() - began, 3))
+            await asyncio.sleep(0.3)
+            held = await wall.input_ready()
+
+    run(jet, test)
+    assert max(took) < 0.3, took

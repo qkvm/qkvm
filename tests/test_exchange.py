@@ -207,6 +207,45 @@ def test_half_a_character_is_no_file_and_what_is_not_printed_is_no_name() -> Non
     assert [(device.url, device.group) for device in odd.devices or []] == [("https://192.168.1.21", "rack1")] and len(odd.left_out) == 1
 
 
+def test_an_intel_amt_pc_written_without_a_port_is_taken_at_its_engines_port_as_an_add_takes_it() -> None:
+    # Register row 12 of 0.2.1 (w11c Open): added or edited without a port, an engine is at 16993 with TLS and 16992
+    # plain, where it answers (server.py's parse); a hand-written file's entry without one was kept at 443 or 80, where
+    # no engine answers and its redirection port is not known. A port that is written stays, 443 too, as in the form.
+    said = read({"devices": [
+        {"url": "https://192.168.1.30", "kind": "amt"},
+        {"url": "http://192.168.1.31/", "kind": "amt"},
+        {"url": "https://192.168.1.32:443", "kind": "amt"},
+        {"url": "https://192.168.1.33:16993", "kind": "amt"},
+        {"url": "https://[fe80::5]", "kind": "amt"},
+        {"url": "https://192.168.1.34", "kind": "kvmd"},
+    ]})  # fmt: skip
+    assert said.left_out == []
+    assert [device.url for device in said.devices or []] == [
+        "https://192.168.1.30:16993", "http://192.168.1.31:16992", "https://192.168.1.32", "https://192.168.1.33:16993",
+        "https://[fe80::5]:16993", "https://192.168.1.34",
+    ]  # fmt: skip
+
+
+def test_a_console_link_is_kept_with_its_host_written_as_a_device_address_is() -> None:
+    # I2 of the 0.2.1 review (pulled back into 0.2.1): the page and the server say whether a console link is on a host name
+    # the wall is looked at under, and spelt that host differently: a browser reads 2130706433 or 127.1 as 127.0.0.1, Python
+    # as no such thing, and a dot at the end of a name was the server's to drop and not the page's. The link is kept with
+    # its host as an address is (small letters, no dot at the end, numbers one way, and none the system would read as
+    # another host than it looks like), so that both read the same host from it. What follows the host is kept as typed.
+    from qkvm.exchange import console_link
+
+    for typed, kept in (
+        ("https://KVM.Example.:8443/Some/Page?x=1#y", "https://kvm.example:8443/Some/Page?x=1#y"),
+        ("https://kvm.example:443/a", "https://kvm.example/a"), ("http://kvm.example:80", "http://kvm.example"),
+        ("https://[0:0:0:0:0:0:0:1]:9443/", "https://[::1]:9443/"), ("  http://192.168.1.20:8080/x  ", "http://192.168.1.20:8080/x"),
+        ("https://bücher.example/", "https://xn--bcher-kva.example/"), ("", ""),
+    ):  # fmt: skip
+        assert console_link(typed) == kept, typed
+    for none in ("http://2130706433/", "http://127.1:8080/", "https://0x7f.0.0.1/", "http://010.1.1.1/", "https://kvm.example:0/", "https://./"):
+        with pytest.raises(ValueError):
+            console_link(none)
+
+
 def test_an_address_is_written_one_way() -> None:
     from qkvm.store import device_url
 

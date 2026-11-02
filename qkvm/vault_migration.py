@@ -10,6 +10,7 @@ import secrets
 import stat
 from typing import Any
 
+from ._folders import open_private
 from .store import Store, _replace_settings, holds_nothing, sealed_beside
 from .vault_storage import MAGIC, RECOVERY_MAGIC, StorageCipher, StorageError, create_key, key_path, read_key
 
@@ -32,7 +33,7 @@ def _settle(directory: Path) -> None:
 
 def _write(path: Path, data: bytes) -> None:
     temp = path.with_name(path.name + ".migration-" + secrets.token_hex(8))
-    descriptor = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    descriptor = open_private(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
     try:
         with os.fdopen(descriptor, "wb") as stream:
             stream.write(data)

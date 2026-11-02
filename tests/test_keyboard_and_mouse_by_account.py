@@ -8,6 +8,7 @@ without the question every other power action is asked first.
 
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 from typing import Any
@@ -97,3 +98,58 @@ def test_a_key_combination_with_the_keyboards_power_key_is_refused(tmp_path: Pat
         refused = admin.post(f"/api/v1/devices/{device}/actions", json={"action": "keys", "keys": "Power"})
         assert (refused.status_code, refused.json()["code"]) == (422, "invalid"), refused.text
         assert not [action for action in comet.state.actions if "Power" in action], comet.state.actions
+
+
+def test_a_saved_action_with_the_keyboards_power_key_is_refused_when_it_is_saved(tmp_path: Path) -> None:
+    # Register row 11 of 0.2.1 (fx-a N5): saved, by the API or from a file, it was taken, and refused at every run on every
+    # machine after (422 on a kvmd KVM, which is told the names as they come; a key it has not got on every other). Now it
+    # is refused where it is saved, with the reason a run gives, and left out of a file with it: one rule for both.
+    from qkvm import exchange
+
+    with Wall(tmp_path) as wall:
+        admin = wall.browser()
+        for keys in ("Power", "ControlLeft,Power"):
+            refused = admin.post("/api/v1/actions", json={"name": "Off", "kind": "keys", "keys": keys})
+            assert refused.status_code == 422, refused.text
+            assert refused.json()["code"] == "invalid" and "Power key is not sent" in refused.json()["message"]
+        kept = admin.post("/api/v1/actions", json={"name": "Lock", "kind": "keys", "keys": "MetaLeft,KeyL"})
+        assert kept.status_code == 201
+        changed = admin.put(f"/api/v1/actions/{kept.json()['action']['id']}", json={"name": "Lock", "kind": "keys", "keys": "MetaLeft,Power"})
+        assert changed.status_code == 422 and "Power key is not sent" in changed.json()["message"]
+        assert [(action["name"], action["keys"]) for action in admin.get("/api/v1/actions").json()["actions"]] == [("Lock", "MetaLeft,KeyL")]
+    read = exchange.unpack(json.dumps({"format": exchange.FORMAT, "version": 1, "actions": [
+        {"name": "Off", "kind": "keys", "keys": "Power"}, {"name": "Lock", "kind": "keys", "keys": "MetaLeft,KeyL"},
+    ]}), "")  # fmt: skip
+    assert [action.name for action in read.actions or []] == ["Lock"]
+    assert len(read.left_out) == 1 and read.left_out[0].startswith("Saved action 1:") and "Power key" in read.left_out[0]
+
+
+def test_the_count_of_takings_a_minute_outlasts_the_listeners_being_opened_again(tmp_path: Path) -> None:
+    # The coordinator's decision on 0.2.1's sweep (beside register row 22): an account's takings and givings back of keyboard
+    # and mouse are counted a minute at a time (MOST_CONTROL_A_MINUTE), and the count lived in the live lines' object, which
+    # the listeners make: opened again (a change of the network settings), it started from nothing. It is the program's now.
+    import gc
+
+    from fastapi.testclient import TestClient
+
+    from qkvm.core import Core
+    from qkvm.server import create_app
+    from tests.test_wall import CSRF
+
+    core = Core(tmp_path)
+    core.unlock_at_start()
+
+    def lines_of(app: object) -> live.Lines:
+        return next(o for o in gc.get_objects() if type(o) is live.Lines and o.manager.core is core and o not in seen)
+
+    holder = live.Holder("u1", "olga", True, "127.0.0.1")
+    seen: list[live.Lines] = []
+    with TestClient(create_app(core), headers=CSRF):
+        first = lines_of(None)
+        seen.append(first)
+        assert all(first.control_said(holder) for _ in range(live.MOST_CONTROL_A_MINUTE))
+        assert first.control_said(holder) is False  # (spent for this minute)
+    with TestClient(create_app(core), headers=CSRF):  # the listeners opened again, the program the same
+        again = lines_of(None)
+        assert again is not first
+        assert again.control_said(holder) is False, "the listeners opened again gave the account a whole minute's takings back"

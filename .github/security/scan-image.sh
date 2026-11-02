@@ -12,10 +12,10 @@ trap 'rm -rf "$scan_tmp"' EXIT
 
 # The scanner executable is pinned; the vulnerability data is deliberately downloaded afresh.
 # An empty private cache also prevents accidental reuse of an old database or scan result.
-version=0.76.0
+version=0.76.1
 case "$(uname -m)" in
-  x86_64) scanner_arch=64bit; checksum=e24b1c51293c1b15e4ba8d45bbc7891ba053f90278ec2698f3562c993e145fe7 ;;
-  aarch64) scanner_arch=ARM64; checksum=aab21e677a7b7071fc79f1711480840754c18a1b9d9cefa7ccd06af63a0e8f4c ;;
+  x86_64) scanner_arch=64bit; checksum=c7cbe3137fb8a48a17574bede3dd6beb16742d1e9772929940fc90082c39d9c0 ;;
+  aarch64) scanner_arch=ARM64; checksum=e174dff2a6dba5e3ae41f8d0537a6324405bd08132497340304c6b20e0f16a1f ;;
   *) echo 'Unsupported scanner host architecture' >&2; exit 2 ;;
 esac
 curl --fail --silent --show-error --location --retry 3 \

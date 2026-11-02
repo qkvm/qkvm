@@ -29,13 +29,13 @@ import uuid
 import xml.etree.ElementTree as ET
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import Any, NamedTuple
 from urllib.parse import urlsplit
 from xml.sax.saxutils import escape
 
 import httpx
 
-from . import rfb
+from . import rfb, vncdevice
 from .kvm import (
     ABOUT_TTL,
     DOWN_CODES,
@@ -220,8 +220,8 @@ class Challenge:
     nonce: str
     opaque: str | None
     algorithm: str  # "MD5", "MD5-sess", "SHA-256", "SHA-256-sess"
-    qop: bool  # it wants "auth" (every engine does); False: the older form without it
     stale: bool  # the nonce ran out, the password was not judged: answer the new nonce and nothing is counted
+    # (qop "auth" always: every engine offers it, and a challenge without it is not answered; see `challenge_from`.)
 
 
 _PAIR = re.compile(r'\s*([A-Za-z0-9_-]+)\s*=\s*(?:"((?:[^"\\]|\\.){0,1024})"|([^\s,"]{0,1024}))\s*(?:,|$)')
@@ -232,6 +232,11 @@ def challenge_from(headers: list[str]) -> Challenge | None:
 
     Bounded as the whole answer is: one that hands out a realm or a nonce that could not stand in a header,
     or wants a hash this program has not got, is "neither yes nor no", and is said to be that.
+
+    And only one that offers qop "auth", as every engine does (its redirection port is answered only so): the older form
+    without it (RFC 2069) has no nonce of this program's in the answer, so whoever answers at the address (plain HTTP, or
+    TLS not checked) chooses the realm and the nonce once and works the password out offline from a table made for them,
+    for every PC of a fleet with one password. (The owner's decision for 0.2.1; until then it was answered.)
     """
     for header in headers:
         scheme, _, rest = header.strip().partition(" ")
@@ -253,9 +258,9 @@ def challenge_from(headers: list[str]) -> Challenge | None:
             return None
         if opaque is not None and not HANDED.fullmatch(opaque):
             return None
-        if algorithm.removesuffix("-SESS") not in DIGESTS or (offered - {""} and "auth" not in offered):
+        if algorithm.removesuffix("-SESS") not in DIGESTS or "auth" not in offered:
             return None
-        return Challenge(realm, nonce, opaque, algorithm, "auth" in offered, fields.get("stale", "").lower() == "true")
+        return Challenge(realm, nonce, opaque, algorithm, fields.get("stale", "").lower() == "true")
     return None
 
 
@@ -274,13 +279,9 @@ def answer_to(challenge: Challenge, count: int, username: str, password: str, me
     if challenge.algorithm.endswith("-SESS"):
         first = digest(first, challenge.nonce, cnonce)
     second = digest(method, uri)
-    if challenge.qop:
-        response = digest(first, challenge.nonce, nc, cnonce, "auth", second)
-    else:
-        response = digest(first, challenge.nonce, second)
+    response = digest(first, challenge.nonce, nc, cnonce, "auth", second)
     fields = [f'username="{username}"', f'realm="{challenge.realm}"', f'nonce="{challenge.nonce}"', f'uri="{uri}"', f'response="{response}"', f"algorithm={challenge.algorithm}"]
-    if challenge.qop:
-        fields += ["qop=auth", f"nc={nc}", f'cnonce="{cnonce}"']
+    fields += ["qop=auth", f"nc={nc}", f'cnonce="{cnonce}"']
     if challenge.opaque is not None:
         fields.append(f'opaque="{challenge.opaque}"')
     return "Digest " + ", ".join(fields)
@@ -403,6 +404,38 @@ async def _sign_in_answer(stream: rfb.Stream, within: float) -> tuple[int, int, 
     return head[1], head[4], (await stream.read(length, within) if length else b"")
 
 
+class Answered(NamedTuple):
+    """Where the engine that said which PC it is answered from (an address; None: not known), and the realm it signs in in
+    (None: not known): what a session to the screen goes to, and compares on its own connection."""
+
+    address: str | None
+    realm: str | None
+
+
+PEER = "qkvm.answered_from"  # (the request extension an answer's address is noted in: see `_peer_of`)
+OTHER_ENGINE = (
+    "Another engine answers on this PC's redirection port: it signs in in another realm than the engine that said it is this "
+    "tile's PC. Nothing was sent to it: no password, no key, and its screen is not shown."
+)
+
+
+async def _peer_of(response: httpx.Response) -> None:
+    """Note on the request the address its answer came from (an event hook of the tile's connection; nothing where the
+    connection does not say it)."""
+    try:
+        stream = response.extensions.get("network_stream")
+        peer = stream.get_extra_info("server_addr") if stream is not None else None
+    except Exception:  # (what the library hands out is its own: an address not to be had is no answer's failure)
+        return
+    if isinstance(peer, tuple) and peer and isinstance(peer[0], str) and peer[0]:
+        response.request.extensions[PEER] = peer[0]
+
+
+class OtherEngine(rfb.RfbError):
+    """What answers on the redirection port is not the engine that said which PC it is (see `signed_in`): nothing of the
+    password went to it."""
+
+
 async def redirect(
     stream: rfb.Stream,
     username: str,
@@ -410,6 +443,7 @@ async def redirect(
     before_password: Callable[[], Any],
     within: float = REDIRECTION_STEP,
     taken: Callable[[], Any] | None = None,
+    realm: str | None = None,
 ) -> None:
     """Intel's handshake on the redirection port, for the KVM, up to where RFB begins.
 
@@ -418,9 +452,10 @@ async def redirect(
     just now, or answered the sign-in with neither yes nor no), AUTH (it said no to the password: only that),
     UNSUPPORTED (no Digest sign-in), LIMIT, TIMEOUT, CLOSED. `before_password` is told the moment before the
     answer made with the password goes out, and nothing of the password goes out before the engine asked; `taken`,
-    the moment the engine says yes to it (whatever follows: the password was taken).
+    the moment the engine says yes to it (whatever follows: the password was taken). `realm`: the realm of the engine that
+    said which PC it is; OtherEngine, before the password goes, where the engine on this connection signs in in another.
     """
-    await signed_in(stream, START_KVM, ("its KVM", "a KVM session"), username, password, before_password, within, taken)
+    await signed_in(stream, START_KVM, ("its KVM", "a KVM session"), username, password, before_password, within, taken, realm)
     await stream.write(KVM_GO)
     for _ in range(MOST_RECORDED + 1):
         first = (await stream.read(1, within))[0]
@@ -440,10 +475,11 @@ async def signed_in(
     before_password: Callable[[], Any],
     within: float = REDIRECTION_STEP,
     taken: Callable[[], Any] | None = None,
+    realm: str | None = None,
 ) -> None:
     """Intel's handshake on the redirection port up to the sign-in taken, for a session of the kind `start` asks for (the
     KVM, the serial console); `words`: what that is ("its KVM", "a KVM session"), for what is said when it is refused. The
-    errors, `before_password` and `taken` are those of `redirect`."""
+    errors, `before_password`, `taken` and `realm` are those of `redirect`."""
     user, uri = username.encode("utf-8"), REDIRECTION_URI.encode()
     if not user or len(user) > 255:
         raise rfb.RfbError(rfb.UNSUPPORTED, "the user name is not one the redirection port's sign-in can carry")  # (sent nothing)
@@ -470,15 +506,19 @@ async def signed_in(
     said, kind, carried = await _sign_in_answer(stream, within)
     if kind != DIGEST or said != ASKING:
         raise rfb.RfbError(rfb.PROTOCOL, f"the engine did not ask for the password the way Digest does (it answered {said} of kind {kind})")
-    realm, nonce, qop = (text.decode("latin-1") for text in texts_of(carried, 3))
-    if not (HANDED.fullmatch(realm) and HANDED.fullmatch(nonce)):
+    challenged, nonce, qop = (text.decode("latin-1") for text in texts_of(carried, 3))
+    if not (HANDED.fullmatch(challenged) and HANDED.fullmatch(nonce)):
         raise rfb.RfbError(rfb.PROTOCOL, "the engine's challenge holds what no challenge does")
     if "auth" not in {part.strip().lower() for part in qop.split(",")}:
         raise rfb.RfbError(rfb.UNSUPPORTED, "the engine wants a kind of Digest this program does not answer")
+    if realm is not None and challenged != realm:
+        # (On this very connection, which the password and then the keys take: an engine that signs in in another realm than
+        # the one that said which PC it is, is another engine. Every engine has one realm, its WS-Management's and this port's.)
+        raise OtherEngine(rfb.REFUSED, "the engine on its redirection port signs in in another realm than the engine that said which PC it is")
     cnonce = secrets.token_hex(16)
-    response = redirection_digest(username, realm, password, nonce, cnonce)
+    response = redirection_digest(username, challenged, password, nonce, cnonce)
     before_password()
-    answer = [user, realm.encode("latin-1"), nonce.encode("latin-1"), uri, cnonce.encode(), NC.encode(), response.encode(), b"auth"]
+    answer = [user, challenged.encode("latin-1"), nonce.encode("latin-1"), uri, cnonce.encode(), NC.encode(), response.encode(), b"auth"]
     await stream.write(sign_in_message(DIGEST, answer))
     said, kind, _ = await _sign_in_answer(stream, within)
     if said == ASKING and kind == DIGEST:
@@ -572,7 +612,10 @@ BOOT_PUT_NUMBERS = ("BootMediaIndex", "FirmwareVerbosity", "IDERBootDevice", "Ue
 # already set (another tool is in the middle of arming it), rather than silently clearing or carrying it out.
 # What Start into BIOS setup says where it would have cleared a BIOS setup boot that was armed before it was pressed (an
 # earlier press, not booted since, or another tool): a press that did not go through leaves the PC as it found it.
-ARMED_BEFORE = "the BIOS setup boot was armed already before this press, and is left armed as it was, so the next boot will land in the BIOS setup"
+ARMED_BEFORE = "the BIOS setup boot was armed already before this press, and is left armed as it was, so the next boot may land in the BIOS setup"
+# What the clearing says where the read before it shows the boot not armed (the Put not taken, or another tool cleared it):
+# nothing was cleared, and "cleared again" would not be so.
+SHOWS_NOT_ARMED = "the BIOS setup boot shows not armed"
 ARMED_BEFORE_MADE_NEXT = "the BIOS setup boot was armed already before this press, which made it the next boot; it is left so, and the next boot will land in the BIOS setup"
 ARMED_BEFORE_MAYBE_NEXT = "the BIOS setup boot was armed already before this press, which may have made it the next boot; it is left so, and the next boot may land in the BIOS setup"
 BOOT_DESTRUCTIVE = ("PlatformErase", "SecureErase", "ConfigurationDataReset", "ReflashBIOS", "UseIDER", "UserPasswordBypass")
@@ -674,6 +717,16 @@ PERHAPS_DONE = "The machine's answer to the command did not come back: it may ha
 UNREADABLE_ANSWER = "The machine's answer to the command could not be read: it may have been done. Look at the PC before trying again."
 
 
+def between_states(power: int) -> KvmError:
+    """What a power button that goes by the PC's power says where that is neither running nor off (RUNNING, NOT_RUNNING):
+    nothing was done, and the state named (a state between two, or one that says nothing)."""
+    if power in POWER_WORDS and power != 1:
+        said = f"changing its state just now ({POWER_WORDS[power]})"
+    else:
+        said = f"in a power state qKVM does not know ({POWER_WORDS.get(power, power)})"
+    return KvmError("action_failed", f"Nothing was done: the PC is {said}. Try again in a moment.")
+
+
 class PerhapsDone(KvmError):
     """A command whose answer did not come back: it went out, and may have been done (code "timeout")."""
 
@@ -712,7 +765,10 @@ def body_of(reply: httpx.Response) -> ET.Element:
         raise KvmError("bad_response", "The machine's answer declares a document type, which SOAP has no use for")
     try:
         root = ET.fromstring(data)
-    except ET.ParseError:
+    except (ET.ParseError, ValueError, LookupError):
+        # (Not only a parse error: the parser refuses an answer that declares a multi-byte encoding with ValueError, and one
+        # that declares an encoding it does not know with LookupError. Left to go past, a reset that went out and was
+        # answered so ended without an answer to the page and without an entry in the activity log.)
         raise KvmError("bad_response", f"The machine's answer is not SOAP (HTTP {reply.status_code})") from None
     body = root.find(f"{{{SOAP}}}Body") if root.tag == f"{{{SOAP}}}Envelope" else None
     if body is None:
@@ -864,9 +920,10 @@ class AmtScreen(VncDevice):
     STILL_WAIT = REDIRECTION_WITHIN + CONNECT_WAIT + 3.0
     STILL_RETRY = BAD_HOLD  # seconds before a still that came to nothing is tried again, doubling up to STILL_EVERY
 
-    def __init__(self, spec: DeviceSpec, checked: Callable[[], Awaitable[None]] | None = None) -> None:
+    def __init__(self, spec: DeviceSpec, checked: Callable[[], Awaitable[Answered]] | None = None) -> None:
         """`checked`: asked before each session is opened whether the engine at the address is that of the tile's PC (the
-        tile's AmtDevice._same_machine): KvmError where it is not, or could not be told."""
+        tile's AmtDevice._before_a_session): KvmError where it is not, or could not be told; else where that engine answered
+        from and the realm it signs in in (see Answered), which the session goes to and compares."""
         super().__init__(spec, None)  # (the certificate is the engine's, remembered by the tile on its first look)
         self._checked = checked
         self._live_at = float("-inf")
@@ -879,6 +936,10 @@ class AmtScreen(VncDevice):
         self._still_at = float("-inf")  # when that still's session drew it
         self._tried_still_at = float("-inf")  # when a still was last attempted (paces retries of one that drew no frame)
         self._still_fails = 0  # stills that opened a session but drew no frame, in a row (reset by one that draws)
+        # (Both as the screen this one took the place of left them: kept beside the screens behind doors' pace, see
+        # vncdevice._STILL_PACED, and not begun at nothing whenever the tile is edited, its certificate trusted, or the saved
+        # passwords locked and opened again.)
+        self._still_fails, self._tried_still_at = vncdevice._STILL_PACED.get(self._still_paced_as(), (0, float("-inf")))
         self._refresh_still = False  # a power change was seen: take one at once (see `want_still`)
         self._taking: asyncio.Task[None] | None = None  # a still session in flight
         self._asking = False  # a session being opened is asking the tile which PC answers (see `_open`)
@@ -900,6 +961,20 @@ class AmtScreen(VncDevice):
     def want_still(self) -> None:
         """Take a still at the next look (the PC's power was seen to change): one picture of what the screen shows now."""
         self._refresh_still = True
+
+    def _still_paced_as(self) -> str:
+        return f"{self.kind}\0{self.spec.base_url}"
+
+    def _keep_still_pace(self) -> None:
+        """Write down how the stills are paced (see __init__): where the last came to nothing; where it drew, nothing to keep."""
+        if self._closed:
+            return  # (retired: the screen that took its place says how its stills are paced)
+        kept = vncdevice._STILL_PACED
+        kept.pop(self._still_paced_as(), None)  # (the newest last)
+        if self._still_fails:
+            kept[self._still_paced_as()] = (self._still_fails, self._tried_still_at)
+            while len(kept) > vncdevice.MOST_PACED:
+                del kept[next(iter(kept))]
 
     async def snapshot(self, width: int, fresh: float | None = None, big: bool = False) -> Snapshot:
         """The PC's screen. Live (the machine enlarged, or its live view open): the session that is held, drawn at a
@@ -969,6 +1044,7 @@ class AmtScreen(VncDevice):
                 # A still that came to nothing, in any way: paced by `_a_still`'s ladder as well as by what the session
                 # recorded, lest a shown tile ask a blocked, refusing or slow port every few seconds.
                 self._still_fails += 1
+            self._keep_still_pace()
             # Close the short session it opened; not one that was open before it, nor one a live view or keys took over
             # while it ran, nor a different one.
             if opened_here and task is not None and task is self._task and not self._is_live() and not self._inputs:
@@ -1002,13 +1078,14 @@ class AmtScreen(VncDevice):
             host, port, tls = redirection_address(self.spec.base_url)
         except ValueError:
             raise self._left_alone(KvmError("bad_response", redirection_unknown(self.spec.base_url) or "Its redirection port is not known")) from None
+        answered = Answered(None, None)
         if self._checked is not None:
             # Which PC the engine at this address is, asked afresh before anything goes to its redirection port: over plain
             # HTTP, or with its certificate not checked, another PC that took the address (a new lease) would be shown here,
             # and sent the keys typed into this tile. See AmtDevice._same_machine.
             self._asking = True  # (on the tile's own connection: not to be cut off, see `_one_still`)
             try:
-                await self._checked()
+                answered = await self._checked()
             except KvmError as ex:
                 if ex is RETIRED or ex.code == "another_machine" or ex.code in DOWN_CODES:
                     # (The tile says it, and opens no session meanwhile; or WS-Management's port failed, which the tile's own
@@ -1019,7 +1096,9 @@ class AmtScreen(VncDevice):
                 self._asking = False
         context = await self._redirection_tls() if tls else None
         try:
-            stream = await rfb.open_tcp(host, port, context, CONNECT_WAIT)
+            # To the address the engine that said which PC it is answered from, not to the name resolved anew: a name with two
+            # addresses (a stale record beside the current one, say) took the session, the password and the keys to another PC.
+            stream = await rfb.open_tcp(answered.address or host, port, context, CONNECT_WAIT, name=host)
         except OSError as ex:
             raise self._failed(self._connect_error(ex, self.spec.tls)) from None
         offered = REJECTED.what("login", self.spec)
@@ -1037,10 +1116,15 @@ class AmtScreen(VncDevice):
 
         try:
             async with asyncio.timeout(REDIRECTION_WITHIN):
-                await redirect(stream, self.spec.username, self.spec.password, sending, taken=taken)
+                # (And on this very connection the engine's realm is compared with that of the engine that said which PC it is,
+                # before anything made of the password goes: see `signed_in`.)
+                await redirect(stream, self.spec.username, self.spec.password, sending, taken=taken, realm=answered.realm)
         except TimeoutError:
             await stream.close()
             raise rfb.RfbError(rfb.TIMEOUT, "the engine did not finish its handshake in time") from None
+        except OtherEngine:
+            await stream.close()
+            raise self._left_alone(KvmError("another_machine", OTHER_ENGINE), most=BAD_HOLD) from None
         except BaseException:
             await stream.close()
             raise
@@ -1170,6 +1254,13 @@ class AmtDevice(Device):
         # request signed it first (a command waits for its turn with the nonce it was bound to while a look's no brings another).
         self._counts: dict[str, int] = {}
         self._answered_under: str | None = None  # the nonce under which the engine gave the last answer that was no no
+        # ...and the realm of that nonce's challenge, and the address the answer came from (None: not known); and both as they
+        # were for the answer that said which PC it is (see `_same_machine`): the session to the screen goes there.
+        self._answered_realm: str | None = None
+        self._answered_from: str | None = None
+        self._checked_realm: str | None = None
+        self._checked_from: str | None = None
+        self._peer_noted: httpx.AsyncClient | None = None  # the connection whose answers are noted where they came from
         # Held by a look while it reads, and by a command from the question which PC answers to its sending: no look spends
         # the nonce, or brings another, in between (an engine whose nonces last few uses would otherwise refuse every command).
         self._quiet = asyncio.Lock()
@@ -1202,6 +1293,14 @@ class AmtDevice(Device):
         self._screen.tidy()
 
     # --- signing in and asking ----------------------------------------------------
+
+    async def _http(self) -> httpx.AsyncClient:
+        client = await super()._http()
+        if self._peer_noted is not client:
+            # Every answer notes, on its request, the address it came from (see `_peer_of`): which PC answers is bound to it.
+            client.event_hooks["response"].append(_peer_of)
+            self._peer_noted = client
+        return client
 
     def _signed(self, client: httpx.AsyncClient, envelope: bytes, challenge: Challenge, timeout: httpx.Timeout | None = None) -> httpx.Request:
         """A request that answers `challenge` with the saved password. (Sent while `_turn` is held: see there.)"""
@@ -1388,6 +1487,7 @@ class AmtDevice(Device):
                         raise PerhapsDone("timeout", UNREADABLE_ANSWER, 504) from None
                     raise failed(ex) from None
                 self._answered_under = challenge.nonce  # (read by whoever awaited this, before anything else runs)
+                self._answered_realm, self._answered_from = challenge.realm, request.extensions.get(PEER)
                 return body
             fresh = self._challenged(reply)
             if command and self.spec.machine:
@@ -1491,9 +1591,28 @@ class AmtDevice(Device):
         found = await self._details(resource, urgent)
         return found[0] if found else {}
 
-    async def _read_about(self, urgent: bool = False) -> dict[str, Any]:
-        """What rarely changes: what the PC is, its firmware, its name and its number. Asked once in a while, not at every look."""
-        if self._about and time.monotonic() - self._about_at < ABOUT_TTL:
+    async def _package_taken(self, urgent: bool) -> Fields:
+        """Where the PC's number is (CIM_ComputerSystemPackage), read as an addition or an edit with its password typed takes it
+        (no number remembered): KvmError where it could not be read, "Which PC answers at this address could not be told"
+        under the read's own code, but for a fault that says this account may not read it, or that there is no such thing
+        there (that is a PC that gives no number). Taken as "none", the tile kept no number, and took whichever PC answered at
+        the address next on first use. (With `_quiet` held, as a detail: see `_detail`.)"""
+        try:
+            async with self._quiet:
+                found = await self._all(PACKAGE, urgent, False)
+        except KvmError as ex:
+            if not self._passing(ex):
+                raise
+            if not (isinstance(ex, Fault) and (ex.not_allowed or ex.no_such_thing)):
+                raise KvmError(ex.code, f"Which PC answers at this address could not be told: {ex.message}", ex.status) from None
+            found = []
+        return found[0] if found else {}
+
+    async def _read_about(self, urgent: bool = False, taking: bool = False) -> dict[str, Any]:
+        """What rarely changes: what the PC is, its firmware, its name and its number. Asked once in a while, not at every look.
+        `taking`: for an addition, or an edit with the password typed, which take the PC's number (see `_package_taken`): read
+        afresh."""
+        if self._about and time.monotonic() - self._about_at < ABOUT_TTL and not taking:
             return self._about
         chassis = await self._first_of(CHASSIS, urgent)
         make, model = named(text_of(chassis, "Manufacturer", 60)), named(text_of(chassis, "Model", 60))
@@ -1510,7 +1629,7 @@ class AmtDevice(Device):
         versions = await self._details(SOFTWARE, urgent)
         firmware = next((text_of(one, "VersionString", 40) for one in versions if text_of(one, "InstanceID", 40) == "AMT"), None)
         general = await self._detail(GENERAL, urgent)
-        package = await self._first_of(PACKAGE, urgent)
+        package = await (self._package_taken(urgent) if taking else self._first_of(PACKAGE, urgent))
         self._about = {
             "make": make,
             "model": model,
@@ -1547,29 +1666,37 @@ class AmtDevice(Device):
 
         Asked strictly at a look too after a challenge in another realm (`_unsure`). Notes the nonce its answer came under
         (`_checked_nonce`): a command, and the reads it is decided by, go only under that one (see `_request`)."""
-        self._checked_nonce = None
+        self._checked_nonce = self._checked_realm = self._checked_from = None
         try:
             found = await self._all(PACKAGE, urgent, vital)
             nonce = self._answered_under  # (the nonce the answer with the number came under: nothing else ran since)
+            answered = (self._answered_realm, self._answered_from)  # (and its realm, and the address it came from)
         except KvmError as ex:
             restricted = isinstance(ex, Fault) and (ex.not_allowed or ex.no_such_thing)
             if ex is RETIRED or (self.spec.machine and not restricted):
                 raise
-            found, nonce = [], None
+            found, nonce, answered = [], None, (None, None)
         # (And the realm: `_judge` may wait for the number to be kept, and a challenge that comes meanwhile is no part of this.)
         realm = self._realm_seen
         await self._judge(own_number(text_of(found[0], "PlatformGUID", 40)) if found else None, strict=True)
         self._checked_nonce = nonce
+        self._checked_realm, self._checked_from = answered
         if self._realm_seen == realm:
             self._unsure = False
 
-    async def _before_a_session(self) -> None:
+    async def _before_a_session(self) -> Answered:
         """Which PC answers, asked before a session to the screen is opened (see AmtScreen._open). Not counted as the tile's
         failure, nor as the redirection port's: a moment of WS-Management's port while the PC starts would hold the tile's
         looks back, and blame the other port; one session is opened at a time, so one such question is under way at a time.
-        Not beside a look or a command either (`_quiet`)."""
+        Not beside a look or a command either (`_quiet`).
+
+        Hands back where the engine that said which PC it is answered from, and the realm it signs in in (where it said none:
+        the realm the password was taken in): the session goes to that address, and is refused where the engine on its
+        connection signs in in another realm (the question and the session were two connections, each resolving the tile's
+        name by itself)."""
         async with self._quiet:
             await self._same_machine(urgent=False, vital=False)
+            return Answered(self._checked_from, self._checked_realm or self._token)
 
     async def _judge(self, seen: str | None, strict: bool) -> None:
         """Whether the engine that answers is that of the PC this tile was added for, by the number it gives for itself
@@ -1605,7 +1732,7 @@ class AmtDevice(Device):
         # What was read of it is another PC's: none of it is kept, nor its power taken for this one's; and what this one's
         # tile last said is not said again for a look that fails meanwhile (HICCUP).
         self._about, self._about_at, self._kvm, self._kvm_at, self._power_on, self._good = {}, 0.0, {}, 0.0, None, None
-        self._checked_nonce = None
+        self._checked_nonce = self._checked_realm = self._checked_from = None
         return self._other
 
     async def _read_kvm(self, urgent: bool = False) -> dict[str, Any]:
@@ -1698,10 +1825,11 @@ class AmtDevice(Device):
 
     async def identify(self) -> dict[str, Any]:
         await self._read_power(urgent=True)  # the one question every account can ask, and the proof that this is an engine with a PC behind it
-        about = await self._read_about(urgent=True)
         # Added: the PC is remembered by its number from here on (the server keeps spec.machine with the tile). Edited: it is
         # the PC remembered, asked afresh, or the edit is refused (unless its password was typed, which takes the PC that
-        # answers now: see the server's update_device).
+        # answers now: see the server's update_device). Where none is remembered (added, or edited with the password typed),
+        # a number that could not be read refuses the addition or the edit (see `_package_taken`).
+        about = await self._read_about(urgent=True, taking=not self.spec.machine)
         if self.spec.machine:
             await self._same_machine(urgent=True)
         else:
@@ -2014,8 +2142,7 @@ class AmtDevice(Device):
             if power not in RUNNING and power not in NOT_RUNNING:
                 # Between states (restarting, being cycled, shutting down), or a state that says nothing: neither "switch on"
                 # nor "reset" is sure to be right.
-                said = f"changing its state just now ({POWER_WORDS[power]})" if power in POWER_WORDS and power != 1 else f"in a power state qKVM does not know ({POWER_WORDS.get(power, power)})"
-                raise KvmError("action_failed", f"Nothing was done: the PC is {said}. Try again in a moment.")
+                raise between_states(power)
             running = power in RUNNING
             wanted = [RESET, CYCLE] if running else [ON]
             state = next((one for one in wanted if not offered or one in offered), None)
@@ -2047,7 +2174,8 @@ class AmtDevice(Device):
                         # Not sent: the press's time ran out before it. Said as that, not as a right that was lost; and what
                         # was armed is cleared below, as for a power change that did not go through.
                         if step == "arm":
-                            raise KvmError("action_failed", f"Nothing was done: the engine took more than {SETUP_WITHIN:.0f} seconds.") from None
+                            late = KvmError("action_failed", f"Nothing was done: the engine took more than {SETUP_WITHIN:.0f} seconds.")
+                            raise self._armed_before_said(late, armed_before) from None
                         ex = KvmError("action_failed", f"the engine took more than {SETUP_WITHIN:.0f} seconds")
                     if step == "power" and (isinstance(ex, PerhapsDone) or (ex.code == "bad_response" and not isinstance(ex, Fault))):
                         # The power command went out and its answer did not come back, or could not be read: it may have been
@@ -2057,14 +2185,16 @@ class AmtDevice(Device):
                     if step == "arm" and not (isinstance(ex, PerhapsDone) or (ex.code == "bad_response" and not isinstance(ex, Fault))):
                         # The Put was refused (a SOAP fault), or never went out (stopped, not reached, another PC, a nonce the
                         # engine handed out meanwhile): nothing was armed, and nothing of the PC's is changed. (One whose answer
-                        # was lost or could not be read may have been taken: cleared below.)
-                        raise
+                        # was lost or could not be read may have been taken: cleared below.) A boot armed before is said.
+                        raise self._armed_before_said(ex, armed_before) from None
                     # Armed, or perhaps armed, and no power change went out, or it was refused for certain: cleared again, so no
                     # ordinary boot (an update at night, a crash) lands in the setup; and said.
                     what = "the power change did not go through" if step == "power" else "the boot could not be armed in full"
                     left = await self._clear_bios_setup(armed_before)
                     if left is None:
                         raise KvmError("action_failed", f"Nothing was done: {what} ({ex.message}); the BIOS setup boot was cleared again.") from None
+                    if left == SHOWS_NOT_ARMED:
+                        raise KvmError("action_failed", f"Nothing was done: {what} ({ex.message}); {left}.") from None
                     if left == ARMED_BEFORE and step == "power":
                         # (The role, which makes it the next boot, went through: the PC is not quite as the press found it.)
                         raise KvmError("action_failed", f"The power change did not go through ({ex.message}); {ARMED_BEFORE_MADE_NEXT}.") from None
@@ -2091,9 +2221,18 @@ class AmtDevice(Device):
                 raise KvmError("timeout", "The PC was switched on and it was not seen to start, the tile being changed meanwhile: it may have been done. The BIOS setup boot stays armed for the PC's next start.", 504) from None
             raise KvmError(ex.code, f"{ex.message} The BIOS setup boot stays armed for the PC's next start.", ex.status) from None
 
+    @staticmethod
+    def _armed_before_said(ex: KvmError, armed_before: bool) -> KvmError:
+        """What a press that armed nothing says (the arming refused, never sent, or too late), where the BIOS setup boot was
+        armed already before it: that it is armed still, and the next boot may land in the setup, as well."""
+        if not armed_before or ex is RETIRED or ex.code == "another_machine":
+            return ex
+        return KvmError(ex.code, f"{ex.message.rstrip('.')}; {ARMED_BEFORE}.", ex.status)
+
     async def _clear_bios_setup(self, armed_before: bool) -> str | None:
         """Best-effort: clear the BIOS setup boot just armed (after the power change was refused), under the same binding.
-        None where it is known cleared (or shows not armed); else what is to be said of it. Not where it was armed already
+        None where it is known cleared; SHOWS_NOT_ARMED where the read before shows it not armed (nothing was cleared); else
+        what is to be said of it. Not where it was armed already
         before this press (ARMED_BEFORE: it is left as it was), and not over a boot option that destroys data which another
         tool armed by the time of the read (the Put writes every option, and would clear that one too)."""
         if armed_before:
@@ -2101,7 +2240,7 @@ class AmtDevice(Device):
         try:
             settings = await self._bound_read(lambda: self._get(BOOT_SETTINGS, urgent=True))
             if bool_of(settings, "BIOSSetup") is False:
-                return None  # (not armed: the Put was not taken, or another tool cleared it)
+                return SHOWS_NOT_ARMED  # (not armed: the Put was not taken, or another tool cleared it)
             armed = [key for key in BOOT_DESTRUCTIVE if bool_of(settings, key)]
             if armed:
                 return f"another tool armed a boot option meanwhile that qKVM does not write over ({', '.join(armed)}), so it was not cleared"
@@ -2118,6 +2257,10 @@ class AmtDevice(Device):
         what was wanted). (None, wanted) where the engine offers none of it while a KVM session is open: see `act`."""
         power, offered = await self._power_before(checked=True)
         running = power in RUNNING
+        if action in ("power_on", "power_off", "atx_power") and power not in RUNNING and power not in NOT_RUNNING:
+            # Neither running nor off (resetting, shutting down, a power cycle under way, or a state that says nothing): what
+            # these go by is not there to go by. Taken for "off", Power off said "already off" and Power on sent "on" into it.
+            raise between_states(power)
         if action in ("power_on", "power_off") and running == (action == "power_on"):
             # Asked for by what is wanted, not by which button: after a power cut, the PCs ticked that came
             # back by themselves are not to be sorted out by hand first.
@@ -2208,6 +2351,8 @@ class AmtDevice(Device):
         deadline = time.monotonic() + within
         while True:
             power, offered = await self._power_before()
+            if power not in RUNNING and power not in NOT_RUNNING:
+                raise between_states(power)  # (began to change its state meanwhile: it is not "already off")
             if power not in RUNNING:
                 # Switched off meanwhile (at the PC, say): what was asked for is not what the PC needs now. (An engine that
                 # offers a power cycle to a PC that is off would switch it on for the reset button.)

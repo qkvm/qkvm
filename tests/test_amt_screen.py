@@ -12,6 +12,7 @@ import asyncio
 import contextlib
 import itertools
 import logging
+import socket
 import threading
 import time
 from collections.abc import AsyncIterator, Iterator
@@ -24,7 +25,7 @@ from starlette.testclient import TestClient
 from qkvm import amt, kvm, live, rfb, update, vault, vncdevice
 from qkvm.amt import AmtDevice, Challenge, answer_to, redirect, redirection_digest, sign_in_message, texts_of
 from qkvm.kvm import REJECTED, DeviceSpec, KvmError
-from tests.fake_amt import AmtState, FakeAmt
+from tests.fake_amt import OTHER_GUID, OTHER_REALM, AmtState, FakeAmt, FakeRedirection, V6Amt
 from tests.fake_vnc import PixelFormat
 from tests.test_redfish import status_of
 from tests.test_wall import CSRF, snap, wait_until, wall
@@ -44,6 +45,7 @@ def fast(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(amt.AmtScreen, "LOOK_PACE", 0.05)
     monkeypatch.setattr(update, "DEFAULT_REPO", "")
     REJECTED.clear()
+    vncdevice._STILL_PACED.clear()  # (how a PC's stills were paced is kept by address: see AmtScreen)
 
 
 @pytest.fixture
@@ -236,7 +238,7 @@ def test_the_reader_takes_rgb565_only_where_it_can_read_it_and_version_4_only_wh
 
 def test_the_redirection_digest_is_the_standards_own() -> None:
     # The same sums as WS-Management's Digest (proved there against RFC 2617's example), over POST and /RedirectionService.
-    challenge = Challenge(realm="Digest:A3F7C2E1A3F7C2E1A3F7C2E1A3F7C2E1", nonce="2a1f0b3c4d5e6f70", opaque=None, algorithm="MD5", qop=True, stale=False)
+    challenge = Challenge(realm="Digest:A3F7C2E1A3F7C2E1A3F7C2E1A3F7C2E1", nonce="2a1f0b3c4d5e6f70", opaque=None, algorithm="MD5", stale=False)
     header = answer_to(challenge, 2, "admin", "P@ssw0rd!", "POST", amt.REDIRECTION_URI, cnonce="0123456789abcdef0123456789abcdef")
     said = dict(part.strip().split("=", 1) for part in header.removeprefix("Digest ").split(", "))
     assert said["nc"] == amt.NC
@@ -733,6 +735,47 @@ def test_a_refused_power_change_whose_clearing_fails_is_a_maybe(tmp_path: Path, 
         reply = client.post(f"/api/v1/devices/{device}/actions", json={"action": "bios_setup"})
         assert (reply.status_code, reply.json()["code"]) == (504, "timeout") and "could not be cleared" in reply.json()["message"]
         assert pc.state.bios_setup_armed is True
+
+
+def test_a_bios_setup_whose_lost_arming_answer_left_it_not_armed_says_so(pc: FakeAmt) -> None:
+    # (Register row 14, the eighth review's AMT corner.) The answer to the arming Put could not be read, and the read before the
+    # clearing shows the boot not armed: nothing was cleared, and the answer said "cleared again". It says what was seen.
+    pc.state.boot_put_unmade_once = True
+
+    async def run() -> None:
+        device = a_pc(pc)
+        try:
+            await settled_status(device, "online")
+            with pytest.raises(KvmError) as refused:
+                await device.act("bios_setup")
+            said = refused.value.message
+            assert "shows not armed" in said and "cleared again" not in said, said
+            assert [v for c, v in pc.state.changes if c == "AMT_BootSettingData"] == [] and pc.state.actions == []
+        finally:
+            await device.close()
+
+    asyncio.run(run())
+
+
+def test_a_bios_setup_whose_arming_is_refused_says_that_one_armed_before_is_armed_still(pc: FakeAmt) -> None:
+    # (The same, the other AMT corner.) Armed already before the press, and the arming Put refused (a SOAP fault): nothing was
+    # done, and the answer said only that. That the boot armed before is armed still, and the next boot may land in the setup,
+    # is said too.
+    pc.state.bios_setup_armed, pc.state.boot_put_odd_once = True, "fault"
+
+    async def run() -> None:
+        device = a_pc(pc)
+        try:
+            await settled_status(device, "online")
+            with pytest.raises(KvmError) as refused:
+                await device.act("bios_setup")
+            said = refused.value.message
+            assert "armed already before this press" in said and "the next boot may land in the BIOS setup" in said, said
+            assert pc.state.actions == [] and pc.state.bios_setup_armed is True
+        finally:
+            await device.close()
+
+    asyncio.run(run())
 
 
 def test_a_bios_setup_whose_role_is_refused_clears_the_boot_again(pc: FakeAmt) -> None:
@@ -1401,6 +1444,54 @@ def test_a_shown_tile_whose_stills_come_to_nothing_asks_less_and_less_often(pc: 
     asyncio.run(run())
 
 
+def test_a_shown_tiles_stills_keep_their_pace_when_its_screen_is_made_anew(pc: FakeAmt, monkeypatch: pytest.MonkeyPatch) -> None:
+    # (Register row 10's AMT part: fx-a L2, w11d Open; the hardening rule that what paces something never lives in an object
+    # made anew.) After a still that came to nothing, the next waits STILL_RETRY and more. That pause lived in the screen,
+    # which is made anew whenever its tile is edited, its certificate trusted, or the saved passwords locked and opened
+    # again: the next screen asked for a still at once, whatever the ladder said. It keeps the pace now; a person who types
+    # the password again (or trusts a certificate) has the next still asked for at once, as for the screens behind doors.
+    monkeypatch.setattr(amt, "REDIRECTION_WITHIN", 0.3)
+    monkeypatch.setattr(amt.AmtScreen, "STILL_RETRY", 30.0)
+    monkeypatch.setattr(vncdevice, "ERROR_HOLD", 0)  # (so the port's own pause after a failure does not do the pacing here)
+    pc.state.came_on_at, pc.state.starting_for = time.monotonic(), 60.0  # (no session opened in time: every still fails)
+
+    async def polled(device: AmtDevice, until: Any, within: float) -> None:
+        """Asked for its picture as a tile that is only shown, every 50 ms, until `until()` or `within` seconds."""
+        deadline = time.monotonic() + within
+        while not until() and time.monotonic() < deadline:
+            with contextlib.suppress(KvmError):
+                await device.snapshot(640)
+            await asyncio.sleep(0.05)
+
+    async def run() -> tuple[int, int, int, int]:
+        first = a_pc(pc)
+        try:
+            await settled_status(first, "online")
+            await polled(first, lambda: first._screen._still_fails >= 1 and (first._screen._taking is None or first._screen._taking.done()), 5.0)
+            asked = pc.state.redirections
+        finally:
+            await first.close()
+        again = a_pc(pc)  # (the tile made anew)
+        try:
+            await settled_status(again, "online")
+            await polled(again, lambda: False, 1.0)
+            kept = pc.state.redirections
+        finally:
+            await again.close()
+        vncdevice.forget_pace(pc.url)  # (a person typed the password again)
+        third = a_pc(pc)
+        try:
+            await settled_status(third, "online")
+            await polled(third, lambda: pc.state.redirections > kept, 3.0)
+            return asked, kept, pc.state.redirections, again._screen._still_fails
+        finally:
+            await third.close()
+
+    asked, kept, forgotten, fails = asyncio.run(run())
+    assert asked >= 1 and kept == asked, f"the screen made anew asked for a still at once ({asked} -> {kept})"
+    assert fails >= 1 and forgotten > kept
+
+
 def test_another_certificate_on_the_redirection_port_is_said_on_the_tile_and_gets_nothing(tmp_path: Path) -> None:
     pc = FakeAmt(AmtState(), tls_dir=tmp_path / "cert-a", redirection_tls_dir=tmp_path / "cert-b").start()
     try:
@@ -1909,3 +2000,76 @@ def test_the_vnc_family_is_spoken_of_as_it_was() -> None:
     device = vncdevice.VncDevice(DeviceSpec("v1", "VNC", "vnc://127.0.0.1:1", "", "x", kind="vnc"))
     assert device.THING == "the VNC server" and device._the() == "The VNC server"
     assert (device.ENCODINGS, device.PIXELS, device.GREETED_AS_38, device.LET_GO_AFTER) == (rfb.ENCODINGS, rfb.RGB888, (), None)
+
+
+# --- which PC answers, on the session's own connection (0.2.1) --------------------------------------------------------
+
+
+def test_the_session_goes_to_the_engine_that_said_which_pc_it_is_where_its_name_has_two_addresses(tmp_path: Path) -> None:
+    # (The device review of 0.2.0, MEDIUM; probe devices/amt/test_p4_session_other_address.py.) The tile's name resolves to two
+    # addresses ("localhost" here: 127.0.0.1 and ::1; a stale record beside the current one, in a real network). Which PC
+    # answers was asked on WS-Management, which reached the tile's PC at one of them; the session to the screen resolved the
+    # name again, reached another PC of the fleet (the same account and password) at the other, and its engine had the Digest
+    # answer and then the keys. The session goes to the address the engine that said which PC it is answered from.
+    if len({info[4][0] for info in socket.getaddrinfo("localhost", 1, type=socket.SOCK_STREAM)}) < 2:
+        pytest.skip("localhost has one address here")
+    a = b_sock = None
+    for _ in range(20):
+        a = V6Amt()
+        b_sock = socket.socket()
+        try:
+            b_sock.bind(("127.0.0.1", a.port + 2))
+            break
+        except OSError:
+            b_sock.close()
+            a.redirection._sock.close()
+            a._sock.close()
+            a = None
+    assert a is not None and b_sock is not None
+    a.url = f"http://localhost:{a.port}"
+    other = AmtState(guid=OTHER_GUID, realm=OTHER_REALM)
+    b = FakeRedirection(other, b_sock, None)
+    a.start()
+    b.start()
+    try:
+        with wall(tmp_path) as client:
+            reply = client.post("/api/v1/devices", json={"url": a.url, "password": "secret", "kind": "amt"})
+            assert reply.status_code == 201, reply.text
+            device = reply.json()["device"]["id"]
+            status_of(client, device, state="online")
+            wait_until(lambda: client.get(snap(device)).status_code == 200, "no picture came", 20)
+            reply = client.post(f"/api/v1/devices/{device}/actions", json={"action": "keys", "keys": "KeyQ"})
+            assert reply.status_code == 200, reply.text
+            assert (other.redirections, other.redirection_logins, other.kvm_sessions, other.screen.keys) == (0, 0, 0, []), "the other PC was reached"
+            assert a.state.kvm_sessions >= 1 and len(a.state.screen.keys) == 2
+    finally:
+        a.stop()
+        b.stop()
+
+
+def test_another_engine_on_the_redirection_port_is_not_sent_the_password_nor_the_keys(tmp_path: Path) -> None:
+    # (The same.) What answers on the redirection port at the very address is not the engine that said which PC it is (its
+    # realm, which every engine has of its own, is another): the session is refused before the Digest answer goes, and
+    # nothing is typed into it. Its realm is compared on the session's own connection, where the password then goes.
+    pc = FakeAmt()
+    other = AmtState(guid=OTHER_GUID, realm=OTHER_REALM)
+    pc.redirection = FakeRedirection(other, pc.redirection._sock, None)
+    pc.start()
+    try:
+        with wall(tmp_path) as client:
+            reply = client.post("/api/v1/devices", json={"url": pc.url, "password": "secret", "kind": "amt"})
+            assert reply.status_code == 201, reply.text
+            device = reply.json()["device"]["id"]
+            status_of(client, device, state="online")
+
+            def said() -> str:
+                client.get(snap(device))  # (the screen is asked for, as a tile does)
+                return str(client.get("/api/v1/status").json()[device]["server"].get("no_screen"))
+
+            wait_until(lambda: said().startswith("Another engine answers on this PC's redirection port"), "the tile did not say that another engine answers on the redirection port", 20)
+            assert client.get("/api/v1/status").json()[device]["screen"] is False
+            reply = client.post(f"/api/v1/devices/{device}/actions", json={"action": "keys", "keys": "KeyQ"})
+            assert reply.status_code != 200, reply.text
+            assert other.redirections >= 1 and (other.redirection_logins, other.kvm_sessions, other.screen.keys) == (0, 0, [])
+    finally:
+        pc.stop()

@@ -134,15 +134,18 @@ def test_a_hole_in_the_activity_log_is_written_into_it_when_it_can_be_written_ag
     log = AuditLog(tmp_path / "audit.log")
     log.write("before", "192.0.2.1")
     log.flush()
-    real_open = Path.open
+    # (audit.log is written through store.private, its own from its first moment: the full disk is stood in for there.)
+    from qkvm import store as written_by
+
+    real_open = written_by.private
     full = {"disk": True}
 
-    def open_unless_full(self: Path, *args: Any, **kwargs: Any) -> Any:
-        if full["disk"] and self.name == "audit.log" and args[:1] == ("a",):
+    def open_unless_full(path: Any, mode: str = "w", **how: Any) -> Any:
+        if full["disk"] and Path(path).name == "audit.log" and mode == "a":
             raise OSError(28, "No space left on device")
-        return real_open(self, *args, **kwargs)
+        return real_open(path, mode, **how)
 
-    monkeypatch.setattr(Path, "open", open_unless_full)
+    monkeypatch.setattr(written_by, "private", open_unless_full)
     for _ in range(3):
         log.write("lost", "192.0.2.1")
     log.flush()

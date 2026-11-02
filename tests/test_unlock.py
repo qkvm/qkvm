@@ -367,7 +367,8 @@ def test_a_sign_out_is_not_undone_by_a_restart_when_it_could_not_be_written_down
     # Whoever kept a copy of a cookie must not get in with it after its owner signed out, a restart later either.
     data = tmp_path / "data"
     disk = {"full": False, "held": False}
-    real_open, real_unlink = os.open, os.unlink
+    # (sessions.json is made by security.open_private, its own from its first moment: the full disk is stood in for there.)
+    real_open, real_unlink = security.open_private, os.unlink
 
     def open_while_there_is_room(path: Any, *args: Any, **kwargs: Any) -> int:
         if disk["full"] and str(path).endswith("sessions.json.new"):
@@ -379,7 +380,7 @@ def test_a_sign_out_is_not_undone_by_a_restart_when_it_could_not_be_written_down
             raise PermissionError(errno.EACCES, "Permission denied")
         real_unlink(path, *args, **kwargs)
 
-    monkeypatch.setattr(os, "open", open_while_there_is_room)
+    monkeypatch.setattr(security, "open_private", open_while_there_is_room)
     monkeypatch.setattr(os, "unlink", unlink_what_is_not_held)
 
     with wall(data) as admin:
@@ -439,7 +440,8 @@ def test_a_sign_out_waits_for_the_disk_only_where_its_sign_in_was_written_down(t
     # (which, told so, signed itself in again).
     data = tmp_path / "data"
     disk = {"takes": True}
-    real_open, real_unlink = os.open, os.unlink
+    # (sessions.json is made by security.open_private, its own from its first moment: the full disk is stood in for there.)
+    real_open, real_unlink = security.open_private, os.unlink
 
     def open_if_it_takes(path: Any, *args: Any, **kwargs: Any) -> int:
         if not disk["takes"] and str(path).endswith("sessions.json.new"):
@@ -451,7 +453,7 @@ def test_a_sign_out_waits_for_the_disk_only_where_its_sign_in_was_written_down(t
             raise PermissionError(errno.EACCES, "Permission denied")
         real_unlink(path, *args, **kwargs)
 
-    monkeypatch.setattr(os, "open", open_if_it_takes)
+    monkeypatch.setattr(security, "open_private", open_if_it_takes)
     monkeypatch.setattr(os, "unlink", unlink_if_it_takes)
     with wall(data) as admin:
         wait_until(lambda: fits(admin), "never made to fit")
@@ -506,7 +508,8 @@ def test_a_disk_that_stays_full_is_said_once_and_tried_now_and_then(tmp_path: Pa
     from qkvm import security
 
     attempts, said = [], []
-    real_open = os.open
+    # (sessions.json is made by security.open_private, its own from its first moment: the full disk is stood in for there.)
+    real_open = security.open_private
 
     def no_room(path: Any, *args: Any, **kwargs: Any) -> int:
         if str(path).endswith("sessions.json.new"):
@@ -514,7 +517,7 @@ def test_a_disk_that_stays_full_is_said_once_and_tried_now_and_then(tmp_path: Pa
             raise OSError(errno.ENOSPC, "No space left on device")
         return real_open(path, *args, **kwargs)
 
-    monkeypatch.setattr(os, "open", no_room)
+    monkeypatch.setattr(security, "open_private", no_room)
     monkeypatch.setattr(security.log, "warning", lambda *args, **kwargs: said.append(args))
     sessions = security.Sessions(tmp_path / "sessions.json")
     sessions.create("203.0.113.9", remember=True, user="ab12cd34", mark="m")

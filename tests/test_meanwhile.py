@@ -18,7 +18,7 @@ from tests.fake_kvm import FakeKvm
 from tests.fake_redfish import FakeBmc
 from tests.test_totp import code_for, switch_on
 from tests.test_users import OTHER, account, browser, visitor
-from tests.test_wall import CSRF, PASSWORD, add, wait_until, wall
+from tests.test_wall import PASSWORD, add, wait_until, wall
 
 
 @pytest.fixture(autouse=True)
@@ -211,27 +211,25 @@ def test_a_request_that_was_let_in_as_an_account_does_not_go_on_as_that_account_
 def test_the_sixth_wrong_code_is_not_judged_however_the_guesses_are_timed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     # "After five of them, from wherever they came, the second step of that account is refused." Whether the
     # account is held is looked at before a sign-in waits for its turn to be judged, and not again when the
-    # turn comes. Whoever has the password sends the guesses while something else has the turn (here: a
-    # request to /api/v1/recover from another address, which anybody may send and which checks a key meanwhile).
+    # turn comes. Whoever has the password sends the guesses while something else has the turn (here: an
+    # admin's change whose save takes its time. It was a request to /api/v1/recover from another address, which
+    # anybody may send, until 0.2.1: that checked a key in the turn, and checks it beside the turns now).
     holding, go_on = threading.Event(), threading.Event()
-    real_open = Vault.open
+    real_write = Store.write
 
-    def open_and_wait(record: Any, password: str) -> Any:
-        key = real_open(record, password)
-        if password.startswith("NOTT"):  # the recovery key that was typed (tidied): not the right one
+    def write_and_wait(self: Store, data: dict[str, Any]) -> None:
+        if not go_on.is_set():
             holding.set()
             go_on.wait(20)
-        return key
+        real_write(self, data)
 
     with wall(tmp_path) as admin:
         who = account(admin, "olga", "operator")
         olga = browser(admin, "olga")
         secret = switch_on(olga, OTHER)
-        monkeypatch.setattr(Vault, "open", staticmethod(open_and_wait))
+        monkeypatch.setattr(Store, "write", write_and_wait)
 
-        elsewhere = TestClient(admin.app, headers=CSRF, client=("198.51.100.7", 40000))
-        elsewhere.portal = admin.portal
-        recovering, _ = in_background(lambda: elsewhere.post("/api/v1/recover", json={"name": "olga", "recovery_key": "NOTT-HERE-AAAA-BBBB", "new_password": "does not matter!"}))
+        recovering, _ = in_background(lambda: admin.post("/api/v1/actions", json={"name": "lock the screen", "kind": "keys", "keys": "MetaLeft,KeyL"}))
         assert holding.wait(10)
 
         guesses = []

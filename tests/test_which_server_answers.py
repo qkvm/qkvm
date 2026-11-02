@@ -80,6 +80,25 @@ def said(reply: httpx.Response) -> tuple[int, str]:
     return reply.status_code, str(reply.json().get("code"))
 
 
+def at_the_open_root(device: RedfishDevice, before: Any, after: Any = None) -> None:
+    """Have `before()` happen as the device reads the controller's open service root (without a session) and `after()` once
+    that read is answered: a new lease made to come at that moment."""
+    sent = device._send
+
+    async def then(client: Any, request: httpx.Request, *args: Any, **kwargs: Any) -> httpx.Response:
+        open_root = request.method == "GET" and request.url.path.rstrip("/") == "/redfish/v1" and "x-auth-token" not in request.headers
+        if not open_root:
+            return await sent(client, request, *args, **kwargs)
+        before()
+        try:
+            return await sent(client, request, *args, **kwargs)
+        finally:
+            if after is not None:
+                after()
+
+    device._send = then  # type: ignore[method-assign]
+
+
 ACTIONS = ("atx_power_long", "atx_reset", "atx_power", "power_on", "power_off", "reboot", "locate_on", "bios_setup")
 
 
@@ -579,14 +598,13 @@ def test_a_controllers_number_is_taken_only_as_the_controller_that_made_the_sess
             assert (await device.status())["state"] == "online" and device.spec.machine == own_number({"UUID": A_SYSTEM})
             bmc.state.root_uuid = A_ROOT  # (it says its number from now on)
             bmc.state.tokens.clear()  # (a new session: the next look asks the controller for its number afresh)
-            read = device._read
 
-            async def a_new_lease_at_the_root(path: str, *args: Any, **kwargs: Any) -> Any:
-                if path == redfish.ROOT and bmc.state.uuid == A_SYSTEM and device._token is not None:
+            def a_new_lease() -> None:
+                if bmc.state.uuid == A_SYSTEM and device._token is not None:
                     another_server(bmc)  # (B: another computer, another controller, none of A's sessions)
-                return await read(path, *args, **kwargs)
 
-            device._read = a_new_lease_at_the_root  # type: ignore[method-assign]
+            # (At the root's read, which is the open one, without a session, since 0.2.1: until then it was read under the session.)
+            at_the_open_root(device, a_new_lease)
             device._status_at = 0.0
             await device.status()
             for _ in range(40):
@@ -613,18 +631,14 @@ def test_a_controllers_number_is_not_taken_where_its_manager_names_another(tmp_p
         device = RedfishDevice(DeviceSpec(id="ab12", name="db-01", base_url=bmc.url, username="admin", password="secret", kind="redfish", tls="insecure", machine=own_number({"UUID": A_SYSTEM}) or ""))
         try:
             assert (await device.status())["state"] == "online"
-            read = device._read
 
-            async def another_root_for_a_moment(path: str, *args: Any, **kwargs: Any) -> Any:
-                if path != redfish.ROOT:
-                    return await read(path, *args, **kwargs)
+            def another_root_for_a_moment() -> None:
                 bmc.state.root_uuid = B_ROOT  # (the open root answered by another controller, for that one read)
-                try:
-                    return await read(path, *args, **kwargs)
-                finally:
-                    bmc.state.root_uuid = None
 
-            device._read = another_root_for_a_moment  # type: ignore[method-assign]
+            def as_it_was() -> None:
+                bmc.state.root_uuid = None
+
+            at_the_open_root(device, another_root_for_a_moment, as_it_was)
             bmc.state.tokens.clear()  # (a new session: the controller is asked for its number afresh)
             device._status_at = 0.0
             await device.status()
@@ -671,6 +685,30 @@ def test_a_controller_whose_manager_names_itself_by_its_services_number_is_known
             another_server(bmc)
             assert said(client.post(f"/api/v1/devices/{device}/actions", json={"action": "atx_reset"})) == (502, "another_machine")
             assert (bmc.state.logins, bmc.state.actions) == (0, [])
+    finally:
+        bmc.stop()
+
+
+def test_a_controller_that_says_its_number_only_to_a_session_is_not_refused_for_it(tmp_path: Path) -> None:
+    # (The desktop's follow-up 3, 0.2.1.) Its service root says its number (UUID) only to a request under one of its sessions.
+    # The number asked before the password goes is the one the root says to anybody, without a session: the controller's
+    # number is learnt from that root too, or it is refused for good after its next sign-in (it says none where one is kept).
+    # Here it says none to anybody: the server is known by its computer's number, as one whose controller says none.
+    bmc = server_a(tmp_path, root_uuid_signed_only=True)
+    try:
+        with wall(tmp_path / "wall") as client:
+            device = add(client, bmc.url)
+            status_of(client, device, state="online")
+            logins = bmc.state.logins
+            bmc.state.tokens.clear()  # (the session ran out: the next sign-in asks the root first, without one)
+            act = f"/api/v1/devices/{device}/actions"
+            assert client.post(act, json={"action": "locate_on"}).status_code == 200
+            assert bmc.state.logins > logins
+            assert status_of(client, device, state="online")["error"] is None
+            assert client.core.store.device(device).machine == own_number({"UUID": A_SYSTEM})  # type: ignore[attr-defined]
+            # ...and told apart by that number: another server is sent nothing.
+            another_server(bmc)
+            assert said(client.post(act, json={"action": "atx_power_long"})) == (502, "another_machine") and bmc.state.actions == []
     finally:
         bmc.stop()
 
@@ -790,3 +828,377 @@ def test_the_screen_of_an_openbmc_server_is_not_opened_under_another_servers_ses
         assert refused.code == "another_machine" and bmc.state.kvm_upgrades == ["token"] and bmc.state.kvm_open == 0
     finally:
         bmc.stop()
+
+
+# --- the console's roads, each bound to the controller compared on its own connection (0.2.1) -----------------------------
+
+
+def a_tile_of_a(bmc: FakeBmc) -> RedfishDevice:
+    return RedfishDevice(DeviceSpec(id="ab12", name="db-01", base_url=bmc.url, username="admin", password="secret", kind="redfish", tls="insecure", machine=A_MARK))
+
+
+async def the_console_refused(device: RedfishDevice, within: float = 15.0) -> KvmError:
+    """What the server's screen is refused with in the end, asked for as a tile asks until it is not "under way"."""
+    deadline = asyncio.get_running_loop().time() + within
+    while True:
+        try:
+            await device.snapshot(640)
+        except KvmError as ex:
+            if ex.code != "no_stream" or asyncio.get_running_loop().time() > deadline:
+                return ex
+        await asyncio.sleep(0.05)
+
+
+def a_new_lease_to_b(bmc: FakeBmc) -> None:
+    """Another server answers from now on: another computer, another controller (its own number), which knows none of the
+    wall's sessions, cookies or console passes."""
+    another_server(bmc)
+    bmc.state.console_passes.clear()
+
+
+def test_the_consoles_web_sign_in_goes_only_where_the_controller_was_compared_on_its_connection(tmp_path: Path) -> None:
+    # (The desktop's follow-up 7 and the reviewer's addition, 0.2.1.) Which server answers is asked over the Redfish session;
+    # the console's web page is signed in to with the password on another connection, made a moment later. A new lease in
+    # between: the other server's web page was offered the password. The sign-in goes on a connection of its own, on which
+    # the controller's open root is read first and its number compared: here it is another's, and nothing goes on it. (The
+    # lease comes as that connection is made: since round 2 it is made alongside the question, and the stand-in, which only
+    # changes its state, cannot keep a connection made before it with the server it had, as a real address would.)
+    bmc = server_a(tmp_path, own_console=True)
+
+    async def run() -> KvmError:
+        device = a_tile_of_a(bmc)
+        try:
+            assert (await device.status())["state"] == "online"
+            opening, opened = device._open_line, []
+
+            async def a_new_lease_as_it_is_made(*args: Any, **kwargs: Any) -> Any:
+                opened.append(1)
+                if len(opened) == 1:
+                    a_new_lease_to_b(bmc)
+                return await opening(*args, **kwargs)
+
+            device._open_line = a_new_lease_as_it_is_made  # type: ignore[method-assign]
+            return await the_console_refused(device)
+        finally:
+            await device.close()
+
+    try:
+        refused = asyncio.run(run())
+        assert refused.code == "another_machine", (refused.code, refused.message)
+        assert (bmc.state.web_logins, bmc.state.heard, bmc.state.watching) == (0, [], 0)  # (not offered the password, no console)
+    finally:
+        bmc.stop()
+
+
+def test_the_consoles_own_connection_goes_only_where_the_controller_was_compared_on_it(tmp_path: Path) -> None:
+    # (The same, the console's WebSocket.) A new lease after the web page handed out the console's pass: the console was a
+    # connection made anew, which took the web page's cookie and the pass (and would have taken the keys) to the other server.
+    # It is opened on the connection the controller's number was compared on (the sign-in's), and where that one has ended (a
+    # new lease ends it, as here), on one made anew on which the controller's open root is read first and its number compared.
+    bmc = server_a(tmp_path, own_console=True)
+
+    async def run() -> KvmError:
+        device = a_tile_of_a(bmc)
+        try:
+            assert (await device.status())["state"] == "online"
+            device._complete_first = False  # (how its console is greeted is known: the pass is the last the web page is asked)
+            web = device._web
+
+            async def a_new_lease_after_the_pass(method: str, path: str, *args: Any, **kwargs: Any) -> httpx.Response:
+                answer = await web(method, path, *args, **kwargs)
+                if (method, path) == ("GET", "/api/kvm/token") and args and bmc.state.uuid == A_SYSTEM:  # (the signed-in one)
+                    a_new_lease_to_b(bmc)
+                    if kwargs.get("line") is not None:
+                        kwargs["line"].close()  # (the connection the pass came on ends with the lease)
+                return answer
+
+            device._web = a_new_lease_after_the_pass  # type: ignore[method-assign]
+            return await the_console_refused(device)
+        finally:
+            await device.close()
+
+    try:
+        refused = asyncio.run(run())
+        assert refused.code == "another_machine", (refused.code, refused.message)
+        assert (bmc.state.heard, bmc.state.watching, bmc.state.hid) == ([], 0, [])  # (no console: no cookie, no pass, no key)
+    finally:
+        bmc.stop()
+
+
+def test_an_openbmc_console_goes_only_where_the_controller_was_compared_on_its_connection(tmp_path: Path) -> None:
+    # (The same, OpenBMC's console, which bmcweb opens with the tile's Redfish session.) Another server at the address,
+    # another controller: the session's token went to it with the console's upgrade (it refused it, not knowing it). The
+    # console is opened on a connection on which the controller's open root is read first: nothing goes to another.
+    bmc = FakeBmc(BmcState(layout="openbmc", uuid=A_SYSTEM, root_uuid=A_ROOT, kvm_screen=ikvm())).start()
+
+    async def run() -> KvmError:
+        device = RedfishDevice(DeviceSpec(id="ab12", name="db-01", base_url=bmc.url, username="admin", password="secret", kind="redfish", machine=A_MARK))
+        try:
+            assert (await device.status())["state"] == "online"
+            another_server(bmc)
+            bmc.state.kvm_upgrades.clear()
+            with pytest.raises(KvmError) as refused:
+                await device.rfb_socket()
+            return refused.value
+        finally:
+            await device.close()
+
+    try:
+        refused = asyncio.run(run())
+        assert refused.code == "another_machine" and bmc.state.kvm_upgrades == [] and bmc.state.kvm_open == 0, (refused.code, bmc.state.kvm_upgrades)
+    finally:
+        bmc.stop()
+
+
+def test_the_sign_ins_password_goes_on_the_connection_the_controllers_number_was_compared_on(tmp_path: Path) -> None:
+    # (The coordinator's decision (a), 0.2.1.) The controller's open root was read, and its number compared, on whichever pooled
+    # connection the HTTP library had; the password went on whichever it had next. The controller closes the connection after
+    # its root's answer, and a new lease comes in that moment: the password went, on a connection made anew, to the other
+    # server. It goes on the very connection the root was read and compared on, and where that one was closed, on one made
+    # anew and compared anew: here another controller answers there, and is sent nothing.
+    bmc = server_a(tmp_path)
+
+    async def run() -> dict[str, Any]:
+        device = a_tile_of_a(bmc)
+        try:
+            assert (await device.status())["state"] == "online"
+            bmc.state.tokens.clear()  # (the session ran out: the next look signs in again)
+            bmc.state.close_after_open_root = True
+            bmc.state.after_open_root = lambda: another_server(bmc)
+            return await device._read_status()
+        finally:
+            await device.close()
+
+    try:
+        status = asyncio.run(run())
+        assert (status["state"], status["error"]["code"]) == ("error", "another_machine"), status
+        assert bmc.state.logins == 0  # (not sent the password)
+    finally:
+        bmc.stop()
+
+
+def test_a_controller_that_closes_the_connection_after_every_answer_gets_no_console_and_is_told_why(tmp_path: Path) -> None:
+    # (The coordinator's decision (c), 0.2.1.) What must reach the controller goes on the connection its number was compared on
+    # (see redfish._Line). One that closes the connection after every answer cannot be compared on a connection that then
+    # carries anything: its console ends at once with a plain word that names the cause, is not asked for again at every
+    # look, and nothing goes on a connection that was not compared (no web sign-in at all, no console). A sign-in of its
+    # Redfish service (its number remembered) is not sent the password either, and the tile says so. No hang, no crash.
+    bmc = server_a(tmp_path, own_console=True)
+    cause = "closes the connection after every answer"
+
+    async def run() -> tuple[KvmError, KvmError, int, dict[str, Any], dict[str, Any]]:
+        device = a_tile_of_a(bmc)
+        try:
+            async with asyncio.timeout(60):
+                assert (await device.status())["state"] == "online"  # (signed in while it kept its connections open)
+                bmc.state.closes_every_connection = True
+                refused = await the_console_refused(device)
+                asked = len(bmc.state.web_asked)
+                again = await the_console_refused(device, within=1.0)  # (asked again at once: said again, and nothing asked of it)
+                assert len(bmc.state.web_asked) == asked
+                status = await device._read_status()
+                bmc.state.tokens.clear()  # (its session ran out: a sign-in now)
+                logins = bmc.state.logins
+                signed = await device._read_status()
+                return refused, again, bmc.state.logins - logins, status, signed
+        finally:
+            await device.close()
+
+    try:
+        refused, again, logins, status, signed = asyncio.run(run())
+        assert refused.code == "no_picture" and cause in refused.message, (refused.code, refused.message)
+        assert (again.code, again.message) == (refused.code, refused.message)
+        assert cause in str(status["server"]["no_screen"]) and status["screen"] is False, status["server"]["no_screen"]
+        assert (bmc.state.web_logins, bmc.state.watching, bmc.state.heard) == (0, 0, [])
+        assert logins == 0 and signed["state"] == "error" and cause in signed["error"]["message"], signed["error"]
+    finally:
+        bmc.stop()
+
+
+def test_a_sign_in_refused_before_its_password_went_is_not_counted_as_sent(tmp_path: Path) -> None:
+    # (The second review's smaller point, 0.2.1.) The controller sends more than its root's answer on the connection its number is
+    # compared on (bytes nobody asked for). The sign-in's request is not written there: nothing of the password went, and it is
+    # not counted as a sign-in that went out and came to nothing (held back as one, and said "does not sign qKVM in").
+    asked: list[str] = []
+
+    async def device_side(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            while True:
+                head = (await reader.readuntil(b"\r\n\r\n")).decode("latin-1")
+                asked.append(head.split("\r\n", 1)[0])
+                if head.startswith("GET /redfish/v1/ "):
+                    body = json.dumps({"RedfishVersion": "1.15.1", "UUID": A_ROOT}).encode()
+                    answer = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n" % len(body) + body
+                    writer.write(answer + b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")  # (and an answer nobody asked for)
+                else:
+                    writer.write(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n")
+                await writer.drain()
+        except (asyncio.IncompleteReadError, ConnectionError, OSError):
+            pass
+        finally:
+            writer.close()
+
+    async def run() -> tuple[KvmError, float]:
+        server = await asyncio.start_server(device_side, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        spec = DeviceSpec(id="ab12", name="db-01", base_url=f"http://127.0.0.1:{port}", username="admin", password="secret", kind="redfish", machine=A_MARK)
+        device = RedfishDevice(spec)
+        try:
+            with pytest.raises(KvmError) as refused:
+                await device._login()
+            return refused.value, kvm.REJECTED.wait_left(kvm.REJECTED.what("login", spec))
+        finally:
+            await device.close()
+            server.close()
+
+    refused, held = asyncio.run(run())
+    assert not any(one.startswith("POST") for one in asked), asked  # (nothing of the password went)
+    assert held == 0 and "does not sign qKVM in" not in refused.message, (held, refused.code, refused.message)
+
+
+async def what_the_console_gives(device: RedfishDevice, within: float = 20.0) -> str:
+    """"a picture" once the server's screen is there; else the code and words it is refused with in the end."""
+    deadline = asyncio.get_running_loop().time() + within
+    while True:
+        try:
+            await device.snapshot(640)
+            return "a picture"
+        except KvmError as ex:
+            if ex.code != "no_stream" or asyncio.get_running_loop().time() > deadline:
+                return f"{ex.code}: {ex.message}"
+        await asyncio.sleep(0.05)
+
+
+@pytest.mark.parametrize("how", ["pinned", "pinned, and another tile shows its certificate", "plain HTTP"])
+def test_a_controller_that_closes_every_connection_goes_on_fresh_pinned_ones_only_where_its_certificate_is_the_tiles(tmp_path: Path, how: str) -> None:
+    # (The second review's L4, 0.2.1; probe review-bmc/probes/p8_closes_every_answer_from_the_start.py.) A controller that closes
+    # the connection after every answer cannot carry the password, the pass or the keys on the connection its number was compared
+    # on. Where its certificate is pinned and no other tile shows it, each of those goes on a connection made afresh right after
+    # the compare, checked against the very same certificate (which binds it to the controller compared); over plain HTTP, with
+    # the certificate not checked (test_a_controller_that_closes_the_connection_after_every_answer_...), or with a certificate
+    # another tile shows too (a maker's one for every board, say), nothing is sent, as before. It had been refused for good.
+    from qkvm.kvm import fetch_certificate
+    from tests.test_redfish import a_screen
+
+    https = how != "plain HTTP"
+    state = BmcState(uuid=A_SYSTEM, root_uuid=A_ROOT, model="SRV-A", own_console=True, screen=a_screen())
+    bmc = FakeBmc(state, tls_dir=tmp_path / "the-makers" if https else None).start()
+
+    async def run() -> tuple[str, int, str, list[Any]]:
+        pem = await fetch_certificate(bmc.url) if https else None
+        spec = DeviceSpec(id="ab12", name="db-01", base_url=bmc.url, username="admin", password="secret", kind="redfish", tls="pinned", cert_pem=pem, machine=A_MARK)
+        device = RedfishDevice(spec)
+        twin = RedfishDevice(DeviceSpec(id="cd34", name="db-02", base_url=bmc.url, username="admin", password="secret", kind="redfish", tls="pinned", cert_pem=pem)) if "another tile" in how else None
+        try:
+            async with asyncio.timeout(60):
+                assert (await device.status())["state"] == "online"  # (signed in while it kept its connections open)
+                bmc.state.closes_every_connection = True
+                bmc.state.tokens.clear()  # (its session ran out: a sign-in now)
+                logins = bmc.state.logins
+                status = await device._read_status()
+                signed = "signed in" if bmc.state.logins == logins + 1 and status["state"] == "online" else f"{status['state']}: {(status.get('error') or {}).get('message')}"
+                console = await what_the_console_gives(device)
+                if console == "a picture":
+                    await device.act("keys", keys="KeyA")
+                    for _ in range(100):
+                        if bmc.state.hid[-2:] == [("key", 0, [0x04]), ("key", 0, [])]:
+                            break
+                        await asyncio.sleep(0.05)
+                return signed, bmc.state.web_logins, console, list(bmc.state.hid)
+        finally:
+            await device.close()
+            if twin is not None:
+                await twin.close()
+
+    try:
+        signed, web_logins, console, hid = asyncio.run(run())
+        if how == "pinned":
+            assert signed == "signed in" and console == "a picture" and web_logins == 1, (signed, console)
+            assert hid[-2:] == [("key", 0, [0x04]), ("key", 0, [])], hid
+        else:
+            cause = "closes the connection after every answer"
+            assert cause in signed and cause in console, (signed, console)  # (the console: its Redfish sign-in, or its own line)
+            assert (web_logins, hid) == (0, [])
+    finally:
+        bmc.stop()
+
+
+@pytest.mark.parametrize("how", ["plain HTTP", "TLS not checked"])
+def test_after_a_new_lease_no_session_token_reaches_the_other_server_on_any_road(tmp_path: Path, how: str) -> None:
+    # (The owner's rule for 0.2.1: the token gap fixed.) The session a sign-in opens is a token every later request carries. It
+    # went on the HTTP library's connections, which are not compared: after a new lease (which ends the connections to the
+    # server that had the address) the first request on a connection made anew handed this tile's token to whatever answered.
+    # Over plain HTTP and with the certificate not checked, every request that carries it goes on a connection of the program's
+    # own, compared when it is made (see redfish._Lines): another server is sent no token by a look, a button, the light, Start
+    # into BIOS setup, the way into the console, or the sign-out of the session as the tile is retired.
+    bmc = FakeBmc(BmcState(uuid=A_SYSTEM, root_uuid=A_ROOT, model="SRV-A"), tls_dir=tmp_path / "the-makers" if how == "TLS not checked" else None).start()
+
+    async def run() -> tuple[list[str], set[str], list[str]]:
+        device = RedfishDevice(DeviceSpec(id="ab12", name="db-01", base_url=bmc.url, username="admin", password="secret", kind="redfish", tls="insecure", machine=A_MARK))
+        said: list[str] = []
+        try:
+            assert (await device.status())["state"] == "online"
+            assert client_of(device) is not None
+            this_tiles = set(bmc.state.tokens)  # (the tokens this server gave this tile)
+            another_server(bmc)
+            bmc.drop_connections()
+            await asyncio.sleep(0.2)
+            heard = len(bmc.state.tokens_heard)
+            status = await device._read_status()
+            said.append(f"look: {(status.get('error') or {}).get('code')}")
+            for action in ACTIONS:
+                try:
+                    await device.act(action)
+                    said.append(f"{action}: done")
+                except KvmError as ex:
+                    said.append(f"{action}: {ex.code}")
+            try:
+                await device.console()
+                said.append("console: handed out")
+            except KvmError as ex:
+                said.append(f"console: {ex.code}")
+        finally:
+            await device.close()  # (the session's sign-out, as the tile is retired)
+        return bmc.state.tokens_heard[heard:], this_tiles, said
+
+    try:
+        heard, this_tiles, said = asyncio.run(run())
+        assert not set(heard) & this_tiles, f"this tile's token went to the other server: {said}"
+        assert all(one.endswith("another_machine") for one in said), said
+    finally:
+        bmc.stop()
+
+
+def test_a_sign_out_on_a_line_made_for_it_goes_to_this_tiles_server_and_to_no_other(tmp_path: Path) -> None:
+    # (With the sign-out's fix of 0.2.1: GitHub's controllers job.) Where no line of the tile's waits as it is retired, the
+    # sign-out makes one, compared as it is made: for a server known by its computer alone, by reading the computer under the
+    # session being given back. Another server that took the address does not know that session (its answer is 401): it is
+    # sent no DELETE, and this tile's session runs out by itself on the server that made it.
+    bmc = server_a(tmp_path, root_uuid=None)
+    seen: dict[str, Any] = {}
+
+    async def run() -> None:
+        device = RedfishDevice(DeviceSpec(id="ab12", name="db-01", base_url=bmc.url, username="admin", password="secret", kind="redfish", tls="insecure", machine=own_number({"UUID": A_SYSTEM}) or ""))
+        try:
+            assert (await device.status())["state"] == "online"
+            another_server(bmc, root=None)
+            bmc.drop_connections()  # (a new lease ends the connections to the server that had the address)
+            await asyncio.sleep(0.2)
+            seen["waiting"] = device._lines.waiting()
+            seen["ports"] = set(bmc.state.conversations)
+        finally:
+            await device.close()
+
+    try:
+        asyncio.run(run())
+        assert seen["waiting"] is False  # (the sign-out makes a line of its own)
+        after = [said for port, heard in bmc.state.conversations.items() if port not in seen["ports"] for said in heard]
+        assert any(said.startswith("GET /redfish/v1/Systems/") for said in after), after  # (the compare, under the session)
+        assert not any(said.startswith("DELETE") for said in after), after
+        assert bmc.state.signed_out == 0
+    finally:
+        bmc.stop()
+
+
+def client_of(device: RedfishDevice) -> object:
+    return device._client

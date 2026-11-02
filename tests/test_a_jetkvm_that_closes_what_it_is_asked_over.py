@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import itertools
 import json
 import random
 import time
@@ -141,7 +142,7 @@ def test_a_key_pressed_meanwhile_is_answered_as_the_devices_fault_and_works_agai
                 assert reply.status_code != 500, reply.text
                 if reply.status_code == 200:
                     break
-                assert reply.json()["code"] in ("dropped", "timeout", "busy", "no_stream", "unreachable"), reply.text
+                assert reply.json()["code"] in ("action_failed", "dropped", "timeout", "busy", "no_stream", "unreachable"), reply.text
                 time.sleep(0.4)
             assert answers[-1] == 200, answers
             assert fake.state.typed[-1] == (0, [40])
@@ -195,7 +196,10 @@ def test_what_is_asked_in_the_moment_after_it_closed_is_the_devices_fault_and_no
             with pytest.raises(KvmError) as refused:
                 await device.act("keys", keys="Enter")
             assert time.monotonic() - began < 2  # answered at once: nobody waited ten seconds for this
-            assert (refused.value.code, refused.value.status) == ("dropped", 502), (refused.value.code, refused.value.status, refused.value.message)
+            # (Said not to be done, in the device's words: "dropped", which this said before, the page shows as "may have been
+            # done" too, and nothing had been sent. See test_a_jetkvm_press_that_never_went_out.py.)
+            assert (refused.value.code, refused.value.status) == ("action_failed", 502), (refused.value.code, refused.value.status, refused.value.message)
+            assert refused.value.message == "It was not done: The JetKVM closed the channel it is asked over", refused.value.message
             assert fake.state.typed == []
         finally:
             await device.close()
@@ -230,14 +234,17 @@ def test_one_that_ends_every_connection_at_once_is_tried_less_and_less_often(mon
         device = jetkvm.JetKvmDevice(DeviceSpec("jet", "A JetKVM", fake.url, "", "secret", kind="jetkvm"))
         began = time.monotonic()
         try:
-            while time.monotonic() - began < 16:
+            # A tile on screen until the fourth failure in a row is counted: some ten seconds on an idle computer. (Watched for
+            # sixteen seconds, as this was, a busy one spent most of them making each attempt, the decoder's process started
+            # for it, and counted two: register row 28.) A minute and a half at the most.
+            while device._failures < 4 and time.monotonic() - began < 90:
                 await device.status()
                 try:
                     await device.snapshot(640)
                 except KvmError:
                     pass
                 await asyncio.sleep(0.25)
-            seen["failures"], seen["connections"] = device._failures, fake.state.sessions
+            seen["failures"], seen["connections"], seen["offers_at"] = device._failures, fake.state.sessions, list(fake.state.offers_at)
         finally:
             await device.close()
 
@@ -249,8 +256,13 @@ def test_one_that_ends_every_connection_at_once_is_tried_less_and_less_often(mon
         finally:
             fake.stop()
     again = [record.getMessage() for record in caplog.records if "reachable again" in record.getMessage()]
-    assert seen["failures"] >= 3, seen  # counted in a row, since it never answered anything
-    assert 2 <= seen["connections"] <= 6, seen  # (at a steady 2.6 s it was seven and more in this time)
+    assert seen["failures"] >= 4, seen  # counted in a row, since it never answered anything
+    assert seen["failures"] <= seen["connections"] <= seen["failures"] + 1, seen  # (each connection one failure)
+    # Less and less often: each attempt comes at least the hold of the failures before it after the one before (one second,
+    # two, four), whatever an attempt itself takes. (Its count begun anew at every attempt, it was a new one every 2.6 s.)
+    at = seen["offers_at"]
+    gaps = [later - earlier for earlier, later in itertools.pairwise(at)]
+    assert len(gaps) >= 3 and all(gap >= kvm.ERROR_HOLD * 2**i - TICK for i, gap in enumerate(gaps)), gaps
     assert again == [], again  # and it is not called reachable for having let itself be connected to
 
 

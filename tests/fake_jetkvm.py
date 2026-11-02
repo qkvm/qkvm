@@ -77,6 +77,7 @@ class JetState:
     frames_from: float = 0.0  # (no picture before this moment: set by `say_signal`)
     silent_screens: int = 0  # the next this many connections' video sends nothing at all, signal or not
     video_answer_late: float = 0.0  # getVideoState answered this long after it was asked, with how it was then (a busy one)
+    video_state_says_ready: bool = True  # False: its answer to getVideoState says no more whether there is a signal
     frozen: bool = False  # as when it loses power: no more video, no more answers, and no goodbye
     width: int = 640
     height: int = 360
@@ -118,6 +119,7 @@ class JetState:
     # Put in by a test: what it says over the signalling once its addresses are out, word for word, each
     # after this long (0.05: while they are still being gathered; 1: when the connection has long been made).
     also_says: list[str] = field(default_factory=list)
+    extra_candidates: list[str] = field(default_factory=list)  # network addresses it offers beside its own, after them
     also_after: float = 1.0
     also_said: int = 0
     # Put in by a test: it refuses every login, as after five wrong passwords, and says when to come back
@@ -127,6 +129,10 @@ class JetState:
     logins: int = 0
     passwords_over: list[str] = field(default_factory=list)  # how each password shown to it travelled: "http" or "https"
     video_offers: list[str] = field(default_factory=list)  # codec negotiation sent by the viewer
+    offers_at: list[float] = field(default_factory=list)  # ...and when each came (time.monotonic(), this process's clock)
+    # False: an offer takes the viewer (as every offer does) and is never answered, as for one whose video connection never
+    # comes about (UDP blocked between the two, its network addresses unreachable from the viewer's).
+    answers_offers: bool = True
     sessions: int = 0  # video connections made so far
     actions: list[str] = field(default_factory=list)
     typed: list[tuple[int, list[int]]] = field(default_factory=list)  # every keyboard state with keys down that a message made
@@ -374,6 +380,8 @@ def make_fake_jetkvm(state: JetState) -> FastAPI:
                 "ready": state.signal, "streaming": 1, "width": state.width, "height": state.height, "fps": 60,
                 **({} if state.signal else {"error": "no_signal"}),
             }  # fmt: skip
+            if not state.video_state_says_ready:
+                result = {key: value for key, value in result.items() if key not in ("ready", "error")}
         elif method == "getUSBState":
             result = "configured"
         elif method == "getLocalVersion":
@@ -558,6 +566,14 @@ def make_fake_jetkvm(state: JetState) -> FastAPI:
     app.state.hand_over, app.state.current, app.state.drop, app.state.close_hid = hand_over, current, drop, close_hid
     app.state.tell_video = tell_video
 
+    def say_on_rpc(text: str) -> None:
+        """Say something on the viewer's `rpc` channel, word for word (a test's: what a real one never says)."""
+        rpc = current["rpc"]
+        if rpc is not None and rpc.readyState == "open":
+            rpc.send(text)
+
+    app.state.say_on_rpc = say_on_rpc
+
     def presses(message: Any) -> Any:
         """The number of a call that presses keys or mouse buttons; None for any other."""
         try:
@@ -630,10 +646,13 @@ def make_fake_jetkvm(state: JetState) -> FastAPI:
                     continue
                 offer = json.loads(base64.b64decode(message["data"]["sd"]))
                 state.video_offers.append(offer["sdp"])
+                state.offers_at.append(time.monotonic())
 
                 # One viewer at a time: tell the previous one, then drop it.
                 current["loop"] = asyncio.get_running_loop()
                 hand_over()
+                if not state.answers_offers:
+                    continue
 
                 pc = RTCPeerConnection(RTCConfiguration(iceServers=[]))
                 peers.add(pc)
@@ -679,7 +698,7 @@ def make_fake_jetkvm(state: JetState) -> FastAPI:
                 ) + "\r\n"
                 answer = base64.b64encode(json.dumps({"type": "answer", "sdp": bare}).encode()).decode()
                 await websocket.send_text(json.dumps({"type": "answer", "data": answer}))
-                for candidate in candidates:
+                for candidate in candidates + state.extra_candidates:
                     await asyncio.sleep(0.01)
                     data = {"candidate": candidate, "sdpMid": "0", "sdpMLineIndex": 0}
                     await websocket.send_text(json.dumps({"type": "new-ice-candidate", "data": data}))
@@ -767,6 +786,12 @@ class FakeJetKvm:
         loop = self._app.state.current.get("loop")
         if loop is not None:
             loop.call_soon_threadsafe(self._app.state.close_hid)
+
+    def say_on_rpc(self, text: str) -> None:
+        """Say `text` on the viewer's channel it is asked over now (from a test's thread)."""
+        loop = self._app.state.current.get("loop")
+        if loop is not None:
+            loop.call_soon_threadsafe(self._app.state.say_on_rpc, text)
 
     def say_signal(self, ready: bool) -> None:
         """The computer's screen goes to sleep, or comes back (from a test's thread), and the viewer is told so at once;

@@ -24,10 +24,12 @@ import contextlib
 import dataclasses
 import functools
 import hashlib
+import io
 import itertools
 import json
 import logging
 import os
+import secrets
 import shutil
 import sqlite3
 import threading
@@ -37,7 +39,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, BinaryIO
 
-from .store import LONGEST_LINE, AuditLog, entry_of, open_shared, read_only_uri
+from ._folders import open_private
+from .store import LONGEST_LINE, AuditLog, entry_of, into_wal, open_shared, sqlite_open
 
 log = logging.getLogger("qkvm")
 
@@ -68,7 +71,7 @@ MOST_WORDS, LONGEST_WORD = 20, 100  # words looked for at once, and characters o
 # the index again (KINDS_MARK), so that it can never say the old kinds.
 KINDS: dict[str, frozenset[str]] = {
     "signin": frozenset({"login", "login_failed", "login_code_asked", "logout", "setup", "password_recovered", "recovery_failed", "display_opened"}),
-    "action": frozenset({"action", "action_failed", "console_opened", "console_failed", "live_control", "live_opened", "live_closed"}),
+    "action": frozenset({"action", "action_failed", "console_opened", "console_failed", "live_control", "live_opened", "live_closed", "activity_left_out"}),
     "alert": frozenset({"alert", "alerts_paused", "alerts_resumed"}),
 }
 KIND_NAMES = ("signin", "action", "change", "alert")
@@ -291,6 +294,52 @@ def leftover_downloads(folder: Path) -> None:
             pass  # (another time: nothing waits for it)
 
 
+class Spool:
+    """A download of this log in the making: in memory up to `in_memory` bytes, beyond that in a file of its own in the data
+    folder, named DOWNLOAD_NAMED, its owner's alone from its first moment and gone when closed (Windows: O_TEMPORARY; POSIX:
+    removed as soon as it is open). tempfile's file was given the folder's entries on Windows, and part of the log was
+    everybody's to read while it was made (the round 4 review, M1). write, tell, seek, read, close, as a file has them."""
+
+    def __init__(self, in_memory: int, folder: Path) -> None:
+        self._in_memory, self._folder = in_memory, folder
+        self._file: Any = io.BytesIO()
+        self._rolled = False
+
+    def write(self, data: bytes) -> int:
+        written = self._file.write(data)
+        if not self._rolled and self._file.tell() > self._in_memory:
+            self._roll_over()
+        return int(written)
+
+    def _roll_over(self) -> None:
+        prefix, suffix = DOWNLOAD_NAMED
+        path = self._folder / f"{prefix}{secrets.token_hex(8)}{suffix}"
+        flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0) | getattr(os, "O_TEMPORARY", 0)
+        file = os.fdopen(open_private(path, flags), "w+b")
+        try:
+            if os.name == "posix":
+                path.unlink()
+            held = self._file
+            file.write(held.getvalue())
+            file.seek(held.tell())
+        except BaseException:
+            file.close()
+            raise
+        self._file, self._rolled = file, True
+
+    def tell(self) -> int:
+        return int(self._file.tell())
+
+    def seek(self, offset: int, whence: int = 0) -> int:
+        return int(self._file.seek(offset, whence))
+
+    def read(self, size: int = -1) -> bytes:
+        return bytes(self._file.read(size))
+
+    def close(self) -> None:
+        self._file.close()
+
+
 CONSOLE_SAID_AN_HOUR = 120  # a server's console opened (or not had): entries one account writes an hour, at the most (Allowance)
 NAMED_AGAIN_AFTER = 3600.0  # seconds after which an entry about a machine is written again whatever an allowance says (Allowance)
 
@@ -327,6 +376,16 @@ class Allowance:
         if about is not None:
             named[about] = now
         return unsaid
+
+    def left_out(self) -> dict[str, int]:
+        """How many entries each account had left out that no entry of it has said yet, for the caller to say: counted from
+        nothing again, the allowance left as spent."""
+        found = {}
+        for who, (left, at, unsaid) in list(self._left.items()):
+            if unsaid:
+                found[who] = unsaid
+                self._left[who] = (left, at, 0)
+        return found
 
 
 def _tail_of(file: BinaryIO, end: int) -> str:
@@ -504,7 +563,7 @@ class Index:
 
     def _query(self, asked: Asked, limit: int, below: int | None = None) -> list[tuple[int, str]]:
         """(id, line) of the newest `limit` entries asked for, below the id `below` where it is given."""
-        conn = sqlite3.connect(read_only_uri(self.path), uri=True, timeout=2.0)
+        conn = sqlite_open(self.path, read=True, timeout=2.0)
         deadline = time.monotonic() + READ_PATIENCE
         try:
             conn.execute("PRAGMA query_only = 1")
@@ -620,7 +679,7 @@ class Index:
         """Open the index, making it where there is none; one that cannot be used is removed and made anew."""
         for attempt in (1, 2):
             try:
-                conn = sqlite3.connect(self.path, timeout=WRITE_PATIENCE, isolation_level="DEFERRED")
+                conn = sqlite_open(self.path, timeout=WRITE_PATIENCE, isolation_level="DEFERRED")
             except sqlite3.Error as ex:
                 self._say("open", "the activity log's index in %s could not be opened: %s", self.path.parent, ex)
                 return False
@@ -659,7 +718,7 @@ class Index:
             conn.set_progress_handler(None, 0)
         if verdict != "ok":
             raise _Unusable(f"quick_check: {str(verdict)[:120]}")
-        conn.execute("PRAGMA journal_mode = WAL")  # reads do not wait for the writer, nor it for them
+        into_wal(conn, self.path)  # reads do not wait for the writer, nor it for them (and SQLite makes no file of its own)
         conn.execute("PRAGMA synchronous = NORMAL")  # a power cut may lose the last moments, never the file: and those are in the text files
         conn.execute(f"PRAGMA journal_size_limit = {WAL_MOST}").fetchall()
         with conn:

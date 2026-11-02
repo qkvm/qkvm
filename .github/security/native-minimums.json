@@ -2,9 +2,9 @@
   "schema": 1,
   "components": {
     "cpython": {
-      "minimum": "3.13.16",
+      "minimum": "3.13.18",
       "source": "The base image (python:3.13-slim, pinned by digest in the Dockerfile) builds CPython from source; it is no Debian package.",
-      "reason": "What the image of 0.2.0 ships (read 2026-10-26). No advisory against 3.13.16 was known then. When python.org publishes a security release of 3.13, raise this to it and move the Dockerfile's base image to a digest that has it."
+      "reason": "The security release of 3.13 that the base image of 0.2.1 carries (python:3.13-slim as Docker Hub served it on 2026-11-01, PYTHON_VERSION 3.13.18 on amd64 and arm64). 3.13.16, in the image of 0.2.0, lacks its security fixes (for Expat, CVE-2026-77214 and CVE-2026-102633; ssl refusing the compromised eMudhra intermediates; tarfile). When python.org publishes a security release of 3.13, raise this to it and move the Dockerfile's base image to a digest that has it."
     },
     "ffmpeg": {
       "minimum": "8.1.1",

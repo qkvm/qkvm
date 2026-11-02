@@ -25,14 +25,14 @@ classifiers = [
     "Topic :: System :: Systems Administration",
 ]
 dependencies = [
-    "fastapi>=0.142",
+    "fastapi>=0.148",  # the first that is told, by telemetry=, to configure and send nothing (0.142 configured OpenTelemetry by itself)
     "starlette>=1.3.1",  # older ones rebuild a request's address from its Host header without checking it
     "uvicorn>=0.54",
     "httpx>=0.28",
     "packaging>=24.2",  # verifies an in-app update's Python and dependency requirements before activation
     "sniffio>=1.3",  # the HTTP library looks for it on every request, and looking in vain is slow
-    "websockets>=15",  # the first that can be told to go straight to a device and not through a proxy
-    "cryptography>=50",
+    "websockets>=17.4",  # older ones take endless empty continuation frames as a client (15 was the first to go straight to a device, not through a proxy)
+    "cryptography>=50.0.2",  # the OpenSSL in the wheels before it (4.0.1, 4.0.2) has known holes, a DTLS one among them
     # A JetKVM sends its picture as WebRTC video only: a WebRTC client and, with it, a video decoder.
     # The largest thing here by far, and loaded only once there is a JetKVM on the wall.
     "aiortc==1.15.0",  # decoder isolation uses this reviewed receiver interface
@@ -40,9 +40,13 @@ dependencies = [
     # Used through the libraries above; listed to keep out versions with known vulnerabilities.
     "anyio>=4.14.2",
     "idna>=3.15",
+    "dnspython>=2.9.0",  # aioice reads a JetKVM's .local candidates with it; older ones can be made to spin on a crafted name
     "certifi>=2026.10.19",  # excludes the compromised emSign intermediates from outbound TLS trust
 
-    "h11>=0.16",  # reads every request that comes in; older ones could be made to see two requests where a proxy in front saw one
+    # Reads every request that comes in (uvicorn), and every answer of a server's controller on a connection of qKVM's own
+    # (redfish.py: the one its number was compared on). 0.16.0 is past GHSA-vqfr-h8mv-ghfj (a chunked body read so that two
+    # requests were seen where a proxy in front saw one), and is the version the HTTP library's httpcore pulls in.
+    "h11>=0.16.0",
 ]
 
 [project.urls]

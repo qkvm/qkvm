@@ -313,7 +313,9 @@ def test_six_wrong_passwords_from_one_ipv6_network_are_not_all_checked(tmp_path:
 
 def test_a_leftover_second_copy_in_the_making_is_not_left_with_what_was_erased(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     data = tmp_path / "data"
-    real_replace, real_unlink, real_copy = os.replace, os.unlink, shutil.copy2
+    from qkvm import store
+
+    real_replace, real_unlink, real_copy = os.replace, os.unlink, store.private
     held = {"bak": False, "new": False}
 
     def replace(source: Any, target: Any, *args: Any, **kwargs: Any) -> None:
@@ -326,14 +328,15 @@ def test_a_leftover_second_copy_in_the_making_is_not_left_with_what_was_erased(t
             raise PermissionError(13, "Permission denied")
         real_unlink(path, *args, **kwargs)
 
-    def copy(source: Any, target: Any, *args: Any, **kwargs: Any) -> Any:
+    def copy(target: Any, *args: Any, **kwargs: Any) -> Any:
+        # (The second copy in the making is made by store itself, its own from its first moment: since the round 4 review.)
         if held["new"] and str(target).endswith("qkvm.bak.new"):
             raise PermissionError(13, "Permission denied")
-        return real_copy(source, target, *args, **kwargs)
+        return real_copy(target, *args, **kwargs)
 
     monkeypatch.setattr(os, "replace", replace)
     monkeypatch.setattr(os, "unlink", unlink)
-    monkeypatch.setattr(shutil, "copy2", copy)
+    monkeypatch.setattr(store, "private", copy)
     with wall(data) as admin:
         wait_until(lambda: fits(admin), "never made to fit")
         held["bak"] = True  # something has qkvm.bak open for a while (a backup program, on Windows)

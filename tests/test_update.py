@@ -701,7 +701,7 @@ def test_only_what_is_named_as_a_version_is_run_as_one(tmp_path: Path) -> None:
         assert starter.active_update(data) is None
 
 
-@pytest.mark.skipif(os.name != "posix", reason="who a folder belongs to is kept another way on Windows, and not looked at there")
+@pytest.mark.skipif(os.name != "posix", reason="who a folder belongs to is kept another way on Windows: tests/test_a_data_folder_on_windows_is_its_owners_alone.py")
 def test_an_update_in_a_folder_others_can_write_to_is_not_run(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     data = tmp_path / "data"
     an_update_that_leaves_a_mark(data)
@@ -756,6 +756,27 @@ def test_the_starter_and_the_program_read_where_the_data_is_alike(tmp_path: Path
     with pytest.raises(SystemExit) as ended:
         run_cli(["--data", str(tmp_path), "status"])
     assert ended.value.code == 2 and "--data" in capsys.readouterr().err
+
+
+def test_a_data_folder_named_twice_is_refused_by_the_starter_and_by_the_program(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    # Given twice, the starter took the first --data-dir and the program the last: the update of one folder was run
+    # for the wall of the other, and going back was done in the folder that was not served. Each refuses it now.
+    one, other = str(tmp_path / "one"), str(tmp_path / "other")
+    mark = an_update_that_leaves_a_mark(Path(one))
+    for twice in (["--data-dir", one, "--data-dir", other], ["-d", one, f"--data-dir={other}"], [f"--data-dir={one}", f"-d{other}"], ["-d", one, "-d", one]):
+        with pytest.raises(SystemExit) as ended:
+            starter.data_dir(twice)
+        assert ended.value.code == 2 and "more than once" in capsys.readouterr().err, twice
+        with pytest.raises(SystemExit) as ended:
+            run_cli(["status", *twice])
+        assert ended.value.code == 2 and "more than once" in capsys.readouterr().err, twice
+    # The command as it is typed: refused before anything is run, an update least of all.
+    said = typed(["--data-dir", one, "--data-dir", other, "--reset-password"], tmp_path, tmp_path)
+    assert said.returncode == 2 and "more than once" in said.stderr and not mark.exists(), said.stderr
+    said = typed(["--data-dir", one, "--data-dir", other], tmp_path, tmp_path)
+    assert said.returncode == 2 and "more than once" in said.stderr and not mark.exists(), said.stderr
+    # Once is once, however it is written.
+    assert starter.data_dir(["--data-dir", one, "--port", "8790"]) == Path(one) and starter.data_dir([f"-d{one}"]) == Path(one)
 
 
 def test_the_wall_proper_is_started_from_this_copy_of_the_program(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -958,3 +979,66 @@ def test_started_in_a_folder_that_is_gone_with_a_data_folder_given_from_there_it
     done = subprocess.run([sys.executable, "-P", "-c", typed, str(gone)], env=env, capture_output=True, text=True, timeout=120)
     assert done.returncode == 2, (done.returncode, done.stderr)
     assert "cannot keep settings in data" in done.stderr and "Traceback" not in done.stderr, done.stderr
+
+
+class OnTheDisk:
+    """What was put on the disk (fsync, of a file or a folder) and what was renamed, in the order it was done."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.done: list[tuple[str, Any]] = []
+        real_fsync, real_replace, real_rename = os.fsync, os.replace, os.rename
+
+        def fsync(descriptor: int) -> None:
+            self.done.append(("fsync", os.fstat(descriptor).st_ino))
+            real_fsync(descriptor)
+
+        def replace(source: Any, target: Any, *args: Any, **kwargs: Any) -> None:
+            self.done.append(("replace", (os.stat(source).st_ino, Path(target))))
+            real_replace(source, target, *args, **kwargs)
+
+        def rename(source: Any, target: Any, *args: Any, **kwargs: Any) -> None:
+            self.done.append(("rename", Path(target)))
+            real_rename(source, target, *args, **kwargs)
+
+        monkeypatch.setattr(os, "fsync", fsync)
+        monkeypatch.setattr(os, "replace", replace)
+        monkeypatch.setattr(os, "rename", rename)
+        # (A folder is put on the disk where the system lets that be asked for: not on Windows. Noted all the same.)
+        monkeypatch.setattr(update_module, "_settle", lambda folder: self.done.append(("folder", Path(folder))), raising=False)
+
+    def synced_before_put_in_place(self) -> list[Path]:
+        """The files that were put in place (replace) without having been put on the disk first."""
+        synced: set[int] = set()
+        unsynced = []
+        for what, detail in self.done:
+            if what == "fsync":
+                synced.add(detail)
+            elif what == "replace" and detail[0] not in synced:
+                unsynced.append(detail[1])
+        return unsynced
+
+    def at(self, what: str, where: Path) -> int:
+        return next(i for i, (kind, detail) in enumerate(self.done) if kind == what and (detail == where or (kind == "replace" and detail[1] == where)))
+
+
+def test_an_installed_update_and_its_pointer_are_on_the_disk_before_they_are_named(github: FakeGitHub, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # The storage review of 0.2.0: the update's files and current.json were written without fsync. A power cut after the
+    # install could leave a version named and proven whose files came back empty (NTFS and XFS keep the length of what
+    # never reached the disk): a start that ends at once, again and again, with no way back by itself.
+    github.publish("9.9.9", make_wheel("9.9.9"))
+    update = updater(github, tmp_path)
+    run(update.check())
+    disk = OnTheDisk(monkeypatch)
+    run(update.install())
+    assert update.installed == "9.9.9"
+    assert disk.synced_before_put_in_place() == [], "put in place before it was on the disk"
+    folders = tmp_path / "updates" / "9.9.9.tmp"
+    named, pointed = disk.at("rename", tmp_path / "updates" / "9.9.9"), disk.at("replace", tmp_path / "updates" / "current.json")
+    for folder in (folders / "qkvm", folders / "qkvm" / "static", folders / "qkvm-9.9.9.dist-info", folders):
+        assert disk.at("folder", folder) < named, folder  # each folder of it, before it is given its name
+    assert named < disk.at("folder", tmp_path / "updates") < pointed  # and that name, before the pointer names it
+    assert ("folder", tmp_path / "updates") in disk.done[pointed:]  # and the pointer's own name, once it is in place
+    # And what the starter writes there itself (a version proven, or gone back from).
+    disk.done.clear()
+    starter.written(tmp_path / "updates" / "current.json", json.dumps({"version": "9.9.9", "proven": True}))
+    assert disk.synced_before_put_in_place() == [] and disk.done[0][0] == "fsync", disk.done

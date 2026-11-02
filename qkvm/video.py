@@ -6,6 +6,7 @@ import asyncio
 import importlib.metadata
 import logging
 import math
+import os
 import queue
 import importlib.util
 from pathlib import Path
@@ -15,6 +16,7 @@ import sys
 import threading
 import time
 import weakref
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -123,6 +125,25 @@ def _reap_later(process: Any) -> None:
         threading.Thread(target=_reap, args=(process,), name="qkvm-video-reaper", daemon=True).start()
     except RuntimeError:  # no new thread (Python 3.12.0 to 3.12.2 at interpreter shutdown, or none left)
         _reap_in_place(process)
+
+
+def _proc_cpu_seconds(pid: int) -> float | None:
+    """A Linux process's time on a processor so far: /proc/PID/schedstat (nanoseconds), else /proc/PID/stat (user and system
+    time in clock ticks); None where neither can be read."""
+    if sys.platform != "linux":
+        return None
+    try:
+        with open(f"/proc/{pid}/schedstat", "rb") as stream:
+            return int(stream.read().split()[0]) / 1e9
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as stream:
+            fields = stream.read().rsplit(b")", 1)[1].split()  # (after the name, which may hold anything)
+        ticks: int = os.sysconf("SC_CLK_TCK")
+        return (int(fields[11]) + int(fields[12])) / ticks
+    except (OSError, ValueError, IndexError):
+        return None
 
 
 class Worker:
@@ -243,6 +264,18 @@ class Worker:
         finally:
             self._lock.release()
 
+    def cpu_seconds(self) -> float | None:
+        """The processor time this worker has used, by the system's count (Windows: the process's kernel and user time;
+        Linux: its time on a processor, from /proc); None where it cannot be told (ended, or not readable)."""
+        process = self._process
+        if process is None:
+            return None
+        counted = getattr(process, "cpu_seconds", None)  # (Windows: the AppProcess counts its own)
+        if counted is not None:
+            seconds: float | None = counted()
+            return seconds
+        return _proc_cpu_seconds(process.pid)
+
     def close(self) -> None:
         process, self._process = getattr(self, "_process", None), None
         if process is None:
@@ -293,6 +326,7 @@ class VideoSession:
         self._warned = False  # this run of deaths has been logged
         self._last_warning = -math.inf
         self._avoid: int | None = None  # the pair the last worker died on, kept through failed starts
+        self.starting = 0.0  # seconds spent starting workers, in all (a request that started one took that much longer)
 
     def request(self, *args: Any, **kwargs: Any) -> tuple[int, int, int, bytes]:
         if not self._lock.acquire(timeout=WORK_WITHIN):
@@ -313,17 +347,32 @@ class VideoSession:
         finally:
             self._lock.release()
 
+    def cpu_seconds(self) -> tuple[Worker | None, float | None]:
+        """Its worker now, and the processor time that worker has used so far by the system's count (Worker.cpu_seconds):
+        read where a wait for pictures begins and ends, the difference is what the worker worked meanwhile, where it is the
+        same worker at both ends. Not what the thread that waited took to see the answer: a stall that holds Python's lock (a
+        collection of garbage) kept that thread from it, and a starved container slowed the worker's clock but not its work.
+        Read without the session's lock (a request may be under way), and not at every request: on a busy wall, each such
+        read where the thread let go of Python's lock and waited to have it back made every picture slower."""
+        worker = self._worker
+        if worker is None:
+            return None, None
+        return worker, worker.cpu_seconds()
+
     def _restart(self) -> None:
         if self._deaths and time.monotonic() < self._retry_at:
             raise VideoError("video worker is recovering")
         if self._worker is not None:
             self._avoid = getattr(self._worker, "pair", None)  # not back beside whatever stalled the one that died
         self._worker = None
+        began = time.monotonic()
         try:
             self._worker = Worker() if self._avoid is None else Worker(avoid=self._avoid)
         except (VideoError, OSError):  # a worker that cannot start waits out the same pause
             self._note_death()
             raise
+        finally:
+            self.starting += time.monotonic() - began
 
     def _note_death(self) -> None:
         now = time.monotonic()
@@ -402,26 +451,79 @@ def isolated_decoder(codec: Any) -> H264Decoder:
     return H264Decoder()
 
 
+KEY_FRAME_ASK_EVERY = 1.0  # seconds between asks for a key frame while one is awaited (an ask goes over UDP: it can be lost)
+
+
+def key_frame(data: bytes) -> bool:
+    """Whether a unit of H.264, as the WebRTC library puts it together (Annex B: each NAL unit after a start code), is a
+    picture that needs none before it: an IDR slice, or the sequence parameter set a key frame begins with. Its NAL units
+    are read up to the first slice only (a picture's slices are all of one kind), never through the picture itself."""
+    at = data.find(b"\x00\x00\x01")
+    while at != -1 and at + 3 < len(data):
+        nal = data[at + 3] & 0x1F
+        if nal in (5, 7):
+            return True
+        if 1 <= nal <= 4:
+            return False  # (a slice of a picture that needs those before it)
+        at = data.find(b"\x00\x00\x01", at + 3)
+    return False
+
+
 class BoundedDecoderQueue(queue.Queue[Any]):
-    """Never block the event loop: overload ends decoding instead of queuing forever."""
-    def __init__(self, worker: Worker | None = None) -> None:
+    """Never block the event loop, nor let a backlog build: where decoding falls behind (four units waiting), what waits is
+    let go of, and what comes after it up to the next key frame (each picture between needs the ones before it), and the
+    sender is asked for one (`ask_key_frame`, at most once in KEY_FRAME_ASK_EVERY while none has come). The stream, and
+    the connection it comes over, go on: ending them, as this did, made the connection anew, its keys, the buttons it held
+    and the JetKVM's one viewer with it, each time a busy computer fell behind."""
+    def __init__(self, worker: Worker | None = None, ask_key_frame: Callable[[], None] | None = None) -> None:
         self.worker = worker
         super().__init__(maxsize=4)
         self.stopped = False
+        # Why decoding stopped, once it has, for whoever hears the track end to say which: "ended" where the receiver ended
+        # the stream (the sender said it ended it, or the connection ended), "too_large" where a unit too large to decode
+        # came, "failed" where the isolated decoder failed (see decoder_worker).
+        self.ended: str | None = None
+        self.ask_key_frame = ask_key_frame
+        self.awaiting_key_frame = False  # decoding fell behind: what comes is let go of until a key frame
+        self.let_go = 0  # units let go of, in all
+        self._asked_at = float("-inf")
 
     def put(self, item: Any, block: bool = True, timeout: float | None = None) -> None:
+        ask, kept = False, True
         with self.not_full:
             if self.stopped:
                 return
-            if item is None or self._qsize() >= self.maxsize or len(item[1].data) > MAX_COMPRESSED:
+            if item is None or len(item[1].data) > MAX_COMPRESSED:
+                self.ended = self.ended or ("ended" if item is None else "too_large")  # (the first word on it stands)
                 self.stopped = True
                 self.queue.clear()
                 item = None
             else:
-                item = (*item, time.monotonic())
-            self._put(item)
-            self.unfinished_tasks += 1
-            self.not_empty.notify()
+                if self._qsize() >= self.maxsize:
+                    self.let_go += self._qsize()
+                    self.queue.clear()
+                    self.awaiting_key_frame = True
+                if self.awaiting_key_frame and key_frame(item[1].data):
+                    self.awaiting_key_frame = False
+                if self.awaiting_key_frame:
+                    self.let_go += 1
+                    now = time.monotonic()
+                    if now - self._asked_at >= KEY_FRAME_ASK_EVERY:
+                        self._asked_at, ask = now, True
+                    kept = False  # (let go of: nothing is put)
+                else:
+                    item = (*item, time.monotonic())
+            if kept:
+                self._put(item)
+                self.unfinished_tasks += 1
+                self.not_empty.notify()
+        if ask and self.ask_key_frame is not None:
+            # (Outside the lock the decoder takes units under. Whatever asking meets is not the receiver's to hear: it puts
+            # units from the middle of its handling of a packet.)
+            try:
+                self.ask_key_frame()
+            except Exception:  # (see above)
+                pass
 
 
 def decoder_worker(loop: asyncio.AbstractEventLoop, input_q: Any, output_q: Any) -> None:
@@ -447,7 +549,10 @@ def decoder_worker(loop: asyncio.AbstractEventLoop, input_q: Any, output_q: Any)
                 stamped = VideoFrame(frame.width, frame.height, frame.worker, frame.ident, received_at)
                 loop.call_soon_threadsafe(deliver, stamped)
     except (VideoError, OSError, RuntimeError):
-        pass  # fail closed and tell the track it ended; no alternate native decoder
+        # Fail closed and tell the track it ended; no alternate native decoder. (Said to be the decoder's doing, where the
+        # queue says why decoding stopped and has not said so already.)
+        if getattr(input_q, "ended", "") is None:
+            input_q.ended = "failed"
     finally:
         if decoder is not None:
             decoder.worker.close()

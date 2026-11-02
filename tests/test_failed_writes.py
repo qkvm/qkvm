@@ -275,8 +275,7 @@ def test_what_the_key_before_opened_the_folder_with_is_gone_after_the_start_that
 
 
 def test_the_same_when_only_the_copy_to_qkvm_bak_is_refused_which_nobody_is_told(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
-    import shutil
-
+    from qkvm import store
     from qkvm.vault import Vault
     from tests.test_unlock import fits
     from tests.test_wall import wait_until
@@ -286,20 +285,21 @@ def test_the_same_when_only_the_copy_to_qkvm_bak_is_refused_which_nobody_is_told
         wait_until(lambda: fits(admin), "never made to fit")
         assert admin.put("/api/v1/alerts", json={"enabled": False}).status_code == 200
     kept_copy = (data / "unlock.key").read_text(encoding="ascii").strip()
-    real_copy, real_unlink = shutil.copy2, os.unlink
+    real_private, real_unlink = store.private, os.unlink
     held = {"too": False}
 
-    def copy_unless_held(source: Any, target: Any, *args: Any, **kwargs: Any) -> Any:
+    def copy_unless_held(target: Any, *args: Any, **kwargs: Any) -> Any:
+        # (The second copy in the making is made by store itself, its own from its first moment: since the round 4 review.)
         if str(target).endswith("qkvm.bak.new"):
             raise PermissionError(13, "Permission denied")  # the folder takes no new file just now
-        return real_copy(source, target, *args, **kwargs)
+        return real_private(target, *args, **kwargs)
 
     def unlink_unless_held(path: Any, *args: Any, **kwargs: Any) -> None:
         if held["too"] and str(path).endswith("qkvm.bak"):
             raise PermissionError(13, "Permission denied")
         real_unlink(path, *args, **kwargs)
 
-    monkeypatch.setattr(shutil, "copy2", copy_unless_held)
+    monkeypatch.setattr(store, "private", copy_unless_held)
     monkeypatch.setattr(os, "unlink", unlink_unless_held)
     # Where the second copy cannot be renewed, it is taken away: no copy rather than one from before.
     with wall(data, sign_in=False, locked_start=True) as later:
@@ -316,7 +316,7 @@ def test_the_same_when_only_the_copy_to_qkvm_bak_is_refused_which_nobody_is_told
         assert admin.put("/api/v1/alerts", json={"enabled": False}).status_code == 200
     kept_copy = (data / "unlock.key").read_text(encoding="ascii").strip()
     held["too"] = True
-    monkeypatch.setattr(shutil, "copy2", copy_unless_held)
+    monkeypatch.setattr(store, "private", copy_unless_held)
     monkeypatch.setattr(os, "unlink", unlink_unless_held)
     core = Core(data, locked_start=True)
     told = core.unlock_at_start()
@@ -336,14 +336,17 @@ def test_an_action_that_could_not_be_written_to_the_activity_log_is_at_least_sai
     state = FakeState(atx=True)
     machine = FakeKvm(state).start()
     disk = {"full": False}
-    real_open = Path.open
+    # (audit.log is written through store.private, its own from its first moment: the full disk is stood in for there.)
+    from qkvm import store
 
-    def open_while_there_is_room(self: Path, mode: str = "r", *args: Any, **kwargs: Any) -> Any:
-        if disk["full"] and self.name == "audit.log" and "a" in mode:
+    real_open = store.private
+
+    def open_while_there_is_room(path: Any, mode: str = "w", **how: Any) -> Any:
+        if disk["full"] and Path(path).name == "audit.log" and "a" in mode:
             raise OSError(28, "No space left on device")
-        return real_open(self, mode, *args, **kwargs)
+        return real_open(path, mode, **how)
 
-    monkeypatch.setattr(Path, "open", open_while_there_is_room)
+    monkeypatch.setattr(store, "private", open_while_there_is_room)
     try:
         with caplog.at_level(logging.DEBUG, logger="qkvm"), wall(tmp_path / "data") as admin:
             device = add(admin, machine.url)

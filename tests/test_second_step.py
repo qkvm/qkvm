@@ -103,19 +103,22 @@ def test_settings_from_before_have_no_step_and_are_read(tmp_path: Path) -> None:
 
 def test_a_clock_that_was_ahead_and_is_put_right_locks_nobody_out(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     # What is kept is the step of the code that was typed (the phone's time), not the step the server thought it was.
-    real_time = time.time
+    # The codes' clock stands still in the middle of a step, and moves only where the test moves it: read from the
+    # real clock, a step that ended between reading it and the wall checking a code made the code two steps old, and
+    # switching on or signing in was answered 401 by chance (register row 25 of 0.2.1).
+    phone = int(time.time() // totp.STEP)
     ahead = [0.0]
 
     class Clock:
         @staticmethod
         def time() -> float:
-            return real_time() + ahead[0]
+            return (phone + 0.5) * totp.STEP + ahead[0]
 
+    monkeypatch.setattr(totp, "time", Clock)
     with wall(tmp_path) as admin:
         secret = str(admin.post("/api/v1/totp/begin", json={"password": PASSWORD}).json()["secret"])
-        key, phone = secret.replace(" ", ""), int(real_time() // totp.STEP)
+        key = secret.replace(" ", "")
         assert admin.post("/api/v1/totp/enable", json={"code": totp.code_at(key, phone - 1)}).status_code == 200
-        monkeypatch.setattr(totp, "time", Clock)
         ahead[0] = 30.0  # the server is half a minute ahead of the phone
         assert visitor(admin, 50040).post("/api/v1/login", json={"password": PASSWORD, "code": totp.code_at(key, phone)}).status_code == 200
         kept = admin.core.store.users[0].totp_step  # type: ignore[attr-defined]

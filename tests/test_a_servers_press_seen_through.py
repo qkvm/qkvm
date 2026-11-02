@@ -9,6 +9,8 @@ nothing to do, and the press said done with the override armed; and a reset answ
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Iterator
 from pathlib import Path
 
 import httpx
@@ -110,6 +112,21 @@ def test_a_server_switched_on_while_the_override_was_set_is_restarted_where_the_
         bmc.stop()
 
 
+def test_a_server_switched_on_while_the_override_was_set_is_restarted_where_the_change_is_answered_204(tmp_path: Path) -> None:
+    # (The coordinator, round 3 of 0.2.1; until then a limit in the README.) The same where the change is answered 204, which is
+    # taken as made and not read back: the power is read once more before the restart, and the server switched on meanwhile is
+    # restarted. (Sent "On", it took that as nothing to do, the button said done, and the override waited for its next boot.)
+    bmc = FakeBmc(BmcState(power="Off", power_after_change="On")).start()
+    try:
+        with wall(tmp_path) as client:
+            device = add(client, bmc.url)
+            status_of(client, device, state="no_signal")
+            assert pressed(client, device, "bios_setup")[0] == 200
+            assert bmc.state.actions == ["system ForceRestart"] and bmc.state.boot_override == ("Disabled", "None")
+    finally:
+        bmc.stop()
+
+
 def test_a_server_that_begins_to_change_its_state_while_the_override_is_set_is_not_restarted_and_the_override_is_cleared(tmp_path: Path) -> None:
     bmc = FakeBmc(BmcState(power="Off", boot_status=202, power_after_change="PoweringOn")).start()
     try:
@@ -156,6 +173,61 @@ def test_a_command_answered_with_an_error_of_the_controllers_own_may_have_been_d
             assert (status, code) == (504, "timeout") and "may" in message, message
     finally:
         bmc.stop()
+
+
+@pytest.mark.parametrize(
+    ("action", "last_read"),
+    [("reboot", "/redfish/v1/Managers/Self"), ("atx_reset", "/redfish/v1/Systems/Self/ResetActionInfo"), ("atx_power_long", "/redfish/v1/Systems/Self/ResetActionInfo")],
+)
+def test_a_press_that_never_went_out_is_said_to_be_not_done(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, action: str, last_read: str) -> None:
+    # (The desktop's follow-up 4, 0.2.1.) Between the last read before a command and the command, the controller forgets every
+    # session (its web service restarted), and its root is slow after it: the command is answered 401 (not done), and the sign-in
+    # that follows does not get as far as the password, its root read before that not answering in time. Nothing was done:
+    # that is what is said, never "done" (a controller's restart was), nor "it may have been done" (the reset button was).
+    monkeypatch.setattr(redfish.RedfishDevice, "WAITS", httpx.Timeout(0.5, connect=2.0, pool=2.0))  # (the root read waits twice this)
+    bmc = FakeBmc().start()
+    try:
+        with wall(tmp_path) as client:
+            device = add(client, bmc.url)
+            status_of(client, device, state="online")
+            bmc.state.forget_after = (last_read, 3.0)
+            status, code, message = pressed(client, device, action)
+            assert (status, code) == (502, "action_failed") and message.startswith("It was not done"), (status, code, message)
+            assert bmc.state.actions == [] and bmc.state.forget_after is None
+            entry = next(e for e in client.get("/api/v1/audit").json()["entries"] if e["event"].startswith("action"))
+            assert entry["event"] == "action_failed" and entry["action"] == action
+    finally:
+        bmc.stop()
+
+
+def test_a_command_whose_read_before_it_gets_no_answer_is_not_sent_and_says_so(bmc_fast: FakeBmc) -> None:
+    # (The same, where the session is gone before the command: the read of the computer it is decided by is answered 401, and
+    # the sign-in after it does not get as far as the password.) Nothing went out: "Nothing was sent", not "it may have been".
+    async def run() -> kvm.KvmError:
+        spec = kvm.DeviceSpec(id="ab12", name="server", base_url=bmc_fast.url, username="admin", password="secret", kind="redfish")
+        device = redfish.RedfishDevice(spec)
+        try:
+            await device.identify()
+            bmc_fast.state.tokens.clear()  # (forgotten: the read of what the reset offers is refused, and signed in again)
+            bmc_fast.state.root_takes = 3.0
+            with pytest.raises(kvm.KvmError) as refused:
+                await device.act("atx_reset")
+            return refused.value
+        finally:
+            bmc_fast.state.root_takes = 0.0
+            await device.close()
+
+    refused = asyncio.run(run())
+    assert refused.code == "action_failed" and refused.message.startswith("Nothing was sent") and redfish.never_sent(refused), refused.message
+    assert bmc_fast.state.actions == [] and not any(request.startswith("POST") for request in bmc_fast.state.requests)
+
+
+@pytest.fixture
+def bmc_fast(monkeypatch: pytest.MonkeyPatch) -> Iterator[FakeBmc]:
+    monkeypatch.setattr(redfish.RedfishDevice, "WAITS", httpx.Timeout(0.5, connect=2.0, pool=2.0))
+    server = FakeBmc().start()
+    yield server
+    server.stop()
 
 
 def test_a_light_answered_with_an_error_of_the_controllers_own_may_have_been_switched(tmp_path: Path) -> None:

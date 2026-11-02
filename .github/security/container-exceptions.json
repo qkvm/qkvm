@@ -1,5 +1,28 @@
 {
   "schema": 1,
-  "os": {"family": "debian", "version": "13.7"},
-  "exceptions": []
+  "os": {
+    "family": "debian",
+    "version": "13.7"
+  },
+  "exceptions": [
+    {
+      "id": "CVE-2026-119373",
+      "severity": "HIGH",
+      "architectures": [
+        "amd64",
+        "arm64"
+      ],
+      "packages": {
+        "libsqlite3-0": "3.46.1-7+deb13u2"
+      },
+      "reviewed": "2026-11-02",
+      "expires": "2026-12-03",
+      "reason": "A heap overflow in SQLite's FTS5 full-text search (fts5MergeRowidLists, detail=none prefix doclists). Its trigger needs a detail=none FTS5 table filled with negative rowids and a prefix MATCH query on it. qKVM makes and queries no FTS5 or other virtual table (its databases, audit.sqlite and history.sqlite, are plain tables written and read with bound parameters), so the trigger is not reachable from it. Debian has no fixed package for trixie, bookworm or unstable on the review date. Accepted for the 0.2.1 image by the owner on 2026-11-02; a published fix or a changed version or severity fails the gate.",
+      "references": [
+        "https://security-tracker.debian.org/tracker/CVE-2026-119373",
+        "https://sqlite.org/src/info/a7f8c92f62",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-119373"
+      ]
+    }
+  ]
 }

@@ -7,6 +7,7 @@ import contextvars
 import csv
 import dataclasses
 import hashlib
+import inspect
 import io
 import json
 import logging
@@ -15,7 +16,6 @@ import os
 import re
 import secrets
 import shutil
-import tempfile
 import threading
 import time
 import unicodedata
@@ -35,8 +35,8 @@ from starlette.requests import ClientDisconnect
 
 from . import about, activity, alerts, amt, discover, exchange, history, live, metrics, proxmox, qr, totp, vncdevice
 from ._version import __version__
-from .core import Core, DeviceManager, auth_mark, driver_for, identity
-from .kvm import FINGERBOT_PRESSES, KEYS, MAX_PROBE, MAX_TEXT, PRESS_ANSWERED, PRESS_SENT, REJECTED, RETIRED, AlreadySo, Device, KvmError, bounded, can_do, fetch_certificate, fingerprint, listens, other_way, plain, publicly_trusted, read_json, saved_fingerprint
+from .core import Core, DeviceManager, auth_mark, driver_for, identity, unknown_kind
+from .kvm import FINGERBOT_PRESSES, KEYS, MAX_PROBE, MAX_TEXT, POWER_KEY_REFUSED, PRESS_ANSWERED, PRESS_SENT, REJECTED, RETIRED, AlreadySo, Device, KvmError, bounded, can_do, fetch_certificate, fingerprint, listens, names_the_power_key, other_way, plain, publicly_trusted, read_json, saved_fingerprint, saved_mark
 from .netbind import BindError, lan_ip, normalize, resolve, tailscale_ip
 from .security import (
     COOKIE,
@@ -50,9 +50,10 @@ from .security import (
     is_secure,
     same_origin,
     same_text,
+    shares_our_name,
     sso_name,
 )
-from .store import FINGERBOT_STRENGTHS, ROLES, ActionRecord, AuditLog, DeviceRecord, TokenRecord, UserRecord, as_a_line, device_url
+from .store import FINGERBOT_STRENGTHS, KINDS, ROLES, ActionRecord, AuditLog, DeviceRecord, TokenRecord, UserRecord, as_a_line, device_url
 from .update import NoLongerAllowed, UpdateError
 from .vault import NoMemory, Vault, VaultLocked, new_recovery_key, tidy_recovery_key
 
@@ -129,10 +130,12 @@ _OPERATOR = re.compile(rf"GET (/api/v1/actions|{_DEVICE}/wol)|POST {_DEVICE}/(ac
 # a time, so that no two can interleave a check ("is that name free?") with each other's write.
 # Running an action on a KVM, signing in and looking for updates are not among them: those can take long.
 # Nor are adding a KVM, changing one and trusting its certificate, which talk to the KVM first (that can
-# take seconds, and must not make every other change wait). Those take the same turn themselves, for
-# the part that changes what is saved: see `one_change` in their handlers.
+# take seconds, and must not make every other change wait). Nor what checks a password or the recovery key
+# first (a deliberate half second each, and anybody may send /recover: strangers' guesses held every change
+# of the wall). Those take the same turn themselves, for the part that changes what is saved, and ask there
+# again whether what they checked still holds: see `one_change` in their handlers.
 _CHANGES = re.compile(
-    r"(POST|PUT|DELETE) /api/v1/(setup|recover|recovery|password|totp/(enable|disable|codes)|users(/[^/]+)?"
+    r"(POST|PUT|DELETE) /api/v1/(setup|totp/enable|users(/[^/]+)?"
     r"|actions(/[^/]+)?|settings|alerts(/pause)?|update|metrics/token|security|tokens(/[^/]+)?|wall/order)|DELETE /api/v1/devices/[^/]+"
     r"|POST /api/v1/devices/remove"
 )
@@ -438,6 +441,18 @@ def tidy_groups(names: list[str]) -> list[str]:
         if name:
             kept.setdefault(name.casefold(), name)
     return list(kept.values())
+
+
+# FastAPI (0.148 at the latest) traces, measures and logs every request through OpenTelemetry wherever something in the
+# process has set a provider up, and sets exporters up itself where FASTAPI_OTEL_AUTO_CONFIGURE=true and an endpoint are in
+# the environment: a request's path, query and address, and to whatever processes the spans what it carried, would go where
+# an environment variable or another library says. qKVM writes down what it does in its own activity log. All of it off,
+# for good, where this FastAPI has it at all (an older one has no such argument, and nothing to switch off).
+TELEMETRY_OFF: dict[str, Any] = (
+    {"telemetry": {"tracing": False, "metrics": False, "logs": False, "operation_spans": False, "auto_configure": False}}
+    if "telemetry" in inspect.signature(FastAPI.__init__).parameters
+    else {}
+)
 
 
 def fail(status: int, code: str, message: str, **headers: str) -> JSONResponse:
@@ -782,6 +797,10 @@ async def jetkvm_at(address: str) -> bool:
     return isinstance(said, dict) and "isSetup" in said
 
 
+class NotFollowed(Exception):
+    """What answers at a plain JetKVM's HTTPS address is not that JetKVM (see the server's `onto_https`); its words say why."""
+
+
 def view(record: DeviceRecord, editing: bool = True) -> dict[str, Any]:
     """What a browser may know about a device. Never the password.
 
@@ -864,26 +883,120 @@ def create_app(core: Core) -> FastAPI:
 
     manager = DeviceManager(core, save_in_turn)
 
+    def certificate_of_another(device_id: str, cert_pem: str) -> DeviceRecord | None:
+        """Another tile of the wall that remembers this certificate (as its own, pinned), if there is one."""
+        mark = saved_mark(cert_pem)
+        return next((d for d in store.devices if d.id != device_id and mark is not None and saved_mark(d.cert_pem) == mark), None)
+
+    async def https_certificate(device_id: str, to: str) -> str:
+        """The certificate a plain JetKVM's HTTPS address `to` shows, looked at before anything is sent there (see
+        `onto_https`). NotFollowed where another tile of the wall remembers it; KvmError where nothing answers there."""
+        shown = await fetch_certificate(to)
+        if (twin := certificate_of_another(device_id, shown)) is not None:
+            raise NotFollowed(f"it shows the certificate of {twin.name}, which is on the wall already")
+        return shown
+
+    async def onto_https(changed: DeviceRecord, to: str, shown: str, password: str | None) -> Device:
+        """A client for a plain JetKVM's tile (as `changed` has it, with the password typed or saved) at its HTTPS address `to`,
+        where what answers there is that JetKVM: the certificate it showed (`shown`, see `https_certificate`) pinned, signed in
+        to and asked which it is as an edit asks (`connect`, JetKvmDevice._same_jetkvm: the JetKVM the tile was added for,
+        and no other), and none another tile is (`twin_of`). `changed` then takes the address, the certificate and what it
+        says it is. NotFollowed where it is not that JetKVM; KvmError where that could not be told (`changed` untouched).
+        For the tile's own move (`moved`) and an edit's (update_device) alike."""
+        trial = dataclasses.replace(changed, url=to, tls="pinned", cert_pem=shown)  # (that very certificate, and no other)
+        try:
+            client, _ = await connect(trial, password, force=False)
+        except KvmError as ex:
+            if ex.code == "another_machine":
+                raise NotFollowed("it is another JetKVM than this tile's: it gives another number for itself") from None
+            raise
+        if (twin := twin_of(trial)) is not None:
+            await client.close()
+            raise NotFollowed(f"it says it is {twin.name}, which is on the wall already")
+        changed.url, changed.tls, changed.cert_pem, changed.machine, changed.ident = trial.url, trial.tls, trial.cert_pem, trial.machine, trial.ident
+        return client
+
+    # A move refused once signed in (another JetKVM at a tile's HTTPS address, or another tile's), by the tile, with the
+    # certificate shown there then and the number the tile knew its JetKVM by: while that address shows it, to a tile that knows
+    # the same JetKVM, it is not signed in to again (see `moved`). Kept here, with the wall, and not with a tile's client, which
+    # is made anew at every edit.
+    refused_after_sign_in: dict[str, tuple[str, str]] = {}
+
     async def moved(device_id: str, url: str, to: str) -> None:
         """A JetKVM on the wall over plain HTTP offers HTTPS by now, and its tile goes there (its driver asks: see jetkvm.py).
 
-        Done as an edit by a person is: one change at a time, the new client made before anything is touched,
-        a new record put in the old one's place (so that an edit under way notices), what is live and what
-        is saved changed together. Only ever onto HTTPS at the same host: nothing comes this way that lets
-        go of a certificate. The activity log says what the wall did by itself.
+        Only where what answers there is that JetKVM. Before anything is sent to it: the certificate it shows is no other
+        tile's (another KVM of the wall, reached through a gateway's port, say). Then, signed in to with that certificate
+        pinned, it is asked which it is as an edit by a person asks (`connect`, and JetKvmDevice._same_jetkvm): the JetKVM the
+        tile was added for and no other, and none that another tile is (the twin check, `twin_of`). Where it asks for a
+        password and none is saved, nothing could be sent that it may not have: the tile goes there, and asks for it (where it
+        is typed, it takes what answers, as in any edit). Anything else at the HTTPS address is not followed, said in the log,
+        and asked about again at the next round (WAY_EVERY).
+
+        Then done as an edit by a person is: one change at a time, the record unchanged since it was looked at, a new record
+        put in the old one's place (so that an edit under way notices), what is live and what is saved changed together.
+        Only ever onto HTTPS at the same host: nothing comes this way that lets go of a certificate. The activity log says
+        what the wall did by itself.
         """
         if not to.startswith("https://") or to != other_way(url):
             return
-        async with one_change:
-            record = store.device(device_id)
-            if record is None or record.url != url or record.kind != "jetkvm" or any(d.url == to for d in store.devices):
+        record = store.device(device_id)
+        if record is None or record.url != url or record.kind != "jetkvm" or any(d.url == to for d in store.devices):
+            return
+
+        def not_followed(why: object) -> None:
+            log.warning("%s: offers HTTPS at %s, and what answers there is not followed: %s", record.name, to, why)
+
+        try:
+            shown = await https_certificate(device_id, to)
+        except NotFollowed as ex:
+            not_followed(ex)
+            return
+        except KvmError:
+            return  # (nothing answers there just now: asked again at the next round)
+        mark = saved_mark(shown)
+        if mark is not None and refused_after_sign_in.get(device_id) == (mark, record.machine):
+            # Refused once signed in, and it shows the same certificate: not signed in to again (a JetKVM has one session, and
+            # each sign-in signs out every browser on its own page, or another tile's). Said once, when it was refused.
+            return
+        changed = dataclasses.replace(record)
+        try:
+            client = await onto_https(changed, to, shown, None)
+        except NotFollowed as ex:
+            not_followed(ex)
+            if mark is not None:
+                refused_after_sign_in[device_id] = (mark, record.machine)
+                for gone in [kept for kept in refused_after_sign_in if store.device(kept) is None]:
+                    del refused_after_sign_in[gone]
+            return
+        except KvmError as ex:
+            if ex.code != "no_password" or record.secret is not None:
+                not_followed(ex.message)
                 return
-            changed = dataclasses.replace(record, url=to, cert_pem=None)  # what it shows there is trusted on first contact, as when one is added
+            # It asks for a password now, and none is saved: nothing was sent that it may not have. It goes there, and asks:
+            # where its owner switched a password on, which covers both its ports, its plain address asks for one as well. Not
+            # where that still lets anybody in (it says its number to anybody there): the tile's JetKVM is well where it is,
+            # and what asks for a password at its HTTPS address is something else (another device behind a gateway's port).
+            from .jetkvm import number_to_anybody  # (loaded where a JetKVM is: most walls have none)
+
+            status, _ = await number_to_anybody(url)
+            if status != 401:
+                not_followed("its JetKVM lets anybody in at its plain address still, and what answers at its HTTPS address asks for a password")
+                return
+            changed.url, changed.tls, changed.cert_pem = to, "pinned", shown
             try:
                 client = manager.client(changed)
-            except Exception:  # the saved passwords were locked away in this very moment: nothing is changed, and it is asked again later
+            except Exception:  # the saved passwords were locked away in this very moment: asked again later
+                return
+        except Exception:  # the saved passwords were locked away in this very moment: nothing is changed, and it is asked again later
+            return
+        async with one_change:
+            # Asking took its time: the tile may have been changed or removed meanwhile, or another put at that address.
+            if store.device(device_id) is not record or any(d.url == to for d in store.devices) or certificate_of_another(device_id, shown) or twin_of(changed):
+                await client.close()
                 return
             store.devices[store.devices.index(record)] = changed
+            refused_after_sign_in.pop(device_id, None)
             await manager.adopt(client)
             try:
                 await save()
@@ -1133,6 +1246,24 @@ def create_app(core: Core) -> FastAPI:
     activity_reads = Reads(ACTIVITY_READS_AT_ONCE, ACTIVITY_TURN_WAIT, "the activity log")
     downloads = Downloads(DOWNLOADS_AT_ONCE)
 
+    def account_named(user_id: str) -> str:
+        """An account's name as its entries carry it, by its id (a token's with " (token)"); the id where it is gone."""
+        if user_id.startswith("token:"):
+            token = next((t for t in store.tokens if f"token:{t.id}" == user_id), None)
+            return f"{token.name} (token)" if token is not None else user_id
+        user = store.user(user_id)
+        return user.name if user is not None else user_id
+
+    def said_left_out() -> None:
+        """What the activity log's allowances left out and no later entry of the account said yet, said as the listeners end
+        (the network settings changed, or qKVM stopping), in an entry of its own each (`of`: "live" for live views, or the
+        event of a server's console; `unsaid`: how many): it waited in memory for the account's next entry, and was lost at a
+        restart (register row 22 of 0.2.1). After a power cut it is lost all the same."""
+        counts = [("live", lines.left_out()), *((event, allowance.left_out()) for event, allowance in console_said.items())]
+        for of, left_out in counts:
+            for who, unsaid in left_out.items():
+                audit.write("activity_left_out", "", user=account_named(who), of=of, unsaid=unsaid)
+
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         manager.load()
@@ -1154,6 +1285,7 @@ def create_app(core: Core) -> FastAPI:
         await outbox.close()
         await lines.close()  # (what a live line still has down on a machine is let go of before the machine's connection goes)
         await manager.close()
+        said_left_out()
         await asyncio.to_thread(core.audit.flush)  # what was done last is on disk before the program ends
         # ...and the activity log's index lets go of its file, all of it brought into the file (what it had not taken in yet,
         # the next start takes in: the text files have it). Started again with the listeners, where they are opened anew.
@@ -1161,7 +1293,7 @@ def create_app(core: Core) -> FastAPI:
         await asyncio.to_thread(core.sessions.flush)  # ...and so is who signed out last
         await asyncio.to_thread(kept.flush)  # ...and what the wall saw last, with when it last looked (history: W4)
 
-    app = FastAPI(title="qKVM", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
+    app = FastAPI(title="qKVM", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None, **TELEMETRY_OFF)
     app.state.trusted_proxies = core.trusted_proxies
     app.state.allowed_clients = core.allowed_clients
 
@@ -1586,6 +1718,29 @@ def create_app(core: Core) -> FastAPI:
             waiting -= 1
             checking.discard(ip)
 
+    async def wrapped(opened: Vault, password: str) -> dict[str, Any]:
+        """`password` made into a record that opens the key `opened` holds: the same work as a check, and as many at a time.
+
+        Done beside everything else, before a change takes its turn (`one_change`): the turn is for the change alone.
+        Raises KvmError where the memory it takes is not to be had.
+        """
+        try:
+            async with password_checks:
+                return await asyncio.to_thread(opened.rewrap, password)
+        except (MemoryError, NoMemory) as ex:
+            raise no_memory(ex) from None
+
+    def changed_meanwhile(user: UserRecord, checked: dict[str, Any] | None) -> JSONResponse | None:
+        """Why a change an account's own password was checked for may not be made, as the account stands now. None: it may.
+
+        The check is made beside everything else, and the change in its turn after it (`one_change`). Meanwhile the
+        account may have been removed or replaced, or its password changed in another tab or by an admin: what was
+        checked is then not the account's password any more, and nothing is done on the strength of it.
+        """
+        if store.user(user.id) is not user or user.auth is not checked:
+            return fail(409, "changed", "Your account was changed while your password was being checked (in another tab, or by an admin). Nothing was done: try again.")
+        return None
+
     said_no_memory = 0.0
 
     def no_memory(ex: BaseException) -> KvmError:
@@ -1841,8 +1996,10 @@ def create_app(core: Core) -> FastAPI:
         user: UserRecord = request.state.user
         if not user.auth:
             return fail(409, "no_password", "This account has no password here: it is signed in by your identity provider")
+        checked = user.auth
         try:
-            key = await check_password(body.current, user.auth, ip)
+            # (Beside every change of the wall, as a sign-in's check is: the turn below is taken for the change alone.)
+            key = await check_password(body.current, checked, ip)
         except KvmError as ex:
             return fail(ex.status, ex.code, ex.message)
         if key is None:
@@ -1852,14 +2009,23 @@ def create_app(core: Core) -> FastAPI:
         # business left, least of all handing the key back to a wall that the last sign-out has just locked.
         if refused := still_allowed(request):
             return refused
-        core.vault.adopt(key)
-        previous = user.auth
-        user.auth = await asyncio.to_thread(core.vault.rewrap, body.new)
-        if refused := await saved("The new password", lambda: setattr(user, "auth", previous)):
-            return refused
-        here = request.cookies.get(COOKIE)
-        core.sessions.drop_user(user.id, keep=here)
-        core.sessions.carry_over(here, auth_mark(user))  # kept signed in here, and so it stays, a restart later too
+        opened = Vault()
+        opened.adopt(key)
+        try:
+            auth = await wrapped(opened, body.new)
+        except KvmError as ex:
+            return fail(ex.status, ex.code, ex.message)
+        async with one_change:
+            # ...and asked again in the turn, with what was checked: the account as it was, its password unchanged.
+            if refused := still_allowed(request) or changed_meanwhile(user, checked):
+                return refused
+            core.vault.adopt(key)
+            user.auth = auth
+            if refused := await saved("The new password", lambda: setattr(user, "auth", checked)):
+                return refused
+            here = request.cookies.get(COOKIE)
+            core.sessions.drop_user(user.id, keep=here)
+            core.sessions.carry_over(here, auth_mark(user))  # kept signed in here, and so it stays, a restart later too
         audit.write("password_changed", ip)
         return JSONResponse({"ok": True})
 
@@ -1887,9 +2053,11 @@ def create_app(core: Core) -> FastAPI:
             user = store.users[0]
         else:
             return fail(422, "name_required", "Enter your user name")
+        recovery = store.recovery if user else None
         try:
-            # Without such an account, or without a recovery key, the same work is done against a made-up record.
-            key = await check_password(tidy_recovery_key(body.recovery_key), store.recovery if user else None, ip)
+            # Without such an account, or without a recovery key, the same work is done against a made-up record. Beside
+            # every change of the wall, as a sign-in's check is: anybody may send this, and the turn is for the change alone.
+            key = await check_password(tidy_recovery_key(body.recovery_key), recovery, ip)
         except KvmError as ex:
             return fail(ex.status, ex.code, ex.message)
         if user is None or key is None:
@@ -1898,11 +2066,21 @@ def create_app(core: Core) -> FastAPI:
             return fail(401, "bad_recovery", "The recovery key is not right" + (" for that user name" if len(store.users) > 1 else ""))
         opened = Vault()
         opened.adopt(key)
-        previous = user.auth
-        user.auth = await asyncio.to_thread(opened.rewrap, body.new_password)
-        if refused := await saved("The new password", lambda: setattr(user, "auth", previous)):
-            return refused
-        core.sessions.drop_user(user.id)
+        try:
+            auth = await wrapped(opened, body.new_password)
+        except KvmError as ex:
+            return fail(ex.status, ex.code, ex.message)
+        async with one_change:
+            # The key was checked as it was then. Replaced meanwhile by a new one, it is not the key any more; and the account
+            # removed or replaced meanwhile is not the one it was checked for.
+            if store.user(user.id) is not user or store.recovery is not recovery:
+                core.limiter.fail(ip, user.name)
+                audit.write("recovery_failed", ip, user=user.name)
+                return fail(401, "bad_recovery", "The recovery key is not right" + (" for that user name" if len(store.users) > 1 else ""))
+            previous, user.auth = user.auth, auth
+            if refused := await saved("The new password", lambda: setattr(user, "auth", previous)):
+                return refused
+            core.sessions.drop_user(user.id)
         core.limiter.reset(ip, user.name)
         audit.write("password_recovered", ip, user=user.name)
         return JSONResponse({"ok": True})
@@ -1910,16 +2088,21 @@ def create_app(core: Core) -> FastAPI:
     @app.post("/api/v1/recovery")
     async def renew_recovery(body: TotpBeginIn, request: Request) -> Response:
         """A new recovery key (admins only). The previous one stops working."""
+        user: UserRecord = request.state.user
+        checked = user.auth
         if refused := await own_password(request, body.password):
             return refused
-        previous = (store.recovery, store.recovery_created)
+        async with one_change:  # (the password checked beside every change; the turn for the change, asked again in it)
+            if refused := still_allowed(request) or changed_meanwhile(user, checked):
+                return refused
+            previous = (store.recovery, store.recovery_created)
 
-        def keep_the_old_key() -> None:
-            store.recovery, store.recovery_created = previous
+            def keep_the_old_key() -> None:
+                store.recovery, store.recovery_created = previous
 
-        key = await new_recovery()
-        if refused := await saved("The new recovery key", keep_the_old_key):
-            return refused  # and the new key is shown to nobody: the one before it is still the key
+            key = await new_recovery()
+            if refused := await saved("The new recovery key", keep_the_old_key):
+                return refused  # and the new key is shown to nobody: the one before it is still the key
         audit.write("recovery_key_created", client_ip(request))
         return JSONResponse({"recovery_key": key, "created": store.recovery_created})
 
@@ -2000,31 +2183,41 @@ def create_app(core: Core) -> FastAPI:
         user: UserRecord = request.state.user
         if user.totp is None:
             return fail(409, "not_enabled", "Two-factor sign-in is not on for this account")
+        checked = user.auth
         if refused := await own_password(request, body.password):
             return refused
-        previous = user.totp_codes
-        codes = totp.new_one_time_codes()
-        user.totp_codes = [core.vault.mark(f"{user.id}:{totp.as_issued(code)}", "one-time code") for code in codes]
-        if refused := await saved("The new codes", lambda: setattr(user, "totp_codes", previous)):
-            return refused
+        async with one_change:  # (the password checked beside every change; the turn for the change, asked again in it)
+            if refused := still_allowed(request) or changed_meanwhile(user, checked):
+                return refused
+            if user.totp is None:  # switched off meanwhile (by an admin, for a lost phone)
+                return fail(409, "not_enabled", "Two-factor sign-in is not on for this account")
+            previous = user.totp_codes
+            codes = totp.new_one_time_codes()
+            user.totp_codes = [core.vault.mark(f"{user.id}:{totp.as_issued(code)}", "one-time code") for code in codes]
+            if refused := await saved("The new codes", lambda: setattr(user, "totp_codes", previous)):
+                return refused
         audit.write("totp_codes_created", client_ip(request))
         return JSONResponse({"ok": True, "user": me(user, request), "recovery_codes": codes})
 
     @app.post("/api/v1/totp/disable")
     async def totp_disable(body: TotpBeginIn, request: Request) -> Response:
         user: UserRecord = request.state.user
+        checked = user.auth
         if refused := await own_password(request, body.password):
             return refused
-        previous = (user.totp, user.totp_codes, user.totp_step, user.totp_changes)
+        async with one_change:  # (the password checked beside every change; the turn for the change, asked again in it)
+            if refused := still_allowed(request) or changed_meanwhile(user, checked):
+                return refused
+            previous = (user.totp, user.totp_codes, user.totp_step, user.totp_changes)
 
-        def still_on() -> None:
-            user.totp, user.totp_codes, user.totp_step, user.totp_changes = previous
+            def still_on() -> None:
+                user.totp, user.totp_codes, user.totp_step, user.totp_changes = previous
 
-        user.totp, user.totp_codes, user.totp_step, user.totp_changes = None, [], 0, user.totp_changes + 1
-        totp_pending.pop(user.id, None)
-        if refused := await saved("Switching two-factor sign-in off", still_on):
-            return refused
-        core.sessions.carry_all(user.id, auth_mark(user))  # less is asked of its browsers now than they gave: they stay, a restart later too
+            user.totp, user.totp_codes, user.totp_step, user.totp_changes = None, [], 0, user.totp_changes + 1
+            totp_pending.pop(user.id, None)
+            if refused := await saved("Switching two-factor sign-in off", still_on):
+                return refused
+            core.sessions.carry_all(user.id, auth_mark(user))  # less is asked of its browsers now than they gave: they stay, a restart later too
         audit.write("totp_disabled", client_ip(request))
         return JSONResponse({"ok": True, "user": me(user, request)})
 
@@ -2091,15 +2284,18 @@ def create_app(core: Core) -> FastAPI:
         now = shown.used = time.time()
         user = token_user(shown)
         showing = current_user(request)
+        # `expires`: when the link runs out (null: when it is taken back); `expires_in`: how many seconds that is from now, by
+        # this wall's clock. The page counts those on its own steady clock: a screen's time of day may be far off.
+        ends = {"expires": shown.expires, "expires_in": None if shown.expires is None else max(0.0, shown.expires - now)}
         if showing is not None and showing.id == user.id:
-            return JSONResponse({"ok": True, "user": me(user)})  # the screen that is on already, asking again
+            return JSONResponse({"ok": True, "user": me(user), **ends})  # the screen that is on already, asking again
         # Whoever has the link can ask without end. What they get for it is bounded: so many screens at a
         # time, the oldest giving way, and a line in the activity log now and then, not one for each.
         core.sessions.keep_newest(user.id, DISPLAY_SESSIONS - 1)
         if now - displays_logged.get(shown.id, 0.0) > 60:
             displays_logged[shown.id] = now
             audit.write("display_opened", client_ip(request), user=user.name)
-        return signed_in(request, remember=True, user=user)
+        return signed_in(request, remember=True, user=user, **ends)
 
     def security_view() -> dict[str, Any]:
         # Who is under the rule and has not set it up yet: they can sign in, and do nothing else until they have.
@@ -2588,15 +2784,30 @@ def create_app(core: Core) -> FastAPI:
         audit.write("device_added", client_ip(request), device=record.name, device_id=record.id, url=url)
         return JSONResponse({"device": view(record), "about": about}, status_code=201)
 
+    def left_alone(record: DeviceRecord) -> JSONResponse | None:
+        """The answer for a tile of a kind this version does not know (core.UnknownKind), which nothing here contacts."""
+        if record.kind in KINDS:
+            return None
+        said = unknown_kind(record.kind)
+        return fail(said.status, said.code, f"{said.message}. It can be removed, not edited, here.")
+
     @app.put("/api/v1/devices/{device_id}")
     async def update_device(device_id: str, body: DeviceIn, request: Request) -> Response:
         record = store.device(device_id)
         if record is None:
             return fail(404, "not_found", "Unknown device")
+        if refusal := left_alone(record):
+            return refusal
         parsed = await parse(body, record)
         if isinstance(parsed, JSONResponse):
             return parsed
         url, open_url, kind = parsed
+        # (Where parse took a plain JetKVM to its HTTPS address by itself: it offers it by now, and the plain one was typed.)
+        try:
+            typed_url = device_url(body.url)
+        except ValueError:
+            typed_url = url
+        by_itself = kind == record.kind == "jetkvm" and record.url.startswith("http://") and url == other_way(record.url) and typed_url == record.url
         changed = dataclasses.replace(
             record,
             name=body.name.strip() or record.name,
@@ -2631,7 +2842,37 @@ def create_app(core: Core) -> FastAPI:
         to_https = moved and record.kind == kind == "jetkvm" and record.url.startswith("http://") and url == other_way(record.url)
         if moved and not typed and not known_again and not to_https and record.secret is not None:
             return fail(422, "password_needed", "There is nothing to know this device by at another address. Type its password to use it there.")
-        if changed.tls != record.tls or (moved and not known_again):
+        # Onto its HTTPS address with its password, typed or saved: only where what answers there is this JetKVM, as when the
+        # tile follows by itself (`onto_https`, and `moved`). Without that check the saved password went to whatever showed
+        # another tile's certificate there, and with the password typed the tile became that other tile's JetKVM. Where parse
+        # took it there by itself and it is not that JetKVM, the edit is made at the plain address typed, as it stands, and
+        # says so; where the HTTPS address was typed, it is refused, in words of that address.
+        client: Device | None = None
+        not_followed = ""
+        if to_https:
+            try:
+                client = await onto_https(changed, url, await https_certificate(record.id, url), body.password or None)
+            except NotFollowed as ex:
+                if not by_itself:
+                    return fail(422, "another_machine", f"What answers at {url} is not this JetKVM ({ex}): nothing was changed")
+                log.warning("%s: offers HTTPS at %s, and what answers there is not followed: %s", record.name, url, ex)
+                not_followed = f"Not followed onto HTTPS at {url}: {ex}"
+                url = changed.url = record.url
+                moved = to_https = False
+            except KvmError as ex:
+                # Not checked: never onto HTTPS unchecked, saved without checking or not ("Keep both" sends that too). There
+                # it fell through to a connect that trusted what answered first, took its number, and refused no twin (the
+                # JetKVM/Proxmox review, F1). Saved without checking where parse took it there by itself: at the plain address
+                # typed, as where what answers is not followed; with the HTTPS address typed, refused.
+                if not body.force:
+                    return fail(422, ex.code, ex.message)
+                if not by_itself:
+                    return fail(422, ex.code, f"{ex.message}. What answers at {url} could not be checked, and a JetKVM is not taken onto HTTPS unchecked: nothing was changed")
+                log.warning("%s: offers HTTPS at %s, which could not be checked: %s", record.name, url, ex.message)
+                not_followed = f"Not followed onto HTTPS at {url}: {ex.message}"
+                url = changed.url = record.url
+                moved = to_https = False
+        if client is None and (changed.tls != record.tls or (moved and not known_again)):
             changed.cert_pem = None  # another mode, or another place that somebody vouched for: trust is established afresh
         # Whoever types the password says "this is it": the machine that answers now is the one the tile is for (a PC whose
         # board was changed, or the one the tile said answers there instead), where one answers (`connect`'s `take`); saved
@@ -2645,12 +2886,13 @@ def create_app(core: Core) -> FastAPI:
         # reads it; and again once the client before it is gone, which may have written meanwhile.
         for url_ in (record.url, changed.url):
             vncdevice.forget_pace(url_)
-        try:
-            client, _ = await connect(changed, body.password or None, body.force and not carried, take=typed)
-        except KvmError as ex:
-            if body.force and carried:
-                return fail(422, "password_needed", f"This device could not be checked at its new address ({ex.message}). Type its password to save it there all the same.")
-            return fail(422, ex.code, ex.message)
+        if client is None:
+            try:
+                client, _ = await connect(changed, body.password or None, body.force and not carried, take=typed)
+            except KvmError as ex:
+                if body.force and carried:
+                    return fail(422, "password_needed", f"This device could not be checked at its new address ({ex.message}). Type its password to save it there all the same.")
+                return fail(422, ex.code, ex.message)
         async with one_change:
             # The KVM was talked to without holding up other changes. What was checked before that is checked again.
             refusal = still_allowed(request)
@@ -2676,8 +2918,14 @@ def create_app(core: Core) -> FastAPI:
                 store.devices[at] = record
                 await manager.replace(record)
                 return not_saved("The change to this device", ex)
-        audit.write("device_changed", client_ip(request), device=changed.name, device_id=changed.id, url=url)
-        return JSONResponse({"device": view(changed)})
+        # (Where the password typed took a machine that gives another number than the one the tile knew, that is said: a person
+        # who typed it for a tile that said "it may be another one" is to find what became of it.)
+        notes = [not_followed] if not_followed else []
+        if typed and record.machine and changed.machine and changed.machine != record.machine:
+            notes.append("It takes the machine that answers now, which gives another number for itself than the one this tile was known by")
+        note = ". ".join(notes)
+        audit.write("device_changed", client_ip(request), device=changed.name, device_id=changed.id, url=url, **({"note": note} if note else {}))
+        return JSONResponse({"device": view(changed), **({"note": not_followed} if not_followed else {})})
 
     @app.delete("/api/v1/devices/{device_id}")
     async def delete_device(device_id: str, request: Request) -> Response:
@@ -2784,6 +3032,8 @@ def create_app(core: Core) -> FastAPI:
         record = store.device(device_id)
         if record is None:
             return fail(404, "not_found", "Unknown device")
+        if refusal := left_alone(record):
+            return refusal
         where = certificate_at(record)
         if where is None:
             return JSONResponse({"saved": None, "presented": None})
@@ -2799,6 +3049,8 @@ def create_app(core: Core) -> FastAPI:
         record = store.device(device_id)
         if record is None:
             return fail(404, "not_found", "Unknown device")
+        if refusal := left_alone(record):
+            return refusal
         try:
             pem = await fetch_certificate(certificate_at(record) or record.url)
         except KvmError as ex:
@@ -2993,8 +3245,8 @@ def create_app(core: Core) -> FastAPI:
         audit.write("action", client_ip(request), **detail)
         return JSONResponse({"ok": True, "note": note})
 
-    # (Each its own: consoles not had, asked for in a loop, leave the openings' allowance as it was.)
-    console_said = {event: activity.Allowance(lambda: activity.CONSOLE_SAID_AN_HOUR) for event in ("console_opened", "console_failed")}
+    # (Each its own: consoles not had, asked for in a loop, leave the openings' allowance as it was. The program's: Core.)
+    console_said = core.console_said
 
     def console_written(event: str, request: Request, device: str, device_id: str, **detail: Any) -> None:
         """A server's console opened or not had, into the activity log: within the account's allowance (activity.Allowance)."""
@@ -3016,6 +3268,16 @@ def create_app(core: Core) -> FastAPI:
             return fail(404, "not_found", "Unknown device")
         if is_token(request.state.user):
             return fail(403, "not_allowed", "A way into a console is for a person's browser, not for a token")
+        # Not to a page on a name this wall is looked at under (another port of it): the browser would hand that page the
+        # sign-in to this wall along with the pass. The page offers no link there and says why; nothing is asked of the device.
+        # (A kind of device that hands out no way in at all says so below, as it did: `no_console`, and nothing is asked.)
+        offers = type(device).console is not Device.console
+        if offers and shares_our_name(record.open_url or record.url, request.headers.get("host", ""), store.server.allowed_hosts):
+            return fail(
+                409, "same_host",
+                "Its console is on a host name qKVM is looked at under, at another port, and a browser would hand it your sign-in to "
+                "qKVM. Look at one of the two under another name or address.",
+            )  # fmt: skip
         try:
             way_in = await device.console()
         except KvmError as ex:
@@ -3146,7 +3408,7 @@ def create_app(core: Core) -> FastAPI:
         user = store.user(holder.user_id)
         return why is None and may_act and user is not None and user.role == "admin"
 
-    lines = live.Lines(manager, standing=live_standing, busy=lambda device_id: device_id in acted_on, audit=audit.write, may_take=live_may_take)
+    lines = live.Lines(manager, standing=live_standing, busy=lambda device_id: device_id in acted_on, audit=audit.write, may_take=live_may_take, said=core.live_said, control_said=core.control_said)
     manager.retiring = lines.retiring  # (keys a line has down on a device are let go of before its connection is closed)
 
     @app.post("/api/v1/devices/{device_id}/live")
@@ -3203,6 +3465,8 @@ def create_app(core: Core) -> FastAPI:
     def check_action(body: CustomActionIn, existing: ActionRecord | None) -> JSONResponse | None:
         if body.kind == "keys" and not KEYS.fullmatch(body.keys):
             return fail(422, "invalid", "Choose at least one key")
+        if body.kind == "keys" and names_the_power_key(body.keys):
+            return fail(422, "invalid", POWER_KEY_REFUSED)  # (which every run would answer, on every machine)
         keeps_text = existing is not None and existing.kind == "text" and existing.secret is not None
         if body.kind == "text" and not body.text and not keeps_text:
             return fail(422, "invalid", "Enter the text to type")
@@ -3765,14 +4029,30 @@ def create_app(core: Core) -> FastAPI:
             found = proxmox.address_of(body.url)
         except ValueError as ex:
             return fail(422, "invalid", str(ex).capitalize())
+        def number_on_its_proxmox(url: str) -> tuple[str, int] | None:
+            try:
+                where = proxmox.address_of(url)
+            except ValueError:
+                return None
+            return (where.origin, where.vmid) if where.vmid is not None else None
+
+        # On the wall by its number on this Proxmox, not by its address: a tile follows its guest to another node of the
+        # cluster with its address left as it was added, and a cluster numbers its guests once (register row 13 of 0.2.1).
+        on_wall = {number: d for d in store.devices if d.kind == "proxmox" and (number := number_on_its_proxmox(d.url)) is not None}
+        # ...and by the number its guest gave for itself (its SMBIOS UUID), where the tile keeps one: a VM made under the
+        # number of a guest that was deleted is not that tile's guest, and is said to be a new VM under the tile's number.
+        kept = {number: d.machine for (origin, number), d in on_wall.items() if origin == found.origin and d.machine}
         try:
-            listed, containers, _ = await proxmox.guests(found.origin, body.username.strip(), body.password, typed=True)
+            listed, containers, _ = await proxmox.guests(found.origin, body.username.strip(), body.password, typed=True, numbers_of=kept)
         except KvmError as ex:
             return fail(422, ex.code, ex.message)
-        on_wall = {d.url: d for d in store.devices}
         for guest in listed:
-            there = on_wall.get(guest["url"])
-            guest["known_as"] = there.name if there is not None else None
+            there = on_wall.get((found.origin, guest["vmid"]))
+            read, own = "own" in guest, guest.pop("own", None)  # (not read: as before, by its number; read and none: not the tile's)
+            if there is not None and read and kept.get(guest["vmid"]) not in (None, own):
+                guest["known_as"], guest["new_under"] = None, there.name
+            else:
+                guest["known_as"] = there.name if there is not None else None
         named = None
         if found.vmid is not None:
             named = next((guest["url"] for guest in listed if guest["vmid"] == found.vmid and found.node in (None, guest["node"])), None)
@@ -3938,8 +4218,9 @@ def create_app(core: Core) -> FastAPI:
         # (Beyond what is held in memory, in the data folder, where the record is: the room kept for the record is asked of the
         # disk it is made on, and what the log holds is not left in the system's temporary folder, nor in memory where that is
         # a tmpfs, nor in a container's own layer where the data folder is a volume.)
-        prefix, suffix = activity.DOWNLOAD_NAMED  # (by which a start finds one a power cut left: activity.leftover_downloads)
-        spool = tempfile.SpooledTemporaryFile(max_size=SPOOL_IN_MEMORY, dir=str(core.data_dir), prefix=prefix, suffix=suffix)
+        # (Named activity.DOWNLOAD_NAMED, by which a start finds one a power cut left: activity.leftover_downloads. Its owner's
+        # alone from its first moment, on Windows too: activity.Spool.)
+        spool = activity.Spool(SPOOL_IN_MEMORY, core.data_dir)
         closing = threading.Lock()  # (taken by the first to let go of it: it is closed once)
 
         def done() -> None:

@@ -293,9 +293,13 @@ def test_an_answer_that_comes_too_late_ends_the_connection_and_leaves_no_key_dow
 def test_keys_from_the_live_view_still_on_their_way_hold_back_an_action_that_types(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     # (Found by the review: after a wait the action typed regardless, in among the keys of the live view still on
     # their way: they would land in its text, a password perhaps.)
-    # (Two seconds for an answer to a report, which the stand-in gives 0.3 s late: with one second, a busy computer's answer
-    # came later once, the connection was made anew, and the action went through: the third reviewer's note.)
-    monkeypatch.setattr(jetkvm, "TAKE_WITHIN", 2.0, raising=False)
+    # (Each report is answered 0.3 s late, and goes once the one before it was answered: the line's twenty take six seconds and
+    # more. An answer is waited for ten seconds: with one, and with two under the whole suite on a busy computer, an answer came
+    # later than that, the connection was made anew and the keys that still waited went nowhere, so that fewer than twenty came,
+    # or the action went through (the third reviewer's note). The action waits two seconds for the keys on their way, its own
+    # bound: refused well within the test client's ten, however long an answer may take.)
+    monkeypatch.setattr(jetkvm, "TAKE_WITHIN", 10.0)
+    monkeypatch.setattr(jetkvm, "LIVE_KEYS_WAIT", 2.0)
     jet = FakeJetKvm(JetState(hidrpc=False, width=640, height=360, together=0.3)).start()  # every report answered 0.3 s late
     try:
         with Wall(tmp_path) as wall:

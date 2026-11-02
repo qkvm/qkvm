@@ -102,7 +102,9 @@ def test_a_real_engines_screen_comes_through_its_kvm_and_matches_the_kvm_in_fron
             snap = await picture_of(device)
             assert snap.content_type == "image/jpeg"
             width, height = size_of(snap.data)
-            assert (width, height) == device._screen.size()
+            # (A still is taken in a session of its own that ends with it, since 0.2.0: the screen then says no size; one
+            # that is still open says the picture's.)
+            assert device._screen.size() in (None, (width, height))
             if not (COMET_URL and COMET_PASSWORD):
                 return
             comet = KvmDevice(DeviceSpec(id="real-comet", name="the KVM in front", base_url=COMET_URL, username="admin", password=COMET_PASSWORD, kind="kvmd"))
@@ -130,18 +132,21 @@ def test_a_real_engines_screen_comes_through_its_kvm_and_matches_the_kvm_in_fron
 
 
 def test_a_real_engines_serial_console_opens_stays_open_and_is_ended_as_it_expects() -> None:
+    # Bound to its tile as on the wall (round 3 of 0.2.1): the tile's question which PC answers is asked before the console
+    # opens, the console goes to the address that answer came from, and the engine's realm is compared there before the
+    # password goes. The tile stays open while the console runs (the question is asked on its connection).
     async def run() -> None:
         device = the_pc()
         try:
-            await device.status()  # (its certificate remembered on first contact, as the tile does it)
+            await device.status()  # (its certificate and its PC's number remembered on first contact, as the tile does it)
+            console = SerialConsole(device.spec, checked=device._before_a_session)
+            stop = asyncio.Event()
+            running = asyncio.create_task(console.run(stop))
+            await asyncio.sleep(amtserial.QUIET_WITHIN + 2)  # (longer than the reader waits for a word of the engine's: its pongs)
+            assert not running.done(), running.exception()
+            stop.set()
+            await running  # (ended as the engine expects; what the PC wrote meanwhile, if anything, is in console.kept)
         finally:
             await device.close()
-        console = SerialConsole(device.spec)
-        stop = asyncio.Event()
-        running = asyncio.create_task(console.run(stop))
-        await asyncio.sleep(amtserial.QUIET_WITHIN + 2)  # (longer than the reader waits for a word of the engine's: its pongs)
-        assert not running.done(), running.exception()
-        stop.set()
-        await running  # (ended as the engine expects; what the PC wrote meanwhile, if anything, is in console.kept)
 
     asyncio.run(run())

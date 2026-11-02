@@ -283,8 +283,7 @@ def test_which_requests_are_handled_one_at_a_time() -> None:
     for change in (
         "POST /api/v1/users", "PUT /api/v1/users/ab12", "DELETE /api/v1/users/ab12", "DELETE /api/v1/devices/ab12",
         "POST /api/v1/actions", "PUT /api/v1/actions/ab12", "DELETE /api/v1/actions/ab12", "PUT /api/v1/settings", "PUT /api/v1/update",
-        "PUT /api/v1/alerts", "POST /api/v1/password", "POST /api/v1/recover", "POST /api/v1/recovery", "POST /api/v1/setup",
-        "POST /api/v1/totp/enable", "POST /api/v1/totp/disable",
+        "PUT /api/v1/alerts", "POST /api/v1/setup", "POST /api/v1/totp/enable",
     ):  # fmt: skip
         assert _CHANGES.fullmatch(change), change
     for other in (
@@ -292,6 +291,9 @@ def test_which_requests_are_handled_one_at_a_time() -> None:
         # These talk to the KVM first, which can take seconds, and take their turn only for what they save
         # (see tests/test_load.py).
         "POST /api/v1/devices", "PUT /api/v1/devices/ab12", "POST /api/v1/devices/ab12/trust",
+        # These check a password or the recovery key first (a deliberate half second, and anybody may send /recover), and
+        # take their turn only for the change (see tests/test_a_password_being_checked_holds_up_no_change.py).
+        "POST /api/v1/password", "POST /api/v1/recover", "POST /api/v1/recovery", "POST /api/v1/totp/disable", "POST /api/v1/totp/codes",
         "POST /api/v1/login", "POST /api/v1/logout", "POST /api/v1/discover", "POST /api/v1/update/install", "GET /api/v1/users",
         "POST /api/v1/alerts/test",
     ):  # fmt: skip
@@ -825,6 +827,40 @@ def test_the_wait_said_is_never_longer_than_the_lock_whatever_the_clock_reads(mo
     for _ in range(1100):
         limiter.fail("192.0.2.1", "admin")
     assert limiter.retry_after("192.0.2.1") == Limiter.LONGEST
+
+
+def test_a_sign_in_beside_a_running_lock_and_a_wrong_guess_after_it_never_shorten_the_lock(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Register row 21 of 0.2.1 (w1-ci-timing, third review). Sign-ins from one address that were let through before its
+    # lock began are still being checked when it begins: one of them right, at an account of its own, takes that
+    # account's slips off the address (Limiter.reset); one wrong, after it, was counted from the smaller sum and set a
+    # lock of that sum in place of the one still running, here none at all.
+    from qkvm import security
+    from qkvm.security import Limiter
+
+    now = [5000.0]
+
+    class Clock:
+        monotonic = staticmethod(lambda: now[0])
+        time = staticmethod(time.time)
+
+    monkeypatch.setattr(security, "time", Clock)
+    limiter = Limiter()
+    for _ in range(3):
+        limiter.fail("192.0.2.1", "bob")
+    for _ in range(4):
+        limiter.fail("192.0.2.1", "admin")
+    running = limiter.retry_after("192.0.2.1")
+    assert running == Limiter.BASE * 4  # seven wrong guesses: the third lock, of two minutes
+    now[0] += 10.0
+    limiter.reset("192.0.2.1", "admin")  # admin's own sign-in, let through before the lock, was right
+    assert limiter.retry_after("192.0.2.1") == running - 10.0  # (what reset does not do either)
+    now[0] += 1.0
+    limiter.fail("192.0.2.1", "bob")  # ...and one more wrong one at bob's, let through with it
+    assert limiter.retry_after("192.0.2.1") == running - 11.0
+    now[0] += running
+    assert limiter.retry_after("192.0.2.1") == 0.0  # the lock ends when it was going to
+    limiter.fail("192.0.2.1", "bob")  # bob's fifth: a lock of its own, as before
+    assert limiter.retry_after("192.0.2.1") == Limiter.BASE
 
 
 def test_a_picture_is_judged_by_its_beginning_and_quickly(fake: FakeKvm) -> None:

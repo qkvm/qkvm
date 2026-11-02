@@ -133,7 +133,9 @@ class AmtState:
     secure_erase_armed: bool = False  # AMT_BootSettingData.SecureErase: a destructive boot another tool left armed
     role_returns: int = 0  # what SetBootConfigRole answers (ReturnValue): 0 done, else refused
     power_answer_empty: bool = False  # a power command is answered without a ReturnValue (an answer that cannot be read)
+    power_answer_encoding: str | None = None  # ...or with this encoding declared in its XML declaration (its bytes as ever)
     boot_put_odd_once: str = ""  # the next Put of AMT_BootSettingData is made, and answered this way instead (see `odd`)
+    boot_put_unmade_once: bool = False  # the next Put of AMT_BootSettingData is not made, and answered with what is no SOAP
     boot_put_takes: float = 0.0  # seconds a Put of AMT_BootSettingData is answered after it was made
     erase_armed_meanwhile: bool = False  # another tool arms a secure erase while the wall makes its boot the next one
     boot_clear_fails: bool = False  # a Put of AMT_BootSettingData that clears BIOSSetup is answered with a fault (and not made)
@@ -440,7 +442,11 @@ def make_fake_amt(state: AmtState) -> FastAPI:
                     state.power = becomes
             said_back = "" if state.power_answer_empty else f"<g:ReturnValue>{returned}</g:ReturnValue>"
             out = f'<g:RequestPowerStateChange_OUTPUT xmlns:g="{amt.POWER_SERVICE}">{said_back}</g:RequestPowerStateChange_OUTPUT>'
-            return envelope(f"{amt.POWER_SERVICE}/RequestPowerStateChangeResponse", relates_to, out, resource)
+            answer = envelope(f"{amt.POWER_SERVICE}/RequestPowerStateChangeResponse", relates_to, out, resource)
+            if state.power_answer_encoding is not None:
+                said = answer.body.replace(b'encoding="UTF-8"', f'encoding="{state.power_answer_encoding}"'.encode(), 1)
+                answer = Response(said, media_type="application/soap+xml")
+            return answer
         if what == "RequestStateChange" and short == "CIM_KVMRedirectionSAP":
             asked = body.findtext(f"{{{amt.KVM_SAP}}}RequestStateChange_INPUT/{{{amt.KVM_SAP}}}RequestedState", "") if body is not None else ""
             state.changes.append((short, asked))
@@ -464,6 +470,9 @@ def make_fake_amt(state: AmtState) -> FastAPI:
             state.changes.append((short, f"ListenerEnabled={said['ListenerEnabled']}"))
             return envelope(f"{amt.TRANSFER}/PutResponse", relates_to, instances(short)[0], resource)  # type: ignore[index]
         if what == "Put" and short == "AMT_BootSettingData":
+            if state.boot_put_unmade_once:
+                state.boot_put_unmade_once = False
+                return oddly("html", relates_to)  # (not made, and its answer one that cannot be read)
             given = body.find(f"{{{amt.BOOT_SETTINGS}}}AMT_BootSettingData") if body is not None else None
             if given is None:
                 return fault(relates_to, "SchemaValidationError", "The supplied SOAP violates the corresponding XML schema definition.")
@@ -831,3 +840,28 @@ class FakeAmt:
         self.redirection.stop()
         if self.beside and amt.REDIRECTION_BESIDE.get(self.port) == self.port + 2 and self.port not in (16992, 16993):
             del amt.REDIRECTION_BESIDE[self.port]
+
+
+# Another PC of the fleet (the same account and password): its number and its realm. And a stand-in engine on [::1] alone,
+# for a name with two addresses ("localhost": 127.0.0.1 and ::1), the other PC's redirection port at the second.
+OTHER_GUID, OTHER_REALM = "99887766554433221100FFEEDDCCBBAA", "Digest:" + "B0B0B0B0" * 4
+
+
+class V6Amt(FakeAmt):
+    """A stand-in engine on [::1] alone: its WS-Management port, and its redirection port beside it."""
+
+    @staticmethod
+    def _pair(port: int) -> tuple[socket.socket, socket.socket]:
+        for _ in range(50):
+            first = socket.socket(socket.AF_INET6)
+            first.bind(("::1", 0))
+            at = first.getsockname()[1]
+            try:
+                if at + 2 > 65535:
+                    raise OSError
+                second = socket.socket(socket.AF_INET6)
+                second.bind(("::1", at + 2))
+                return first, second
+            except OSError:
+                first.close()
+        raise RuntimeError("no two free ports")

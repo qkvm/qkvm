@@ -219,16 +219,19 @@ def test_the_writer_never_makes_the_wall_wait_however_the_disk_behaves(tmp_path:
     kept.start()
     kept.observe("dev", ONLINE, now=time.time())
     assert in_the_write.wait(5), "the writer never took the first row"  # (and hangs in it from here on)
-    slowest = 0.0
+    slow: list[float] = []
     began = time.monotonic()
     for number in range(history.QUEUE_SIZE + 2000):
         before = time.monotonic()
         kept.observe("dev", ONLINE if number % 2 else OFFLINE, now=time.time() + 1 + number)  # a change at every look: a row each
-        slowest = max(slowest, time.monotonic() - before)
-    # Nothing waited for the disk: the writer is still in its first write, and every note came back at once. (The
-    # numbers are loose on purpose: a busy machine pauses a thread now and then, and that is not a note that waited.)
+        if (took := time.monotonic() - before) >= 0.5:
+            slow.append(took)
+    # Nothing waited for the disk: the writer is still in its first write, and the notes came back at once. (The numbers
+    # are loose on purpose: a busy machine pauses a thread now and then, and that is not a note that waited. A note that
+    # waits for the writer waits at every note once the queue is full, two thousand of them; a pause makes one or two
+    # slow, and one did: 0.56 s on two cores shared with eight processes that kept them busy, register row 28 of 0.2.1.)
     assert not stalled.is_set() and kept._waiting.unfinished_tasks > 0
-    assert slowest < 0.5, f"one note took {slowest:.3f} s with the disk stalled"
+    assert len(slow) <= 3 and max(slow, default=0.0) < history.WRITE_PATIENCE, f"{len(slow)} notes took 0.5 s or more with the disk stalled: {slow[:5]}"
     assert time.monotonic() - began < 15.0
     assert kept.dropped >= 2000  # a full queue drops and counts, as the activity log does
     stalled.set()
@@ -604,7 +607,10 @@ def test_a_checkpoint_turned_away_by_another_is_tried_at_the_next_look_and_one_h
     other.start()
     outcomes: set[str] = set()
     try:
-        for _ in range(100):
+        # (Which of the two holds the file at a look is a race between this thread and the other connection's: as many
+        # looks as 20 s hold, until each has been seen, rather than a hundred, which missed one now and then, on 0.2.0 too.)
+        until = time.monotonic() + 20
+        while time.monotonic() < until:
             assert not kept._checkpoint()
             outcomes.add("next look" if kept._wal_again <= time.monotonic() else "a minute" if kept._wal_again >= time.monotonic() + 50 else "?")
             if {"next look", "a minute"} <= outcomes:

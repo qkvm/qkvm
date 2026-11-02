@@ -25,7 +25,7 @@ import os
 import platform
 import re
 import shutil
-import tempfile
+import secrets
 import time
 import zipfile
 import zlib
@@ -44,8 +44,10 @@ from packaging.requirements import InvalidRequirement, Requirement
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
 from packaging.version import InvalidVersion, Version
 
+from ._folders import open_private, own_folder
 from ._version import __version__
 from .kvm import public_context
+from .store import _settle
 
 log = logging.getLogger("qkvm")
 
@@ -190,12 +192,19 @@ def check_startup_requirements(package: Path, version: str) -> None:
 
 
 def _write_private(path: Path, data: bytes) -> None:
-    """Replace an update file atomically with an owner-only file, regardless of the caller's umask."""
-    descriptor, name = tempfile.mkstemp(prefix=".qkvm-update-", dir=path.parent)
-    temporary = Path(name)
+    """Replace an update file atomically with an owner-only file, regardless of the caller's umask.
+
+    On the disk before it takes the name (fsync): a power cut leaves the length of a file whose data never got there, with
+    zeros for it, and an update whose files came back so was named, and run, at every start, ending at once.
+    """
+    # (Under a name of its own, made by this program: tempfile's is given the folder's entries on Windows.)
+    temporary = path.with_name(f".qkvm-update-{secrets.token_hex(8)}")
+    descriptor = open_private(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0))
     try:
         with os.fdopen(descriptor, "wb") as stream:
             stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
         temporary.replace(path)
     finally:
         temporary.unlink(missing_ok=True)
@@ -236,16 +245,23 @@ def unpack(wheel: bytes, version: str, destination: Path) -> None:
 
         staging = destination.with_name(destination.name + ".tmp")
         shutil.rmtree(staging, ignore_errors=True)
-        staging.mkdir(mode=0o700)
+        own_folder(staging)  # (this account named in its ACL on Windows: _folders.own_folder)
+        folders = {staging}
         for member in members:
             parts = member.filename.split("/")
             parent = staging
             for part in parts[:-1]:
                 parent = parent / part
-                parent.mkdir(mode=0o700, exist_ok=True)
+                own_folder(parent)
+                folders.add(parent)
             _write_private(parent / parts[-1], archive.read(member))
+    # Every file is on the disk (_write_private), and so is every folder's list of them, before the whole takes its name;
+    # and that name, before the pointer names the version (Updater._activate).
+    for folder in sorted(folders, key=lambda path: len(path.parts), reverse=True):
+        _settle(folder)
     shutil.rmtree(destination, ignore_errors=True)
     staging.rename(destination)
+    _settle(destination.parent)
 
 
 class Updater:
@@ -467,7 +483,7 @@ class Updater:
         return release.version
 
     def _activate(self, version: str, wheel: bytes) -> None:
-        self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        own_folder(self.directory)
         if os.name == "posix":
             self.directory.chmod(0o700)
         unpack(wheel, version, self.directory / version)
@@ -482,6 +498,7 @@ class Updater:
         # (Whether the one before got through its first half minute is kept with it: the starter goes back to
         # it as a version that ran, or as one that is still on trial. See __main__.roll_back.)
         _write_private(pointer, json.dumps({"version": version, "previous": previous, "previous_proven": ran}).encode("utf-8"))
+        _settle(self.directory)  # (the pointer's own name in the folder: a start after a power cut finds what was written)
         # Keep the new version and the one to fall back to; older ones only take up space.
         for entry in self.directory.iterdir():
             if entry.is_dir() and entry.name not in (version, previous):

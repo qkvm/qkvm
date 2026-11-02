@@ -801,7 +801,6 @@ def test_a_download_is_made_in_the_data_folder_and_waits_for_no_disk_on_the_even
     # that a start finds what a power cut left of one (the reviewer of FX-C).
     import asyncio
     import shutil
-    import tempfile
 
     from qkvm import server
 
@@ -814,7 +813,7 @@ def test_a_download_is_made_in_the_data_folder_and_waits_for_no_disk_on_the_even
 
     written(tmp_path, old_entries(1_760_000_000.0, ["rack-1"], 3000), 2)
     monkeypatch.setattr(server, "SPOOL_IN_MEMORY", 10_000)  # (on the disk at once)
-    usage, spooled = shutil.disk_usage, tempfile.SpooledTemporaryFile
+    usage, spooled = shutil.disk_usage, activity.Spool
     asked: list[tuple[Path, bool]] = []
     made: list[Any] = []
     closed: list[bool] = []
@@ -823,9 +822,10 @@ def test_a_download_is_made_in_the_data_folder_and_waits_for_no_disk_on_the_even
         asked.append((Path(folder), on_the_loop()))
         return usage(folder)
 
-    def spool(*args: Any, **kwargs: Any) -> Any:
-        file = spooled(*args, **kwargs)
-        made.append((Path(kwargs["dir"]), kwargs.get("prefix"), kwargs.get("suffix")))
+    def spool(in_memory: int, folder: Path) -> Any:
+        # (activity.Spool, which makes its file in `folder` named activity.DOWNLOAD_NAMED: its own, since the round 4 review)
+        file = spooled(in_memory, folder)
+        made.append((Path(folder), *activity.DOWNLOAD_NAMED))
         close = file.close
 
         def closing() -> None:
@@ -843,7 +843,7 @@ def test_a_download_is_made_in_the_data_folder_and_waits_for_no_disk_on_the_even
         assert not (tmp_path / "qkvm-download-abc123.tmp").exists() and (tmp_path / "qkvm-download-notes.txt").exists()
         caught_up(admin.core.activity)  # type: ignore[attr-defined]
         monkeypatch.setattr(server.shutil, "disk_usage", disk_usage)
-        monkeypatch.setattr(server.tempfile, "SpooledTemporaryFile", spool)
+        monkeypatch.setattr(server.activity, "Spool", spool)
         reply = admin.get("/api/v1/audit/export", params={"format": "csv"})
         assert reply.status_code == 200 and len(reply.content) > 10_000
         wait_until(lambda: bool(closed), "the download's file was never let go of")
@@ -1300,6 +1300,51 @@ def test_a_script_asking_for_a_servers_console_in_a_loop_cannot_push_the_log_out
     finally:
         spare.stop()
         payroll.stop()
+
+
+def test_what_an_allowance_left_out_is_said_when_the_listeners_end_and_their_reopening_starts_nothing_afresh(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Register row 22 of 0.2.1 (fx-c Open): the count of entries left out lived in memory only, in what the listeners make
+    # (the routes, the live lines), and waited there for the account's next entry: lost at a restart, and at a reopening of
+    # the listeners (a change of the network settings), which also gave every account its whole allowance again. Now the
+    # allowances are the program's, and what no later entry has said yet is said in an entry of its own when the listeners
+    # end, whatever ends them (after a power cut it is lost all the same).
+    from qkvm import redfish
+    from qkvm.core import Core
+    from qkvm.server import create_app
+    from tests.fake_redfish import FakeBmc
+    from tests.test_wall import CSRF
+
+    monkeypatch.setattr(redfish, "HICCUP", 0)
+    monkeypatch.setattr(activity, "CONSOLE_SAID_AN_HOUR", 3)
+    spare = FakeBmc().start()
+    core = Core(tmp_path)
+    core.unlock_at_start()
+
+    def written() -> list[tuple[str, str, int]]:
+        core.audit.flush(60)
+        return [(entry.get("user", ""), entry["event"], entry.get("unsaid", 0)) for entry in core.audit.tail(1000) if entry["event"].startswith(("console_", "activity_left_out"))]
+
+    try:
+        with TestClient(create_app(core), headers=CSRF, client=("127.0.0.1", 50000)) as admin:
+            assert admin.post("/api/v1/setup", json={"password": PASSWORD}).status_code == 200
+            one = add(admin, spare.url, name="spare server")
+            olga_id = account(admin, "olga", "operator")
+            olga = browser(admin, "olga", port=50002)
+            assert {olga.post(f"/api/v1/devices/{one}/console").status_code for _ in range(5)} == {200}
+            assert written() == [("olga", "console_opened", 0)] * 3  # (two left out)
+            core.live_said[olga_id] = (0.0, time.monotonic(), 4)  # (and four of her live views, as the lines count them)
+        # The listeners ended (the network settings changed, or qKVM stops): what was left out is said.
+        core.audit.flush(60)
+        said = [entry for entry in core.audit.tail(1000) if entry["event"] == "activity_left_out"]
+        assert sorted((entry["user"], entry["of"], entry["unsaid"]) for entry in said) == [("olga", "console_opened", 2), ("olga", "live", 4)], said
+        with TestClient(create_app(core), headers=CSRF, client=("127.0.0.1", 50000)) as admin:  # opened again, the program the same
+            assert admin.post("/api/v1/login", json={"name": "admin", "password": PASSWORD}).status_code == 200
+            olga = browser(admin, "olga", port=50002)
+            assert olga.post(f"/api/v1/devices/{one}/console").status_code == 200
+            # (Her allowance was spent before, and still is: left out and counted, not written as if nothing had been.)
+            assert written().count(("olga", "console_opened", 0)) == 3, written()
+    finally:
+        spare.stop()
 
 
 def test_an_allowance_writes_each_machine_once_an_hour_whatever_is_left_of_it(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -8,6 +8,7 @@ throws nothing and breaks none of its rules (the helpers see to that).
 from __future__ import annotations
 
 import json
+import re
 import time
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
@@ -109,6 +110,39 @@ def test_the_activity_section_narrows_to_a_machine_an_account_and_a_time_and_dow
     finally:
         first.stop()
         second.stop()
+
+
+def test_what_was_done_to_a_machine_counts_its_ages_on_and_shows_a_new_entry_within_seconds(tmp_path: Path, browser: Browser) -> None:  # noqa: F811
+    # Register row 8 of 0.2.1 (r2-devices F4): "Done to it" was drawn with the history, once a minute: its "13 s ago" was
+    # still said a minute later, and an entry made meanwhile showed up to a minute late. Now its ages count on every
+    # second from the entries in hand, and what was done to it is asked again every ten seconds.
+    fake = FakeKvm(FakeState()).start()
+    try:
+        with a_wall(tmp_path, ("Build server", fake)) as (live, admin):
+            ident = admin.get("/api/v1/wall").json()["devices"][0]["id"]
+            with looking(browser, live) as page:
+                page.clock.install()  # (time goes on as it does, and is moved on below)
+                # A machine with a week of history behind it, which the view looks at again once a minute (one just added
+                # is looked at again within seconds, and its column drawn again with it).
+                now = time.time()
+                summary = {"share": 1.0, "watched": 3600.0, "since": now - 3600, "until": now, "last_seen": now, "sensors": []}
+                page.route("**/api/v1/devices/*/history", lambda route: route.fulfill(status=200, json=summary))
+                sign_in(page, live)
+                tile(page, "Build server").focus()
+                page.keyboard.press("Enter")
+                page.locator("#focus-details > summary").click()
+                done = page.locator("#focus-history .history-done")
+                first = done.locator(".done-list li").first
+                expect(first).to_contain_text("admin KVM added")
+                expect(first.locator(".done-when")).to_have_text("just now")
+                page.clock.fast_forward(20_000)  # (twenty seconds on: well before the history's next look, a minute after the first)
+                expect(first.locator(".done-when")).to_have_text(re.compile(r"^\d+ s ago$"), timeout=5000)
+                # Somebody does something to it elsewhere (another browser, a script): within seconds, not at the next minute.
+                assert admin.post(f"/api/v1/devices/{ident}/actions", json={"action": "jiggler_on"}).status_code == 200
+                page.clock.fast_forward(11_000)
+                expect(done.locator(".done-list li").first).to_contain_text("Keep awake", timeout=5000)
+    finally:
+        fake.stop()
 
 
 def test_a_machine_looked_at_often_says_so_and_not_that_nothing_was_done_to_it(tmp_path: Path, browser: Browser) -> None:  # noqa: F811

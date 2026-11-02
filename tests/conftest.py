@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import logging
+import os
 import queue
+import subprocess
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -13,6 +16,20 @@ from qkvm import activity, amt, history, jetkvm, kvm, redfish
 
 TICK = 0.02  # what a clock may be out by: on Windows before Python 3.13 it ticks every sixteen thousandths of a second
 SCALE = 300.0  # how much shorter every wait is for a test that asks for `scaled`: a minute is a fifth of a second
+
+
+@pytest.fixture(autouse=True, scope="session")
+def folders_of_their_own(tmp_path_factory: pytest.TempPathFactory) -> None:
+    """On Windows, the tests' folders are their runner's alone, as qKVM keeps a data folder (and as Python 3.12.4 and later
+    make the folder pytest asks for with mode 0o700: the earlier ones ignore the mode there, and the folders took whatever
+    their drive gives everybody). The starter runs no update from a folder others may write to (_folders.not_alone): in a
+    folder that is everybody's, no test of an update would see one run."""
+    if os.name != "nt":
+        return
+    subprocess.run(
+        ["icacls", str(tmp_path_factory.getbasetemp()), "/inheritance:r", "/grant:r", "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F", "*S-1-3-4:(OI)(CI)F"],
+        check=True, capture_output=True,
+    )  # fmt: skip
 
 
 @pytest.fixture(autouse=True)
@@ -112,12 +129,49 @@ def no_activity_index_left_following() -> Iterator[None]:
                 index._writer.join(max(0.0, deadline - time.monotonic()))
 
 
+LOGGERS_THE_PROGRAM_SETS_UP = ("qkvm", "uvicorn.error", "asyncio", "httpx", "httpcore", "websockets", "aiortc", "aioice")
+
+
+@pytest.fixture(autouse=True)
+def logging_as_it_was() -> Iterator[None]:
+    """The loggers the program sets up are as they were before the test, after it. A test that runs the command line
+    (or sets up the program's logging itself) leaves `qkvm` and the web server's logger at the level asked for,
+    writing to a queue nobody reads any more and passing nothing on, the event loop at its errors and the libraries
+    at their warnings, as the program has it until it ends: a test after it that listened at the finest level heard
+    nothing finer, and one that holds what must never be logged held it to nothing (register row 26 of 0.2.1). What
+    pytest itself puts on a logger for one part of a test is its own, and is left to it."""
+
+    def own(handlers: list[logging.Handler]) -> list[logging.Handler]:
+        return [handler for handler in handlers if not type(handler).__module__.startswith("_pytest")]
+
+    kept = {}
+    for name in LOGGERS_THE_PROGRAM_SETS_UP:
+        logger = logging.getLogger(name)
+        kept[name] = (own(logger.handlers), logger.filters[:], logger.propagate, logger.level, logger.disabled)
+    try:
+        yield
+    finally:
+        for name, (handlers, filters, propagate, level, disabled) in kept.items():
+            logger = logging.getLogger(name)
+            logger.handlers[:] = handlers + [handler for handler in logger.handlers if handler not in handlers and not own([handler])]
+            logger.filters[:], logger.propagate, logger.disabled = filters, propagate, disabled
+            logger.setLevel(level)
+
+
 @pytest.fixture(autouse=True)
 def nothing_rejected_before() -> None:
     """Which passwords devices said no to is remembered beside the connections to them, for as long as the
     program runs. The stand-in device of one test may be given the port another one's had: it is not to
     find that one's rejected password waiting for it."""
     kvm.REJECTED.clear()
+
+
+@pytest.fixture(autouse=True)
+def nothing_paced_before() -> None:
+    """What paces a KVM's power buttons and the questions to its Fingerbot is kept beside the connections as well, by the
+    tile's id and the KVM's address, for as long as the program runs (kvm.PACED): the stand-in of one test, at the port
+    another one's had, or a tile with the same id, is not to find that one's press still held."""
+    kvm.PACED.clear()
 
 
 @pytest.fixture(autouse=True)

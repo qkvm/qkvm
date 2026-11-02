@@ -282,3 +282,63 @@ def test_frames_queued_before_the_signal_returns_are_not_new_pictures() -> None:
         assert track.calls == 4
 
     asyncio.run(run())
+
+
+# --- the fourth review's lows and notes of R2 (register row 17) ------------------------------------------------------
+
+
+def test_a_connection_opened_with_a_signal_that_never_sends_a_first_picture_is_taken_for_one_that_stopped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # (a) A connection opened while the computer's screen was on (or as it woke, before any "no") that never got a picture
+    # waited until nobody had watched for five minutes: the tile said "Waiting for the first picture" all that while. Its first
+    # picture is waited for PICTURE_AFTER_SIGNAL from the connection's opening, and where none comes the wall connects again.
+    monkeypatch.setattr(jetkvm, "PICTURE_AFTER_SIGNAL", 2.0)
+    jet = FakeJetKvm(JetState(silent_screens=1)).start()
+    try:
+        with wall(tmp_path) as client:
+            device = add(client, jet.url)
+            wait_until(lambda: screen_shown(client, device), "no picture came on a new connection", timeout=20)
+            assert jet.state.sessions == 2  # (the first, silent, given up on; the second shows the screen)
+    finally:
+        jet.stop()
+
+
+def test_the_status_does_not_say_online_over_a_blank_tile_where_the_jetkvm_said_no_signal_last(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # (b) The status read the newest of what the JetKVM said of its input, and where that did not say whether there is a
+    # signal, fell back to "has a picture": a JetKVM that said no and then never a yes or no again was online over a blank
+    # tile, where the tile and the stall rule read the last yes or no it said.
+    jet = FakeJetKvm(JetState()).start()
+    try:
+        with wall(tmp_path) as client:
+            device = add(client, jet.url)
+            picture(client, device)
+            jet.say_signal(False)  # (the computer's screen goes to sleep: said in an event)
+            wait_until(lambda: said(client, device, "no_signal"), "the screen going was not said", timeout=10)
+            jet.state.video_state_says_ready = False  # (from now on its answers say no more whether there is a signal)
+            seen = states_for(client, device, 2.0)
+            assert "online" not in seen, seen
+    finally:
+        jet.stop()
+
+
+def test_the_live_line_does_not_hand_out_the_picture_from_before_after_the_first_new_frame() -> None:
+    # (c) A live line hid the picture from before only while the first new one was awaited: in the moment after that first
+    # frame came and before the line's loop had made a JPEG of it (one turn of the loop), a viewer that came was handed the
+    # old picture. It is hidden wherever the JetKVM said its screen was back after the frame it was made of.
+    from qkvm import live
+
+    device = jetkvm.JetKvmDevice(DeviceSpec("j", "jet", "http://127.0.0.1:18901", "", "", kind="jetkvm"))
+    session = jetkvm._Session()
+    device._session = session
+    source = live.JetSource(live.Machine(None, "j", device))  # type: ignore[arg-type]
+    session.frame, session.frame_at = object(), 10.0
+    source.offer(1, True, b"the picture of a frame from 10.0")
+    source.made_of_at = 10.0  # (the time of the frame it was made of, as the line's loop keeps it)
+    assert source.last is not None
+    session.ready_said, session.signal_at = True, 11.0  # the JetKVM says its screen is back...
+    assert source.last is None
+    session.frame_at = 12.0  # ...and its first new frame comes, not yet made into a picture by the loop
+    assert source.last is None, "the picture from before was handed out after the first new frame"

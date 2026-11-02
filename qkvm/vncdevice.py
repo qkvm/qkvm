@@ -240,6 +240,8 @@ class VncDevice(Device):
         self._refusal_until = 0.0
         self._bad = 0  # such connections in a row
         self._inputs = 0  # keys or the pointer on their way to the server now (see `inputting`)
+        self._making = 0  # pictures being made of the screen now, for whoever asked (see `snapshot`)
+        self._made_at = float("-inf")  # ...and when the last of them was handed over (or came to nothing)
         self._held_off = 0  # while above 0, no session is opened (see `no_session`)
         self._ended_at = float("-inf")  # when the last session ended, whichever way (see `session_ended_within`)
         self._why_held_off = ""
@@ -373,8 +375,19 @@ class VncDevice(Device):
         return {"model": name, "version": version, "hostname": name}
 
     async def snapshot(self, width: int, fresh: float | None = None, big: bool = False) -> Snapshot:
+        # Where this family lets go of a connection nobody looks at (LET_GO_AFTER), it is not let go of while a picture is
+        # being made of it, and is held LET_GO_AFTER from the moment the picture is handed over, as after keys (see
+        # `inputting`). Counted from the moment it was asked for, a picture that took longer to make than that (a busy
+        # computer makes the first of a connection in seconds: its video worker is started for it) had its connection let
+        # go of under it, its encoder closed, and the next look opened another (of a Proxmox guest: one more task in its
+        # log). What is drawn, and at what pace, is counted from the moment it was asked for, as before (`_watched`).
         self._looking()
-        return await self._picture(width, fresh, big=big)
+        self._making += 1
+        try:
+            return await self._picture(width, fresh, big=big)
+        finally:
+            self._making -= 1
+            self._made_at = time.monotonic()
 
     async def _picture(self, width: int, fresh: float | None, big: bool = False) -> Snapshot:
         """The screen of the session that is up, as a JPEG at least `width` wide (a session started where there is none),
@@ -868,9 +881,9 @@ class VncDevice(Device):
         """LetGo where nobody has looked for LET_GO_AFTER; else the seconds until that would be so (inf: never, for this family or now)."""
         if self.LET_GO_AFTER is None or self._is_live():
             return float("inf")
-        if self._inputs:
-            return self.LET_GO_AFTER  # (input is going: asked again at the latest when it could be LET_GO_AFTER after its end)
-        unwanted_in = self._wanted_at + self.LET_GO_AFTER - time.monotonic()
+        if self._inputs or self._making:
+            return self.LET_GO_AFTER  # (input is going, or a picture is being made: asked again at the latest when it could be LET_GO_AFTER after its end)
+        unwanted_in = max(self._wanted_at, self._made_at) + self.LET_GO_AFTER - time.monotonic()
         if unwanted_in <= 0:
             raise LetGo
         return max(0.05, unwanted_in)
@@ -890,13 +903,17 @@ class VncDevice(Device):
 Paced = tuple[int, float, str, str, int, int, float, str, bool, bool, bool, float]
 _PACED: dict[str, Paced] = {}
 MOST_PACED = 2048  # of them; the oldest go first
+# And the stills of a PC with Intel AMT whose tile is only shown (amt.AmtScreen), for the same reason: stills in a row that
+# came to nothing, and when the last was tried. Its screen made anew asked for a still at once, whatever its ladder said.
+_STILL_PACED: dict[str, tuple[int, float]] = {}
 
 
 def forget_pace(url: str) -> None:
     """A person has just done what may cure it (typed the password or token again, trusted a certificate again): the
-    screens behind doors at this address are asked for as if for the first time."""
-    for key in [key for key in _PACED if key.split("\0", 1)[1:] == [url]]:
-        del _PACED[key]
+    screens behind doors at this address, and the stills of a PC's, are asked for as if for the first time."""
+    for kept in (_PACED, _STILL_PACED):
+        for key in [key for key in kept if key.split("\0", 1)[1:] == [url]]:
+            del kept[key]
 
 
 class DoorScreen(VncDevice):

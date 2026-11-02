@@ -21,7 +21,7 @@ from typing import Any
 import httpx
 import pytest
 
-from qkvm import amt, discover, exchange, kvm, update, vault
+from qkvm import amt, discover, exchange, kvm, update, vault, vncdevice
 from qkvm.amt import AmtDevice, Challenge, answer_to, body_of, challenge_from, family_of, fields_of, int_of, own_number
 from qkvm.kvm import DeviceSpec, KvmError
 from tests.conftest import SCALE, TICK
@@ -45,6 +45,7 @@ def fast(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(amt, "HICCUP", 0)
     monkeypatch.setattr(amt, "CONFIRM_EVERY", 0.05)
     monkeypatch.setattr(amt.AmtScreen, "LOOK_PACE", 0.05)  # (the screen is asked for what changed twenty times a second)
+    vncdevice._STILL_PACED.clear()  # (how a PC's stills were paced is kept by address: see AmtScreen)
     monkeypatch.setattr(update, "DEFAULT_REPO", "")
 
 
@@ -162,6 +163,55 @@ def test_the_power_buttons_mean_what_they_mean_on_an_amt_pc(tmp_path: Path, pc: 
             ("power_on", "already on"), ("power_off", None), ("power_off", "already off"), ("atx_power", None), ("atx_power", None),
             ("power_on", None), ("atx_power_long", None), ("power_on", None), ("atx_reset", None),
         ]  # fmt: skip
+
+
+@pytest.mark.parametrize("power", [1, 5, 9, 10, 11, 12, 14, 99])
+def test_a_pc_neither_running_nor_off_is_not_said_to_be_off_and_its_buttons_send_nothing(tmp_path: Path, pc: FakeAmt, power: int) -> None:
+    # (The device review of 0.2.0, MEDIUM; probe devices/amt/test_p1_odd_power.py.) The engine says a power state that is
+    # neither running nor off (resetting, shutting down, restarting, a power cycle under way, "other", or one not in the
+    # class reference): Power off said "already off" and sent nothing, Power on and the power button sent "on" into the
+    # middle of it. Nothing is decided by such a state: refused, with the state named, as Start into BIOS setup refuses it
+    # (test_a_pc_between_power_states_is_not_started_into_its_setup).
+    pc.state.power = power
+    with wall(tmp_path) as client:
+        device = add(client, pc.url)
+        status_of(client, device, state="online")
+        named = amt.POWER_WORDS.get(power, str(power))
+        for action in ("power_off", "power_on", "atx_power"):
+            reply = client.post(f"/api/v1/devices/{device}/actions", json={"action": action})
+            said = reply.json()
+            assert (reply.status_code, said.get("code")) == (502, "action_failed") and said["message"].startswith("Nothing was done"), (action, said)
+            assert named in said["message"], (action, said["message"])
+        assert pc.state.actions == []
+
+
+def test_a_power_cut_waiting_for_a_kvm_session_to_end_is_not_said_done_of_a_pc_between_states(pc: FakeAmt) -> None:
+    # (The same, on the other road: Hold power waits for a KVM session of the wall's to end, and looks at the power again.)
+    pc.state.offered = [2, 5, 10, 12]  # (no power cut on offer just now: a KVM session is open)
+
+    async def run() -> BaseException:
+        device = a_pc(pc)
+        try:
+            assert (await device.status())["state"] == "online"
+            deciding = device._decide_and_command
+
+            async def then_it_begins_to_reset(action: str, still: Any) -> Any:
+                found = await deciding(action, still)
+                pc.state.power = 10  # (the PC begins to reset meanwhile)
+                return found
+
+            device._decide_and_command = then_it_begins_to_reset  # type: ignore[method-assign]
+            try:
+                await device.act("atx_power_long")
+            except (KvmError, kvm.AlreadySo) as ex:
+                return ex
+            raise AssertionError("it was said done")
+        finally:
+            await device.close()
+
+    outcome = asyncio.run(run())
+    assert isinstance(outcome, KvmError) and outcome.code == "action_failed" and "Resetting" in outcome.message, repr(outcome)
+    assert pc.state.actions == []
 
 
 def test_a_shutdown_the_machine_does_not_offer_is_not_replaced_by_a_power_cut(tmp_path: Path, pc: FakeAmt) -> None:
@@ -910,9 +960,11 @@ def test_a_look_in_another_realm_asks_strictly_and_says_so_of_an_engine_that_nam
 
 
 def test_an_engine_that_cannot_say_its_number_keeps_its_buttons_and_screen_where_none_is_remembered(tmp_path: Path) -> None:
-    # Asked for its number, it answers with a fault of its own: with no number remembered there is nothing to tell it apart
-    # from, and it is worked as before the number was asked for at all (the buttons were refused "Nothing was sent").
-    pc = FakeAmt(AmtState(odd={"CIM_ComputerSystemPackage": "fault_other"})).start()
+    # Asked for its number, it answers that this account may not read it: with no number remembered there is nothing to tell
+    # it apart from, and it is worked as before the number was asked for at all (the buttons were refused "Nothing was sent").
+    # (Until 0.2.1 a fault of its own as well, an error of the moment among them: as it is added, or edited with its password
+    # typed, that is refused now, see test_a_pc_whose_number_cannot_be_read_as_it_is_added_is_not_added_unknown.)
+    pc = FakeAmt(AmtState(odd={"CIM_ComputerSystemPackage": "fault"})).start()
     try:
         with wall(tmp_path) as client:
             device = add(client, pc.url)
@@ -1729,6 +1781,55 @@ def test_an_edit_takes_the_pc_that_answers_now_only_where_its_password_is_typed(
         machines[-1].stop()
 
 
+@pytest.mark.parametrize("how", ["fault_other", "nonsense"])
+def test_an_edit_with_the_password_typed_while_the_pcs_number_cannot_be_read_keeps_it(tmp_path: Path, how: str) -> None:
+    # (Register row 1, fx-b1 Open; the class 708a39b and 9d651ef closed for Proxmox and JetKVM.) Whoever types the password in
+    # an edit takes the PC that answers now, by the number it gives for itself. Where that read failed just then (a fault of
+    # the engine's own, an answer this program makes nothing of), the edit saved the tile with no number at all, and the next
+    # PC to answer at the address was taken on first use, and its power cut. Now which PC answers could not be told, nothing
+    # is taken, and the next try takes it.
+    machines = [FakeAmt().start()]
+    try:
+        with wall(tmp_path) as client:
+            device = add(client, machines[0].url, name="Desk 7")
+            before = client.core.store.device(device).machine  # type: ignore[attr-defined]
+            assert before == own_number(GUID)
+            machines[0].state.odd = {"CIM_ComputerSystemPackage": how}
+            edit = client.put(f"/api/v1/devices/{device}", json={"url": machines[0].url, "name": "Desk 7", "password": "secret"})
+            machines[0].state.odd = {}
+            assert (edit.status_code, edit.json().get("code")) == (422, "bad_response"), edit.text
+            assert "could not be told" in edit.json()["message"]
+            assert client.core.store.device(device).machine == before  # type: ignore[attr-defined]
+            # The worst case: another PC answers at the address before the tile looks again. It is sent no power command.
+            machines.append(swap_in(machines[0], another_pc()))
+            other = machines[-1]
+            pressed = client.post(f"/api/v1/devices/{device}/actions", json={"action": "atx_power_long"})
+            assert (pressed.status_code, pressed.json().get("code")) == (502, "another_machine"), pressed.text
+            assert other.state.actions == []
+            # Tried again with its number read, the edit takes the PC that answers now, as ever.
+            taken = client.put(f"/api/v1/devices/{device}", json={"url": other.url, "name": "Desk 8", "password": "secret"})
+            assert taken.status_code == 200, taken.text
+            assert client.core.store.device(device).machine == own_number(OTHER_GUID)  # type: ignore[attr-defined]
+    finally:
+        machines[-1].stop()
+
+
+def test_a_pc_whose_number_cannot_be_read_as_it_is_added_is_not_added_unknown(tmp_path: Path) -> None:
+    # (The same, as a Proxmox guest and a JetKVM whose number cannot be read as they are added.) Which PC it is could not be
+    # told: nothing is added that would take the first PC it sees at the address for it, and the next try adds it.
+    pc = FakeAmt(AmtState(odd={"CIM_ComputerSystemPackage": "fault_other"})).start()
+    try:
+        with wall(tmp_path) as client:
+            first = client.post("/api/v1/devices", json={"url": pc.url, "password": "secret", "kind": "amt"})
+            assert (first.status_code, first.json().get("code")) == (422, "bad_response"), first.text
+            assert "could not be told" in first.json()["message"] and client.core.store.devices == []  # type: ignore[attr-defined]
+            pc.state.odd = {}
+            device = add(client, pc.url)
+            assert client.core.store.device(device).machine == own_number(GUID)  # type: ignore[attr-defined]
+    finally:
+        pc.stop()
+
+
 def test_a_tile_that_remembers_no_pc_takes_the_first_it_sees_and_keeps_it(tmp_path: Path) -> None:
     # A tile saved before its PC's number was kept with it (as a settings file of a build before this one has it, a tile
     # added while its PC could not be reached, or one from a file that had none): the first look takes the number the PC
@@ -1762,7 +1863,7 @@ def test_a_tile_that_remembers_no_pc_takes_the_first_it_sees_and_keeps_it(tmp_pa
 
 def test_the_digest_answer_is_the_standards_own_example() -> None:
     # RFC 2617, section 3.5 (and RFC 7616, 3.9.1): the one worked example everybody checks against.
-    challenge = Challenge(realm="testrealm@host.com", nonce="dcd98b7102dd2f0e8b11d0f600bfb0c093", opaque="5ccc069c403ebaf9f0171e9517f40e41", algorithm="MD5", qop=True, stale=False)
+    challenge = Challenge(realm="testrealm@host.com", nonce="dcd98b7102dd2f0e8b11d0f600bfb0c093", opaque="5ccc069c403ebaf9f0171e9517f40e41", algorithm="MD5", stale=False)
     header = answer_to(challenge, 1, "Mufasa", "Circle Of Life", "GET", "/dir/index.html", cnonce="0a4f113b")
     assert 'response="6629fae49393a05397450978507c4ef1"' in header
     assert header.startswith('Digest username="Mufasa", realm="testrealm@host.com", nonce="dcd98b7102dd2f0e8b11d0f600bfb0c093", uri="/dir/index.html"')
@@ -1771,18 +1872,65 @@ def test_the_digest_answer_is_the_standards_own_example() -> None:
 
 def test_a_challenge_is_read_as_the_standard_writes_it_and_refused_where_it_cannot_be_answered() -> None:
     read = challenge_from(['Basic realm="first"', 'Digest realm="Digest:ABCD1234", nonce="n1", stale=true, qop="auth,auth-int", opaque="o", algorithm=MD5'])
-    assert read == Challenge("Digest:ABCD1234", "n1", "o", "MD5", True, True)
-    assert challenge_from(['Digest realm="a \\"quoted\\" realm", nonce="n2"']) is None  # read as the standard writes it, and refused: it could not be sent back as it is
-    assert challenge_from(['Digest realm="a realm with spaces", nonce="n2"']) == Challenge("a realm with spaces", "n2", None, "MD5", False, False)
-    assert challenge_from(['Digest realm="r", nonce="n", algorithm=SHA-256']) == Challenge("r", "n", None, "SHA-256", False, False)
-    assert challenge_from(['Digest realm="r", nonce="n", algorithm=sha-256-sess, qop=auth']) == Challenge("r", "n", None, "SHA-256-SESS", True, False)
+    assert read == Challenge("Digest:ABCD1234", "n1", "o", "MD5", True)
+    assert challenge_from(['Digest realm="a \\"quoted\\" realm", nonce="n2", qop="auth"']) is None  # read as the standard writes it, and refused: it could not be sent back as it is
+    assert challenge_from(['Digest realm="a realm with spaces", nonce="n2", qop="auth"']) == Challenge("a realm with spaces", "n2", None, "MD5", False)
+    assert challenge_from(['Digest realm="r", nonce="n", algorithm=SHA-256, qop="auth"']) == Challenge("r", "n", None, "SHA-256", False)
+    assert challenge_from(['Digest realm="r", nonce="n", algorithm=sha-256-sess, qop=auth']) == Challenge("r", "n", None, "SHA-256-SESS", False)
+    # (Without qop "auth", the older form, it is not answered since 0.2.1: see test_a_digest_challenge_without_qop_is_not_answered.)
+    assert challenge_from(['Digest realm="a realm with spaces", nonce="n2"']) is None
     assert challenge_from(['Negotiate', 'Basic realm="x"']) is None
-    assert challenge_from(['Digest nonce="n"']) is None  # no realm
+    assert challenge_from(['Digest nonce="n", qop="auth"']) is None  # no realm
     assert challenge_from(['Digest realm="r", nonce="n", qop="auth-int"']) is None  # a kind this program does not do
-    assert challenge_from(['Digest realm="r", nonce="n", algorithm=SHA-512-256']) is None  # a hash it has not got
-    assert challenge_from(['Digest realm="r\r\nX-Injected: 1", nonce="n"']) is None  # what could end the header line
-    assert challenge_from([f'Digest realm="r", nonce="{"n" * 2000}"']) is None  # and what is far longer than a nonce
-    assert challenge_from(["Digest realm=plain, nonce=bare"]) == Challenge("plain", "bare", None, "MD5", False, False)
+    assert challenge_from(['Digest realm="r", nonce="n", algorithm=SHA-512-256, qop="auth"']) is None  # a hash it has not got
+    assert challenge_from(['Digest realm="r\r\nX-Injected: 1", nonce="n", qop="auth"']) is None  # what could end the header line
+    assert challenge_from([f'Digest realm="r", nonce="{"n" * 2000}", qop="auth"']) is None  # and what is far longer than a nonce
+    assert challenge_from(["Digest realm=plain, nonce=bare, qop=auth"]) == Challenge("plain", "bare", None, "MD5", False)
+
+
+def test_a_digest_challenge_without_qop_is_not_answered(tmp_path: Path) -> None:
+    # (The owner's decision for 0.2.1, on the device review's LOW; probe devices/amt/p2_digest_downgrade.py.) Every engine
+    # offers qop "auth", and its redirection port is answered only so. A challenge without it (RFC 2069's form) has no nonce of
+    # this program's in the answer: whoever answers at the address (plain HTTP, or TLS not checked) picks the realm and the
+    # nonce once and works out the password offline from a table made for them, for every PC of a fleet. It is not answered:
+    # nothing made of the password goes, and the machine is said not to sign in as Intel AMT does.
+    for offered in ('Digest realm="Digest:0123456789ABCDEF", nonce="fixednonce"', 'Digest realm="r", nonce="n", qop=""', 'Digest realm="r", nonce="n", algorithm=SHA-256'):
+        assert challenge_from([offered]) is None, offered
+    seen: list[str] = []
+
+    async def engine(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            while True:
+                head = (await reader.readuntil(b"\r\n\r\n")).decode("latin-1")
+                length = next((int(line.split(":", 1)[1]) for line in head.split("\r\n") if line.lower().startswith("content-length:")), 0)
+                seen.extend(line for line in head.split("\r\n") if line.lower().startswith("authorization:"))
+                if length:
+                    await reader.readexactly(length)
+                writer.write(
+                    b"HTTP/1.1 401 Unauthorized\r\nServer: Intel(R) Active Management Technology 16.1.25\r\n"
+                    b'WWW-Authenticate: Digest realm="Digest:00000000000000000000000000000000", nonce="fixednonce"\r\nContent-Length: 0\r\n\r\n'
+                )
+                await writer.drain()
+        except (asyncio.IncompleteReadError, ConnectionError):
+            pass
+        finally:
+            writer.close()
+
+    async def run() -> KvmError:
+        server = await asyncio.start_server(engine, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        device = AmtDevice(DeviceSpec(id="p2", name="PC", base_url=f"http://127.0.0.1:{port}", username="admin", password="secret", kind="amt"))
+        try:
+            with pytest.raises(KvmError) as refused:
+                await device.identify()
+            return refused.value
+        finally:
+            await device.close()
+            server.close()
+
+    refused = asyncio.run(run())
+    assert refused.code == "bad_response" and "Digest" in refused.message, refused.message
+    assert seen == []  # (nothing made of the password went out)
 
 
 def test_what_the_machine_says_is_taken_by_kind() -> None:
@@ -1816,6 +1964,33 @@ def test_an_answer_written_another_way_is_refused_before_it_is_parsed() -> None:
     # (A plain answer with a byte order mark is read as the parser reads it.)
     fine = b"\xef\xbb\xbf" + f'<s:Envelope xmlns:s="{amt.SOAP}"><s:Body><a/></s:Body></s:Envelope>'.encode()
     assert len(body_of(httpx.Response(200, headers={"Content-Type": "application/soap+xml"}, content=fine, request=request))) == 1
+
+
+@pytest.mark.parametrize("declared", ["shift_jis", "euc-jp", "utf-32", "cp932", "utf-7", "no-such-encoding", "x" * 200])
+def test_an_answer_that_declares_an_encoding_the_parser_will_not_read_is_no_answer_and_no_crash(declared: str) -> None:
+    # (The device review of 0.2.0, LOW; probe devices/amt/test_p5_encoding_valueerror.py.) The parser refuses a document
+    # that declares a multi-byte encoding with ValueError, and one it does not know with LookupError: neither is the parse
+    # error it was asked about, and both went past every caller. It is an answer that is not SOAP, as any other.
+    data = f'<?xml version="1.0" encoding="{declared}"?><s:Envelope xmlns:s="{amt.SOAP}"><s:Body><a/></s:Body></s:Envelope>'.encode()
+    reply = httpx.Response(200, headers={"Content-Type": "application/soap+xml"}, content=data, request=httpx.Request("POST", "http://127.0.0.1/wsman"))
+    with pytest.raises(KvmError) as refused:
+        body_of(reply)
+    assert refused.value.code == "bad_response" and "not SOAP" in refused.value.message
+
+
+def test_a_reset_answered_in_an_encoding_the_parser_will_not_read_is_a_maybe_and_written_down(tmp_path: Path, pc: FakeAmt) -> None:
+    # (The same, where it mattered.) The reset went out and was carried out; its answer declares shift_jis. That uncaught
+    # error ended the request with no answer the page could read and no entry in the activity log of a reset that went out.
+    # Now it is what an answer that cannot be read after a command is: it may have been done, and written down as that.
+    pc.state.power_answer_encoding = "shift_jis"
+    with wall(tmp_path) as client:
+        device = add(client, pc.url)
+        status_of(client, device, state="online")
+        reply = client.post(f"/api/v1/devices/{device}/actions", json={"action": "atx_reset"})
+        assert (reply.status_code, reply.json().get("code")) == (504, "timeout") and "may have been done" in reply.json()["message"], reply.text
+        assert pc.state.actions == [10]
+        entry = next(e for e in client.get("/api/v1/audit").json()["entries"] if e["event"].startswith("action"))
+        assert (entry["event"], entry["action"]) == ("action_failed", "atx_reset") and "may have been done" in entry["error"]
 
 
 def test_a_faults_words_are_one_printable_line() -> None:

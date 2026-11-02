@@ -22,17 +22,22 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import json
 import logging
 import re
 import time
+import weakref
+import zlib
 from collections import defaultdict, deque
 from collections.abc import Awaitable, Callable
 from concurrent.futures import ThreadPoolExecutor
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple, cast
 import hashlib
-from urllib.parse import unquote, urlsplit
+from urllib.parse import unquote, urlencode, urlsplit
 
+import h11
 import httpx
+from websockets.asyncio.client import ClientConnection
 from websockets.exceptions import ConnectionClosed, InvalidStatus, WebSocketException
 
 from . import ami
@@ -67,12 +72,13 @@ from .kvm import (
     number,
     plain,
     read_json,
+    saved_mark,
     share_window,
     sign_in_waits,
     stopped,
     tier_for,
     went_out,
-    ws_connect,
+    ws_connect as _to_a_device,
     ws_error,
 )
 
@@ -128,13 +134,17 @@ BMC_WAITS = httpx.Timeout(20.0, connect=4.0, pool=8.0)
 # read and change that clear it again wait this long for their answer: one given up on leaves an override that may be
 # set, with nothing restarted.
 BOOT_WAITS = httpx.Timeout(60.0, connect=4.0, pool=8.0)
-# The service root read before a sign-in (see RedfishDevice._same_controller): that board answered it without a sign-in in
+# The service root read before a sign-in (see RedfishDevice._open_line): that board answered it without a sign-in in
 # 12 to 20.5 seconds (2026-10-19), against the 20 s of a look's read; given up on, no sign-in goes at all and the tile goes
 # offline. So it is given this many times a look's read (40 s, twice the longest seen).
 ROOT_WAIT_TIMES = 2.0
 # ...and so a server switched on into its setup is waited for that minute after the change, and CONFIRM_WITHIN beyond it,
 # before it is said not to have come on: with CONFIRM_WITHIN alone, every read of it fell into the busy minute.
 BOOT_BUSY = 60.0
+# After a change answered 204 (taken as made, not read back), the computer is read once more before the power change, for its
+# power (a server switched on meanwhile is restarted, not sent On): its answer is waited for this long and no longer. That
+# board answered no read for its busy minute; the restart is not held up for it.
+AFTER_204_READ = 5.0
 
 NO_PICTURE = KvmError("no_picture", "A management controller has no picture of the screen", 404)
 
@@ -171,10 +181,47 @@ MASTER_WAIT = 3.0
 # viewer takes no key for its first five seconds then. Nor does qKVM.
 HID_SETTLE = 5.0
 INPUT_SAY = 2.0  # seconds a key or the pointer has to go out over the console (the console's own answers have CONSOLE_SAY)
-LET_GO_WITHIN = 4.0  # seconds a letting go that is owed (a typing cut off with a key down) has to go out
+# ...but a letting go (a report with nothing down) is never given up for the backlog: it waits for room as long as the console's
+# own answers do, and where it cannot go out in that time the console session is ended, which has the controller let go of what
+# the session held. (Given up after INPUT_SAY, a controller that read nothing for a few seconds and read again went on with
+# the key down on the server, repeating.)
+LET_GO_SAY = CONSOLE_SAY
+LET_GO_WITHIN = 4.0  # seconds a letting go that is owed (a typing cut off with a key down) is waited for as the device is retired
 KEY_PAUSE = 0.004  # seconds between the reports of a typed text (as a JetKVM is typed at)
 HOLD = 0.05  # seconds the keys of a combination (Ctrl+Alt+Del, a saved one) are held down before they are let go
 TYPE_ASK_EVERY = 25  # keys typed before it is asked again whether whoever asked for it may still do that
+
+
+CONSOLE_LINE_CLOSES = (
+    "The controller closes the connection after every answer, so what its console needs (the sign-in of its web page, the "
+    "console's pass, its keys) cannot go on the connection its number was compared on, and its certificate is not one this "
+    "tile alone has pinned (plain HTTP, a certificate not checked, or one another tile shows too): none of it is sent, and "
+    "the console is not opened. It is asked again later."
+)
+TOKEN_LINE_CLOSES = (
+    "The controller closes the connection after every answer, so what carries this tile's session (its looks, its buttons) "
+    "cannot go on a connection its number was compared on, and its certificate is not one this tile alone has pinned (plain "
+    "HTTP, a certificate not checked, or one another tile shows too): nothing is sent."
+)
+SIGN_IN_LINE_CLOSES = (
+    "The controller closes the connection after every answer, so its password cannot go on the connection its number was "
+    "compared on, and its certificate is not one this tile alone has pinned (plain HTTP, a certificate not checked, or one "
+    "another tile shows too): qKVM does not send it. It is asked again in ten minutes."
+)
+UNASKED = (
+    "The controller sends what it was not asked for on the connection its number was compared on (after its answer, or between "
+    "two), which ends that connection"
+)
+
+
+def line_closes(words: str, unasked: bool) -> str:
+    """`words` (CONSOLE_LINE_CLOSES, SIGN_IN_LINE_CLOSES), or, where the line ended for what came unasked, the same said so."""
+    return UNASKED + words[words.index(", so") :] if unasked else words
+
+
+# Every server's tile there is, to know whether a pinned certificate is one another tile shows too (see `_pinned_alone`).
+_TILES: weakref.WeakSet[RedfishDevice] = weakref.WeakSet()
+LET_GO_LOST = "A letting go of a key or a button could not go out to the server's console in time: the console session was ended, which lets go of it"
 
 
 def handed_over() -> KvmError:
@@ -204,6 +251,414 @@ PASS_REFUSED = {
 }
 
 
+# A line (see `_Line`): what it may carry in one request's head, and the most an answer's head may be beside its body.
+LINE_PATH = re.compile(r"/[!-~]{0,1023}")
+LINE_NAME = re.compile(r"[A-Za-z0-9-]{1,64}")
+LINE_VALUE = re.compile(r"[ -~]{0,4096}")
+LINE_HEAD = 100 * 1024  # (the most a head, or a piece's own line, may be: what the HTTP library lets h11 take, too)
+MOST_PIECES = 4096  # chunks an answer's body may come in (a controller sends a few; a stream of four-byte ones is no answer)
+MOST_INTERIM = 8  # answers of the 1xx kind nobody asked for, read past before the answer
+YIELD_EVERY = 256  # pieces of an answer read before the wall has its turn
+
+
+class NotAsked(KvmError):
+    """A request on a line that was not written at all (the connection had ended, or held what nobody asked for, or what
+    was to be sent could not stand in a request): nothing of it went."""
+
+
+class _Connection(asyncio.Protocol):
+    """One TCP connection of a line (see `_Line`): what came on it, handed to h11 to be read as HTTP answers; whether it ended."""
+
+    def __init__(self) -> None:
+        self.http = h11.Connection(our_role=h11.CLIENT, max_incomplete_event_size=LINE_HEAD)
+        self.transport: asyncio.Transport | None = None
+        self.came = asyncio.Event()  # something came, or the connection ended
+        self.ended = False
+        self.unasked = False  # it ended for what came on it unasked
+        self.eof = False  # (h11 was told that nothing more comes)
+        self.heard = 0  # bytes that came on it
+        self.most = 0  # while an answer is read: where what came is more than any answer, and the connection is cut off
+
+    def connection_made(self, transport: asyncio.BaseTransport) -> None:
+        self.transport = cast(asyncio.Transport, transport)
+
+    def data_received(self, data: bytes) -> None:
+        self.heard += len(data)
+        if not self.most:
+            # Nothing is asked on it just now (between two requests, or before the first): what comes is nobody's, and is not
+            # taken in. The connection ends here; the next request makes and compares another (see `_Line`).
+            self.ended = self.unasked = True
+            if self.transport is not None:
+                self.transport.abort()
+            self.came.set()
+            return
+        if not self.eof:
+            self.http.receive_data(data)  # (kept for the reading in `_Line.ask`, which takes it a piece at a time)
+        if self.heard > self.most and self.transport is not None:
+            self.transport.abort()  # (far more than an answer: whoever reads is told the connection is gone)
+        self.came.set()
+
+    def eof_received(self) -> bool | None:
+        self._ends()
+        return None
+
+    def connection_lost(self, exc: Exception | None) -> None:
+        self._ends()
+
+    def _ends(self) -> None:
+        self.ended = True
+        if not self.eof:
+            self.eof = True
+            with contextlib.suppress(RuntimeError):
+                self.http.receive_data(b"")
+        self.came.set()
+
+    def usable(self) -> bool:
+        return not self.ended and self.transport is not None and not self.transport.is_closing()
+
+    def idle(self) -> bool:
+        """Nothing asked, nothing owed, nothing came that was not asked for: the next request may go on it."""
+        http = self.http
+        return http.our_state is h11.IDLE and http.their_state is h11.IDLE and not http.trailing_data[0]
+
+
+class LineAnswer(NamedTuple):
+    """An answer read on a line: its status, its head as it came (names and values), and its body."""
+
+    status_code: int
+    headers: list[tuple[str, str]]
+    body: bytes
+
+
+class _Line:
+    """A connection to the controller, made by this program for what must reach the controller this tile was added for
+    (see RedfishDevice._open_line): its service root is read on it first, as anybody may read it, and its number compared;
+    what carries the password, the console's pass, a session's token or the keys then goes on the very same connection. (A
+    request of the HTTP library goes on whichever of its connections is free, or on a new one that resolves the name anew:
+    what was asked on one says nothing of which controller answers on the other.) One that the controller closed is made
+    anew, and compared anew, by `_open_line`.
+
+    HTTP/1.1 (and HTTP/1.0 answers), one request at a time, each answer read by h11 (the HTTP library's own reader), linearly,
+    within LINE_HEAD for its head, MAX_REPLY and MOST_PIECES for its body, MOST_INTERIM answers of the 1xx kind before it, and
+    the request's time; or handed over as it is to the WebSocket library, for the console's own connection (`give`)."""
+
+    def __init__(self) -> None:
+        self.connection: _Connection | None = None
+        self.handed = False  # given to the WebSocket library (see `give`): it is that library's from then on
+        # Its controller's number (or its computer's) compared on it as it was made; False where nothing was remembered to
+        # compare with then (a tile's first contact), or nothing was compared (see `_open_line`).
+        self.compared = False
+        self.idle_since = time.monotonic()  # (since when it waits among a tile's lines: see `_Lines.fresh`)
+        self.used = False  # (taken for a request, or made for the sign-in: not one made ahead that nobody took yet)
+
+    def usable(self) -> bool:
+        return self.connection is not None and self.connection.usable()
+
+    def unasked(self) -> bool:
+        """Whether its last connection ended for what came on it unasked (and not because the controller closed it)."""
+        return self.connection is not None and self.connection.unasked
+
+    async def ask(self, method: str, path: str, headers: list[tuple[str, str]], body: bytes, within: float) -> LineAnswer:
+        """Send the request (`body` with its length where there is one) and read its answer whole, within `within` seconds.
+        NotAsked where it was not written at all; KvmError where no answer came (dropped, timeout), or what came is no answer
+        this program reads, or more than one (bad_response)."""
+        line = self.connection
+        if line is None or not line.usable() or line.transport is None:
+            raise NotAsked("dropped", "The connection to the controller was closed")
+        if not line.idle():
+            raise NotAsked("bad_response", "The controller sent what it was not asked for")
+        http = line.http
+        try:
+            out = http.send(h11.Request(method=method, target=path, headers=headers)) or b""
+            if body:
+                out += http.send(h11.Data(data=body)) or b""
+            out += http.send(h11.EndOfMessage()) or b""
+        except h11.LocalProtocolError:
+            raise NotAsked("bad_response", "What was to be sent to the controller cannot stand in a request") from None
+        line.most = line.heard + MAX_REPLY + LINE_HEAD
+        line.transport.write(out)
+        status, said, content = 0, [], bytearray()
+        pieces = interim = handled = 0
+        try:
+            async with asyncio.timeout(within):
+                while True:
+                    try:
+                        event = http.next_event()
+                    except h11.RemoteProtocolError:
+                        if line.heard > line.most:
+                            raise KvmError("dropped", "The device sent far more data than this program accepts") from None
+                        raise KvmError("bad_response", "The controller's answer is not one this program reads") from None
+                    if event is h11.NEED_DATA:
+                        if line.heard > line.most:
+                            raise KvmError("dropped", "The device sent far more data than this program accepts")
+                        line.came.clear()
+                        await line.came.wait()
+                        continue
+                    handled += 1
+                    if handled % YIELD_EVERY == 0:
+                        await asyncio.sleep(0)  # (what came is read a few hundred pieces at a time: the wall goes on meanwhile)
+                    if isinstance(event, h11.InformationalResponse):
+                        interim += 1  # (a 1xx answer nobody asked for, before the answer: read past, a few of them)
+                        if interim > MOST_INTERIM:
+                            raise KvmError("bad_response", "The controller sends answers of the 1xx kind and no answer")
+                    elif isinstance(event, h11.Response):
+                        status = event.status_code
+                        said = [(bytes(name).decode("latin-1"), bytes(value).decode("latin-1")) for name, value in event.headers.raw_items()]
+                    elif isinstance(event, h11.Data):
+                        pieces += event.chunk_start  # (its chunks, not the pieces the network splits it into: MAX_REPLY bounds those)
+                        content += event.data
+                        if len(content) > MAX_REPLY or pieces > MOST_PIECES:
+                            raise KvmError("dropped", "The device sent far more data than this program accepts")
+                    elif isinstance(event, h11.EndOfMessage):
+                        break
+                    elif isinstance(event, h11.ConnectionClosed):
+                        raise KvmError("dropped", "The device closed the connection")
+                    else:
+                        raise KvmError("bad_response", "The controller's answer is not one this program reads")
+        except TimeoutError:
+            line.ended = True  # (an answer not read to its end leaves nothing that could carry the next request)
+            line.transport.abort()
+            raise KvmError("timeout", "Device did not respond in time", 504) from None
+        except BaseException:
+            line.ended = True
+            line.transport.abort()
+            raise
+        finally:
+            line.most = 0
+        if http.trailing_data[0]:
+            # (More came with the answer than the answer: nobody's, as between two requests. The line ends.)
+            line.ended = line.unasked = True
+            line.transport.abort()
+        elif http.our_state is h11.DONE and http.their_state is h11.DONE:
+            http.start_next_cycle()
+        else:
+            line.ended = True  # (it closes the connection after this answer, HTTP/1.0 as a rule: nothing more is sent on it)
+        return LineAnswer(status, said, bytes(content))
+
+    def give(self) -> asyncio.Transport:
+        """The connection itself, for the WebSocket library to go on with (its handshake the next thing on it)."""
+        line = self.connection
+        if line is None or not line.usable() or line.transport is None:
+            raise KvmError("dropped", "The controller closed the connection its number was compared on")
+        if not line.idle():
+            raise KvmError("bad_response", "The controller sent what it was not asked for")
+        transport, line.transport, self.handed = line.transport, None, True  # (h11 holds nothing of it: the upgrade is the next thing)
+        return transport
+
+    def close(self) -> None:
+        line = self.connection
+        if line is not None and line.transport is not None and not line.transport.is_closing():
+            line.transport.close()
+
+    def abort(self) -> None:
+        """Cut off at once: whatever is read on it is told the connection is gone."""
+        line = self.connection
+        if line is not None and line.transport is not None:
+            line.ended = True
+            line.transport.abort()
+
+    def taken(self) -> _Line:
+        """A line of its own for whoever goes on with this one's connection (whatever closes this one leaves it alone)."""
+        other = _Line()
+        if not self.handed:
+            other.connection, self.connection = self.connection, None
+            other.compared = self.compared
+        return other
+
+
+MOST_LINES = 3  # lines a tile keeps for its session's token: one in use, one ready beside it, and one being made
+# A line that waited this long is closed, not used: something between the wall and the controller (a NAT's or a firewall's
+# idle timeout) may have forgotten it without a word, and what goes on it then goes nowhere (a press waited twenty seconds and
+# failed: the final review of 0.2.1). As 0.2.0's connections were kept (kvm.Device.LIMITS, keepalive_expiry).
+LINE_IDLE_KEPT = 30.0
+
+
+class _Lines:
+    """The connections of the program's own on which a server's tile sends its session's token (see RedfishDevice._request),
+    each compared as it is made (`_open_line`): kept while open (a real controller kept an idle one open a minute and more),
+    and made anew, and compared anew, where one ended. A request has one to itself while its answer is read; where it takes
+    the last one that waits, another is made ready beside it, so that a press does not wait behind a look's slow answer (and
+    one that waits takes whichever comes first: a line given back, or the one made). MOST_LINES at the most."""
+
+    def __init__(self, device: RedfishDevice) -> None:
+        self._device = device
+        self.idle: list[_Line] = []
+        self.busy: set[_Line] = set()
+        self._making: asyncio.Task[_Line] | None = None
+        self._failure: BaseException | None = None
+        self._changed = asyncio.Event()
+        self.closed = False
+        # A controller that closed a line right after its compare (it closes every connection): said until then, no line made.
+        self._refusal: KvmError | None = None
+        self._refused_until = 0.0
+        self.ended_at = float("-inf")  # when a line last came back closed (by the controller with its answer, or cut off)
+        # Whether a line is made ready ahead where a request takes the last one that waits: not once the controller closed one
+        # so made before it was used (it closes idle connections within moments; each such line cost a root read for nothing).
+        self.ahead = True
+
+    def _count(self) -> int:
+        return len(self.idle) + len(self.busy) + (self._making is not None)
+
+    def _make_one(self) -> None:
+        if self._making is None and not self.closed and self._count() < MOST_LINES:
+            self._making = asyncio.ensure_future(self._device._open_line())
+            self._making.add_done_callback(self._made)
+
+    def _made(self, task: asyncio.Task[_Line]) -> None:
+        if self._making is task:
+            self._making = None
+        if not task.cancelled():
+            failure = task.exception()
+            if failure is not None:
+                self._failure = failure  # (told to whoever waits for a line; looked at here, so that it is never left unread)
+            elif self.closed:
+                task.result().close()
+            elif not task.result().usable():
+                # Closed right after its compare: the controller closes every connection, and nothing can go on one its number
+                # was compared on. Said, and not tried again at every look (CONSOLE_GIVE_UP).
+                line = task.result()
+                line.close()
+                self._failure = self._refusal = KvmError("no_sign_in", line_closes(TOKEN_LINE_CLOSES, line.unasked()), 503)
+                self._refused_until = time.monotonic() + CONSOLE_GIVE_UP
+            else:
+                task.result().idle_since = time.monotonic()
+                self.idle.append(task.result())
+        self._changed.set()
+
+    async def take(self, within: float) -> _Line:
+        """A line to the controller, open and compared, this request's alone until it is given back. KvmError where none could
+        be made (another server answers there, it cannot be reached, ...) or none came free within `within` seconds."""
+        try:
+            async with asyncio.timeout(within):
+                while True:
+                    if self.closed:
+                        raise RETIRED.with_traceback(None)
+                    if self._refusal is not None and time.monotonic() < self._refused_until and not self.idle:
+                        raise self._refusal.with_traceback(None)
+                    while self.idle:
+                        line = self.idle.pop()
+                        if self.fresh(line):
+                            line.used = True
+                            self.busy.add(line)
+                            if not self.idle and self.ahead:
+                                self._make_one()  # (one ready beside it, for whoever comes while this one is in use)
+                            return line
+                        if not line.used and not line.usable():
+                            self.ahead = False  # (the controller closed it before it was used: see `ahead`)
+                        line.close()
+                    self._failure = None
+                    self._make_one()
+                    self._changed.clear()
+                    await self._changed.wait()
+                    if self._failure is not None and not self.idle:
+                        failure, self._failure = self._failure, None
+                        raise failure.with_traceback(None)
+        except TimeoutError:
+            raise KvmError("timeout", "Every connection to the controller was in use, and none could be made in time", 504) from None
+
+    def waiting(self, compared: bool = False) -> bool:
+        """Whether a line waits, open (`compared`: one compared as it was made); none is taken."""
+        return any(self.fresh(line) and (line.compared or not compared) for line in self.idle)
+
+    def idle_one(self, compared: bool = False) -> _Line | None:
+        """A line that waits, open (`compared`: one compared as it was made), taken as `take` takes one; None where none waits
+        (whoever asks makes one of its own)."""
+        for line in reversed(list(self.idle)):
+            if not self.fresh(line):
+                if not line.used and not line.usable():
+                    self.ahead = False  # (as in `take`)
+                self.idle.remove(line)
+                line.close()
+            elif line.compared or not compared:
+                line.used = True
+                self.idle.remove(line)
+                self.busy.add(line)
+                return line
+        return None
+
+    def give_back(self, line: _Line) -> None:
+        self.busy.discard(line)
+        if line.usable() and not line.handed and not self.closed and line not in self.idle:
+            line.idle_since = time.monotonic()
+            self.idle.append(line)
+        else:
+            if not line.usable():
+                self.ended_at = time.monotonic()
+            line.close()
+        self._changed.set()
+
+    @staticmethod
+    def fresh(line: _Line) -> bool:
+        """Whether a line that waits may be taken: open, and waiting less than LINE_IDLE_KEPT."""
+        return line.usable() and time.monotonic() - line.idle_since < LINE_IDLE_KEPT
+
+    def drop_idle(self) -> None:
+        """Close every line that waits: one of them ended with nothing read, and the others waited as long (a controller that
+        restarted, a NAT that forgot them). The next request makes one afresh, and compares it."""
+        for line in self.idle:
+            line.close()
+        self.idle.clear()
+
+    def let_go(self, line: _Line) -> None:
+        """A line taken for good (handed to the WebSocket library): no longer one of these."""
+        self.busy.discard(line)
+        self._changed.set()
+
+    def keep(self, line: _Line) -> bool:
+        """Keep a line made and compared elsewhere (the sign-in's) for what follows; False where it is not kept."""
+        if self.closed or not line.usable() or self._count() >= MOST_LINES:
+            return False
+        self._refusal = None  # (a line was had after all)
+        line.idle_since, line.used = time.monotonic(), True
+        self.idle.append(line)
+        self._changed.set()
+        return True
+
+    def abort_busy(self) -> None:
+        for line in list(self.busy):
+            line.abort()
+
+    def close(self) -> None:
+        self.closed = True
+        if self._making is not None:
+            self._making.cancel()
+        for line in [*self.idle, *self.busy]:
+            line.close()
+        self.idle.clear()
+        self._changed.set()
+
+
+class ws_connect(_to_a_device):  # (named as the one it stands in for in this file, which is what a test replaces)
+    """A WebSocket to the controller (its console, AMI's or OpenBMC's) on a line its number was compared on (`line`: see
+    `_Line`), and on nothing else: the handshake, the cookie or the session's token, the pass and the keys go on that very
+    connection."""
+
+    def __init__(self, uri: str, *, line: _Line | None = None, **options: Any) -> None:
+        if line is None:
+            raise ValueError("a connection to a server's console goes only on a line its controller was compared on")
+        super().__init__(uri, **options)
+        self._line = line
+
+    async def open_tcp_connection(self) -> ClientConnection:
+        transport = self._line.give()
+        connection = self.factory(self.ws_uri)
+        transport.set_protocol(connection)
+        connection.connection_made(transport)
+        return connection
+
+
+def service_root(reply: httpx.Response) -> dict[str, Any]:
+    """A controller's service root out of its answer; KvmError where it is none (an error of its own, one of its moments:
+    nothing is judged by that, and nothing is sent)."""
+    try:
+        root = read_json(reply) if reply.status_code == 200 else None
+    except ValueError:
+        root = None
+    if not isinstance(root, dict) or "RedfishVersion" not in root:
+        raise KvmError("bad_response", f"The controller did not show its service root (HTTP {reply.status_code}), which is read before its password goes")
+    return root
+
+
 def screen_jpeg(width: int, height: int, screen: bytearray, target: int | None, quantizer: int, session: VideoSession | None = None) -> bytes:
     """A screen of three bytes a pixel as a JPEG, shrunk to `target` pixels wide when that is smaller.
 
@@ -228,12 +683,14 @@ class _Console:
         self.frames = 0  # how many have been read: a JPEG made at an earlier count is not the latest picture
         self.since = 0.0  # when the first of them was (time.monotonic())
         self.done = asyncio.Event()
+        self.ended = False  # its connection has ended: no picture of it is handed out from then on (`done` follows soon after)
         self.error: KvmError | None = None
         self.encoded: dict[str, tuple[int, Snapshot]] = {}
         self.heard: list[str] = []  # the first things the controller said, for the log when no picture comes of it
 # What a board says where nobody filled in its name.
 PLACEHOLDER = re.compile(r"\s*(to be filled by o\.?e\.?m\.?|default string|system product name|not specified|n/?a|unknown)?\s*", re.IGNORECASE)
 PATH = re.compile(r"/redfish/v1(/[A-Za-z0-9._~!$&'()*+,;=:@%-]+)*/?")
+ESCAPE = re.compile(r"%([0-9A-Fa-f]{2})?")  # a percent, and the byte it escapes (None: it escapes none)
 NUMBER = re.compile(r"[0-9A-Fa-f]{8}-(?:[0-9A-Fa-f]{4}-){3}[0-9A-Fa-f]{12}")
 # The way into its own console that a controller hands out: a page on itself and a pass, nothing else.
 CONSOLE = re.compile(r"(/[A-Za-z0-9_~-][A-Za-z0-9._~-]*)+\?[A-Za-z0-9._~%&=+-]{1,512}")
@@ -266,11 +723,33 @@ def link(value: Any) -> str | None:
     """A place on the controller that it points to itself, or None for anything else it may claim."""
     if not isinstance(value, str) or len(value) > 300 or not PATH.fullmatch(value):
         return None
+    # Every percent begins an escape of a byte a path may hold: not a percent itself (a place spelt twice over, "%252e%252e",
+    # is ".." to whatever reads it twice), no byte of 0x80 and above (an overlong "%c0%ae" is a dot to a lenient reader, and
+    # no controller names its places in more than ASCII), and no control byte (a NUL, a line feed that ends the request line).
+    for escape in ESCAPE.finditer(value):
+        byte = escape.group(1)
+        if byte is None or (said := int(byte, 16)) == 0x25 or said < 0x20 or said >= 0x7F:
+            return None
     # And no way back up out of /redfish/v1, however it is spelt: the request would be sent to where that leads.
     spelt_out = unquote(value)
     if "\\" in spelt_out or spelt_out.count("/") != value.count("/") or any(part in (".", "..") for part in spelt_out.split("/")):
         return None
     return value
+
+
+def session_place(location: str) -> str | None:
+    """Where the session a controller just made is, to be signed out of again (a DELETE with the session's token): the place
+    its answer names (Location), where that is one segment directly under the sessions collection (one slash after it allowed);
+    None for anything else it may name (an account, the collection itself, a place below a session), which is sent no DELETE."""
+    try:
+        place = link(urlsplit(location).path)
+    except ValueError:  # what it gave as the place of the session is not an address at all
+        return None
+    if place is None or not place.startswith(SESSIONS + "/"):
+        return None
+    session = place[len(SESSIONS) + 1 :]
+    session = session[:-1] if session.endswith("/") else session  # (one slash at its end, as HPE's iLO writes its places)
+    return place if session and "/" not in session else None
 
 
 def locator(system: dict[str, Any]) -> tuple[bool | None, dict[str, Any] | None, dict[str, Any] | None]:
@@ -307,10 +786,13 @@ def boot_targets(system: dict[str, Any]) -> list[str]:
 SETUP_OVERRIDE = ("once", "biossetup")  # what Start into BIOS setup sets, as `boot_override` says it
 SETUP_CHANGE = {"Boot": {"BootSourceOverrideEnabled": "Once", "BootSourceOverrideTarget": "BiosSetup"}}
 NOT_CLEARED = "the BIOS setup boot override may be set and could not be cleared, so the next boot may land in the BIOS setup"
-SET_BEFORE = "the BIOS setup boot override was set already before this press, and is left set as it was, so the next boot will land in the BIOS setup"
+SET_BEFORE = "the BIOS setup boot override was set already before this press, and is left set as it was, so the next boot may land in the BIOS setup"
 # Where the clearing found the override off and went out before a change of the press's that the controller accepted
 # (or whose answer was lost): the clearing cannot undo what comes after it.
-CLEARED_LATE = "it showed off and was cleared; should the controller still make the change it accepted, the next boot will land in the BIOS setup"
+CLEARED_LATE = (
+    "the BIOS setup boot override showed off and was cleared; should this press's change still be made (accepted for later, "
+    "or its answer lost), the next boot will land in the BIOS setup"
+)
 # What tells that a request never went out (nothing it would change was changed): anything else after it was sent may
 # have been done (a timeout, a broken answer, an answer that could not be read, an address it was sent on to that is none).
 NOT_SENT = frozenset({"unreachable", "stopped", "cert_mismatch", "cert_invalid", "no_sign_in", "auth_failed", "no_password", "another_machine"})
@@ -319,6 +801,26 @@ NOT_SENT = frozenset({"unreachable", "stopped", "cert_mismatch", "cert_invalid",
 # for this press, SETUP_PATIENCE in app.js). Nothing under way is cut off for it: a request is waited out within its own
 # time (BOOT_WAITS), and a clearing goes to its end. The real board took 36 s over the change and the restart together.
 SETUP_WITHIN = 120.0
+
+
+def power_decides(power: str | None, action: str) -> bool:
+    """Whether the server runs, as the power buttons that go by it (switch on, shut down, the power button) take its state
+    (`power`, PowerState as the controller said it): On and Off for what they are; switching on (PoweringOn) and shutting down
+    (PoweringOff) as what they are, which is where switching on and shutting down are going already (AlreadySo) and the other
+    way is not sent into the middle of; any other state, or none said, decides nothing, and nothing is sent (as Start into BIOS
+    setup refuses one: see `_setup_plan`). KvmError says why; Paused, say, was taken for "on": "already on", and the power
+    button asked a server that is not running to shut down. (Hold power and the reset button are not decided by the state.)"""
+    if power in ("On", "Off"):
+        return power == "On"
+    if power == "PoweringOn" and action == "power_on":
+        raise AlreadySo("already switching on")
+    if power == "PoweringOff" and action == "power_off":
+        raise AlreadySo("already shutting down")
+    if power in ("PoweringOn", "PoweringOff"):
+        doing = "switching on" if power == "PoweringOn" else "shutting down"
+        raise KvmError("action_failed", f"Nothing was done: the server is {doing} just now ({power}). Try again in a moment.")
+    said = f"in a power state qKVM does not act on ({power})" if power else "in a power state its controller does not say"
+    raise KvmError("action_failed", f"Nothing was done: the server is {said}.")
 
 
 def took_too_long() -> str:
@@ -335,8 +837,9 @@ class SetupSteps:
         self.until = time.monotonic() + SETUP_WITHIN
         self.changed_at: float | None = None  # when the controller answered the change of the boot override with a yes
 
-    def overdue(self) -> bool:
-        return time.monotonic() >= self.until
+    def overdue(self, spare: float = 0.0) -> bool:
+        """Whether the press's time is up (`spare`: or will be within that many seconds)."""
+        return time.monotonic() + spare >= self.until
 
 
 def boot_override(system: Any) -> tuple[str, str]:
@@ -387,7 +890,7 @@ def marks_of(machine: str) -> tuple[str, str | None]:
 
 
 # What a tile says, and a button, a key or its console is answered with, where the server at its address is not the one it
-# was added for (see RedfishDevice._judge and `_same_controller`).
+# was added for (see RedfishDevice._judge and `_open_line`).
 ANOTHER_SERVER = (
     "Another server answers at this address: it gives another number for itself (its UUID) than the server this tile was "
     "added for. Nothing is done to it: no power command, no key, no console. If it is this tile's server now, edit the tile and type its password."
@@ -533,6 +1036,8 @@ class RedfishDevice(Device):
 
     def __init__(self, spec: DeviceSpec, on_pin: Any = None) -> None:
         super().__init__(spec, on_pin)
+        _TILES.add(self)
+        self._lines = _Lines(self)  # (what carries its session's token, where the certificate does not bind a connection: see `_request`)
         self._token: str | None = None
         self._session: str | None = None  # where to sign out again
         self._login_lock = asyncio.Lock()
@@ -572,7 +1077,7 @@ class RedfishDevice(Device):
         # console is given to somebody at the controller's own page and when it ends. `_input_era` goes up at each of
         # those moments: whoever began typing in an earlier one is told so (`_input_lost`) and sends nothing more, so a
         # line that held the keyboard takes it again and begins from a keyboard with nothing down.
-        self._live_send: Callable[[bytes, int], Awaitable[None]] | None = None
+        self._live_send: Callable[[bytes, int, bool], Awaitable[None]] | None = None  # (a report, its era, whether it lets go of all)
         self._say_lock = asyncio.Lock()
         self._can_input = asyncio.Event()
         self._input_era = 0
@@ -630,36 +1135,87 @@ class RedfishDevice(Device):
         # Whatever else was under way ends here, a sign-in among it. The session is read after that: read
         # first, one that a sign-in was given while the console was being waited for was never given back.
         await stopped([self._status_task, *self._flights])
+        self._lines.abort_busy()  # (and what is under way on its own lines, as on the HTTP library's: see `_send`)
         token, session, client = self._token, self._session, self._client
         self._token = self._session = None
         goodbyes: list[Any] = []
         if self._leaving:
-            # The sign-out of its web page, begun as the console stopped: waited for, within its own time,
-            # before the connections are closed under it.
+            # The sign-out of its web page, begun as the console stopped (on a line of its own, its root read first): waited
+            # for SIGN_OUT_WITHIN and no longer, beside the Redfish session's. It needs nothing of the connections closed below,
+            # and goes on by itself where the program goes on; at the program's end it is cut off wherever it is, and on a
+            # board slower than that the web session runs out by itself on the controller.
             goodbyes.append(asyncio.wait(set(self._leaving), timeout=SIGN_OUT_WITHIN))
         if token and session and client is not None and self._down_error is None and not already:
             goodbyes.append(self._give_back(client, session, token))
         if goodbyes:
             await asyncio.gather(*goodbyes)
+        self._lines.close()
         await super().close()
 
-    @staticmethod
-    async def _give_back(client: httpx.AsyncClient, session: str, token: str) -> None:
+    async def _give_back(self, client: httpx.AsyncClient, session: str, token: str) -> None:
         # A controller allows only so many sessions at a time. Leaving this one behind would use one up
-        # until it runs out by itself, half an hour later.
+        # until it runs out by itself, half an hour later. With the token: where the certificate does not bind the HTTP
+        # library's connections, on a line of this tile's (one that waits, or one made and compared now), as every request
+        # that carries it (see `_request`).
         try:
-            goodbye = client.build_request("DELETE", session, headers={"X-Auth-Token": token}, timeout=SIGN_OUT)
-            await bounded(client, goodbye, MAX_REPLY, SIGN_OUT_WITHIN)
-        except (httpx.HTTPError, KvmError):
+            if self._pinned_alone():
+                goodbye = client.build_request("DELETE", session, headers={"X-Auth-Token": token}, timeout=SIGN_OUT)
+                await bounded(client, goodbye, MAX_REPLY, SIGN_OUT_WITHIN)
+                return
+            async with asyncio.timeout(SIGN_OUT_WITHIN):
+                line = self._lines.idle_one()
+                for last in (False, True):
+                    own = line is None
+                    if line is None:
+                        # Compared as it is made: where the server is known by its computer alone, by reading the computer
+                        # under the session being given back (the tile's own was put aside as it retired, and a retired tile
+                        # signs in no more: no line waited, and nothing was signed out of. GitHub's controllers job, 0.2.1).
+                        line = await self._open_line(token=token)
+                    heard = line.connection.heard if line.connection is not None else 0
+                    try:
+                        await self._on_the_line(line, "DELETE", session, {"X-Auth-Token": token}, within=SIGN_OUT.read, again=False)
+                        return
+                    except KvmError as ex:
+                        # Nothing of the DELETE answered (not written at all, or the connection ended with nothing read: one the
+                        # controller closed just as it went): once more, on a line made afresh and compared. Not after a part
+                        # of an answer, nor after none came in time (the controller may be at it, and the time is spent).
+                        ended = line.connection is not None and line.connection.ended and line.connection.heard == heard
+                        if last or not (isinstance(ex, NotAsked) or (ended and ex.code != "timeout")):
+                            raise
+                    finally:
+                        if own:
+                            line.close()
+                        else:
+                            self._lines.give_back(line)
+                    line = None
+        except (httpx.HTTPError, KvmError, OSError):  # (TimeoutError among them)
             pass
 
-    @staticmethod
-    async def _leave_its_web_page(client: httpx.AsyncClient, headers: dict[str, str]) -> None:
+    async def _leave_its_web_page(self, headers: dict[str, str], line: _Line) -> None:
+        """Sign out of its web page, with its session's cookie: on `line` (the connection the controller was compared on, taken
+        over by this task) where it is still open, else on one of the tile's own lines that waits (see `_Lines`), else on one
+        made anew and compared anew (see `_Line`); never on the HTTP library's connections, which would take the cookie to
+        whatever answers there. Within its own time, which a slow root's read is part of: given up, the session runs out by
+        itself on the controller. (Also as the device is retired: the line needs nothing of the device's connection but the
+        certificate it has.) The line it went on is given to the tile's lines after, where they have room for it."""
+        waits = self._waits()
+        within = (waits.connect or 4.0) + ROOT_WAIT_TIMES * (waits.read or 20.0) + SIGN_OUT_WITHIN
         try:
-            await bounded(client, client.build_request("DELETE", "/api/session", headers=headers, timeout=SIGN_OUT), MAX_REPLY, SIGN_OUT_WITHIN)
-        except (httpx.HTTPError, KvmError):
+            async with asyncio.timeout(within):
+                if not line.usable():
+                    waiting = self._lines.idle_one(compared=True)
+                    if waiting is not None:
+                        # (This sign-out's own from here: what retiring cuts off on the tile's lines is not this, which it waits for.)
+                        self._lines.let_go(waiting)
+                        line = waiting
+                    else:
+                        await self._line_kept(line)
+                await self._on_the_line(line, "DELETE", "/api/session", headers, within=SIGN_OUT.read, again=False)
+        except (KvmError, OSError):  # (TimeoutError among them)
             pass
-        client.cookies.clear()
+        finally:
+            if not self._lines.keep(line):
+                line.close()
 
     # --- signing in and asking ----------------------------------------------------
 
@@ -667,23 +1223,58 @@ class RedfishDevice(Device):
         async with self._login_lock:
             if self._token:
                 return self._token
+            if self._closed:
+                raise RETIRED.with_traceback(None)  # (retired: no new session is made, whatever asks for one)
             if self._login_error and time.monotonic() < self._login_retry_at:
                 raise self._login_error.with_traceback(None)
             if not self.spec.password:
                 raise KvmError("no_password", "No password saved for this device")
             offered = REJECTED.what("login", self.spec)
             self._not_yet(offered, NO_SAID)
-            client = await self._http()
-            compared = await self._same_controller(client)  # (where its number is remembered: asked before the password goes)
-            login = client.build_request("POST", SESSIONS, json={"UserName": self.spec.username, "Password": self.spec.password}, timeout=sign_in_waits())
-            before = REJECTED.sent(offered)
+            # The password goes on a connection of its own (see `_Line`), on which the controller's open root is read first and
+            # its number compared, where one is remembered: on that very connection, and never on whichever the HTTP library
+            # has free next, which may go elsewhere (a new lease). Where nothing is remembered of the controller, nothing is read
+            # before it.
+            compared = marks_of(self.spec.machine)[1] is not None
             try:
-                reply = await self._send(client, login, MAX_REPLY)
-            except httpx.HTTPError as ex:
-                raise self._came_to_nothing(offered, _transport_error(ex, self.spec.tls), NO_SAID, before, went_out(ex)) from ex
+                line = await self._open_line(signing_in=True)
+                if not line.usable():
+                    await self._open_line(line, signing_in=True)  # (it closed the one its root was read on: once more)
+                if not line.usable() and compared and self._pinned_alone():
+                    # (It closes the connection after every answer: as for the console, see `_line_kept`. Where nothing of the
+                    # controller is remembered, nothing was read before the password: the line was never closed by a compare.)
+                    await self._open_line(line, signing_in=True, compare=False)
             except KvmError as ex:
-                raise self._came_to_nothing(offered, ex, NO_SAID, before) from None
-            self._answered()
+                if ex.code == "another_machine" or ex is RETIRED:
+                    raise ex.with_traceback(None) from None
+                raise self._failed(ex) from None  # (nothing was sent: said as the root's read, or the connection, failed)
+            keep = False
+            try:
+                if not line.usable():
+                    # It closes the connection after every answer: the password cannot go where the number was compared, and
+                    # is not sent. Asked again only after a while, and said as what it is.
+                    said = line_closes(SIGN_IN_LINE_CLOSES, line.unasked())
+                    self._login_error = KvmError("no_sign_in", said, 503)
+                    self._login_retry_at = time.monotonic() + CONSOLE_GIVE_UP
+                    log.warning("%s: %s", self.label, said)
+                    raise self._login_error
+                body = json.dumps({"UserName": self.spec.username, "Password": self.spec.password}, separators=(",", ":"), ensure_ascii=False).encode()
+                before = REJECTED.sent(offered)
+                try:
+                    reply = await self._on_the_line(line, "POST", SESSIONS, content=body, content_type="application/json", within=sign_in_waits().read, again=False)
+                except NotAsked as ex:
+                    # (Not written at all: nothing of the password went. Not counted as a sign-in that went out and came to
+                    # nothing; the tile is asked again a little later, and says what stood in the way.)
+                    REJECTED.put_back(offered, before)
+                    self._login_error, self._login_retry_at = KvmError(ex.code, ex.message, ex.status), time.monotonic() + LOGIN_RETRY
+                    raise self._login_error from None
+                except KvmError as ex:
+                    raise self._came_to_nothing(offered, ex, NO_SAID, before) from None
+                # (Compared, and signed in on: kept, where the session comes of it, for what carries that session.)
+                keep = reply.status_code in (200, 201) and TOKEN.fullmatch(reply.headers.get("x-auth-token", "")) is not None
+            finally:
+                if not (keep and self._lines.keep(line)):
+                    line.close()
             if reply.status_code in (401, 403):
                 # A controller locks an account after a few wrong passwords: do not offer it the same one every few
                 # seconds, and less often each time it says no (see LOGIN_BACKOFFS).
@@ -701,10 +1292,7 @@ class RedfishDevice(Device):
             self._token = token
             if compared:
                 self._controller_tokens.append(token)  # (a session of the controller whose number was just compared: see `_judge`)
-            try:
-                self._session = link(urlsplit(reply.headers.get("location", "")).path)
-            except ValueError:  # what it gave as the place of the session is not an address at all
-                self._session = None
+            self._session = session_place(reply.headers.get("location", ""))
             return token
 
     async def _request(
@@ -725,7 +1313,12 @@ class RedfishDevice(Device):
         under which the computer was last found to be this tile's (`_checked_token`). A server that took the address since does
         not know that session, and answers 401: the program signs in anew, and asks which server answers before the command goes
         (`_same_server`). So what takes a command is the server that was asked, however the address changed hands meanwhile,
-        whatever certificate and password the two share."""
+        whatever certificate and password the two share.
+
+        A command that changes something says so where it did not go out (NothingSent): what stood in its way before it was
+        sent (a sign-in that did not get as far as the password, which server answers that could not be read, the tile changed
+        meanwhile) is "nothing was sent", or, where it went out once and was answered 401, "it was not done"; never an answer
+        that did not come (which says "it may have been done"), as the sign-in's own read of the root that got none would."""
         if not urgent:
             self._check_backoff()
 
@@ -735,29 +1328,78 @@ class RedfishDevice(Device):
         retried = relogged = False
         asked = 0
         while True:
-            token = self._token or await self._login()
-            if command and self.spec.machine and token != self._checked_token:
-                asked += 1
-                if asked > MOST_ASKED:
-                    raise NothingSent("action_failed", "Nothing was sent: the controller at this address signed this program in anew while it was asked which server it is. Try again.")
-                await self._which_server_before_a_command(urgent)
-                continue
-            client = await self._http()
+            line: _Line | None = None
             try:
-                signed = {**(headers or {}), "X-Auth-Token": token, "Accept": "application/json"}
-                request = client.build_request(method, path, headers=signed, **kwargs)
-                if still is not None and not still():
-                    raise KvmError("stopped", "It was not done: whoever asked for it may no longer do that", 403)
-                reply = await self._send(client, request, MAX_REPLY)
-            except KvmError as ex:
-                raise failed(ex) from None
-            except (httpx.RemoteProtocolError, httpx.ReadError, httpx.WriteError) as ex:
-                if method == "GET" and not retried:  # a connection the controller closed while it sat idle
-                    retried = True
+                token = self._token or await self._login()
+                if command and self.spec.machine and token != self._checked_token:
+                    asked += 1
+                    if asked > MOST_ASKED:
+                        raise NothingSent("action_failed", "Nothing was sent: the controller at this address signed this program in anew while it was asked which server it is. Try again.")
+                    await self._which_server_before_a_command(urgent)
                     continue
-                raise failed(_transport_error(ex, self.spec.tls)) from ex
-            except httpx.HTTPError as ex:
-                raise failed(_transport_error(ex, self.spec.tls)) from ex
+                if self._pinned_alone():
+                    # (Its certificate is pinned and no other tile shows it: the TLS handshake binds every connection of the HTTP
+                    # library's to the controller that holds its key, and the token goes on them.)
+                    client = await self._http()
+                else:
+                    # Over plain HTTP, with the certificate not checked, or with one another tile shows too, nothing binds the HTTP
+                    # library's connections to this controller: one made anew after a new lease reached another, and was handed
+                    # the token. The token goes on a line of this tile's own, compared as it was made (see `_Lines`).
+                    line = await self._lines.take(self._line_wait())
+                    try:
+                        await self._line_kept(line, TOKEN_LINE_CLOSES, "no_sign_in")
+                    except BaseException:
+                        self._lines.give_back(line)
+                        raise
+            except KvmError as ex:
+                if command and method != "GET":
+                    raise self._not_done(ex, refused=relogged) from None
+                raise (ex if ex.code == "another_machine" or ex is RETIRED else failed(ex)).with_traceback(None) from None
+            signed = {**(headers or {}), "X-Auth-Token": token, "Accept": "application/json"}
+            if line is not None:
+                try:
+                    if still is not None and not still():
+                        raise KvmError("stopped", "It was not done: whoever asked for it may no longer do that", 403)
+                    said = kwargs.get("json")
+                    body = json.dumps(said, separators=(",", ":"), ensure_ascii=False).encode() if said is not None else None
+                    waits = kwargs.get("timeout")
+                    within = waits.read if isinstance(waits, httpx.Timeout) and waits.read else None
+                    heard = line.connection.heard if line.connection is not None else 0
+                    reply = await self._on_the_line(line, method, path, signed, content=body, content_type="application/json" if body is not None else None, within=within, again=False)
+                except NotAsked as ex:
+                    if not retried:  # (nothing of it was written: the line had ended just then; another is taken)
+                        retried = True
+                        continue
+                    raise (self._not_done(ex, refused=relogged) if command and method != "GET" else failed(ex)) from None
+                except KvmError as ex:
+                    if self._closed:
+                        raise RETIRED.with_traceback(None) from None  # (the device retired under it, as the HTTP library's: see `_send`)
+                    # (A line the controller closed just as it was used, or one that ended with nothing read, a reset as a
+                    # controller that restarted answers: the lines that wait beside it waited as long, and are let go of; asked
+                    # once more on one made afresh and compared. A press is not: it may have gone. The final review of 0.2.1.)
+                    quiet = line.connection is not None and line.connection.ended and line.connection.heard == heard and ex.code != "timeout"
+                    if (ex.code == "dropped" or quiet) and method == "GET" and not retried:
+                        retried = True
+                        self._lines.drop_idle()
+                        continue
+                    raise failed(ex) from None
+                finally:
+                    self._lines.give_back(line)
+            else:
+                try:
+                    request = client.build_request(method, path, headers=signed, **kwargs)
+                    if still is not None and not still():
+                        raise KvmError("stopped", "It was not done: whoever asked for it may no longer do that", 403)
+                    reply = await self._send(client, request, MAX_REPLY)
+                except KvmError as ex:
+                    raise failed(ex) from None
+                except (httpx.RemoteProtocolError, httpx.ReadError, httpx.WriteError) as ex:
+                    if method == "GET" and not retried:  # a connection the controller closed while it sat idle
+                        retried = True
+                        continue
+                    raise failed(_transport_error(ex, self.spec.tls)) from ex
+                except httpx.HTTPError as ex:
+                    raise failed(_transport_error(ex, self.spec.tls)) from ex
             self._answered()
             if reply.status_code != 401:
                 self._answered_token = token  # (read by whoever awaited this, before anything else runs: see `_checked_read`)
@@ -820,6 +1462,10 @@ class RedfishDevice(Device):
         Links.ManagedBy): that is taken first, and the first one listed only where the computer says
         nothing. An iDRAC lists every disk enclosure as a chassis too, and whichever comes first in that
         list has no sensors; AMI's boards, with one of each called "Self", say the same thing both ways.
+
+        Looked up once in ABOUT_TTL; where a read on the way failed (one of the controller's moments: the chassis, or where
+        its sensors are, not found just now), again after ABOUT_RETRY, and what was found before for that computer stands
+        meanwhile (kept as nothing for ten minutes, the temperatures and fans were gone from the tile).
         """
         if self._places and time.monotonic() - self._places_at < ABOUT_TTL:
             return self._places
@@ -829,6 +1475,7 @@ class RedfishDevice(Device):
         if system is None:
             raise KvmError("bad_response", "The controller lists no computer")
         places = {"system": system}
+        missed = False  # (a read on the way failed: see above)
         said = (await self._get(system, urgent)).get("Links")
         for name, key, by_the_computer in (("chassis", "Chassis", "Chassis"), ("manager", "Managers", "ManagedBy")):
             # (A link to somewhere else is no link, and the next one is looked at: see `link`. A computer names
@@ -841,22 +1488,27 @@ class RedfishDevice(Device):
                 try:
                     found = await self._first(root.get(key), urgent, False)
                 except KvmError:
-                    found = None
+                    found, missed = None, True
             if found:
                 places[name] = found
         if update := link(_dig(root, "UpdateService", "@odata.id")):
             places["update"] = update  # (where its firmware inventory is: see `_inventory_version`)
         if "chassis" in places:
-            places.update(await self._sensor_places(places["chassis"], urgent))
-        self._places, self._places_at = places, time.monotonic()
+            sensors = await self._sensor_places(places["chassis"], urgent)
+            missed = missed or sensors is None
+            places.update(sensors or {})
+        if missed and self._places.get("system") == system:
+            places = {**self._places, **places}  # (what was found before stands, where it was not found just now)
+        self._places, self._places_at = places, time.monotonic() - (ABOUT_TTL - ABOUT_RETRY if missed else 0.0)
         return places
 
-    async def _sensor_places(self, chassis: str, urgent: bool) -> dict[str, str]:
-        """Where the chassis keeps its sensors: `thermal` (the older shape), or `metrics` and `fans` (the newer)."""
+    async def _sensor_places(self, chassis: str, urgent: bool) -> dict[str, str] | None:
+        """Where the chassis keeps its sensors: `thermal` (the older shape), or `metrics` and `fans` (the newer). None where a
+        read failed just now (looked up again soon: see `_find`)."""
         try:
             found = await self._get(chassis, urgent, False)
         except KvmError:
-            return {}
+            return None
         thermal = link(_dig(found, "Thermal", "@odata.id"))
         if thermal:
             return {"thermal": thermal}
@@ -866,7 +1518,7 @@ class RedfishDevice(Device):
         try:
             parts = await self._get(subsystem, urgent, False)
         except KvmError:
-            return {}
+            return None
         return {name: place for name, key in (("metrics", "ThermalMetrics"), ("fans", "Fans")) if (place := link(_dig(parts, key, "@odata.id")))}
 
     async def _sensors(self, places: dict[str, str]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -879,10 +1531,12 @@ class RedfishDevice(Device):
         with a sign-in between (see `_request`: once more on a connection the controller had closed, once more
         after signing in again), each of them within its own bounds.
 
-        A fan not read in this look (no time was left for it, or it did not answer) keeps what the last look read
-        of it, and the fans read longest ago are asked for first: a controller that is slow does not make a fan
-        that is not well drop off the tile, and every fan is read again in turn. One the controller no longer
-        lists is gone.
+        A fan not read in this look keeps what the last look read of it, and the fans read longest ago are asked for
+        first: a controller that is slow does not make a fan that is not well drop off the tile, and every fan is read
+        again in turn. Where no time was left for it, its reading as well; where it was asked for and did not answer,
+        not its reading (which it kept, look after look, shown as its speed now, for as long as its reads failed): it is
+        listed with its health as last read and no reading, until it answers. One the controller no longer lists is
+        gone.
         """
         if "thermal" in places:
             try:
@@ -921,6 +1575,10 @@ class RedfishDevice(Device):
             try:
                 fresh[place] = (time.monotonic(), fan_of(await self._get(place, vital=False)))
             except KvmError:
+                last = known.get(place)
+                if last is not None and last[1] is not None:
+                    # (When it was read stays as it was: it is asked first at the next look.)
+                    fresh[place] = (last[0], {**last[1], "reading": None})
                 continue
         self._fans_read = {place: fresh.get(place) or known[place] for place in order if place in fresh or place in known}
         return temperatures, [fan for _, fan in self._fans_read.values() if fan is not None]
@@ -1034,18 +1692,18 @@ class RedfishDevice(Device):
     # (its UUID), which is asked before anything is sent to it, and by the number its controller's service root gives, which
     # anybody may read, asked before the password goes. Both are remembered when the tile is added (DeviceSpec.machine).
 
-    async def _same_controller(self, client: httpx.AsyncClient) -> bool:
-        """Where the controller's number is remembered, its service root is read (without the password) and its number
-        compared, before the password goes: KvmError "another_machine" where another one answers, or one that says none; a
-        root that is none just now (an error of its own, no answer) is said as that, and nothing is sent. True where it was
-        compared (the session that follows is one this controller made: see `_controller_tokens`); False where nothing is
-        remembered of it to compare with. (Only ever compared here: a number read without a session says nothing of which
-        controller answers under one, so none is taken from this read, see `_controller_under`.)"""
-        remembered = marks_of(self.spec.machine)[1]
-        if remembered is None:
-            return False
+    async def _open_root(self, client: httpx.AsyncClient, vital: bool = True) -> dict[str, Any]:
+        """The controller's service root as it shows it to anybody: read without the password and without a session (the number
+        it says there, read so on the sign-in's own connection, is the one compared before the password goes: see `_open_line`;
+        and the one learnt: see `_controller_under`). KvmError where
+        it did not show one (an error of its own, no answer: nothing is judged by that, and nothing is sent). `vital`: a failure
+        counts as the controller being down, as for any read (False: said, and not counted)."""
         usual = client.timeout
         waits = httpx.Timeout(ROOT_WAIT_TIMES * (usual.read or 20.0), connect=usual.connect, pool=usual.pool, write=usual.write)
+
+        def failed(error: KvmError) -> KvmError:
+            return self._failed(error) if vital else error
+
         for again in (True, False):
             try:
                 reply = await self._send(client, client.build_request("GET", ROOT, headers={"Accept": "application/json"}, timeout=waits), MAX_REPLY)
@@ -1053,38 +1711,231 @@ class RedfishDevice(Device):
             except (httpx.RemoteProtocolError, httpx.ReadError, httpx.WriteError) as ex:
                 if again:  # (a connection the controller closed while it sat idle)
                     continue
-                raise self._failed(_transport_error(ex, self.spec.tls)) from ex
+                raise failed(_transport_error(ex, self.spec.tls)) from ex
             except httpx.HTTPError as ex:
-                raise self._failed(_transport_error(ex, self.spec.tls)) from ex
+                raise failed(_transport_error(ex, self.spec.tls)) from ex
             except KvmError as ex:
-                raise self._failed(ex) from None
+                raise failed(ex) from None
         self._answered()
+        return service_root(reply)
+
+    # --- a line: a connection of its own, on which the controller's number is compared before what must reach it goes ---------
+
+    async def _open_line(self, line: _Line | None = None, *, signing_in: bool = False, compare: bool = True, token: str | None = None) -> _Line:
+        """A connection to the controller, made for what must reach the controller this tile was added for (see `_Line`): its
+        open service root read on it and its number compared with the one remembered; where the computer's number alone is
+        remembered, the computer read on it under this tile's session (which another controller does not know) and compared;
+        where nothing is remembered, nothing (a tile that knows no server yet takes the first, as everywhere). KvmError
+        "another_machine" where another answers on it, and nothing more goes on it. `line`: one whose connection ended, made
+        anew, and compared anew. `signing_in`: for the sign-in itself, which has no session yet: the controller's number alone.
+        `compare`: False only right after a compare on a connection with the same pinned certificate (see `_pinned_alone`).
+        `token`: the session the computer is read under, where not the tile's own (the one being given back as it retires)."""
+        if self._client is None:
+            await self._http()  # (the certificate as the tile has it: `_tls`; also as the device is retired, from then on)
+        parts = urlsplit(self.spec.base_url)
         try:
-            root = read_json(reply) if reply.status_code == 200 else None
+            host, port = parts.hostname or "", parts.port or (443 if parts.scheme == "https" else 80)
         except ValueError:
-            root = None
-        if not isinstance(root, dict) or "RedfishVersion" not in root:
-            # (Not a service root at all just now: one of its moments. Nothing is judged by that, and nothing is sent.)
-            raise KvmError("bad_response", f"The controller did not show its service root (HTTP {reply.status_code}), which is read before its password goes")
-        seen = controller_number(root)
-        if seen != remembered:
-            raise self._another(ANOTHER_CONTROLLER if seen is not None else NO_CONTROLLER_NUMBER)
+            raise KvmError("unreachable", "This device's address is not one that can be connected to") from None
+        if line is None:
+            line = _Line()
+        line.close()
+        made = _Connection()
+        loop, connect = asyncio.get_running_loop(), self._waits().connect or 4.0
+        # The TCP connection, then the TLS handshake on it: each within the connect time, as the HTTP library gives them.
+        try:
+            async with asyncio.timeout(connect):
+                plain, _ = await loop.create_connection(lambda: made, host, port)
+        except OSError as ex:  # (refused, unreachable, and a timeout among them)
+            raise ws_error(ex, self.spec.tls) from None
+        from .rfb import _keep_alive
+
+        if (sock := plain.get_extra_info("socket")) is not None:
+            _keep_alive(sock)  # (the system notices a connection that went away without a word: see LINE_IDLE_KEPT)
+        if self._tls is not None:
+            try:
+                async with asyncio.timeout(connect + 1.0):  # (the handshake's own time below; this one should that be missed)
+                    secured = await loop.start_tls(plain, made, self._tls, server_hostname=host, ssl_handshake_timeout=connect)
+            except BaseException as ex:
+                plain.abort()
+                if isinstance(ex, OSError):  # (a certificate refused, a handshake that broke off or took too long)
+                    raise ws_error(ex, self.spec.tls) from None
+                raise
+            if secured is None:
+                plain.abort()
+                raise KvmError("dropped", "The device closed the connection")
+            made.transport = secured
+        line.connection = made
+        line.compared = False
+        if not compare:
+            return line
+        try:
+            line.compared = await self._compare_on(line, signing_in, token)
+        except BaseException:
+            line.close()
+            raise
+        return line
+
+    def _pinned_alone(self) -> bool:
+        """Whether this tile's controller is spoken to with a certificate it pinned (HTTPS, TLS pinned) that no other server's
+        tile shows: then a connection checked against it reaches the controller whose number was compared on another connection
+        checked against it a moment before (the holder of that certificate's key), and a controller that closes the connection
+        after every answer is sent the request on one made afresh (see `_line_kept`). Not over plain HTTP, nor with the
+        certificate not checked, nor where another tile shows the same one (a maker's one for every board, say). A certificate
+        shared with boards that are on no tile here cannot be told: the compare made right before covers that one, but for the
+        moment between the two connections."""
+        spec = self.spec
+        mark = saved_mark(spec.cert_pem) if spec.base_url.startswith("https") and spec.tls == "pinned" else None
+        if mark is None:
+            return False
+        return not any(other.spec.id != spec.id and not other._closed and saved_mark(other.spec.cert_pem) == mark for other in list(_TILES))
+
+    async def _line_kept(self, line: _Line, words: str = CONSOLE_LINE_CLOSES, code: str = "no_picture") -> None:
+        """`line` open for what goes next: made anew, and compared anew, where the controller closed it. KvmError "no_picture"
+        (one that stands: the console is not asked for at every look) where it closes the connection after every answer, so
+        that nothing can go on one its number was compared on; nothing then goes anywhere else either."""
+        if not line.usable():
+            await self._open_line(line)
+        if not line.usable() and self._pinned_alone():
+            # It closes the connection after every answer. Its number was compared just now on a connection checked against
+            # the certificate this tile pinned and no other shows: the request goes on one made afresh, checked against it too.
+            await self._open_line(line, compare=False)
+        if not line.usable():
+            raise KvmError(code, line_closes(words, line.unasked()), 404 if code == "no_picture" else 503)
+
+    async def _system_on(self, line: _Line, token: str, within: float) -> str:
+        """Where the controller keeps its computer, read on `line` under the session `token` (the root, then its Systems)."""
+        signed = {"Accept": "application/json", "X-Auth-Token": token}
+        found: Any = None
+        try:
+            root = read_json(await self._on_the_line(line, "GET", ROOT, signed, within=within, again=False))
+            systems = link(_dig(root, "Systems", "@odata.id"))
+            if systems is not None:
+                members = read_json(await self._on_the_line(line, "GET", systems, signed, within=within, again=False)).get("Members")
+                found = link(_dig(members[0], "@odata.id")) if isinstance(members, list) and members else None
+        except (ValueError, AttributeError):
+            found = None
+        if not isinstance(found, str):
+            raise KvmError("bad_response", "The controller lists no computer")
+        return found
+
+    def _line_wait(self) -> float:
+        """How long a request waits for a line to send its token on: as long as one may take to be made."""
+        waits = self._waits()
+        return (waits.connect or 4.0) * 2 + ROOT_WAIT_TIMES * (waits.read or 20.0)
+
+    def _waits(self) -> httpx.Timeout:
+        """How long this controller is waited for (its connections' own: see WAITS)."""
+        return self.WAITS or BMC_WAITS
+
+    async def _compare_on(self, line: _Line, signing_in: bool = False, token: str | None = None) -> bool:
+        """Which controller answers on `line`, asked on it first (see `_open_line`): True where something was compared (and
+        found to be this tile's), False where nothing was remembered to compare with (or, signing in, the computer's alone).
+        `token`: the session the computer is read under, where not the tile's own (see `_open_line`)."""
+        server, controller = marks_of(self.spec.machine)
+        read = self._waits().read or 20.0
+        if controller is not None:
+            answer = await self._on_the_line(line, "GET", ROOT, {"Accept": "application/json"}, within=ROOT_WAIT_TIMES * read, again=False)
+            seen = controller_number(service_root(answer))
+            if seen != controller:
+                raise self._another(ANOTHER_CONTROLLER if seen is not None else NO_CONTROLLER_NUMBER)
+        elif server and not signing_in:
+            # (The computer is asked under the session: where the controller says no number, nothing else tells. Where it is
+            # is read on this very line where it is not known yet: through `_request` it would wait for this line to be made.)
+            token = token or self._token or await self._login()
+            place = self._places.get("system") or await self._system_on(line, token, read)
+            answer = await self._on_the_line(line, "GET", place, {"Accept": "application/json", "X-Auth-Token": token}, within=read, again=False)
+            try:
+                system = read_json(answer) if answer.status_code == 200 else None
+            except ValueError:
+                system = None
+            if not isinstance(system, dict):
+                raise KvmError("bad_response", f"Which server answers on the connection to its console could not be read (HTTP {answer.status_code})")
+            seen = own_number(system)
+            if seen != server:
+                raise self._another(ANOTHER_SERVER if seen is not None else NO_SERVER_NUMBER)
+        else:
+            return False
         return True
+
+    async def _on_the_line(
+        self,
+        line: _Line,
+        method: str,
+        path: str,
+        headers: dict[str, str] | None = None,
+        data: dict[str, str] | None = None,
+        within: float | None = None,
+        again: bool = True,
+        content: bytes | None = None,
+        content_type: str | None = None,
+    ) -> httpx.Response:
+        """A request on `line`, its answer as the HTTP library would have handed it over (unpacked where it was packed, within
+        MAX_REPLY). `again`: a line whose connection ended (the controller closes one after an answer, or one that sat idle) is
+        made anew, and compared anew, before anything goes on it (see `_open_line`)."""
+        if not line.usable():
+            if not again:
+                raise NotAsked("dropped", "The controller closed the connection")
+            await self._line_kept(line)
+        body = urlencode(data).encode() if data is not None else content or b""
+        said = {
+            "Host": httpx.URL(self.spec.base_url).netloc.decode("ascii"), "Accept": "*/*", "Accept-Encoding": "identity",
+            "User-Agent": f"python-httpx/{httpx.__version__}", **(headers or {}),
+        }  # fmt: skip
+        if data is not None or content_type is not None:
+            said["Content-Type"] = "application/x-www-form-urlencoded" if data is not None else str(content_type)
+        if data is not None or content is not None or method not in ("GET", "DELETE"):
+            said["Content-Length"] = str(len(body))
+        if not LINE_PATH.fullmatch(path) or not all(LINE_NAME.fullmatch(name) and LINE_VALUE.fullmatch(value) for name, value in said.items()):
+            raise NotAsked("bad_response", "What was to be sent to the controller cannot stand in a request")
+        answer = await line.ask(method, path, list(said.items()), body, within or (self._waits().read or 20.0))
+        self._answered()
+        content = answer.body
+
+        def all_of(name: str) -> list[str]:
+            return [value for said_name, value in answer.headers if said_name.lower() == name.lower()]
+
+        packed = ",".join(all_of("Content-Encoding")).strip().lower()
+        if packed in ("gzip", "x-gzip"):
+            unpack = zlib.decompressobj(16 + zlib.MAX_WBITS)
+            try:
+                content = unpack.decompress(content, MAX_REPLY + 1)
+            except zlib.error:
+                raise KvmError("dropped", "The device's answer is not packed the way it says it is") from None
+            if len(content) > MAX_REPLY or not unpack.eof:
+                raise KvmError("dropped", "The device sent far more data than this program accepts")
+        elif packed not in ("", "identity"):
+            raise KvmError("dropped", "The device packed its answer in a way this program does not unpack")
+        kept = [(name, value) for name, value in answer.headers if name.lower() not in ("content-encoding", "content-length", "transfer-encoding")]
+        asked = httpx.Request(method, self.spec.base_url.rstrip("/") + path)
+        where = all_of("Location")
+        if answer.status_code in (301, 302, 303, 307, 308) and where:
+            # (As the HTTP library has it, which works out where an answer sends it on to, followed or not: one that sends it
+            # on to an address that is none is an answer this program makes nothing of. See `bounded`.)
+            try:
+                to = httpx.URL(where[0])
+                to = to.copy_with(host=asked.url.host) if to.scheme and not to.host else to
+                asked.url.join(to)
+            except Exception:  # (whatever the library says of an address that is none)
+                raise KvmError("bad_response", "The device sent this program on to an address that is none") from None
+        return httpx.Response(answer.status_code, headers=kept, content=content, request=asked)
 
     async def _controller_under(self, token: str | None) -> tuple[str | None, bool]:
         """The controller's number, as the controller that made the session `token` says it, and whether that could be asked
-        under it: its service root's UUID, taken only where its manager, read under that session after the root, names the
-        same, as the service it hosts (`ServiceEntryPointUUID`) or as itself (`UUID`: a real AMI board names the same in all
-        three; bmcweb's manager names the service). The root is open to anybody, and says nothing of which controller made a
-        session; the manager is read under the session, and another controller does not know it (401). (None, True) where
-        either says none, or they differ; (None, False) where it could not be read under that session (asked again another
-        time; once a session, so a controller that says none costs a read of each a session)."""
+        under it: the UUID its service root says to anybody (read without a session, as it is read before the password goes:
+        see `_open_line`; a controller that says its number only under a session would otherwise be refused at its
+        next sign-in, for good), taken only where its manager, read under that session after the root, names the same, as
+        the service it hosts (`ServiceEntryPointUUID`) or as itself (`UUID`: a real AMI board names the same in all three;
+        bmcweb's manager names the service). The root is open to anybody, and says nothing of which controller made a session;
+        the manager is read under the session, and another controller does not know it (401). (None, True) where either says
+        none, or they differ; (None, False) where it could not be read under that session (asked again another time; once a
+        session, so a controller that says none costs a read of each a session)."""
         root, under = self._root_seen
         if under is not None and under == token:
             return root, True
         found: str | None = None
         try:
-            said, _ = await self._read(ROOT, urgent=True, vital=False)
+            said = await self._open_root(await self._http(), vital=False)
             place = (await self._find(urgent=True)).get("manager")
             if place is not None:
                 manager, _ = await self._read(place, urgent=True, vital=False)
@@ -1119,6 +1970,19 @@ class RedfishDevice(Device):
             if ex.code == "another_machine" or ex is RETIRED:
                 raise ex.with_traceback(None) from None
             raise NothingSent("action_failed", f"Nothing was sent: which server answers could not be read ({ex.message})") from None
+
+    def _not_done(self, ex: KvmError, refused: bool = False) -> KvmError:
+        """What a command says whose way out was stopped by `ex` before it went (or, `refused`, after it went once and was
+        answered 401): NothingSent where `ex` would say that it may have been done (no answer in time, one that broke off, one
+        that was no answer, the tile changed meanwhile); `ex` as it is where it says what it is already (another server, a
+        password not taken, a refusal of the program's own)."""
+        lead = "It was not done" if refused else "Nothing was sent"
+        if ex is not RETIRED and ex.code not in ("timeout", "dropped", "bad_response"):
+            if refused and isinstance(ex, NothingSent) and ex.message.startswith("Nothing was sent"):
+                return NothingSent(ex.code, lead + ex.message[len("Nothing was sent") :], ex.status)
+            return ex.with_traceback(None)
+        why = "the tile was changed meanwhile" if ex is RETIRED or self._closed else ex.message[:1].lower() + ex.message[1:]
+        return NothingSent("action_failed", f"{lead}: {why}")
 
     async def _judge(self, seen: str | None, token: str | None) -> None:
         """Whether the server that answers under the session `token` is the one this tile was added for, by the number its
@@ -1209,6 +2073,10 @@ class RedfishDevice(Device):
             self._console = _Console()
             self._console_task = asyncio.create_task(self._run_console(self._console))
             raise KvmError("no_stream", "Opening the server's console", 503)
+        if console.ended:
+            # (Its connection has ended, and what is left of it is being put away: its last frame is not the screen any more,
+            # and the next picture asked for opens another console once it is put away, a moment later.)
+            raise KvmError("no_stream", "Opening the server's console again", 503)
         if not console.frames:
             raise KvmError("no_stream", "Waiting for the server's screen", 503)
         return console
@@ -1261,10 +2129,13 @@ class RedfishDevice(Device):
                 token = self._token or await self._login()
                 if token != self._checked_token:
                     raise KvmError("no_stream", "The controller signed this program in anew while it was asked which server it is", 503)
-            await self._http()  # (the certificate is known by now: the session came over it)
+            # On a connection of its own, on which the controller's number is compared first: the session's token, and the
+            # screen, are another controller's business at no moment (see `_Line`). (Its certificate is known by now.)
+            line = await self._open_line()
             try:
+                await self._line_kept(line)
                 return await ws_connect(
-                    "ws" + self.spec.base_url[len("http") :] + path, additional_headers={"X-Auth-Token": token}, ssl=self._tls,
+                    "ws" + self.spec.base_url[len("http") :] + path, line=line, additional_headers={"X-Auth-Token": token},
                     open_timeout=CONSOLE_OPENING, close_timeout=1, max_size=OPENBMC_MOST, max_queue=4,
                     ping_interval=None,  # (whether it is alive is seen by what arrives: see vncdevice's heartbeat)
                 )  # fmt: skip
@@ -1283,6 +2154,9 @@ class RedfishDevice(Device):
                 raise KvmError("bad_response", f"The controller did not open its console (HTTP {ex.response.status_code})") from None
             except (OSError, WebSocketException) as ex:
                 raise ws_error(ex, self.spec.tls) from None
+            finally:
+                if not line.handed:
+                    line.close()
         raise KvmError("bad_response", "The controller keeps refusing the session for its console")
 
     async def live_screen(self) -> tuple[int, int, int, bytearray]:
@@ -1331,6 +2205,11 @@ class RedfishDevice(Device):
     def _next_seq(self) -> int:
         self._hid_seq = (self._hid_seq + 1) & 0x7FFFFFFF
         return self._hid_seq
+
+    def input_taken(self) -> KvmError | None:
+        # The console given to somebody at the controller's own page, or switched to another session (`give_up_input`): the
+        # line that held the keyboard learned it at its next key only, showing "control on" until then.
+        return handed_over() if self._handed_over else None
 
     def _input_ends(self, why: KvmError) -> None:
         """Keys and the pointer go no more over this session's console: whoever began in it is told `why`."""
@@ -1389,11 +2268,11 @@ class RedfishDevice(Device):
         if era != self._input_era or self._live_send is None:
             raise self._input_lost.with_traceback(None)
 
-    async def _send_hid(self, packet: bytes, era: int) -> None:
+    async def _send_hid(self, packet: bytes, era: int, letting_go: bool = False) -> None:
         send = self._live_send
         if era != self._input_era or send is None:
             raise self._input_lost.with_traceback(None)
-        await send(packet, era)  # (the era is asked again under the console's lock: see `send_input`)
+        await send(packet, era, letting_go)  # (the era is asked again under the console's lock: see `send_input`)
 
     async def send_keyboard(self, modifiers: int, keys: list[int], era: int) -> None:
         """The whole state of the keyboard (the modifier bits and the keys down) to the server's USB, over the console.
@@ -1403,7 +2282,7 @@ class RedfishDevice(Device):
         self._held_keys = self._held_keys or down  # (may be down from the moment it goes out)
         self._key_notes += 1
         note = self._key_notes
-        await self._send_hid(ami.keyboard(modifiers, keys, self._next_seq()), era)
+        await self._send_hid(ami.keyboard(modifiers, keys, self._next_seq()), era, letting_go=not down)
         # Said what is down only by the report noted last (reports go out in the order they were noted: one lock, no
         # wait between): an earlier one finishing late would say "nothing" of a press that is on its way. And not where
         # the console was given away meanwhile: what was let go of then stays let go of.
@@ -1414,6 +2293,7 @@ class RedfishDevice(Device):
         """A mouse report to the server's USB: `x`, `y` are a place (0 to 32767) for an absolute mouse, or a move for a
         relative one. `era` as for `send_keyboard`."""
         self._may_send(era)
+        held = self._held_buttons
         self._held_buttons |= buttons
         # Noted before it goes, as the buttons are: a letting go that overtakes it lets go of them where it put them.
         self._mouse_at = None if relative else (x, y)
@@ -1423,7 +2303,7 @@ class RedfishDevice(Device):
             packet = ami.mouse_rel(buttons, x, y, wheel, self._next_seq())
         else:
             packet = ami.mouse_abs(buttons, x, y, wheel, self._next_seq())
-        await self._send_hid(packet, era)
+        await self._send_hid(packet, era, letting_go=not buttons and bool(held))  # (letting go of buttons held: never given up)
         if era == self._input_era and note == self._button_notes:  # (as for the keyboard)
             self._held_buttons = buttons
 
@@ -1441,10 +2321,11 @@ class RedfishDevice(Device):
 
     async def _let_go_now(self, era: int) -> None:
         try:
-            async with asyncio.timeout(LET_GO_WITHIN):
-                await self.send_keyboard(0, [], era)
-        except (KvmError, TimeoutError, OSError):
-            pass  # (the console is gone, and with its session what it held)
+            # (No time of its own: a letting go waits for room as long as the console's own answers may, and the console session
+            # is ended where it cannot go out in that time; see LET_GO_SAY.)
+            await self.send_keyboard(0, [], era)
+        except (KvmError, OSError):
+            pass  # (the console is gone, or was ended for it, and with its session what it held)
 
     def _not_typed(self, action: str, text: str, ex: KvmError, typeable: Callable[[str], bool]) -> KvmError:
         """What is said of a key or a text that cannot be sent. Of a text, where it went wrong and not what is there:
@@ -1595,8 +2476,12 @@ class RedfishDevice(Device):
             console.screen = Screen()
             await asyncio.to_thread(console.video_encoder.close)
 
-    async def _web(self, method: str, path: str, headers: dict[str, str] | None = None, **kwargs: Any) -> httpx.Response:
-        """A request to the controller's own web page (not Redfish): the console is that page's."""
+    async def _web(self, method: str, path: str, headers: dict[str, str] | None = None, *, line: _Line | None = None, **kwargs: Any) -> httpx.Response:
+        """A request to the controller's own web page (not Redfish): the console is that page's. `line`: on that connection
+        (see `_Line`), for what carries the password, the console's pass or the web page's session."""
+        if line is not None:
+            waits = kwargs.get("timeout")
+            return await self._on_the_line(line, method, path, headers, data=kwargs.get("data"), within=waits.read if isinstance(waits, httpx.Timeout) else None)
         client = await self._http()
         try:
             return await self._send(client, client.build_request(method, path, headers=headers, **kwargs), MAX_REPLY)
@@ -1651,14 +2536,46 @@ class RedfishDevice(Device):
         # answer that is one of its moments is none, and held the console up for half a minute and more.)
         # And it is asked strictly which server answers (see `_judge`): another one's web page is not offered the password,
         # and its screen is not shown here, nor typed into.
-        await self._which_server_for_the_console()
+        # The web page's own sign-in goes on a connection that is the console's alone, on which the controller's number was
+        # compared as it was made (see `_Line`): the password, the pass the web page hands out, its session and then the console
+        # itself go on that one, to the controller compared, and to no other that took the address since the question below
+        # (which goes over the Redfish session, on another connection). It is one of the tile's own lines that waits, compared
+        # as it was made (see `_Lines`; not one made at the tile's first contact, when no number was known to compare), taken
+        # for good once the question below is answered; where none waits, one is made, and its root read (a quarter of a minute
+        # on a slow board), alongside the question, not after it.
         web = REJECTED.what("web", self.spec)
-        if REJECTED.wait_left(web) > 0:
-            if REJECTED.times(web):
-                raise KvmError("no_picture", "The controller's web page rejected the saved login: it is not offered again yet", 404)
-            # Not a no: its last sign-in there came to nothing (no answer, or one that says neither). Asked
-            # again as the console is after any failure, and not said to be rejected.
-            raise not_signing_in("the last sign-in to its web page came to nothing")
+        began = time.monotonic()
+        opening = None if REJECTED.wait_left(web) > 0 or self._lines.waiting(compared=True) else asyncio.ensure_future(self._open_line())
+        try:
+            await self._which_server_for_the_console()
+            if REJECTED.wait_left(web) > 0:
+                if REJECTED.times(web):
+                    raise KvmError("no_picture", "The controller's web page rejected the saved login: it is not offered again yet", 404)
+                # Not a no: its last sign-in there came to nothing (no answer, or one that says neither). Asked
+                # again as the console is after any failure, and not said to be rejected.
+                raise not_signing_in("the last sign-in to its web page came to nothing")
+            # (Not where a line of the tile's came back closed meanwhile, the question's own among them: a controller that has
+            # begun to close the connection after every answer would be sent the web page's sign-in on one kept from before.)
+            line = self._lines.idle_one(compared=True) if opening is None and self._lines.ended_at < began else None
+            if line is not None:
+                self._lines.let_go(line)  # (the console's from here on: handed to the WebSocket library, or closed)
+            else:
+                line = await (opening if opening is not None else self._open_line())
+        except BaseException:
+            if opening is not None:
+                opening.cancel()
+                await asyncio.wait({opening})  # (a cancelled opening ends at once; one that was made is closed)
+                if not opening.cancelled() and opening.exception() is None:
+                    opening.result().close()
+            raise
+        try:
+            await self._line_kept(line)  # (a controller that closes it after every answer is sent nothing, and that is said)
+            await self._signed_in_to_the_web_page(console, web, line)
+        finally:
+            line.close()
+
+    async def _signed_in_to_the_web_page(self, console: _Console, web: str, line: _Line) -> None:
+        """`_hold_console` from the web page's sign-in on, which goes on `line` with what follows it on the page."""
         # In a task of its own, which being told to stop does not end: the controller makes the session when it
         # answers, wanted or not, and has few. Retired in that very moment (the device taken off the wall, the
         # wall shut down), the answer is waited for all the same, for nothing but to sign out of it again.
@@ -1666,7 +2583,7 @@ class RedfishDevice(Device):
         # in time, nothing was noted of it, and the next connection offered the password here again at once.)
         before = REJECTED.sent(web)
         signing_in = asyncio.ensure_future(
-            self._web("POST", "/api/session", data={"username": self.spec.username, "password": self.spec.password}, timeout=sign_in_waits())
+            self._web("POST", "/api/session", data={"username": self.spec.username, "password": self.spec.password}, timeout=sign_in_waits(), line=line)
         )
         signing_in.add_done_callback(lambda done: done.cancelled() or done.exception())  # (nobody may be left to hear how it ended)
         retired = False
@@ -1722,11 +2639,11 @@ class RedfishDevice(Device):
         try:
             if retired:
                 raise asyncio.CancelledError
-            # Asked again now that its web page has signed this program in, before it hands out the pass: the address that
-            # answered that sign-in may have changed hands since the question before it, and its console (the screen on this
-            # tile, the keys of a live line) is not opened to another server. (The moments between are not bound.)
+            # Asked again now that its web page has signed this program in, before it hands out the pass: the controller compared
+            # on the sign-in's connection may manage another computer since the question before it (a board changed, its
+            # controller kept), and its console (the screen on this tile, the keys of a live line) is not opened to another server.
             await self._which_server_for_the_console()
-            asked = await self._web("GET", "/api/kvm/token", headers)
+            asked = await self._web("GET", "/api/kvm/token", headers, line=line)
             try:
                 given = read_json(asked) if asked.status_code == 200 else {}
             except ValueError:
@@ -1741,32 +2658,38 @@ class RedfishDevice(Device):
             if self._complete_first is None:
                 # The firmware says what it can do. Whether a console may reconnect decides how it wants to be greeted.
                 try:
-                    can = await self._web("GET", "/api/configuration/project", headers)
+                    can = await self._web("GET", "/api/configuration/project", headers, line=line)
                     self._complete_first = can.status_code == 200 and ami.RECONNECTS in can.text[:MAX_REPLY]
                 except KvmError:
                     self._complete_first = False
                 log.info("%s: its console is greeted %s", self.label, "with 'complete' first (its firmware lets a console reconnect)" if self._complete_first else "with the pass")
             host = urlsplit(self.spec.base_url).netloc
-            await self._watch_console(console, headers["Cookie"], console_pass, own, as_text(given.get("server_ip") or "") or host, session)
+            # The console itself on the same connection (its upgrade the next request on it), compared once for all of it; on
+            # one made anew, and compared anew, where the controller closed it meanwhile. (A controller is slow to show its
+            # root: a quarter of a minute on a real board, which a connection of its own for the console would add again.)
+            await self._line_kept(line)
+            await self._watch_console(console, headers["Cookie"], console_pass, own, as_text(given.get("server_ip") or "") or host, session, line)
         finally:
             # A controller has few web sessions to give out. This one is given back whatever happened: in a
             # task of its own, waited for here and, where this one is told to stop meanwhile, by whoever
             # retires the device (see close). Done in this task, it was cut short by the second telling,
             # half a second after the first, and a controller that took longer over it kept the session.
-            client = self._client
-            if client is not None:
-                leaving = asyncio.ensure_future(self._leave_its_web_page(client, headers))
-                self._leaving.add(leaving)
-                leaving.add_done_callback(self._leaving.discard)
-                await asyncio.wait({leaving})
+            # (On the connection the controller was compared on, which the task takes over where it is still open: see
+            # `_leave_its_web_page`.) Not waited for here: on a slow board it reads a root first, a quarter of a minute in which
+            # this console would stand as an open one, its last frame the screen and no new console opened. Waited for by
+            # whoever retires the device, within its time (see close).
+            leaving = asyncio.ensure_future(self._leave_its_web_page(headers, line.taken()))
+            self._leaving.add(leaving)
+            leaving.add_done_callback(self._leaving.discard)
 
-    async def _watch_console(self, console: _Console, cookie: str, console_pass: str, own: str, controller: str, session: str) -> None:
+    async def _watch_console(self, console: _Console, cookie: str, console_pass: str, own: str, controller: str, session: str, line: _Line | None = None) -> None:
+        """The console's own connection, on `line` (one the controller's number was compared on: see `_Line`), held and read."""
         url = "ws" + self.spec.base_url[len("http"):] + "/kvm"
         origin = self.spec.base_url.rstrip("/")
         try:
             connection = await ws_connect(
-                url, additional_headers={"Cookie": cookie}, origin=origin, subprotocols=["binary", "base64"],
-                ssl=self._tls, open_timeout=CONSOLE_OPENING, close_timeout=1,
+                url, line=line, additional_headers={"Cookie": cookie}, origin=origin, subprotocols=["binary", "base64"],
+                open_timeout=CONSOLE_OPENING, close_timeout=1,
                 # What may arrive in one go, and how much may wait to be read while a frame is: megabytes, not half a gigabyte.
                 max_size=ami.LONGEST + 64, max_queue=2,
                 # No pings of the library's own: a real controller does not answer them, and the library then hangs
@@ -1778,6 +2701,9 @@ class RedfishDevice(Device):
             raise KvmError("timeout", "The controller's console did not answer in time", 504) from ex
         except (OSError, WebSocketException) as ex:
             raise KvmError("dropped", f"The controller's console could not be opened ({type(ex).__name__})") from ex
+        finally:
+            if line is not None and not line.handed:
+                line.close()
         plain_bytes = connection.subprotocol == "binary"
         mine = False  # the controller said this session's console is this program's, and has not given it to anybody since
 
@@ -1800,23 +2726,51 @@ class RedfishDevice(Device):
                 # Whoever looks next for what arrived reads it, and is told there that the connection is closed.
                 pass
 
-        async def send_input(data: bytes, era: int) -> None:
+        let_go_lost = False  # a letting go could not go out, and the session was ended for it
+
+        def end_for_a_letting_go() -> None:
+            # A key or a button of this program's may be down on the server, and its letting go cannot go out: the session is
+            # ended here and now (its connection cut off, the loop told), which has the controller let go of what the session
+            # held. Going on with the console would leave it down, repeating.
+            nonlocal let_go_lost
+            if not let_go_lost:
+                let_go_lost = True
+                log.warning("%s: a letting go of a key or a button could not go out to the server's console in time: the console session is ended, which lets go of it", self.label)
+                connection.transport.abort()
+
+        async def send_input(data: bytes, era: int, letting_go: bool = False) -> None:
             # Keys and the pointer, from whoever holds them: within a shorter time than the loop's own answers, never
             # into a console that was given to somebody meanwhile, has ended, or has changed hands since the era they
             # were begun in (asked once the lock is had, so that nothing gets in after the letting go that came before
             # the giving, and nothing of an earlier era once the console came back); and a connection that has closed
             # is said to be closed: a key, or its letting go, does not look delivered when it went nowhere.
+            # A letting go (`letting_go`: nothing down after it) is never given up for the backlog: it waits as long as the
+            # loop's own answers do (LET_GO_SAY), and where it does not go out in that time, or is stopped before it went,
+            # the session is ended for it (`end_for_a_letting_go`).
+            went = False
+
+            def still_owed() -> bool:
+                # (Not where the console changed hands or ended meanwhile: what was down was let go of then, see `give_up_input`.)
+                return letting_go and not went and self._live_send is send_input and era == self._input_era and not self._handed_over
+
             try:
-                async with asyncio.timeout(INPUT_SAY), self._say_lock:
+                async with asyncio.timeout(LET_GO_SAY if letting_go else INPUT_SAY), self._say_lock:
                     if self._handed_over:
                         raise handed_over()
                     if self._live_send is not send_input or era != self._input_era:
                         raise self._input_lost.with_traceback(None)
                     await connection.send(data if plain_bytes else base64.b64encode(data).decode())
+                    went = True
             except TimeoutError:
+                if still_owed():
+                    end_for_a_letting_go()
                 raise KvmError("dropped", "The server's console stopped taking keys and the mouse") from None
             except ConnectionClosed:
                 raise KvmError("dropped", "The server's console was closed") from None
+            except asyncio.CancelledError:
+                if still_owed():
+                    end_for_a_letting_go()  # (stopped before it went out: whoever stopped it will not let go of it either)
+                raise
 
         async def release_held() -> None:
             # What this program has down on the server, as far as it has said, let go of over this session: before the
@@ -1856,6 +2810,8 @@ class RedfishDevice(Device):
         try:
             while True:
                 now = time.monotonic()
+                if let_go_lost:
+                    raise KvmError("dropped", LET_GO_LOST)
                 if now - self._console_wanted_at > CONSOLE_IDLE:
                     return  # nobody is looking: the seat is given back
                 if now - heard_at > CONSOLE_QUIET:
@@ -1865,6 +2821,8 @@ class RedfishDevice(Device):
                 except TimeoutError:
                     data = b""
                 except WebSocketException as ex:
+                    if let_go_lost:
+                        raise KvmError("dropped", LET_GO_LOST) from ex
                     if greeted and not accepted:
                         # It closed on the greeting, without a word about the pass: it wants to be greeted the other way.
                         self._complete_first = not self._complete_first
@@ -1987,8 +2945,9 @@ class RedfishDevice(Device):
                     await send(ami.message(ami.BEHIND))  # "every frame so far has been drawn"
                     said_at = time.monotonic()
         except WebSocketException as ex:
-            raise KvmError("dropped", "The controller closed its console") from ex
+            raise KvmError("dropped", LET_GO_LOST if let_go_lost else "The controller closed its console") from ex
         finally:
+            console.ended = True  # (no picture of it from here on: see `_console_with_a_picture`)
             # Nothing more of any line's goes out over a console that is ending. A line that held the keyboard lets go
             # of what it had down through `release_all` while the console is still open (see live.py); what is still
             # down by this program's word (a typing cut off as the tile was removed) is let go of here, before the
@@ -1997,10 +2956,12 @@ class RedfishDevice(Device):
             # connection.)
             self._input_ends(KvmError("dropped", "The server's console was closed"))
             self._accepted_at, self._handed_over = None, False
-            if not mine:
+            if not mine or let_go_lost:
+                # (Ended for a letting go that could not go out: its connection is cut off, and with the session the
+                # controller lets go of what it held. Nothing more is said into it.)
                 self._held_keys, self._held_buttons = False, 0
             try:
-                if greeted:
+                if greeted and not let_go_lost:
                     # Said as the controller's own page says it when its window is closed: a console that just goes
                     # away is waited for by the controller, which is then slow to answer anybody. Said from the
                     # greeting on, not from the pass being found good: who else is there is said before that.
@@ -2201,19 +3162,24 @@ class RedfishDevice(Device):
             return
         if action not in ("reboot", "power_on", "power_off", "atx_power", "atx_power_long", "atx_reset"):
             raise KvmError("invalid", "A management controller cannot do that", 422)
-        places = await self._find(urgent=True)
-        # Which server answers, asked before anything is sent to it (the controller's restart included): what decides the
-        # command is this read, and the command goes under the session it was answered under (see `_request`).
-        system, _ = await self._checked_read(places["system"], urgent=True)
+        try:
+            places = await self._find(urgent=True)
+            # Which server answers, asked before anything is sent to it (the controller's restart included): what decides the
+            # command is this read, and the command goes under the session it was answered under (see `_request`).
+            system, _ = await self._checked_read(places["system"], urgent=True)
+            manager = await self._get(places["manager"], urgent=True) if action == "reboot" and "manager" in places else None
+        except KvmError as ex:
+            raise self._not_done(ex) from None  # (only reads so far: nothing was sent)
         if action == "reboot":
-            if "manager" not in places:
+            if manager is None:
                 raise KvmError("action_failed", "This controller does not say how to restart it")
             place, name, wanted = places["manager"], "#Manager.Reset", ["ForceRestart", "GracefulRestart"]
-            resource = await self._get(place, urgent=True)
+            resource = manager
         else:
             place, name = places["system"], "#ComputerSystem.Reset"
             resource = system
-            running = plain(resource.get("PowerState"), 20) not in ("Off", "PoweringOff")
+            # (Decided by the state only where what is wanted goes by it: not hold power, nor the reset button.)
+            running = power_decides(plain(resource.get("PowerState"), 20), action) if action in ("power_on", "power_off", "atx_power") else True
             if action in ("power_on", "power_off") and running == (action == "power_on"):
                 # Asked for by what is wanted, not by which button: forty servers ticked after a power cut,
                 # of which some came back by themselves, are not to be sorted into two piles by hand first.
@@ -2234,8 +3200,8 @@ class RedfishDevice(Device):
             # (Finding the way there took several questions, and a controller is slow over each: asked now.)
             reply = await self._request("POST", target, urgent=True, still=still, command=True, json={"ResetType": kind})
         except KvmError as ex:
-            if action == "reboot" and ex.code in ("dropped", "timeout"):
-                return  # a controller that is already going down may never answer
+            if action == "reboot" and ex.code in ("dropped", "timeout") and not never_sent(ex):
+                return  # a controller that is already going down may never answer (where the restart went out)
             raise
         self._accepted(reply)
         seen_by = {"On": True, "ForceOff": False}.get(kind) if name == "#ComputerSystem.Reset" else None
@@ -2278,11 +3244,11 @@ class RedfishDevice(Device):
             raise KvmError("invalid", "This controller does not offer starting into the BIOS setup (it allows no 'BiosSetup' boot override)", 422)
         self._no_other_override(system)
         before = boot_override(system)
-        running, kind, target = await self._setup_plan(system)
+        running, kind, target = await self._planned(system, before)
         if steps.overdue():
-            raise KvmError("action_failed", f"Nothing was done: {took_too_long()}.")
+            raise self._before_said(KvmError("action_failed", f"Nothing was done: {took_too_long()}."), before)
         steps.at = "setting"
-        reply = await self._set_setup_override(place, mark, still, before, steps)
+        reply = await self._setting(place, mark, still, before, steps)
         if reply.status_code in (412, 428):
             # The state changed since it was read, or the controller wants a mark it did not give (or does not take back the
             # mark it gave): nothing was set. Read again, and looked at again: another tool's override, or a power change
@@ -2294,25 +3260,28 @@ class RedfishDevice(Device):
                 if ex.code == "another_machine":
                     raise ex.with_traceback(None) from None  # (nothing was set: said as it is)
                 why = "the tile was changed meanwhile" if ex is RETIRED else ex.message
-                raise KvmError("action_failed", f"Nothing was done: the controller did not take the BIOS setup boot override, and could not be read again ({why}).") from None
+                failed = KvmError("action_failed", f"Nothing was done: the controller did not take the BIOS setup boot override, and could not be read again ({why}).")
+                raise self._before_said(failed, before) from None
             self._no_other_override(system)
             before = boot_override(system)
-            running, kind, target = await self._setup_plan(system)
+            running, kind, target = await self._planned(system, before)
             if steps.overdue():
-                raise KvmError("action_failed", f"Nothing was done: {took_too_long()}.")
+                raise self._before_said(KvmError("action_failed", f"Nothing was done: {took_too_long()}."), before)
             steps.at = "setting"
-            reply = await self._set_setup_override(place, "*", still, before, steps)
+            reply = await self._setting(place, "*", still, before, steps)
         if reply.status_code not in (200, 202, 204):
-            raise self._refused(reply)  # (a 4xx: refused for certain, and nothing was set; any other is a "maybe", said above)
+            # (A 4xx: refused for certain, and nothing was set; any other is a "maybe", said above.)
+            raise self._before_said(self._refused(reply), before)
         steps.changed_at = time.monotonic()
         shown, seen = await self._setup_shown(place, reply, steps)
         pending, whole = shown is not True, shown is True  # (see `_clear_setup_override`)
+        if shown is True and seen is None and not steps.overdue():
+            seen = await self._power_after_204(place)  # (a 204: taken as made, and nothing read back; its power read once)
         if shown is True and seen is not None and plain(seen.get("PowerState"), 20) is not None:
-            # Read after the change (a 200 that shows it, or a read back after a 202): the power as that read has it decides
-            # what goes out, not the read before the change. A server switched on meanwhile (at its button, by another tool)
-            # is restarted, where "On" would be nothing to do to it and the override would wait for its next boot; one that
-            # began to change its state is left alone, and the override cleared again. (After a 204 nothing is read: the
-            # board this was built on answered no read for a minute then; see the README.)
+            # Read after the change (a 200 that shows it, a read back after a 202, the one read after a 204): the power as that
+            # read has it decides what goes out, not the read before the change. A server switched on meanwhile (at its button,
+            # by another tool) is restarted, where "On" would be nothing to do to it and the override would wait for its next
+            # boot; one that began to change its state is left alone, and the override cleared again.
             power = plain(seen.get("PowerState"), 20)
             try:
                 running, kind, target = await self._setup_plan({**system, "PowerState": power})
@@ -2339,11 +3308,23 @@ class RedfishDevice(Device):
         what = "restart" if running else "switching on"
         target = target or f"{place.rstrip('/')}/Actions/ComputerSystem.Reset"
         steps.at = "restarting"
+        # (Seen set, or not read back: the override "is", or "may be", set for the next boot where the restart may have gone.)
+        is_set, lands = ("is set", "will land") if shown is True else ("may be set", "may land")
+        # On the HTTP library's connections (a certificate this tile alone has pinned) the press's time is asked before its wait
+        # for a connection and the connect, which can take this long; on a line of the tile's own, right before it is written.
+        spare = (BOOT_WAITS.pool or 0.0) + (BOOT_WAITS.connect or 0.0) if self._pinned_alone() else 0.0
+        refused_for: list[str] = []  # (what `in_time` last said no for: the press's time, or a right lost)
 
         def in_time() -> bool:
             # Asked before the restart goes out, also again where the controller wanted a new sign-in first: not after the
             # press's time, nor once whoever pressed may no longer do it.
-            return not steps.overdue() and (still is None or still())
+            if steps.overdue(spare):
+                refused_for.append("late")
+                return False
+            if still is not None and not still():
+                refused_for.append("stopped")
+                return False
+            return True
 
         try:
             reply = await self._request("POST", target, urgent=True, still=in_time, command=True, json={"ResetType": kind}, timeout=BOOT_WAITS)
@@ -2352,10 +3333,12 @@ class RedfishDevice(Device):
                 # Gone, or perhaps gone, and its answer lost or not read: the restart may have been done, and the override is
                 # set for the next boot.
                 why = "the tile was changed meanwhile" if ex is RETIRED else ex.message
-                raise KvmError("timeout", f"The BIOS setup boot is set for the next boot, and the {what} may or may not have gone through ({why}). Look at the server: if it did not start, the next boot of any kind will land in the BIOS setup.", 504) from None
+                raise KvmError("timeout", f"The BIOS setup boot {is_set} for the next boot, and the {what} may or may not have gone through ({why}). Look at the server: if it did not start, the next boot of any kind {lands} in the BIOS setup.", 504) from None
             steps.at = "clearing"
             left = await self._clear_setup_override(place, before, pending, whole)
-            if ex.code == "stopped" and steps.overdue():
+            # (Why it was not sent, as `in_time` said it: a clearing that ran past the press's time after a right was lost
+            # said "took more than 120 seconds".)
+            if ex.code == "stopped" and refused_for[-1:] == ["late"]:
                 raise self._left(f"Nothing was restarted: {took_too_long()} before the restart", left, pending) from None
             raise self._unset(ex, left, self._may_be_set(left, pending)) from None  # (it never went out)
         if 400 <= reply.status_code < 500:
@@ -2367,7 +3350,7 @@ class RedfishDevice(Device):
             # An error of the controller's own, or an answer no command has: whether the restart was done is not said. The
             # override is left set (it may be what the server is starting into now), and that is said.
             why = f"{'an error of its own' if reply.status_code >= 500 else 'an answer a command does not have'} ({self._said(reply) or f'HTTP {reply.status_code}'})"
-            raise KvmError("timeout", f"The BIOS setup boot is set for the next boot, and the controller answered the {what} with {why}: it may or may not have gone through. Look at the server: if it did not start, the next boot of any kind will land in the BIOS setup.", 504)
+            raise KvmError("timeout", f"The BIOS setup boot {is_set} for the next boot, and the controller answered the {what} with {why}: it may or may not have gone through. Look at the server: if it did not start, the next boot of any kind {lands} in the BIOS setup.", 504)
         self._accepted(reply)
         if running:
             return
@@ -2382,6 +3365,47 @@ class RedfishDevice(Device):
             if ex is RETIRED:
                 raise KvmError("timeout", "The server was told to switch on, and it was not seen to start, the tile being changed meanwhile: it may have been done. The BIOS setup boot override stays set for the server's next start.", 504) from None
             raise KvmError(ex.code, f"{ex.message} The BIOS setup boot override stays set for the server's next start.", ex.status) from None
+
+    async def _power_after_204(self, place: str) -> dict[str, Any] | None:
+        """The computer, read once after a change answered 204 (the standard's word that it was made in full, so it is not read
+        back), for its power now: within AFTER_204_READ, as the server it is (another that took the address meanwhile is no
+        read of it). None where no answer came in that time, or none of this server's (the board this was built on answered no
+        read for about a minute after the change): the power read before the change decides then, as it did before 0.2.1."""
+        usual = self._waits()
+        waits = httpx.Timeout(AFTER_204_READ, connect=usual.connect, pool=usual.pool, write=usual.write)
+        try:
+            system, _ = await self._checked_read(place, urgent=True, vital=False, waits=waits)
+        except KvmError as ex:
+            if ex is RETIRED or self._closed:
+                raise KvmError("timeout", "Nothing was restarted, and the BIOS setup boot override may be set: the tile was changed meanwhile. Look at the server's boot override, or start into BIOS setup again.", 504) from None
+            return None  # (another server's answer included: the restart, bound to this server's session, is refused)
+        return system
+
+    async def _planned(self, system: dict[str, Any], before: tuple[str, str]) -> tuple[bool, str, str | None]:
+        """`_setup_plan`, its refusals (nothing done) saying an override set before the press (see `_before_said`)."""
+        try:
+            return await self._setup_plan(system)
+        except KvmError as ex:
+            raise self._before_said(ex, before) from None
+
+    async def _setting(self, place: str, mark: str | None, still: Callable[[], bool] | None, before: tuple[str, str], steps: SetupSteps) -> httpx.Response:
+        """`_set_setup_override`, a change that never went out saying an override set before the press (see `_before_said`)."""
+        try:
+            return await self._set_setup_override(place, mark, still, before, steps)
+        except KvmError as ex:
+            if never_sent(ex):
+                raise self._before_said(ex, before) from None
+            raise
+
+    @staticmethod
+    def _before_said(ex: KvmError, before: tuple[str, str]) -> KvmError:
+        """What a press that set nothing says (refused, never sent, too late, a server between states), where the BIOS setup
+        boot override was set already before it: that it is set still, and the next boot may land in the setup, as well (so it
+        was before the press too; said nowhere, the answer read as if nothing were pending)."""
+        if before != SETUP_OVERRIDE or ex is RETIRED or ex.code == "another_machine":
+            return ex
+        kind = type(ex) if type(ex) in (KvmError, NothingSent) else KvmError
+        return kind(ex.code, f"{ex.message.rstrip('.')}; {SET_BEFORE}.", ex.status)
 
     @staticmethod
     def _may_be_set(left: str | None, pending: bool) -> bool:
@@ -2505,6 +3529,8 @@ class RedfishDevice(Device):
             if time.monotonic() >= deadline:
                 return (None if seen is None else False), None
             await asyncio.sleep(CONFIRM_EVERY)
+            if steps.overdue():
+                return (None if seen is None else False), None  # (nor a read after the pause that is past the press's time)
 
     @staticmethod
     def _unset(ex: KvmError, left: str | None, maybe: bool) -> KvmError:
@@ -2650,8 +3676,11 @@ class RedfishDevice(Device):
             self._refresh_soon()
 
     async def _locate(self, on: bool, still: Callable[[], bool] | None = None) -> None:
-        place = (await self._find(urgent=True))["system"]
-        system, mark = await self._checked_read(place, urgent=True)  # (which server answers: see `_judge`)
+        try:
+            place = (await self._find(urgent=True))["system"]
+            system, mark = await self._checked_read(place, urgent=True)  # (which server answers: see `_judge`)
+        except KvmError as ex:
+            raise self._not_done(ex) from None  # (only reads so far: nothing was sent)
         change = locator(system)[1 if on else 2]
         if change is None:
             raise KvmError("action_failed", "This controller has no locator light to switch")

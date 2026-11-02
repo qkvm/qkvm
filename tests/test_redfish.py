@@ -118,6 +118,64 @@ def test_one_sign_in_serves_many_looks_and_is_given_back(tmp_path: Path, bmc: Fa
         assert bmc.state.logins == 2 and bmc.state.tokens == {}
 
 
+@pytest.mark.parametrize(
+    "named",
+    [
+        "/redfish/v1/AccountService/Accounts/2",  # an account: deleted with the session's token, it is gone
+        "/redfish/v1/SessionService/Sessions",  # the collection itself
+        "/redfish/v1/SessionService/Sessions/{session}/x",  # below a session
+        "/redfish/v1/SessionService/Sessions/",  # no session at all
+        "/redfish/v1/SessionService/Sessions//",  # (nor two slashes)
+        "https://elsewhere.example/redfish/v1/Systems/Self",
+    ],
+)
+def test_signing_out_goes_to_the_session_and_to_nothing_else_the_controller_names(bmc: FakeBmc, named: str) -> None:
+    # (The desktop's follow-up 2, 0.2.1.) The place a controller names for the session it made is where signing out sends a
+    # DELETE with the session's token. One segment directly under the sessions collection is a session; anything else it may
+    # name (an account, the collection, a place below a session, another address) is sent no DELETE at all.
+    bmc.state.session_location = named
+
+    async def run() -> None:
+        device = redfish.RedfishDevice(kvm.DeviceSpec(id="ab12", name="server", base_url=bmc.url, username="admin", password="secret", kind="redfish"))
+        try:
+            await device.identify()
+        finally:
+            await device.close()
+
+    asyncio.run(run())
+    assert [request for request in bmc.state.requests if request.startswith("DELETE")] == [] and bmc.state.signed_out == 0, named
+    # (Named as the standard has it, the session is given back: the one before is left to run out by itself.)
+    left = dict(bmc.state.tokens)
+    bmc.state.session_location = "/redfish/v1/SessionService/Sessions/{session}"
+    asyncio.run(run())
+    assert bmc.state.signed_out == 1 and bmc.state.tokens == left and len(left) == 1
+
+
+@pytest.mark.parametrize(
+    "named",
+    [
+        "/redfish/v1/SessionService/Sessions/{session}/",
+        "https://10.0.0.100/redfish/v1/SessionService/Sessions/{session}/",
+        "/redfish/v1/SessionService/Sessions/{session}",
+    ],
+)
+def test_a_session_named_with_one_slash_at_its_end_is_signed_out_of(bmc: FakeBmc, named: str) -> None:
+    # (The second review's L3, 0.2.1; probe review-bmc/probes/p9_session_place_trailing_slash.py.) One slash at the end of the
+    # session's place (HPE's iLO writes its places so, it seems) is still one segment under the sessions collection: 0.2.0 signed
+    # out there, and since the follow-up 2 nothing was signed out of. One slash is allowed, and only that (see the test above).
+    bmc.state.session_location = named
+
+    async def run() -> None:
+        device = redfish.RedfishDevice(kvm.DeviceSpec(id="ab12", name="server", base_url=bmc.url, username="admin", password="secret", kind="redfish"))
+        try:
+            await device.identify()
+        finally:
+            await device.close()
+
+    asyncio.run(run())
+    assert bmc.state.signed_out == 1 and bmc.state.tokens == {}, named
+
+
 def test_a_controller_that_dawdles_over_the_sign_out_does_not_hold_up_the_removal(tmp_path: Path, bmc: FakeBmc, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(redfish, "SIGN_OUT_WITHIN", 1.0)
     bmc.state.dawdles = True  # it answers, a byte at a time, for ten seconds: no single wait for the next piece runs out
@@ -128,6 +186,74 @@ def test_a_controller_that_dawdles_over_the_sign_out_does_not_hold_up_the_remova
         assert client.delete(f"/api/v1/devices/{device}").status_code == 200
         assert time.monotonic() - began < 4
         assert bmc.state.signed_out == 1  # it was asked, all the same
+
+
+def test_a_session_is_given_back_where_no_line_waits_as_the_tile_is_removed(tmp_path: Path) -> None:
+    # (GitHub's controllers job on 0.2.1's release commit, twice: sushy-tools' tile was removed and its session never given
+    # back.) A look was under way as the tile was removed, on a line being made for it (the controller had closed the lines
+    # that waited) or on the one it had, and was cut off: no line waited, and the sign-out made one of its own, compared as it
+    # is made. A server known by its computer alone (its controller says no number, or its manager names another, as
+    # sushy-tools' does) is compared by reading the computer under the session; that session had been put aside as the tile
+    # retired, the compare asked for a new sign-in instead, which a retired tile refuses, and nothing was signed out of. The
+    # compare goes under the session being given back.
+    bmc = FakeBmc(BmcState(root_uuid=None)).start()
+    try:
+        with wall(tmp_path) as client:
+            device = add(client, bmc.url)
+            assert client.core.store.device(device).machine == redfish.own_number({"UUID": bmc.state.uuid})  # type: ignore[attr-defined]
+            status_of(client, device, state="online")
+            bmc.drop_connections()  # (the lines that waited are gone)
+            time.sleep(0.2)
+
+            def reads() -> int:
+                return sum(1 for request in bmc.state.requests if request == "GET /redfish/v1/Systems/Self")
+
+            before = reads()
+            bmc.state.system_takes = 3.0
+            client.get("/api/v1/status")  # a look, which needs a line: one is made, and compared on the slow computer
+            wait_until(lambda: reads() > before, "no look went out")
+            bmc.state.system_takes = 0.0
+            began = time.monotonic()
+            assert client.delete(f"/api/v1/devices/{device}").status_code == 200
+            assert time.monotonic() - began < redfish.SIGN_OUT_WITHIN + 2.5
+            assert bmc.state.signed_out == 1 and bmc.state.tokens == {}  # no session is left behind on the controller
+    finally:
+        bmc.stop()
+
+
+@pytest.mark.parametrize("known_by", ["its computer and its controller", "its computer alone"])
+def test_a_sign_out_whose_line_was_gone_as_it_went_is_sent_once_more_on_a_line_made_and_compared(known_by: str) -> None:
+    # The sign-out goes on a line of the tile's that waits. Where the controller ended that connection just as the DELETE went
+    # (this side had not heard of it yet), nothing of the DELETE was answered and the session is still there: it is sent once
+    # more, on a line made afresh and compared as it is made, within the sign-out's time. (A DELETE of a session that went
+    # would be answered 404 a second time: nothing else is done.)
+    bmc = FakeBmc(BmcState(root_uuid=None) if known_by == "its computer alone" else None).start()
+    state = bmc.state
+    machine = (redfish.own_number({"UUID": state.uuid}) or "") + (redfish.controller_number({"UUID": state.root_uuid}) or "")
+    cut: list[str] = []
+
+    async def run() -> None:
+        device = redfish.RedfishDevice(kvm.DeviceSpec(id="ab12", name="server", base_url=bmc.url, username="admin", password="secret", kind="redfish", machine=machine))
+        sent = device._on_the_line
+
+        async def gone_as_it_goes(line: Any, method: str, path: str, *args: Any, **kwargs: Any) -> httpx.Response:
+            if method == "DELETE" and not cut:
+                cut.append(path)
+                bmc.drop_connections()  # (ended on the controller's side; this side hears of it only as the DELETE goes)
+            return await sent(line, method, path, *args, **kwargs)
+
+        try:
+            assert (await device.status())["state"] == "online"
+            assert device._lines.waiting()  # (the sign-out has a line that waits to go on)
+            device._on_the_line = gone_as_it_goes  # type: ignore[method-assign]
+        finally:
+            await device.close()
+
+    try:
+        asyncio.run(run())
+        assert cut and state.signed_out == 1 and state.tokens == {}, (cut, state.signed_out)
+    finally:
+        bmc.stop()
 
 
 def test_a_controller_is_not_asked_more_often_than_a_server_changes(tmp_path: Path, bmc: FakeBmc, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -195,20 +321,24 @@ def test_start_into_bios_setup_sets_the_boot_override_then_restarts_or_powers_on
 
 def test_a_change_answered_204_is_taken_as_made_and_the_restart_follows_at_once(tmp_path: Path, bmc: FakeBmc, monkeypatch: pytest.MonkeyPatch) -> None:
     # The real AMI board answered the change of its boot override 204, and then left reads of the computer unanswered for about
-    # a minute while it took the restart sent right after. A 204 is the standard's word that the change was made: no read goes
-    # between it and the restart (one would have run out, and the button with it).
+    # a minute while it took the restart sent right after. A 204 is the standard's word that the change was made: it is not
+    # read back. Its power is read once (round 3 of 0.2.1: a server switched on meanwhile is restarted, not sent On), within
+    # AFTER_204_READ; a read that gets no answer in that time does not hold the restart back, nor end the press (until 0.2.1 no
+    # read went between the 204 and the restart: one waited out in full would have run out, and the button with it).
     monkeypatch.setattr(redfish.RedfishDevice, "WAITS", httpx.Timeout(1.0, connect=1.0))
+    monkeypatch.setattr(redfish, "AFTER_204_READ", 0.5)
     bmc.state.busy_after_boot_change = 2.5
     with wall(tmp_path) as client:
         device = add(client, bmc.url)
         status_of(client, device, state="online")
         before = len(bmc.state.requests)
+        began = time.monotonic()
         assert client.post(f"/api/v1/devices/{device}/actions", json={"action": "bios_setup"}).status_code == 200
-        assert bmc.state.actions == ["system ForceRestart"]
+        assert bmc.state.actions == ["system ForceRestart"] and time.monotonic() - began < 2.5
         asked = bmc.state.requests[before:]
         changed = asked.index("PATCH /redfish/v1/Systems/Self")
         restarted = asked.index("POST /redfish/v1/Systems/Self/Actions/ComputerSystem.Reset")
-        assert changed < restarted and "GET /redfish/v1/Systems/Self" not in asked[changed:restarted]
+        assert changed < restarted and asked[changed:restarted].count("GET /redfish/v1/Systems/Self") == 1
 
 
 def test_a_board_that_does_not_allow_a_bios_setup_boot_is_not_offered_it(tmp_path: Path, bmc: FakeBmc) -> None:
@@ -356,7 +486,8 @@ def test_a_bios_setup_the_controller_takes_and_does_not_show_restarts_nothing(tm
         # accepted and may yet make, and cannot undo it. A "maybe", said so.
         said = reply.json()["message"]
         assert (reply.status_code, reply.json()["code"]) == (504, "timeout") and "does not show it set" in said
-        assert "should the controller still make the change it accepted" in said
+        # (Register row 14: "it" read as the power change, and "the change it accepted" was not true where its answer was lost.)
+        assert "showed off and was cleared; should this press's change still be made" in said
         assert bmc.state.actions == [] and boot_changes(bmc) == ["Once", "Disabled"]
         bmc.state.boot_kept = True
         assert client.post(act, json={"action": "bios_setup"}).status_code == 200
@@ -543,6 +674,129 @@ def test_a_setup_boot_set_before_the_press_is_left_as_it_was(tmp_path: Path, bmc
         assert bmc.state.boot_override == ("Once", "BiosSetup") and boot_changes(bmc) == ["Once"]
 
 
+# --- Start into BIOS setup: the eighth review's lows (register row 14, 0.2.1) ------------------------------------------------
+
+
+def a_setup_tile(bmc: FakeBmc) -> redfish.RedfishDevice:
+    return redfish.RedfishDevice(kvm.DeviceSpec(id="t7", name="server", base_url=bmc.url, username="admin", password="secret", kind="redfish"))
+
+
+def test_a_press_whose_right_is_lost_before_its_restart_says_so_where_its_clearing_runs_past_its_time(bmc: FakeBmc, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Whoever pressed may no longer do it by the restart (their rights were taken): nothing is restarted, and the override is
+    # cleared. Where that clearing ran past the press's two minutes, the answer said the controller "took more than 120
+    # seconds", which is not why. It says why.
+    monkeypatch.setattr(redfish, "SETUP_WITHIN", 1.5)
+
+    async def run() -> kvm.KvmError:
+        device = a_setup_tile(bmc)
+        try:
+            clearing = device._clear_setup_override
+
+            async def slow_clearing(*args: Any) -> str | None:
+                await asyncio.sleep(1.7)  # (past the press's time)
+                return await clearing(*args)
+
+            device._clear_setup_override = slow_clearing  # type: ignore[method-assign]
+            with pytest.raises(kvm.KvmError) as refused:
+                # (May do it until the change has gone; not by the restart.)
+                await device.act("bios_setup", still=lambda: not any(asked.startswith("PATCH") for asked in bmc.state.requests))
+            return refused.value
+        finally:
+            await device.close()
+
+    said = asyncio.run(run())
+    assert said.code == "stopped" and "may no longer do that" in said.message and "took more than" not in said.message, said.message
+    assert bmc.state.actions == [] and bmc.state.boot_override[0] == "Disabled"
+
+
+def test_no_restart_goes_out_where_a_new_connection_could_take_it_past_the_press_time(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # The press's time was asked before the HTTP library's wait for a connection and the connect: the restart could reach the
+    # wire that much (some 12 s) after the two minutes. Asked with that time to spare where the restart goes on the library's
+    # connections (a certificate this tile alone has pinned); on a line of the tile's own it is asked right before it is written.
+    monkeypatch.setattr(redfish, "SETUP_WITHIN", 3.0)
+    monkeypatch.setattr(redfish, "BOOT_WAITS", httpx.Timeout(10.0, connect=1.0, pool=1.0))
+    bmc = FakeBmc(BmcState(), tls_dir=tmp_path / "certificate").start()
+    try:
+        with wall(tmp_path / "wall") as client:
+            device = add(client, bmc.url)
+            status_of(client, device, state="online")
+            bmc.state.slow_boot_changes, bmc.state.slow_boot_by = 1, 1.5  # (the change: 1.5 s of the 3, then 2 s to spare are not left)
+            reply = client.post(f"/api/v1/devices/{device}/actions", json={"action": "bios_setup"})
+            assert reply.status_code == 502 and "took more than" in reply.json()["message"] and "cleared again" in reply.json()["message"], reply.text
+            assert bmc.state.actions == [] and bmc.state.boot_override[0] == "Disabled"
+    finally:
+        bmc.stop()
+
+
+def test_no_read_of_the_override_goes_out_past_the_press_time(bmc: FakeBmc, monkeypatch: pytest.MonkeyPatch) -> None:
+    # A change taken for later (202) is read back until it shows; the read after a pause went out without a look at the press's
+    # time, up to CONFIRM_EVERY past it, and held the clearing up by that read.
+    monkeypatch.setattr(redfish, "SETUP_WITHIN", 1.0)
+    monkeypatch.setattr(redfish, "CONFIRM_EVERY", 1.5)
+    monkeypatch.setattr(redfish, "CONFIRM_WITHIN", 10.0)
+    bmc.state.boot_status, bmc.state.boot_kept = 202, False
+
+    async def run() -> kvm.KvmError:
+        device = a_setup_tile(bmc)
+        try:
+            with pytest.raises(kvm.KvmError) as refused:
+                await device.act("bios_setup")
+            return refused.value
+        finally:
+            await device.close()
+
+    said = asyncio.run(run())
+    asked = bmc.state.requests
+    changes = [n for n, one in enumerate(asked) if one.startswith("PATCH")]
+    assert len(changes) == 2, asked
+    between = asked[changes[0] + 1 : changes[1]]
+    # (One read back before the time ran out, then the clearing's own read.)
+    assert between.count("GET /redfish/v1/Systems/Self") == 2, between
+    assert "took more than" in said.message and bmc.state.actions == []
+
+
+def test_a_restart_that_may_have_gone_says_the_override_may_be_set_where_it_was_never_seen_set(bmc: FakeBmc, monkeypatch: pytest.MonkeyPatch) -> None:
+    # A change taken for later (202), and not read back (no read came): the restart goes out, and is answered with an error of
+    # the controller's own. The answer said the override "is set": it was never seen set. It may be.
+    monkeypatch.setattr(redfish, "CONFIRM_WITHIN", 0.5)
+    monkeypatch.setattr(redfish, "CONFIRM_EVERY", 0.1)
+    bmc.state.boot_status, bmc.state.reset_status = 202, 500
+
+    async def run() -> kvm.KvmError:
+        device = a_setup_tile(bmc)
+        try:
+            reading = device._read
+
+            async def no_read_after_the_change(path: str, urgent: bool = False, vital: bool = True, waits: Any = None) -> tuple[dict[str, Any], str | None]:
+                if any(asked.startswith("PATCH") for asked in bmc.state.requests) and path.endswith("/Systems/Self"):
+                    raise kvm.KvmError("timeout", "Device did not respond in time", 504)
+                return await reading(path, urgent, vital, waits)
+
+            device._read = no_read_after_the_change  # type: ignore[method-assign]
+            with pytest.raises(kvm.KvmError) as refused:
+                await device.act("bios_setup")
+            return refused.value
+        finally:
+            await device.close()
+
+    said = asyncio.run(run())
+    assert said.code == "timeout" and "The BIOS setup boot may be set for the next boot" in said.message, said.message
+
+
+def test_a_press_that_set_nothing_says_that_the_setup_boot_set_before_it_is_set_still(tmp_path: Path, bmc: FakeBmc) -> None:
+    # Set already before the press (an earlier press, not booted since), and the change refused for certain (a 4xx): nothing was
+    # done, and the answer said only that. That the override from before is still set, and the next boot may land in the setup,
+    # is said too (it was so before the press as well).
+    bmc.state.boot_override, bmc.state.boot_status, bmc.state.boot_kept = ("Once", "BiosSetup"), 400, False
+    with wall(tmp_path) as client:
+        device = add(client, bmc.url)
+        status_of(client, device, state="online")
+        reply = client.post(f"/api/v1/devices/{device}/actions", json={"action": "bios_setup"})
+        said = reply.json()["message"]
+        assert reply.status_code == 502 and "set already before this press" in said and "the next boot may land in the BIOS setup" in said, said
+        assert bmc.state.boot_override == ("Once", "BiosSetup") and bmc.state.actions == []
+
+
 def test_a_change_made_in_part_is_cleared_as_the_press_own(tmp_path: Path, bmc: FakeBmc, monkeypatch: pytest.MonkeyPatch) -> None:
     # (The fifth review's L3.) A controller that takes Once and not the target, and answers 200: the override does not show,
     # nothing is restarted, and what it made (Once, with the target there was before) is the press's own: cleared, not taken
@@ -716,6 +970,39 @@ def test_switching_on_leaves_alone_what_is_on_and_shutting_down_what_is_off(tmp_
         ]
 
 
+@pytest.mark.parametrize(
+    ("power", "action", "outcome"),
+    [
+        # A state that is neither on nor off, nor said at all: nothing is decided by it (it was "on": "already on", and the
+        # power button asked a server that is not running to shut down).
+        *[(power, action, "refused") for power in ("Paused", "Unknown", "Resetting", None) for action in ("power_on", "power_off", "atx_power")],
+        # Switching on, or shutting down, read for what it is: where it is going already is said so; the other way is not sent
+        # into the middle of it (the power button's "shut down" to a server that is starting, its "on" to one shutting down).
+        ("PoweringOn", "power_on", "already switching on"), ("PoweringOn", "power_off", "refused"), ("PoweringOn", "atx_power", "refused"),
+        ("PoweringOff", "power_off", "already shutting down"), ("PoweringOff", "power_on", "refused"), ("PoweringOff", "atx_power", "refused"),
+        # (And on and off as ever.)
+        ("On", "power_on", "already on"), ("Off", "power_off", "already off"), ("On", "atx_power", "system GracefulShutdown"), ("Off", "atx_power", "system On"),
+    ],
+)  # fmt: skip
+def test_a_power_state_decides_a_button_only_as_what_it_is(tmp_path: Path, bmc: FakeBmc, power: str | None, action: str, outcome: str) -> None:
+    # (The desktop's follow-up 5, 0.2.1, with the reviewer's addition.) Only On, Off, PoweringOn and PoweringOff decide what
+    # a power button does; any other state is refused, and named, as Start into BIOS setup refuses one (see
+    # test_a_server_between_states_is_not_started_into_its_setup).
+    with wall(tmp_path) as client:
+        device = add(client, bmc.url)
+        bmc.state.power = power  # type: ignore[assignment]
+        reply = client.post(f"/api/v1/devices/{device}/actions", json={"action": action})
+        said = reply.json()
+        if outcome == "refused":
+            assert (reply.status_code, said.get("code")) == (502, "action_failed") and said["message"].startswith("Nothing was done"), (said, bmc.state.actions)
+            assert (power or "does not say") in said["message"], said["message"]
+            assert bmc.state.actions == []
+        elif outcome.startswith("system "):
+            assert reply.status_code == 200 and bmc.state.actions == [outcome], said
+        else:
+            assert reply.status_code == 200 and said["note"] == outcome and bmc.state.actions == [], said
+
+
 def test_a_kvm_is_not_asked_whether_it_is_on(tmp_path: Path) -> None:
     # A KVM's power button is a wire to the computer's own button, and whether that computer is on it knows
     # from a light that may not be wired up at all: "switch on" is not something it can promise.
@@ -761,6 +1048,21 @@ def test_a_controller_cannot_send_the_wall_somewhere_else(tmp_path: Path, bmc: F
     with wall(tmp_path) as client:
         reply = client.post("/api/v1/devices", json={"url": bmc.url, "password": "secret"})
         assert (reply.status_code, reply.json()["code"]) == (422, "bad_response")
+
+
+def test_a_link_spelt_twice_over_or_with_bytes_no_path_has_is_no_link() -> None:
+    # (The desktop's follow-up 1, 0.2.1.) A place spelt twice over ("%252e" is "%2e" once it is read, and a controller or a
+    # server before it that reads it twice climbs out of /redfish/v1), as a long form of a character (an overlong UTF-8
+    # "%c0%ae" is a dot to a reader that is lenient about it), with a byte no path has (a NUL, a line feed that would end
+    # the request line), or with a percent that begins no escape: none is a place the session token is taken to.
+    for claimed in (
+        "/redfish/v1/%252e%252e/%252e%252e/api/session", "/redfish/v1/a%25", "/redfish/v1/%c0%ae%c0%ae/api", "/redfish/v1/Systems/%e2%80%a8",
+        "/redfish/v1/a%ff", "/redfish/v1/a%80", "/redfish/v1/a%00b", "/redfish/v1/a%0d%0aX-Injected:%20yes", "/redfish/v1/a%09", "/redfish/v1/a%7F",
+        "/redfish/v1/a%1f", "/redfish/v1/a%zz", "/redfish/v1/a%2", "/redfish/v1/a%",
+    ):  # fmt: skip
+        assert link(claimed) is None, claimed
+    for honest in ("/redfish/v1/Systems/a%20b", "/redfish/v1/Chassis/Self%2DA/Thermal", "/redfish/v1/Systems/%41%7e"):
+        assert link(honest) == honest, honest
 
 
 def test_what_a_controller_says_about_itself_is_not_taken_at_face_value(tmp_path: Path, bmc: FakeBmc) -> None:
@@ -855,6 +1157,40 @@ def test_open_console_leads_straight_in_where_the_controller_hands_out_a_pass(tm
         if file.is_file():
             kept = file.read_bytes()
             assert not any(made.encode() in kept for made in bmc.state.passes), file
+
+
+def test_no_way_in_is_made_out_to_a_console_on_a_host_name_the_wall_is_looked_at_under(tmp_path: Path, bmc: FakeBmc) -> None:
+    # A browser keeps what signs it in to the wall by host name, not by port: the server's own page on another port of the
+    # wall's name would be handed the wall's cookie along with the pass (SECURITY.md, "qKVM has a host name of its own").
+    # The page offers no link there; the wall makes out no pass there either, by the name the request came by or by one it
+    # was given (allowed_hosts). Nothing is asked of the controller for it, and nothing is written down: nobody tried.
+    with wall(tmp_path) as client:
+        device = add(client, bmc.url)  # http://127.0.0.1:<port>
+        assert status_of(client, device, state="online")["console"] is True
+        for host in ("127.0.0.1:8787", "127.0.0.1"):
+            refused = client.post(f"/api/v1/devices/{device}/console", headers={"Host": host})
+            assert (refused.status_code, refused.json()["code"]) == (409, "same_host"), refused.text
+        assert bmc.state.passes == []
+        assert client.post(f"/api/v1/devices/{device}/console").status_code == 200  # (looked at as "testserver": another name)
+        # Where a browser reaches the controller by a name the wall was given for itself, however it is written.
+        client.core.store.server.allowed_hosts = ["wall.example.net"]  # type: ignore[attr-defined]
+        for written in ("https://wall.example.net:8443/", "https://WALL.Example.NET.:9443/x"):
+            assert client.put(f"/api/v1/devices/{device}", json={"url": bmc.url, "open_url": written}).status_code == 200
+            refused = client.post(f"/api/v1/devices/{device}/console", headers={"Host": "192.0.2.7:8787"})
+            assert (refused.status_code, refused.json()["code"]) == (409, "same_host"), (written, refused.text)
+        assert client.put(f"/api/v1/devices/{device}", json={"url": bmc.url, "open_url": "https://bmc7.example.net:8443/"}).status_code == 200
+        assert client.post(f"/api/v1/devices/{device}/console", headers={"Host": "192.0.2.7:8787"}).status_code == 200
+        assert len(bmc.state.passes) == 2
+        written_down = [entry["event"] for entry in client.get("/api/v1/audit").json()["entries"] if entry["event"].startswith("console_")]
+        assert written_down == ["console_opened"] * 2, written_down
+        # A kind of device that hands out no way in at all says so, on whatever name it is: as before.
+        kvm_alone = FakeKvm().start()
+        try:
+            plain = add(client, kvm_alone.url)
+            refused = client.post(f"/api/v1/devices/{plain}/console", headers={"Host": "127.0.0.1:8787"})
+            assert (refused.status_code, refused.json()["code"]) == (404, "no_console"), refused.text
+        finally:
+            kvm_alone.stop()
 
 
 def test_the_way_in_is_for_those_who_may_act_on_the_machine(tmp_path: Path, bmc: FakeBmc) -> None:
@@ -1786,6 +2122,449 @@ def test_keys_typed_text_and_ctrl_alt_del_reach_the_servers_console(tmp_path: Pa
         assert bmc.state.actions == [] and bmc.state.changes == []
 
 
+def test_the_console_over_tls_goes_on_the_connection_its_controller_was_compared_on(tmp_path: Path) -> None:
+    # (0.2.1.) The web page's sign-in, its pass and the console itself go on one connection of the program's own, on which the
+    # controller's open root is read first (see redfish._Line), over TLS with the certificate the tile pinned: the screen
+    # comes, keys go, and the root is read once for all of it (once more at the first look, for the controller's number).
+    bmc = FakeBmc(BmcState(own_console=True, screen=a_screen(), piece=50), tls_dir=tmp_path / "certificate").start()
+    try:
+        with wall(tmp_path / "wall") as client:
+            device = add(client, bmc.url)
+            roots = bmc.state.roots_unsigned
+            picture_of(client, device)
+            assert client.post(f"/api/v1/devices/{device}/actions", json={"action": "keys", "keys": "KeyA"}).status_code == 200
+            wait_until(lambda: bmc.state.hid[-2:] == [("key", 0, [0x04]), ("key", 0, [])], f"the key never arrived: {bmc.state.hid}")
+            assert bmc.state.web_logins == 1 and bmc.state.roots_unsigned == roots + 1
+    finally:
+        bmc.stop()
+
+
+def test_a_console_opened_while_a_compared_line_waits_reads_no_root_of_its_own() -> None:
+    # (Round 3 of 0.2.1, item 3.) The session's token goes on the tile's own lines, each compared as it was made and kept while
+    # the controller keeps it (round 3, item 1). The console's web page is signed in to on one of those that waits, which takes
+    # it for good (it is handed to the WebSocket library), and no root is read first for it: a quarter of a minute on a slow
+    # board, every time a console is opened (a real one runs out after half an hour without a key). Its sign-out goes on one
+    # that waits too, where the console's own was handed over. Plain HTTP, a tile whose number is remembered (as every tile on
+    # the wall after its first look); the stand-in keeps an idle connection as the real slow board did. (Before: each a
+    # connection of its own, its root read first.)
+    mark = str(redfish.own_number({"UUID": SLOW_SYSTEM})) + str(redfish.controller_number({"UUID": SLOW_ROOT}))
+    bmc = FakeBmc(BmcState(own_console=True, screen=a_screen(), uuid=SLOW_SYSTEM, root_uuid=SLOW_ROOT, keeps_idle=65.0)).start()
+
+    async def scene() -> tuple[set[int], set[int]]:
+        device = redfish.RedfishDevice(kvm.DeviceSpec(id="ab12", name="db-01", base_url=bmc.url, username="admin", password="secret", kind="redfish", machine=mark))
+        try:
+            assert (await device.status())["state"] == "online"
+            made = set(bmc.state.conversations)
+            for _ in range(200):
+                with contextlib.suppress(kvm.KvmError):
+                    await device.snapshot(640)
+                    break
+                await asyncio.sleep(0.1)
+            return made, set(bmc.state.conversations)
+        finally:
+            await device.close()  # (the console ends, and its web page is left)
+
+    try:
+        before_the_console, before_leaving = asyncio.run(scene())
+        wait_until(lambda: bmc.state.web_signed_out == 1, "its web page was not signed out of")
+        said = bmc.state.conversations
+        signing_in = [port for port, heard in said.items() if "POST /api/session" in heard]
+        assert len(signing_in) == 1 and signing_in[0] in before_the_console, f"the web page was signed in to on a connection made for it: {said}"
+        assert said[signing_in[0]][0] == "GET /redfish/v1 open"  # (compared as it was made)
+        leaving = [port for port, heard in said.items() if "DELETE /api/session cookie" in heard]
+        assert len(leaving) == 1 and leaving[0] in before_leaving, f"its web page was signed out of on a connection made for it: {said}"
+        assert said[leaving[0]][0] == "GET /redfish/v1 open"
+    finally:
+        bmc.stop()
+
+
+def test_the_web_pages_session_goes_only_on_connections_its_controller_was_compared_on(tmp_path: Path) -> None:
+    # (The coordinator's decision (b), 0.2.1.) The console's web page is signed out of at the end with its session's cookie: on
+    # the connection its controller was compared on where that one is still open, else on one made anew and compared anew;
+    # never on the HTTP library's connections, which would take the cookie to whatever answers there (it went so until now).
+    bmc = FakeBmc(BmcState(own_console=True, screen=a_screen(), piece=50)).start()
+    try:
+        with wall(tmp_path) as client:
+            device = add(client, bmc.url)
+            picture_of(client, device)
+            assert client.delete(f"/api/v1/devices/{device}").status_code == 200  # (the console ends, and its web page is left)
+        wait_until(lambda: bmc.state.web_signed_out == 1, "its web page was not signed out of")
+        carried = {port: said for port, said in bmc.state.conversations.items() if any(one.endswith(" cookie") for one in said)}
+        assert any("DELETE /api/session cookie" in said for said in carried.values()), carried
+        assert all(said[0] == "GET /redfish/v1 open" for said in carried.values()), carried
+    finally:
+        bmc.stop()
+
+
+LINE_ROOT = "1a2b3c4d-5e6f-4a1b-8c2d-3e4f5a6b7c8d"
+LINE_MARK = "server:" + "1" * 32 + str(redfish.controller_number({"UUID": LINE_ROOT}))
+
+
+def test_what_a_controller_sends_on_a_line_while_nothing_is_asked_ends_that_line() -> None:
+    # (The second review's M2, 0.2.1; probe review-bmc/probes/p6_idle_line_floods.py.) A line waits between two requests (the
+    # console's web sign-in, then which server answers over the Redfish session, then the pass), and what came on it then was
+    # taken in without end: a device that passed the compare (its root's number is anybody's to read and say back) sent a
+    # gigabyte in five seconds. Whatever comes while no answer is read ends the line; the next request makes and compares a new
+    # one.
+    import json as json_module
+
+    connections: list[int] = []
+
+    async def device_side(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        connections.append(1)
+        floods = len(connections) == 1
+        try:
+            while True:
+                await reader.readuntil(b"\r\n\r\n")
+                body = json_module.dumps({"RedfishVersion": "1.15.1", "UUID": LINE_ROOT}).encode()
+                writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n" % len(body) + body)
+                await writer.drain()
+                if floods:
+                    await asyncio.sleep(0.05)  # (the answer was read: the line waits now)
+                    for _ in range(64):  # (64 MiB at the most: enough to be seen, and a test's own end)
+                        writer.write(b"x" * (1 << 20))
+                        await writer.drain()
+                    return
+        except (asyncio.IncompleteReadError, ConnectionError, OSError):
+            pass
+        finally:
+            writer.close()
+
+    async def run() -> tuple[int, bool, int]:
+        server = await asyncio.start_server(device_side, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        device = redfish.RedfishDevice(kvm.DeviceSpec(id="ab12", name="db-01", base_url=f"http://127.0.0.1:{port}", username="admin", password="secret", kind="redfish", machine=LINE_MARK))
+        try:
+            line = await device._open_line(signing_in=True)
+            await asyncio.sleep(1.0)
+            held = len(line.connection.http.trailing_data[0]) if line.connection is not None else 0
+            still = line.usable()
+            answer = await device._on_the_line(line, "GET", "/redfish/v1/", {"Accept": "application/json"})
+            line.close()
+            return held, still, answer.status_code
+        finally:
+            await device.close()
+            server.close()
+
+    held, still, status = asyncio.run(run())
+    assert held < 64 * 1024 and not still, (held, still)
+    assert status == 200 and len(connections) == 2  # (a new line, compared, for the next request)
+
+
+SLOW_SYSTEM, SLOW_ROOT = "4c4c4544-0042-3510-8054-b9c04f4a3532", "1a2b3c4d-5e6f-4a1b-8c2d-3e4f5a6b7c8d"
+
+
+def test_a_console_that_ends_on_a_slow_controller_neither_freezes_the_picture_nor_holds_the_next(monkeypatch: pytest.MonkeyPatch) -> None:
+    # (The second review's M3, 0.2.1; probe review-bmc/probes/p4_slow_board_console.py, here at a seventh of its times.) The
+    # owner's slow board shows its root in 12 to 20 seconds. At a console's end its web page was signed out of on a line made
+    # anew, its root read first, and the console waited for that: meanwhile the ended console's last frame was handed out as
+    # the screen, and no new console opened; then the next console read the root again, after the question which server
+    # answers. Now a console that ended is no picture at once, the sign-out goes on by itself, and the next console's root is
+    # read alongside the question: one root read stands between two consoles, and no frozen picture.
+    root, lasts, run = 2.0, 3.0, 16.0
+    monkeypatch.setattr(redfish, "LOOK_EVERY", 1000.0)  # (no looks between: the console's own roads only)
+    monkeypatch.setattr(redfish, "CONSOLE_SETTLED", 1.0)  # (a session that ran its time, as a real one after half an hour)
+    mark = str(redfish.own_number({"UUID": SLOW_SYSTEM})) + str(redfish.controller_number({"UUID": SLOW_ROOT}))
+    bmc = FakeBmc(BmcState(own_console=True, screen=a_screen(), uuid=SLOW_SYSTEM, root_uuid=SLOW_ROOT, session_lasts=lasts)).start()
+
+    async def scene() -> tuple[float, float, float, int]:
+        device = redfish.RedfishDevice(kvm.DeviceSpec(id="ab12", name="db-01", base_url=bmc.url, username="admin", password="secret", kind="redfish", machine=mark))
+        try:
+            assert (await device.status())["state"] == "online"
+            for _ in range(200):  # (the first console, its root still quick: its picture once, the encoder made ready)
+                with contextlib.suppress(kvm.KvmError):
+                    await device.snapshot(640)
+                    break
+                await asyncio.sleep(0.1)
+            bmc.state.root_takes = root  # (slow from here on)
+            logins = bmc.state.web_logins
+            began = last = time.monotonic()
+            shown = frozen = gap = longest = 0.0
+            while time.monotonic() - began < run:
+                try:
+                    await device.snapshot(640)
+                    open_at_the_controller = bmc.state.watching > 0
+                    outcome = "shown" if open_at_the_controller else "frozen"
+                except kvm.KvmError:
+                    outcome = "gap"
+                now = time.monotonic()
+                step, last = now - last, now  # (the interval this call ends: what it returned)
+                if outcome == "gap":
+                    gap += step
+                    longest = max(longest, gap)
+                else:
+                    gap = 0.0
+                    if outcome == "frozen":
+                        frozen += step  # (a picture handed out while no console is open at the controller)
+                    else:
+                        shown += step
+                await asyncio.sleep(0.1)
+            return shown, frozen, longest, bmc.state.web_logins - logins
+        finally:
+            await device.close()
+
+    try:
+        shown, frozen, longest, logins = asyncio.run(scene())
+        assert frozen < 0.5, f"the picture of a console that had ended was shown for {frozen:.1f} s"
+        assert longest < root + 1.2, f"{longest:.1f} s without a picture between two consoles (one root read is {root} s)"
+        assert logins >= 2 and shown > run * lasts / (lasts + root + 1.0), (logins, round(shown, 1))
+    finally:
+        bmc.stop()
+
+
+def test_retiring_a_server_whose_console_is_open_on_a_slow_controller_keeps_close_to_its_time(monkeypatch: pytest.MonkeyPatch) -> None:
+    # (The second review's L1, 0.2.1; probe review-bmc/probes/p5_retire_with_console_open.py.) A tile retired (edited, removed)
+    # while its console is open, on a controller whose root is slow: the web page's sign-out reads the root first, on a line of
+    # its own. close() waited for the console task, which waited for that sign-out, and then for the sign-out again: past the
+    # time a retirement gives a sign-out. It waits that time and no longer; the sign-out goes on by itself where the program
+    # goes on, and signs the web page out once the root has been read. (At the program's end it is cut off there: see README.)
+    # (A sign-out that must read the root: no compared line of the tile's waits, the controller having closed them after a
+    # second without a request. Where one waits, it goes on that one at once: see the test of round 3's item 3 above.)
+    root, sign_out = 3.0, 1.0
+    monkeypatch.setattr(redfish, "SIGN_OUT_WITHIN", sign_out)
+    monkeypatch.setattr(redfish, "LOOK_EVERY", 1000.0)
+    mark = str(redfish.own_number({"UUID": SLOW_SYSTEM})) + str(redfish.controller_number({"UUID": SLOW_ROOT}))
+    bmc = FakeBmc(BmcState(own_console=True, screen=a_screen(), uuid=SLOW_SYSTEM, root_uuid=SLOW_ROOT, keeps_idle=1.0)).start()
+
+    async def scene() -> tuple[float, int, int, int]:
+        device = redfish.RedfishDevice(kvm.DeviceSpec(id="ab12", name="db-01", base_url=bmc.url, username="admin", password="secret", kind="redfish", machine=mark))
+        assert (await device.status())["state"] == "online"
+        for _ in range(200):
+            with contextlib.suppress(kvm.KvmError):
+                await device.snapshot(640)
+                break
+            await asyncio.sleep(0.1)
+        await asyncio.sleep(1.5)  # (the lines that waited are closed by the controller meanwhile)
+        bmc.state.root_takes = root
+        began = time.monotonic()
+        await device.close()
+        took, at_close = time.monotonic() - began, len(bmc.state.web_sessions)
+        for _ in range(int((root + 3.0) / 0.1)):  # (the program goes on: the sign-out with it)
+            if bmc.state.web_signed_out:
+                break
+            await asyncio.sleep(0.1)
+        return took, at_close, bmc.state.web_signed_out, len(bmc.state.web_sessions)
+
+    try:
+        took, at_close, signed_out, left = asyncio.run(scene())
+        assert took < sign_out + 0.3, f"close() took {took:.1f} s (a sign-out is given {sign_out} s)"
+        assert (at_close, signed_out, left) == (1, 1, 0)
+    finally:
+        bmc.stop()
+
+
+def test_a_lines_connection_and_its_tls_handshake_each_have_the_connect_time(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # (The second review's smaller point, 0.2.1.) The HTTP library gives a connection's TCP and its TLS handshake the connect
+    # time each (4 s to a controller); a line gave them that time together, and a slow board whose two each take most of it
+    # was taken for one that cannot be reached. Here every TCP connection takes 0.7 s to make (the line's, and that of the
+    # stand-in in front of the controller, which the handshake waits for) and the connect time is 1 s.
+    monkeypatch.setattr(redfish.RedfishDevice, "WAITS", httpx.Timeout(20.0, connect=1.0, pool=8.0))
+    bmc = FakeBmc(BmcState(), tls_dir=tmp_path / "certificate").start()
+
+    async def pump(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            while data := await reader.read(65536):
+                writer.write(data)
+                await writer.drain()
+        except (ConnectionError, OSError):
+            pass
+        finally:
+            writer.close()
+
+    async def in_front(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        upstream_reader, upstream_writer = await asyncio.open_connection("127.0.0.1", bmc.port)
+        await asyncio.gather(pump(reader, upstream_writer), pump(upstream_reader, writer))
+
+    async def scene() -> bool:
+        pem = await kvm.fetch_certificate(bmc.url)
+        proxy = await asyncio.start_server(in_front, "127.0.0.1", 0)
+        url = f"https://127.0.0.1:{proxy.sockets[0].getsockname()[1]}"
+        device = redfish.RedfishDevice(kvm.DeviceSpec(id="ab12", name="db-01", base_url=url, username="admin", password="secret", kind="redfish", tls="pinned", cert_pem=pem))
+        made = asyncio.BaseEventLoop.create_connection
+
+        async def slowly(self: Any, *args: Any, **kwargs: Any) -> Any:
+            await asyncio.sleep(0.7)
+            return await made(self, *args, **kwargs)
+
+        try:
+            await device._http()  # (the certificate as the tile has it)
+            asyncio.BaseEventLoop.create_connection = slowly  # type: ignore[method-assign]
+            line = await device._open_line(signing_in=True)
+            usable = line.usable()
+            line.close()
+            return usable
+        finally:
+            asyncio.BaseEventLoop.create_connection = made  # type: ignore[method-assign]
+            await device.close()
+            proxy.close()
+
+    try:
+        assert asyncio.run(scene())
+    finally:
+        bmc.stop()
+
+
+def test_a_root_answered_in_tiny_pieces_does_not_hold_the_wall_still() -> None:
+    # (The second review's M1, 0.2.1; probe review-bmc/probes/p1_chunked_stall.py.) Whatever answers at a server tile's address
+    # answers the root, read on the sign-in's own line before its number is compared, in pieces of four bytes, as many as the
+    # line takes. The line's reader joined them one by one (quadratic): a tile watched for a minute held the whole wall still
+    # for 19 s, 1.7 s at a time. Read linearly, with a cap on the pieces: not a tenth of a second at a time.
+    async def hostile(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            await reader.readuntil(b"\r\n\r\n")
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n")
+            piece = b"4\r\n    \r\n" * 10_000
+            for _ in range(25):  # (250 000 pieces: more than the line takes)
+                writer.write(piece)
+                await writer.drain()
+            writer.write(b"0\r\n\r\n")
+            await writer.drain()
+            await asyncio.sleep(1)
+        except (ConnectionError, OSError, asyncio.IncompleteReadError):
+            pass
+        finally:
+            writer.close()
+
+    async def run() -> tuple[float, dict[str, Any]]:
+        server = await asyncio.start_server(hostile, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        device = redfish.RedfishDevice(kvm.DeviceSpec(id="ab12", name="db-01", base_url=f"http://127.0.0.1:{port}", username="admin", password="secret", kind="redfish", machine=LINE_MARK))
+        lags: list[float] = []
+        stop = asyncio.Event()
+
+        async def ticker() -> None:
+            last = time.perf_counter()
+            while not stop.is_set():
+                await asyncio.sleep(0.005)
+                now = time.perf_counter()
+                lags.append(now - last - 0.005)
+                last = now
+
+        ticking = asyncio.create_task(ticker())
+        status: dict[str, Any] = {}
+        try:
+            end = time.perf_counter() + 8.0
+            while time.perf_counter() < end:  # (as a watched tile is asked: every look signs in again, its root read first)
+                status = await device.status()
+                await asyncio.sleep(0.5)
+        finally:
+            stop.set()
+            await ticking
+            await device.close()
+            server.close()
+        return max(lags), status
+
+    longest, status = asyncio.run(run())
+    assert longest < 0.1, f"the wall stood still for {longest:.2f} s at a time"
+    assert status.get("state") != "online" and "far more data" in str((status.get("error") or {}).get("message")), status
+
+
+def test_an_answer_within_its_size_is_read_in_however_many_pieces_the_network_brings_it() -> None:
+    # (The final review of 0.2.1, drivers half, a LOW.) MOST_PIECES counted the pieces the reader is handed, as many as the
+    # network splits an answer into: an answer of 2 MB in 4000 chunks that came in twice as many pieces was dropped as "far
+    # more data". The chunks are counted (a stream of tiny ones is still no answer: the test above), and the size by MAX_REPLY.
+    wire = [b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"]
+    for _ in range(4000):
+        chunk = b"1f4\r\n" + b"x" * 500 + b"\r\n"
+        wire += [chunk[:250], chunk[250:]]  # (each chunk in two pieces, as a network may bring it)
+    wire.append(b"0\r\n\r\n")
+
+    async def run() -> redfish.LineAnswer:
+        line, connection = redfish._Line(), redfish._Connection()
+
+        class Transport:
+            def write(self, data: bytes) -> None:
+                asyncio.get_running_loop().create_task(bring())
+
+            def is_closing(self) -> bool:
+                return False
+
+            def abort(self) -> None:
+                connection.ended = True
+
+            def close(self) -> None:
+                pass
+
+        async def bring() -> None:
+            for piece in wire:
+                while connection.came.is_set():  # (one piece at a time: what came before is read first)
+                    await asyncio.sleep(0)
+                connection.data_received(piece)
+
+        connection.connection_made(Transport())  # type: ignore[arg-type]
+        line.connection = connection
+        return await line.ask("GET", "/redfish/v1/", [("Host", "bmc")], b"", 20.0)
+
+    answer = asyncio.run(run())
+    assert answer.status_code == 200 and len(answer.body) == 4000 * 500
+
+
+@pytest.mark.parametrize("how", ["HTTP/1.0, kept open", "an unasked 100 Continue first", "HTTP/1.0, closed after every answer"])
+def test_a_line_reads_the_answers_http_allows(how: str) -> None:
+    # (The second review's L2, 0.2.1; probe review-bmc/probes/p2_well_answers.py.) An HTTP/1.0 answer (an embedded server's, kept
+    # open or not), and a 1xx answer nobody asked for before the answer itself (RFC 9110 15.2), are answers HTTP allows and the HTTP
+    # library reads: 0.2.0 signed in to all three, each request on a connection of its own where it had to. The line refused them
+    # as no answer at all. Now it reads them. The 1xx is read past, and the sign-in goes on the very connection the root was read
+    # on. An HTTP/1.0 answer does not keep its connection for another request (as the HTTP library's reader, h11, takes HTTP/1.0,
+    # its "keep-alive" too): such a controller closes every connection, and over plain HTTP that is said, and nothing is sent (with
+    # its certificate pinned and its own, each request goes on a fresh connection: see
+    # test_a_controller_that_closes_every_connection_goes_on_fresh_pinned_ones_...).
+    import json as json_module
+
+    heard: list[str] = []
+
+    async def serve(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            while True:
+                head = (await reader.readuntil(b"\r\n\r\n")).decode("latin-1")
+                lines = head.split("\r\n")
+                method, path, _ = lines[0].split(" ", 2)
+                length = next((int(line.split(":", 1)[1]) for line in lines if line.lower().startswith("content-length:")), 0)
+                body = await reader.readexactly(length) if length else b""
+                heard.append(f"{method} {path}" + (" (password)" if b"Password" in body else ""))
+                extra = ""
+                if path.rstrip("/") == "/redfish/v1" and method == "GET":
+                    said: dict[str, Any] = {"RedfishVersion": "1.15.1", "UUID": LINE_ROOT}
+                    status = "200 OK"
+                elif path == "/redfish/v1/SessionService/Sessions" and method == "POST":
+                    said, status = {"Id": "1"}, "201 Created"
+                    extra = "X-Auth-Token: " + "a" * 32 + "\r\nLocation: /redfish/v1/SessionService/Sessions/1\r\n"
+                else:
+                    said, status = {"error": "no"}, "404 Not Found"
+                data = json_module.dumps(said).encode()
+                version = "HTTP/1.1" if how.startswith("an unasked") else "HTTP/1.0"
+                keep = {"HTTP/1.0, kept open": "Connection: keep-alive\r\n", "HTTP/1.0, closed after every answer": "Connection: close\r\n"}.get(how, "")
+                first = b"HTTP/1.1 100 Continue\r\n\r\n" if how.startswith("an unasked") else b""
+                writer.write(first + f"{version} {status}\r\nContent-Type: application/json\r\nContent-Length: {len(data)}\r\n{keep}{extra}\r\n".encode() + data)
+                await writer.drain()
+                if how.endswith("every answer"):
+                    break
+        except (asyncio.IncompleteReadError, ConnectionError, OSError):
+            pass
+        finally:
+            writer.close()
+
+    async def run() -> str:
+        server = await asyncio.start_server(serve, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        device = redfish.RedfishDevice(kvm.DeviceSpec(id="ab12", name="db-01", base_url=f"http://127.0.0.1:{port}", username="admin", password="secret", kind="redfish", machine=LINE_MARK))
+        try:
+            await device._login()
+            return "signed in"
+        except kvm.KvmError as ex:
+            return f"{ex.code}: {ex.message}"
+        finally:
+            await device.close()
+            server.close()
+
+    said = asyncio.run(run())
+    if how.startswith("HTTP/1.0"):
+        assert "closes the connection after every answer" in said and not any("(password)" in one for one in heard), (said, heard)
+    else:
+        assert said == "signed in", (said, heard)
+        assert heard[:2] == ["GET /redfish/v1/", "POST /redfish/v1/SessionService/Sessions (password)"], heard
+
+
 def test_a_controller_with_no_console_qkvm_reads_cannot_take_keys(tmp_path: Path, bmc: FakeBmc) -> None:
     # The default controller here has no console qKVM reads. Keys are not an action it can do; attempted, it is
     # told so, and once that is known the tile stops offering them.
@@ -1981,6 +2760,143 @@ def test_a_press_on_its_way_behind_a_letting_go_is_let_go_of_before_the_console_
                 await watching
 
     asyncio.run(run())
+
+
+class DeafForAWhile(StallingConsole):
+    """A console connection that can stop reading for a while: from `deaf()` on, every send's data is written and then waits
+    until `hears()` (as a WebSocket's does while the far end reads nothing); its transport says whether it was cut off."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.reading = asyncio.Event()
+        self.reading.set()
+        self.waiting = asyncio.Event()  # a send is waiting for room
+        self.aborted = False
+        console = self
+
+        class Transport:
+            def abort(self) -> None:
+                console.aborted = True
+
+        self.transport = Transport()
+
+    async def send(self, data: Any) -> None:
+        self.sent.extend(ami.Messages().feed(bytes(data)))
+        if not self.reading.is_set():
+            self.waiting.set()
+            await self.reading.wait()
+
+    def keys(self) -> list[str]:
+        return [one.body[33:41].hex() for one in self.sent if one.kind == ami.HID]
+
+
+async def a_console_held(conn: StallingConsole, device: redfish.RedfishDevice) -> tuple[asyncio.Future[None], asyncio.Future[None]]:
+    """`device`'s console loop over `conn`, held by this program (the pass taken, "the console is yours"), and looked at."""
+    console = device._console = redfish._Console()
+    device._console_wanted_at = time.monotonic()
+    device._has_console = True
+    device._controller = {"known": True, "rfb": None, "console": None, "version": None, "openbmc": False}
+    watching = asyncio.ensure_future(device._watch_console(console, "c=1", "pass", "127.0.0.1", "127.0.0.1", "s"))
+    console.frames = 1  # (a picture is there: the console counts as open and showing)
+
+    async def looked_at() -> None:
+        while True:
+            device._console_wanted_at = time.monotonic()
+            await asyncio.sleep(0.05)
+
+    looking = asyncio.ensure_future(looked_at())
+    for said in (ami.message(ami.ALLOWED, 2), ami.message(ami.PASS_SEEN, 0, bytes([1, 0])), ami.message(ami.NEXT_HOLDER, ami.BECAME_MASTER)):
+        await conn.incoming.put(said)
+    for _ in range(200):
+        if device._live_send is not None:
+            break
+        await asyncio.sleep(0.01)
+    assert device._live_send is not None
+    return watching, looking
+
+
+UP, A_DOWN = "0000000000000000", "0000040000000000"
+
+
+def test_a_letting_go_behind_a_controller_that_reads_nothing_for_a_while_is_not_given_up(monkeypatch: pytest.MonkeyPatch) -> None:
+    # (The desktop's follow-up 8, 0.2.1; probe devices/redfish/probe_item8_release.py.) A typed key is down when the controller
+    # stops reading for longer than a key may wait to go out (its "still there?" answered, and that answer waiting for room).
+    # The key's letting go waited as long as a key, and the one owed after it as long again: both were given up, the
+    # controller read again, and the console went on with the key down on the server, repeating. A letting go is never given
+    # up for the backlog: it goes as soon as the controller reads again.
+    monkeypatch.setattr(redfish, "HOLD", 0.2)
+    monkeypatch.setattr(redfish, "INPUT_SAY", 0.3)
+    monkeypatch.setattr(redfish, "LET_GO_WITHIN", 0.6)
+    conn = DeafForAWhile()
+    monkeypatch.setattr(redfish, "ws_connect", lambda *args, **kwargs: asyncio.sleep(0, conn))
+
+    async def run() -> tuple[list[str], bool, bool]:
+        device = redfish.RedfishDevice(kvm.DeviceSpec(id="t8", name="server", base_url="http://127.0.0.1:9", username="admin", password="x", kind="redfish"))
+        watching, looking = await a_console_held(conn, device)
+        try:
+            typing = asyncio.ensure_future(device.act("keys", keys="KeyA"))
+            for _ in range(200):
+                if A_DOWN in conn.keys():
+                    break
+                await asyncio.sleep(0.01)
+            conn.reading.clear()  # (the controller reads nothing for a while)
+            await conn.incoming.put(ami.message(ami.STILL_THERE))
+            await conn.waiting.wait()
+            await asyncio.sleep(2.0)  # (longer than the key's letting go and the one owed after it were given, together)
+            conn.reading.set()
+            with contextlib.suppress(kvm.KvmError):
+                await typing
+            await asyncio.sleep(0.5)
+            return conn.keys(), not watching.done(), device._held_keys
+        finally:
+            looking.cancel()
+            watching.cancel()
+            with contextlib.suppress(asyncio.CancelledError, kvm.KvmError):
+                await watching
+
+    keys, still_open, held = asyncio.run(run())
+    assert still_open and keys[-1] == UP and not held, f"the console went on with the key down: {keys}, held={held}"
+
+
+def test_a_letting_go_that_cannot_go_out_ends_the_console_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    # (The same.) The controller reads nothing for longer than a letting go may wait: the console session is ended (its
+    # connection cut off), which has the controller let go of what the session held, and the console is not gone on with.
+    monkeypatch.setattr(redfish, "HOLD", 0.2)
+    monkeypatch.setattr(redfish, "INPUT_SAY", 0.3)
+    monkeypatch.setattr(redfish, "LET_GO_WITHIN", 0.6)
+    monkeypatch.setattr(redfish, "LET_GO_SAY", 1.0, raising=False)
+    conn = DeafForAWhile()
+    monkeypatch.setattr(redfish, "ws_connect", lambda *args, **kwargs: asyncio.sleep(0, conn))
+
+    async def run() -> tuple[bool, bool, str]:
+        device = redfish.RedfishDevice(kvm.DeviceSpec(id="t9", name="server", base_url="http://127.0.0.1:9", username="admin", password="x", kind="redfish"))
+        watching, looking = await a_console_held(conn, device)
+        try:
+            typing = asyncio.ensure_future(device.act("keys", keys="KeyA"))
+            for _ in range(200):
+                if A_DOWN in conn.keys():
+                    break
+                await asyncio.sleep(0.01)
+            conn.reading.clear()  # (and does not read again)
+            with contextlib.suppress(kvm.KvmError):
+                await typing
+            for _ in range(60):
+                if watching.done():
+                    break
+                await asyncio.sleep(0.1)
+            ended = ""
+            if watching.done() and not watching.cancelled() and isinstance(watching.exception(), kvm.KvmError):
+                ended = str(watching.exception())
+            return conn.aborted, watching.done(), ended
+        finally:
+            looking.cancel()
+            watching.cancel()
+            conn.reading.set()
+            with contextlib.suppress(asyncio.CancelledError, kvm.KvmError):
+                await watching
+
+    aborted, ended, said = asyncio.run(run())
+    assert aborted and ended and "letting go" in said, (aborted, ended, said)
 
 
 class LoseKeys:

@@ -40,14 +40,16 @@ ROUTES: dict[tuple[str, str], tuple[str, str]] = {
     ("GET", "/api/v1/session"): ("nobody", ""),
     ("POST", "/api/v1/setup"): ("nobody", "C"),
     ("POST", "/api/v1/login"): ("nobody", "T"),  # (for a code that is used up; the session itself is kept in memory)
-    ("POST", "/api/v1/recover"): ("nobody", "C"),
+    # The recovery key, and an account's own password below, are checked beside every change, and the turn is taken for the
+    # change alone: anybody may send /recover, and its check in the turn held every change of the wall (review of 0.2.0).
+    ("POST", "/api/v1/recover"): ("nobody", "T"),
     ("POST", "/api/v1/display"): ("nobody", ""),  # a session, in memory
     ("POST", "/api/v1/logout"): ("viewer", "E"),  # a session, in memory
-    ("POST", "/api/v1/password"): ("viewer", "CO"),
+    ("POST", "/api/v1/password"): ("viewer", "TO"),
     ("POST", "/api/v1/totp/begin"): ("viewer", "OE"),  # what is begun is kept in memory until it is enabled
     ("POST", "/api/v1/totp/enable"): ("viewer", "COE"),
-    ("POST", "/api/v1/totp/codes"): ("viewer", "CO"),
-    ("POST", "/api/v1/totp/disable"): ("viewer", "CO"),
+    ("POST", "/api/v1/totp/codes"): ("viewer", "TO"),
+    ("POST", "/api/v1/totp/disable"): ("viewer", "TO"),
     ("GET", "/api/v1/about"): ("viewer", ""),
     ("GET", "/api/v1/wall"): ("viewer", ""),
     ("GET", "/api/v1/status"): ("viewer", ""),
@@ -81,7 +83,7 @@ ROUTES: dict[tuple[str, str], tuple[str, str]] = {
     ("DELETE", "/api/v1/tokens/{token_id}"): ("admin", "C"),
     ("GET", "/api/v1/security"): ("admin", ""),
     ("PUT", "/api/v1/security"): ("admin", "C"),
-    ("POST", "/api/v1/recovery"): ("admin", "C"),
+    ("POST", "/api/v1/recovery"): ("admin", "T"),
     ("GET", "/api/v1/settings"): ("admin", ""),
     ("PUT", "/api/v1/settings"): ("admin", "C"),
     ("GET", "/api/v1/alerts"): ("admin", ""),

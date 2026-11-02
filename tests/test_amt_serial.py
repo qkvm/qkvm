@@ -7,16 +7,18 @@ was text. So what a PC writes is the stand-in's here, and the hostile engine is 
 from __future__ import annotations
 
 import asyncio
+import socket
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Awaitable, Callable, Iterator
 from types import SimpleNamespace
 
 import pytest
 
 from qkvm import amtserial, rfb
+from qkvm.amt import AmtDevice, Answered
 from qkvm.amtserial import Kept, SerialConsole
 from qkvm.kvm import REJECTED, DeviceSpec, KvmError
-from tests.fake_amt import AmtState, FakeAmt
+from tests.fake_amt import OTHER_GUID, OTHER_REALM, AmtState, FakeAmt, FakeRedirection, V6Amt
 
 
 @pytest.fixture(autouse=True)
@@ -32,8 +34,23 @@ def pc() -> Iterator[FakeAmt]:
     machine.stop()
 
 
+def asked_of(spec: DeviceSpec) -> Callable[[], Awaitable[Answered]]:
+    """The tile's question which PC answers (AmtDevice._before_a_session), as a console is given it: asked by a tile of `spec`
+    made for the question and closed after it, in the loop the console runs in."""
+
+    async def checked() -> Answered:
+        device = AmtDevice(spec)
+        try:
+            return await device._before_a_session()
+        finally:
+            await device.close()
+
+    return checked
+
+
 def console_of(machine: FakeAmt, password: str = "secret") -> SerialConsole:
-    return SerialConsole(DeviceSpec(id="ab12", name="PC", base_url=machine.url, username="admin", password=password, kind="amt"))
+    spec = DeviceSpec(id="ab12", name="PC", base_url=machine.url, username="admin", password=password, kind="amt")
+    return SerialConsole(spec, checked=asked_of(spec))
 
 
 async def read_until(console: SerialConsole, wanted: int, within: float = 5.0, quiet_within: float = amtserial.QUIET_WITHIN) -> None:
@@ -290,3 +307,116 @@ def test_a_serial_console_open_bars_cutting_the_power_as_a_kvm_session_does(pc: 
             await running
 
     asyncio.run(run())
+
+
+# --- which PC answers, on the console's own connection (0.2.1) --------------------------------------------------------
+
+
+def bound(url: str) -> tuple[AmtDevice, SerialConsole]:
+    """A tile of the PC, and its serial console bound to it: before it opens, the console asks the tile which PC answers
+    (AmtDevice._before_a_session, as the screen session does), goes to the address that answer came from and compares the
+    realm there."""
+    device = AmtDevice(DeviceSpec(id="ab12", name="PC", base_url=url, username="admin", password="secret", kind="amt"))
+    return device, SerialConsole(device.spec, checked=device._before_a_session)
+
+
+def test_another_engine_on_the_redirection_port_is_not_sent_the_password_by_the_serial_console() -> None:
+    # (Round 3 of 0.2.1, as the screen session since 76e85b2.) What answers on the redirection port at the very address is not
+    # the engine that said which PC it is (its realm, which every engine has of its own, is another): the console is refused
+    # before the Digest answer goes, and none is begun. Before: the other engine had the Digest answer and gave its console.
+    pc = FakeAmt()
+    pc.state.sol_text = [b"hello"]
+    other = AmtState(guid=OTHER_GUID, realm=OTHER_REALM, sol_text=[b"other"])
+    pc.redirection = FakeRedirection(other, pc.redirection._sock, None)
+    pc.start()
+    try:
+        device, console = bound(pc.url)
+
+        async def run() -> KvmError:
+            try:
+                with pytest.raises(KvmError) as caught:
+                    await console.run(asyncio.Event())
+                return caught.value
+            finally:
+                await device.close()
+
+        error = asyncio.run(run())
+        assert (error.code, error.message) == ("another_machine", amtserial.OTHER_ENGINE)
+        assert other.redirections == 1 and (other.redirection_logins, other.sol_sessions) == (0, 0), "the other engine was sent the Digest answer"
+        assert console.kept.total == 0 and REJECTED.times(REJECTED.what("login", console.spec)) == 0
+    finally:
+        pc.stop()
+
+
+def test_the_serial_console_goes_to_the_engine_that_said_which_pc_it_is_where_its_name_has_two_addresses() -> None:
+    # (The same.) The tile's name resolves to two addresses ("localhost" here: 127.0.0.1 and ::1; a stale record beside the
+    # current one, in a real network). Which PC answers is asked on WS-Management, which reaches the tile's PC at one of them;
+    # the console goes to the address that answer came from, not to the name resolved anew (before: it reached the other PC at
+    # the other address, which had the Digest answer and gave its console).
+    if len({info[4][0] for info in socket.getaddrinfo("localhost", 1, type=socket.SOCK_STREAM)}) < 2:
+        pytest.skip("localhost has one address here")
+    a = b_sock = None
+    for _ in range(20):
+        a = V6Amt()
+        b_sock = socket.socket()
+        try:
+            b_sock.bind(("127.0.0.1", a.port + 2))
+            break
+        except OSError:
+            b_sock.close()
+            a.redirection._sock.close()
+            a._sock.close()
+            a = None
+    assert a is not None and b_sock is not None
+    a.url = f"http://localhost:{a.port}"
+    a.state.sol_text = [b"hello"]
+    other = AmtState(guid=OTHER_GUID, realm=OTHER_REALM, sol_text=[b"other"])
+    b = FakeRedirection(other, b_sock, None)
+    a.start()
+    b.start()
+    try:
+        device, console = bound(a.url)
+
+        async def run() -> None:
+            try:
+                await read_until(console, 5)
+            finally:
+                await device.close()
+
+        asyncio.run(run())
+        assert console.kept.last() == b"hello"
+        assert (other.redirections, other.redirection_logins, other.sol_sessions) == (0, 0, 0), "the other PC was reached"
+        assert (a.state.redirection_logins, a.state.sol_sessions) == (1, 1)
+    finally:
+        a.stop()
+        b.stop()
+
+
+def test_a_serial_console_whose_tile_cannot_tell_which_pc_answers_opens_nothing(pc: FakeAmt) -> None:
+    # (The same.) What the tile's question says is said by the console, and nothing goes to the redirection port: here the PC
+    # answers with the number of another PC than the one this tile was added for.
+    from qkvm.amt import own_number
+
+    device = AmtDevice(DeviceSpec(id="ab12", name="PC", base_url=pc.url, username="admin", password="secret", kind="amt", machine=own_number(OTHER_GUID)))
+    console = SerialConsole(device.spec, checked=device._before_a_session)
+
+    async def run() -> KvmError:
+        try:
+            with pytest.raises(KvmError) as caught:
+                await console.run(asyncio.Event())
+            return caught.value
+        finally:
+            await device.close()
+
+    assert asyncio.run(run()).code == "another_machine"
+    assert pc.state.redirections == 0 and pc.state.sol_sessions == 0
+
+
+def test_a_serial_console_is_not_made_without_its_tiles_question_which_pc_answers() -> None:
+    # (The coordinator, round 3 of 0.2.1.) Bound as the screen session is, or not made at all: nothing builds a serial console
+    # that would go to whatever answers at the name and sign in there.
+    spec = DeviceSpec(id="ab12", name="PC", base_url="http://127.0.0.1:16992", username="admin", password="secret", kind="amt")
+    with pytest.raises(TypeError):
+        SerialConsole(spec)  # type: ignore[call-arg]
+    with pytest.raises(TypeError):
+        SerialConsole(spec, Kept())  # type: ignore[arg-type,misc]

@@ -43,6 +43,7 @@ def fast(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(update, "DEFAULT_REPO", "")
     REJECTED.clear()
     vncdevice._PACED.clear()
+    proxmox._FORGIVEN.clear()
     proxmox._NODES.clear()
     proxmox._LISTED_FOR.clear()
 
@@ -219,6 +220,34 @@ def test_the_guests_a_token_may_see_are_listed_to_pick_from(tmp_path: Path, pve:
         assert operator.post("/api/v1/proxmox/guests", json={"url": pve.url, "username": TOKEN_ID, "password": SECRET}).status_code == 403  # adding is for admins
 
 
+def test_the_list_to_pick_from_knows_a_guest_on_the_wall_by_its_number_whatever_node_it_is_on_now(tmp_path: Path, pve: FakeProxmox) -> None:
+    # Register row 13 of 0.2.1 (fx-b2 Open). The list marked a guest "on the wall" by its address, which names the node it
+    # was added on: a guest moved to another node of its cluster since (its tile follows it there, its address stays as it
+    # was added) was listed as one to pick, with a box to tick, and its tile's name nowhere.
+    pve.state.nodes = ["pve1", "pve2"]
+    with wall(tmp_path) as admin:
+        assert admin.post("/api/v1/devices", json={"url": pve.guest_url(100), **TOKEN}).status_code == 201
+        pve.state.guests[100].node = "pve2"  # moved within the cluster
+        said = admin.post("/api/v1/proxmox/guests", json={"url": pve.url, "username": TOKEN_ID, "password": SECRET}).json()
+        assert [(guest["vmid"], guest["node"], guest["known_as"]) for guest in said["guests"]] == [(100, "pve2", "web"), (101, "pve1", None)]
+
+
+def test_the_list_to_pick_from_says_a_new_vm_under_the_number_of_a_tile_and_not_that_it_is_the_tiles(tmp_path: Path, pve: FakeProxmox) -> None:
+    # Register row 13 of 0.2.1, the rest of it (the coordinator's decision): a guest deleted and another VM made under its
+    # number was listed as on the wall under the deleted guest's tile, by its number alone. The tile keeps the number its
+    # guest gave for itself (its SMBIOS UUID): where the VM under that number now gives another, it is not that tile's, and
+    # the list says so plainly. (Its box stays off: the number is the tile's until that tile is removed.)
+    with wall(tmp_path) as admin:
+        assert admin.post("/api/v1/devices", json={"url": pve.guest_url(100), **TOKEN}).status_code == 201
+        wait_until(lambda: admin.core.store.devices[0].machine != "", "the guest's own number was never kept")  # type: ignore[attr-defined]
+        listed = admin.post("/api/v1/proxmox/guests", json={"url": pve.url, "username": TOKEN_ID, "password": SECRET}).json()["guests"]
+        assert (listed[0]["vmid"], listed[0]["known_as"], listed[0].get("new_under")) == (100, "web", None)
+        pve.delete_guest(100)
+        assert pve.make_guest("fresh").vmid == 100
+        listed = admin.post("/api/v1/proxmox/guests", json={"url": pve.url, "username": TOKEN_ID, "password": SECRET}).json()["guests"]
+        assert [(guest["vmid"], guest["name"], guest["known_as"], guest.get("new_under")) for guest in listed] == [(100, "fresh", None, "web"), (101, "db", None, None)]
+
+
 def test_a_guest_named_by_its_number_alone_gets_its_node_looked_up(tmp_path: Path, pve: FakeProxmox) -> None:
     pve.state.nodes = ["pve1", "pve2"]
     pve.state.guests[100].node = "pve2"
@@ -374,6 +403,42 @@ def test_one_console_is_held_while_somebody_looks_and_let_go_of_after(pve: FakeP
             await picture_of(device)  # somebody looks again: a console again
             assert consoles_opened(pve) == 2
             assert all(ticket.used for ticket in pve.state.tickets) and pve.state.hung == 0
+        finally:
+            await device.close()
+
+    asyncio.run(run())
+
+
+def test_a_console_is_not_let_go_of_while_a_picture_is_being_made_of_it(pve: FakeProxmox, monkeypatch: pytest.MonkeyPatch) -> None:
+    # (Register row 28, found under load: the test above failed there.) A console is not let go of while a picture is being
+    # made of it, and is held LET_GO_AFTER from the moment the picture is handed over, as after keys (see
+    # VncDevice.inputting). It was let go of LET_GO_AFTER after the picture was asked for, while it was still being made
+    # (a busy computer makes a large one in seconds: under a load of my own, four and a half against the test's hold of
+    # one), and the next look opened another console, one more task in Proxmox's log. Here the hold is half a second and
+    # each picture takes one and a half to make.
+    monkeypatch.setattr(proxmox.ProxmoxConsole, "LET_GO_AFTER", 0.5)
+    real = vncdevice.rgb_jpeg
+
+    def slow(*args: Any, **kwargs: Any) -> Any:
+        time.sleep(1.5)  # (in the thread the picture is made in, as a busy computer makes it)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(vncdevice, "rgb_jpeg", slow)
+
+    async def run() -> None:
+        device = a_guest(pve)
+        try:
+            await device.status()
+            await picture_of(device)
+            session = device._console._session
+            assert session is not None and not session.done.is_set(), "let go of while its picture was being made"
+            await device.snapshot(640)  # (another size: made anew, in one and a half seconds again)
+            assert device._console._session is session and not session.done.is_set()
+            assert consoles_opened(pve) == 1 and pve.state.consoles == 1
+            deadline = time.monotonic() + 5
+            while pve.state.consoles and time.monotonic() < deadline:  # nobody looks: let go of half a second after
+                await asyncio.sleep(0.05)
+            assert pve.state.consoles == 0 and consoles_opened(pve) == 1
         finally:
             await device.close()
 
@@ -1559,13 +1624,24 @@ def test_a_console_cut_after_a_while_twice_is_waited_for_the_second_time(pve: Fa
     asyncio.run(run())
 
 
-async def cut_whenever_served(pve: FakeProxmox, device: ProxmoxGuest, served: float, seconds: float, live: bool = False, once: bool = False) -> None:
+async def cut_whenever_served(
+    pve: FakeProxmox, device: ProxmoxGuest, served: float, seconds: float, live: bool = False, once: bool = False, from_first_picture: bool = False
+) -> None:
     """Ask for the guest's screen as a tile does (or as a live line, `live`) for `seconds`, and cut every console Proxmox
-    holds once it has served `served` seconds: a proxy in front with a limit of its own. `once`: the first cut ends it."""
-    deadline = time.monotonic() + seconds
-    while time.monotonic() < deadline:
+    holds once it has served `served` seconds: a proxy in front with a limit of its own. `once`: the first cut ends it.
+    `from_first_picture`: the seconds are counted from the first picture (given up on where none comes in a minute).
+
+    (Each console's first picture starts the video worker it is made in, which takes a busy computer seconds: under a load
+    of my own the first took six of the seven seconds the ladder test watched, and one console was all it saw. Register
+    row 28.)"""
+    deadline = None if from_first_picture else time.monotonic() + seconds
+    give_up = time.monotonic() + 60
+    while deadline is None or time.monotonic() < deadline:
+        assert time.monotonic() < give_up, "no picture of the guest's screen in a minute"
         try:
             await (device.live_screen() if live else device.snapshot(640))
+            if deadline is None:
+                deadline = time.monotonic() + seconds
         except KvmError:
             pass
         session = device._console._session
@@ -1595,7 +1671,7 @@ def test_a_console_cut_again_and_again_after_it_served_climbs_the_ladder(pve: Fa
         device = a_guest(pve)
         try:
             await device.status()
-            await cut_whenever_served(pve, device, served=0.6, seconds=7.0, live=live)
+            await cut_whenever_served(pve, device, served=0.6, seconds=7.0, live=live, from_first_picture=True)
             assert consoles_opened(pve) == 3, f"{consoles_opened(pve)} consoles"
             assert device._console._failures == 3
             assert device.console_readable is False
@@ -2498,3 +2574,244 @@ def test_the_number_a_guest_gives_goes_into_an_export_file_and_comes_out_of_it(t
         pve.make_guest("prod-db")
         refused = client.post(f"/api/v1/devices/{record.id}/actions", json={"action": "atx_power_long"})
         assert (refused.status_code, refused.json()["code"]) == (502, "another_machine") and pve.state.tasks == []
+
+
+# --- the guest's number, where its settings cannot be read as an edit or an addition takes it -----------------------------
+
+
+def settings_have_a_moment(monkeypatch: pytest.MonkeyPatch, times: int = 1) -> list[int]:
+    """The guest's settings (where its number is) answer an error of Proxmox's own the next `times` times they are read."""
+    real = ProxmoxGuest._guest
+    left = [times]
+
+    async def flaky(self: ProxmoxGuest, method: str, step: str, what: str, **options: Any) -> Any:
+        if step == "config" and left[0] > 0:
+            left[0] -= 1
+            raise proxmox.Unwell("bad_response", "Proxmox answered read this guest's settings with HTTP 500: unable to read file: busy")
+        return await real(self, method, step, what, **options)
+
+    monkeypatch.setattr(ProxmoxGuest, "_guest", flaky)
+    return left
+
+
+def test_an_edit_with_the_tokens_secret_typed_while_the_settings_cannot_be_read_keeps_the_guests_number(
+    tmp_path: Path, pve: FakeProxmox, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # (The review's probe p3.) Whoever types the token's secret in an edit takes the virtual machine that has the guest's
+    # number now: which one that is, is read from its settings. Read as an error of the moment, the edit saved the tile with no
+    # number at all, and the next virtual machine made under the guest's number was taken on first use: "Hold power" stopped it.
+    with wall(tmp_path) as client:
+        device = client.post("/api/v1/devices", json={"url": pve.guest_url(100), **TOKEN}).json()["device"]["id"]
+        before = client.core.store.device(device).machine  # type: ignore[attr-defined]
+        assert before == number_of(pve.state.guests[100])
+        settings_have_a_moment(monkeypatch)
+        edit = client.put(f"/api/v1/devices/{device}", json={"url": pve.guest_url(100), **TOKEN, "name": "web"})
+        assert (edit.status_code, edit.json()["code"]) == (422, "bad_response"), edit.text
+        assert "could not be told" in edit.json()["message"]
+        assert client.core.store.device(device).machine == before  # type: ignore[attr-defined]
+        # The worst case: the guest is deleted, and another virtual machine made under its number before the tile looks again.
+        pve.delete_guest(100)
+        other = pve.make_guest("prod-db")
+        pressed = client.post(f"/api/v1/devices/{device}/actions", json={"action": "atx_power_long"})
+        assert (pressed.status_code, pressed.json()["code"]) == (502, "another_machine"), pressed.text
+        assert other.status == "running" and pve.state.tasks == []
+        # Tried again once the settings are read, the edit takes what has the number now, as ever.
+        taken = client.put(f"/api/v1/devices/{device}", json={"url": pve.guest_url(100), **TOKEN, "name": "web"})
+        assert taken.status_code == 200 and client.core.store.device(device).machine == number_of(other)  # type: ignore[attr-defined]
+
+
+def test_a_guest_whose_settings_cannot_be_read_as_it_is_added_is_not_added_unknown(tmp_path: Path, pve: FakeProxmox, monkeypatch: pytest.MonkeyPatch) -> None:
+    # (As a server whose number cannot be read as it is added: which machine it is could not be told, nothing is added that
+    # would take the first virtual machine it sees for it, and the next try adds it.)
+    with wall(tmp_path) as client:
+        settings_have_a_moment(monkeypatch)
+        first = client.post("/api/v1/devices", json={"url": pve.guest_url(100), **TOKEN})
+        assert (first.status_code, first.json()["code"]) == (422, "bad_response") and "could not be told" in first.json()["message"], first.text
+        assert client.core.store.devices == []  # type: ignore[attr-defined]
+        again = client.post("/api/v1/devices", json={"url": pve.guest_url(100), **TOKEN})
+        assert again.status_code == 201, again.text
+        assert client.core.store.device(again.json()["device"]["id"]).machine == number_of(pve.state.guests[100])  # type: ignore[attr-defined]
+
+
+def test_an_edit_without_the_secret_while_the_settings_cannot_be_read_is_saved_and_keeps_the_number(tmp_path: Path, pve: FakeProxmox, monkeypatch: pytest.MonkeyPatch) -> None:
+    # (The earlier decision, tests/test_which_server_answers.py: a number that could not be read just now is said as nothing,
+    # which is not "it says none": an edit that takes nothing keeps what the tile is known by, and is saved.)
+    with wall(tmp_path) as client:
+        device = client.post("/api/v1/devices", json={"url": pve.guest_url(100), **TOKEN}).json()["device"]["id"]
+        before = client.core.store.device(device).machine  # type: ignore[attr-defined]
+        settings_have_a_moment(monkeypatch)
+        edit = client.put(f"/api/v1/devices/{device}", json={"url": pve.guest_url(100), "username": TOKEN_ID, "password": "", "kind": "proxmox", "name": "web, renamed"})
+        assert edit.status_code == 200, edit.text
+        assert client.core.store.device(device).machine == before  # type: ignore[attr-defined]
+
+
+# --- a power command whose answer was lost --------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("lost", [596, 597, 502, 503, 504])
+def test_a_power_command_whose_answer_was_lost_may_have_been_done(tmp_path: Path, pve: FakeProxmox, lost: int) -> None:
+    # (The review's probe p4.) A tile names one node; a guest on another node of the cluster is reached through it, and Proxmox
+    # hands the command on and passes its own codes back where the answer did not come back (596, 597), as a proxy in front of
+    # it does (502 to 504). The command was carried out: said as not done, the history kept it as not pressed, and "Retry
+    # failed" pressed it again. It may have been done, and is said so.
+    pve.state.power_answer = lost
+    with wall(tmp_path) as client:
+        device = client.post("/api/v1/devices", json={"url": pve.guest_url(100), **TOKEN}).json()["device"]["id"]
+        pressed = client.post(f"/api/v1/devices/{device}/actions", json={"action": "atx_reset"})
+        assert (pressed.status_code, pressed.json()["code"]) == (504, "timeout"), pressed.text
+        assert "may have been done" in pressed.json()["message"] and [task["type"] for task in pve.state.tasks] == ["qmreset"]
+        deadline = time.monotonic() + 10
+        while not (rows := [row for row in client.get(f"/api/v1/devices/{device}/history", params={"what": "events"}).json()["rows"] if row["kind"] == "pressed"]):
+            assert time.monotonic() < deadline, "the press never reached the history"
+            time.sleep(0.1)
+        assert [(row["what"], row["ok"]) for row in rows] == [("atx_reset", None)]  # (unknown: not "not pressed")
+
+
+def test_a_power_command_proxmox_could_not_hand_on_is_not_done(tmp_path: Path, pve: FakeProxmox) -> None:
+    # 595: the node the command was for could not be connected to. Nothing reached it: not done, as before.
+    pve.state.power_answer = 595
+    with wall(tmp_path) as client:
+        device = client.post("/api/v1/devices", json={"url": pve.guest_url(100), **TOKEN}).json()["device"]["id"]
+        pressed = client.post(f"/api/v1/devices/{device}/actions", json={"action": "atx_reset"})
+        assert (pressed.status_code, pressed.json()["code"]) == (502, "unreachable"), pressed.text
+        assert pve.state.tasks == []
+
+
+# --- a wrong token on many guests at once ---------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("how", ["certificate not saved yet", "the system's list first used"])
+def test_a_wrong_token_on_many_guests_signing_in_together_is_one_no(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, how: str) -> None:
+    # (The review's probe p1.) Every guest of one Proxmox shares one verdict on its token (README: "for every guest of that
+    # Proxmox together"). Where the first looks came together with a wait before the sign-in (the certificate fetched on first
+    # contact, the system's list of authorities read on first use), each passed the check before any had gone out, and each
+    # no was counted: twelve guests, twelve noes, and the token held back for an hour where one no holds it a minute.
+    guests = 12
+    pve = FakeProxmox(PveState(guests={100 + i: Guest(100 + i, f"g{i}") for i in range(guests)}), tls_dir=tmp_path / "pve").start()
+    if how == "the system's list first used":
+
+        def slow_list() -> Any:  # (reading the system's list takes a moment, in a thread; nothing is asked of the network)
+            time.sleep(0.25)
+            return kvm.unverified_context()
+
+        monkeypatch.setattr(kvm, "system_context", kvm._once(slow_list))
+    wrong = "11111111-2222-3333-4444-555555555555"
+    tls, cert = ("system", None) if how == "the system's list first used" else ("pinned", None)
+
+    async def run() -> tuple[int, int, float]:
+        tiles = [
+            ProxmoxGuest(DeviceSpec(id=f"g{i}", name=f"g{i}", base_url=pve.guest_url(100 + i), username=TOKEN_ID, password=wrong, tls=tls, cert_pem=cert, kind="proxmox"))
+            for i in range(guests)
+        ]
+        try:
+            said = await asyncio.gather(*(tile._read_status() for tile in tiles))
+            assert {one["state"] for one in said} <= {"auth", "error"} and any(one["state"] == "auth" for one in said), said
+            return pve.state.refused, REJECTED.times(tiles[0]._offered()), REJECTED.wait_left(tiles[0]._offered())
+        finally:
+            for tile in tiles:
+                await tile.close()
+
+    try:
+        refused, noes, held = asyncio.run(run())
+        assert (refused, noes) == (1, 1), f"401s at Proxmox: {refused}, noes counted: {noes}"
+        assert 0 < held <= kvm.wait_after_rejections(1)  # (a minute, not an hour)
+    finally:
+        pve.stop()
+
+
+# --- a token taken back in the middle of a start's wait (register row 20) -------------------------------------------------
+
+
+def test_a_token_taken_back_during_a_starts_wait_adds_no_sign_in_past_the_waits_bound(pve: FakeProxmox, monkeypatch: pytest.MonkeyPatch) -> None:
+    # (fx-b2's note.) Every read in the wait for a start is held to one bound from the press (`until`); a 401 in the middle of
+    # it signed in again with no bound but the sign-in's own (Proxmox holds a refused token's answer three seconds), past
+    # what the page waits for the button. A sign-in goes only where the wait has the time a sign-in may take.
+    monkeypatch.setattr(proxmox, "TASK_WITHIN", 1.0)
+    monkeypatch.setattr(proxmox, "CONFIRM_WITHIN", 1.0)
+    pve.state.power_takes = 100.0  # (the guest is not seen started within the wait)
+    real = ProxmoxGuest._guest
+
+    async def then_taken_back(self: ProxmoxGuest, method: str, step: str, what: str, **options: Any) -> Any:
+        said = await real(self, method, step, what, **options)
+        if method == "POST" and step == "status/start":
+            pve.state.secret = "99999999-8888-7777-6666-555555555555"  # (the token deleted in Proxmox, just then)
+        return said
+
+    monkeypatch.setattr(ProxmoxGuest, "_guest", then_taken_back)
+
+    async def run() -> KvmError:
+        device = a_guest(pve, 101)  # (stopped)
+        device._refresh_soon = lambda: None  # type: ignore[method-assign,assignment,return-value]  # (the wait's own reads alone: no look of the tile's beside it)
+        try:
+            with pytest.raises(KvmError) as said:
+                await device.act("power_on")
+            return said.value
+        finally:
+            await device.close()
+
+    said = asyncio.run(run())
+    assert said.code == "timeout", (said.code, said.message)  # (whether it started was not seen: said as that)
+    assert "GET /version" not in pve.state.refused_paths, pve.state.refused_paths  # (no sign-in in the wait)
+
+
+def test_the_once_in_five_minutes_forgiveness_outlives_the_tile_being_made_anew(pve: FakeProxmox) -> None:
+    # (Register row 10, the Proxmox part.) When the console was last forgiven for the guest seen stopped (or begun again) was
+    # kept in the console, which is made anew at every edit of the tile, at a lock and unlock, at a removal and an addition:
+    # each new one could forgive at once, and a Proxmox that says "stopped" by turns had the ladder reset as often. Kept
+    # beside the ladder itself now, by address, as the ladder is (vncdevice._PACED).
+    async def run() -> None:
+        first = a_guest(pve)
+        try:
+            first._console._failures = 3
+            first._console.guest_stopped()
+            assert first._console._failures == 0  # (forgiven)
+        finally:
+            await first.close()
+        again = a_guest(pve)  # (the tile edited: a new guest, a new console, at the same address)
+        try:
+            again._console._failures = 4
+            again._console.guest_stopped()
+            assert again._console._failures == 4, "forgiven again at once by the console made anew"
+            again._console.guest_began_again(time.monotonic())  # (and the other forgiveness, likewise: none to give here)
+        finally:
+            await again.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("how", ["certificate saved", "certificate not saved yet", "the system's list first used"])
+def test_many_guests_with_the_right_token_looking_at_once_are_all_online_at_their_first_look(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, how: str) -> None:
+    # (Pulled back from 0.3.0; the second review's note on c8c54cd.) At a wall's start with many guests of one Proxmox on one
+    # token, the first guest's sign-in went, and the others, held back while it was under way ("a sign-in to it is under way,
+    # or the last one came to nothing"), said no_sign_in at their first look: eleven of twelve tiles flashed a problem. They
+    # wait for that sign-in's answer now, and go on as it went.
+    guests = 12
+    pve = FakeProxmox(PveState(guests={100 + i: Guest(100 + i, f"g{i}") for i in range(guests)}), tls_dir=tmp_path / "pve").start()
+    if how == "the system's list first used":
+
+        def slow_list() -> Any:  # (reading the system's list takes a moment, in a thread; nothing is asked of the network)
+            time.sleep(0.25)
+            return kvm.unverified_context()
+
+        monkeypatch.setattr(kvm, "system_context", kvm._once(slow_list))
+
+    async def run() -> list[str]:
+        cert = await kvm.fetch_certificate(pve.guest_url(100)) if how == "certificate saved" else None
+        tls = "system" if how == "the system's list first used" else "pinned"
+        tiles = [
+            ProxmoxGuest(DeviceSpec(id=f"g{i}", name=f"g{i}", base_url=pve.guest_url(100 + i), username=TOKEN_ID, password=SECRET, tls=tls, cert_pem=cert, kind="proxmox"))
+            for i in range(guests)
+        ]
+        try:
+            said = await asyncio.gather(*(tile._read_status() for tile in tiles))
+            return [str(one["state"]) for one in said]
+        finally:
+            for tile in tiles:
+                await tile.close()
+
+    try:
+        states = asyncio.run(run())
+        assert states == ["online"] * guests, states
+        assert pve.state.refused == 0
+    finally:
+        pve.stop()

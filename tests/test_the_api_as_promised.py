@@ -291,7 +291,7 @@ def test_every_promised_request_answers_as_the_table_says(tmp_path: Path, monkey
         seen.refused("POST", "/api/v1/display", screen.post("/api/v1/display", json={"key": "qkvm_not-a-link-that-was-made"}), 401, "bad_key")
         shown = screen.post("/api/v1/display", json={"key": link})
         assert shown.status_code == 200, shown.text
-        seen.shaped(("POST", "/api/v1/display"), shown.json(), {"ok": BOOL, "user": DICT})
+        seen.shaped(("POST", "/api/v1/display"), shown.json(), {"ok": BOOL, "user": DICT, "expires": NUM + NULL, "expires_in": NUM + NULL})
         seen.shaped("An account", shown.json()["user"], ACCOUNT)
         assert shown.json()["user"]["token"] is True and shown.json()["user"]["role"] == "viewer"
         assert screen.get("/api/v1/wall").status_code == 200

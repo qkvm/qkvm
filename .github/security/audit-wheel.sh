@@ -21,7 +21,7 @@ with open(sys.argv[1], "w", encoding="utf-8") as requirements:
             requirements.write(f"{name}=={version}\n")
 PY
 python -m venv "$audit_tmp/auditor"
-"$audit_tmp/auditor/bin/python" -m pip install pip-audit==2.10.0
+"$audit_tmp/auditor/bin/python" -m pip install pip-audit==2.10.1
 # No cache reuse: a release always checks today's advisory service, and lookup errors fail closed.
 "$audit_tmp/auditor/bin/python" -m pip_audit --strict --disable-pip --no-deps \
   --cache-dir "$audit_tmp/cache" -r "$out/requirements.txt" --format json --output "$out/pip-audit.json"

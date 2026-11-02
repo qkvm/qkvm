@@ -85,6 +85,10 @@ HELLO_WITHIN = 10.0  # seconds a line has to show its pass
 # picture is: a viewer behind by two is handed the newest). A picture is held once for every viewer that has it waiting.
 QUEUE_H264, QUEUE_JPEG = 8, 2
 MOST_WORDS = 64  # messages of text that may wait for one viewer; more, and it is not reading at all
+# ...and that may come from one while its holder's word waits for the hand-over (HAND_OVER_WITHIN), and are kept for after:
+# the pointer's moves are folded, keys and buttons are not, and somebody typing on for the sixteen seconds sends some three
+# hundred of them. More, and the line floods.
+MOST_WORDS_WAITING = 512
 MOST_WORD = 4096  # bytes one message from a client may be: the longest the draft has is a few dozen
 MOST_A_SECOND = 2000  # messages from one client in one second; more is flooding (a mouse reports a thousand times a second at the most)
 MOST_STEPS = 8  # words to a device that one relative move of the pointer is cut into, at the most (a signed byte each way: a thousand pixels)
@@ -1277,13 +1281,19 @@ class JetSource(Source):
     """A JetKVM's picture: JPEG made of the frames this program decodes, each when there is a new one, at the viewers' pace."""
 
     codec = "jpeg"
+    made_of_at = float("-inf")  # the time of the frame the last picture was made of (see `last`)
 
     @property
     def last(self) -> Picture | None:
         """The last picture offered, for a viewer that comes or asks for a key frame; none where the JetKVM has said its
-        screen is back since it (asked of the device as it is asked for, not at the next turn of the loop)."""
-        awaited = getattr(self.machine.device, "picture_awaited", None)
-        return None if callable(awaited) and awaited() else self._last
+        screen is back since the frame it was made of (asked of the device as it is asked for, not at the next turn of the
+        loop). Not only while the first new frame is awaited: in the turn after it came, before the loop has made a picture of
+        it, a viewer that came was handed the one from before."""
+        device = self.machine.device
+        awaited, back_since = getattr(device, "picture_awaited", None), getattr(device, "screen_back_since", None)
+        if (callable(awaited) and awaited()) or (callable(back_since) and back_since(self.made_of_at)):
+            return None
+        return self._last
 
     @last.setter
     def last(self, picture: Picture | None) -> None:
@@ -1307,6 +1317,7 @@ class JetSource(Source):
                 target = None if size == FULL or TIERS[size][0] >= frame.width else TIERS[size][0]
                 data = await asyncio.to_thread(encode_jpeg, frame, target, QUANTIZER[size])
                 self.resize(_as_jpeg(data))
+                self.made_of_at = at
                 self.offer(JPEG, True, data)
             await asyncio.sleep(max(0.0, due - time.monotonic()))
 
@@ -1564,6 +1575,15 @@ class Machine:
                 # (a real one let go of a key this line held as it did). Said now: left to the next key, the holder
                 # heard only that the connection had closed, after typing into nothing.
                 self._let_go(self.holder, "in_use", now[2] or "Someone is using the KVM's own page")
+        try:
+            taken = self.device.input_taken()
+        except Exception as ex:  # (as a status that cannot be read: nothing is said of it)
+            self.device._unexpected("asking whether a machine's keyboard was taken failed", ex)
+            taken = None
+        if taken is not None and self.holder is not None:
+            # A server's console given to somebody at its controller's own page, with nothing of the tile's status changed (its
+            # screen goes on): said now, not at the holder's next key.
+            self._let_go(self.holder, taken.code, taken.message)
         video = status.get("video") if isinstance(status.get("video"), dict) else None
         source = self.sources.get("h264")
         if source is not None and video is not None and type(video.get("width")) is int and type(video.get("height")) is int:
@@ -1926,6 +1946,8 @@ class Lines:
         busy: Callable[[str], bool],
         audit: Callable[..., None],
         may_take: Callable[[Holder, str], bool] = lambda holder, device_id: False,
+        said: dict[str, tuple[float, float, int]] | None = None,
+        control_said: dict[str, deque[float]] | None = None,
     ) -> None:
         self.manager = manager
         self.standing = standing
@@ -1942,10 +1964,12 @@ class Lines:
         # Device id -> the ways in of the lines that held its keyboard and mouse, until what they had on their way and down is
         # through (`handed_over`). Beside the machines, as `_owed` is: a machine goes with its last viewer.
         self.handing: dict[str, list[Hid]] = {}
-        # Account (Holder.user_id) -> (entries of live views it may still write, when that was counted, those left out since).
-        self._said_live: dict[str, tuple[float, float, int]] = {}
-        # Account (Holder.user_id) -> when it took or gave back keyboard and mouse within the last minute (MOST_CONTROL_A_MINUTE).
-        self._control_said: dict[str, deque[float]] = {}
+        # Account (Holder.user_id) -> (entries of live views it may still write, when that was counted, those left out since):
+        # `said`, the program's (Core.live_said), which outlasts the listeners and these lines with them.
+        self._said_live: dict[str, tuple[float, float, int]] = said if said is not None else {}
+        # Account (Holder.user_id) -> when it took or gave back keyboard and mouse within the last minute (MOST_CONTROL_A_MINUTE):
+        # `control_said`, the program's (Core.control_said), which outlasts the listeners and these lines with them.
+        self._control_said: dict[str, deque[float]] = control_said if control_said is not None else {}
 
     def control_said(self, holder: Holder) -> bool:
         """One more taking or giving back of keyboard and mouse by this account, on any of its lines: False where that would
@@ -1973,6 +1997,16 @@ class Lines:
             return
         self._said_live[holder.user_id] = (left - 1, now, 0)
         self.audit(event, holder.ip, **detail, **({"unsaid": unsaid} if unsaid else {}))
+
+    def left_out(self) -> dict[str, int]:
+        """How many entries of live views each account had left out that no entry of it has said yet, for the caller to say:
+        counted from nothing again, the allowance left as spent (as activity.Allowance.left_out)."""
+        found = {}
+        for who, (left, at, unsaid) in list(self._said_live.items()):
+            if unsaid:
+                found[who] = unsaid
+                self._said_live[who] = (left, at, 0)
+        return found
 
     @staticmethod
     def offers(device: Device) -> bool:
@@ -2113,31 +2147,56 @@ class Lines:
         # reading of the socket begun then and not over yet.
         kept: deque[tuple[Any, MutableMapping[str, Any]]] = deque()  # (its `t`, where it has one; the message)
         reading: asyncio.Future[MutableMapping[str, Any]] | None = None
+        most = MOST_WORDS  # what may be kept while the asking is answered (or a word waits: MOST_WORDS_WAITING)
 
         def keep(message: MutableMapping[str, Any]) -> None:
             """What came while an asking was answered, kept for after. A new size of the view, or a key frame asked for
-            again, is folded into the one kept (a page sends its size at every step of a window being dragged); beyond
-            MOST_WORDS of anything else the line is flooding, and ends (the asking then finds it gone)."""
+            again, is folded into the one kept (a page sends its size at every step of a window being dragged); a place of
+            the pointer right after another into that one, as a step of the pointer or a turn of the wheel into the one
+            before it, as far as a word carries (nothing between them: a drag keeps where its button went down and up);
+            beyond `most` of anything else the line is flooding, and ends (the asking then finds it gone)."""
             text = message.get("text")
-            kind = _parse(text).get("t") if isinstance(text, str) and len(text) <= MOST_WORD else None
+            said = _parse(text) if isinstance(text, str) and len(text) <= MOST_WORD else {}
+            kind = said.get("t")
             if kind in ("shape", "key_frame"):
                 for at, (before, _) in enumerate(kept):
                     if before == kind:
                         if kind == "shape":
                             kept[at] = (kind, message)  # (the newest size; where it stands among the rest does not matter)
                         return
-            if len(kept) >= MOST_WORDS:
+            if kept and kept[-1][0] == kind and kind in ("m", "mr", "mw"):
+                if kind == "m":
+                    kept[-1] = (kind, message)  # (the newest place)
+                    return
+                last = _parse(kept[-1][1]["text"])
+                if kind == "mr":
+                    dx = (_number(last.get("dx"), -FARTHEST, FARTHEST) or 0) + (_number(said.get("dx"), -FARTHEST, FARTHEST) or 0)
+                    dy = (_number(last.get("dy"), -FARTHEST, FARTHEST) or 0) + (_number(said.get("dy"), -FARTHEST, FARTHEST) or 0)
+                    if max(abs(dx), abs(dy)) <= MOST_STEP * MOST_STEPS:
+                        kept[-1] = (kind, {"type": "websocket.receive", "text": json.dumps({"t": "mr", "dx": dx, "dy": dy})})
+                        return
+                else:
+                    dx, dy = _notches(last.get("dx")) + _notches(said.get("dx")), _notches(last.get("dy")) + _notches(said.get("dy"))
+                    if max(abs(dx), abs(dy)) <= MOST_NOTCHES:
+                        kept[-1] = (kind, {"type": "websocket.receive", "text": json.dumps({"t": "mw", "dx": dx, "dy": dy})})
+                        return
+            if len(kept) >= most:
                 line.end("flooding", "This line sent far more while keyboard and mouse were being asked for than a viewer has reason to")
                 return
             kept.append((kind, message))
 
-        async def answer_to(asking: Coroutine[Any, Any, dict[str, Any]]) -> dict[str, Any]:
+        async def given(word: dict[str, Any]) -> dict[str, Any]:
+            await machine.input(line, word)
+            return {}
+
+        async def answer_to(asking: Coroutine[Any, Any, dict[str, Any]], waiting: int = MOST_WORDS) -> dict[str, Any]:
             """The answer to an asking for keyboard and mouse, which takes as long as the way in to the machine takes (up to
             WAY_IN_WITHIN). Meanwhile the socket is read, never left unread (a socket not read is not found closed), and what
             comes is kept for after, in turn: a viewer that went away meanwhile (the view closed, the page left) ends the line
             at once, so that the asking finds it gone once the way in is made, and a take-over takes nothing from whoever
             holds the machine for nobody."""
-            nonlocal reading
+            nonlocal reading, most
+            most = waiting
             answering = asyncio.ensure_future(asking)
             gone = False
             try:
@@ -2226,7 +2285,14 @@ class Lines:
                 taking_from = said_from if isinstance(said_from, str) else None
                 line.say(await answer_to(machine.control(line, on, take=word.get("take") is True, taking_from=taking_from)))
             elif kind in ("k", "m", "mr", "mb", "mw", "up"):
-                await machine.input(line, word)
+                if self.handing.get(machine.device_id):
+                    # Its first word after a hand-over waits for what the holder before still lets go of (HAND_OVER_WITHIN):
+                    # the socket is read meanwhile, as while keyboard and mouse are asked for, and what comes is taken in
+                    # turn after it. Not read, a viewer gone was not seen, and the web server's pings went unanswered once
+                    # a pointer still moving had filled what it holds unread (register row 9 of 0.2.1, fx-a N3).
+                    await answer_to(given(word), MOST_WORDS_WAITING)
+                else:
+                    await machine.input(line, word)
 
     async def retiring(self, device: Device) -> None:
         """This device's connection is about to be closed (the tile edited or removed, the wall locking itself): its lines

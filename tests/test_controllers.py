@@ -329,6 +329,39 @@ def test_a_look_whose_time_is_up_before_the_list_of_fans_does_not_ask_for_it(tmp
         bmc.stop()
 
 
+@pytest.mark.parametrize("layout", ["ami", "openbmc"])
+def test_a_chassis_not_read_for_a_moment_is_looked_for_again_soon_and_what_was_found_stands(monkeypatch: pytest.MonkeyPatch, layout: str) -> None:
+    # (Register row 5, w6 note 12.) Where the server keeps its sensors is looked up once in ten minutes: its chassis is read for
+    # where they are. One passing failure of that read was kept as "no sensors" for the ten minutes, and the temperatures and
+    # fans were gone from the tile. Now it is looked up again after a minute (ABOUT_RETRY), and where they were found before,
+    # that stands meanwhile.
+    from qkvm.kvm import DeviceSpec
+
+    monkeypatch.setattr(redfish, "ABOUT_RETRY", 0.5)
+    bmc = FakeBmc(BmcState(layout=layout, chassis_fails=1)).start()
+
+    def temperatures(status: dict[str, Any]) -> int:
+        return len(status["server"]["temperatures"])
+
+    async def scene() -> list[int]:
+        device = redfish.RedfishDevice(DeviceSpec(id="ab12", name="db-01", base_url=bmc.url, username="admin", password="secret", kind="redfish"))
+        try:
+            first = await device._read_status()  # (the chassis not read: nothing known of the sensors yet)
+            await asyncio.sleep(0.7)
+            second = await device._read_status()
+            device._places_at = float("-inf")  # (ten minutes on: where things are is looked up again, and the chassis fails once)
+            bmc.state.chassis_fails = 1
+            third = await device._read_status()
+            return [temperatures(first), temperatures(second), temperatures(third)]
+        finally:
+            await device.close()
+
+    try:
+        assert asyncio.run(scene()) == [0, 3, 3]
+    finally:
+        bmc.stop()
+
+
 def fan_reads(bmc: FakeBmc) -> int:
     return sum(1 for request in bmc.state.requests if "/ThermalSubsystem/Fans/" in request)
 
@@ -360,6 +393,32 @@ def test_a_fan_the_look_had_no_time_for_keeps_what_was_last_read_of_it(tmp_path:
                 time.sleep(0.2)
             # Every one of them was asked for again, the last ones in the list too.
             assert all(any(request.endswith(f"/Fans/fan_{name}") for request in bmc.state.requests[read_before:]) for name in every)
+    finally:
+        bmc.stop()
+
+
+def test_a_fan_whose_read_keeps_failing_is_not_shown_with_its_last_reading_as_if_current(tmp_path: Path) -> None:
+    # (Register row 6, w6 open.) A fan the look had no time for keeps what was last read of it (above). One whose read is asked
+    # for and fails kept its last reading too, look after look, shown as its speed now. It is listed still, with its health as
+    # last read (an unwell one stays among the unwell), and without a reading ("-" on the page) until it answers again; then
+    # its reading is back.
+    bmc = FakeBmc(BmcState(layout="openbmc")).start()
+    try:
+        with wall(tmp_path) as client:
+            device = add(client, bmc.url)
+
+            def fans() -> dict[str, Any]:
+                return {fan["name"]: fan["reading"] for fan in status_of(client, device, state="online")["server"]["fans"]}
+
+            assert fans() == {"CPU0_FAN": 1650, "CPU1_FAN": 18}
+            bmc.state.fan_failing = "fan_CPU0_FAN"
+            asked = len(bmc.state.requests)
+            wait_until(lambda: client.get("/api/v1/status").status_code == 200 and len(bmc.state.requests) > asked + 3, "not looked at again")
+            wait_until(lambda: fans() == {"CPU0_FAN": None, "CPU1_FAN": 18}, f"the fan whose read fails still shows a reading: {fans()}")
+            status = status_of(client, device, state="online")
+            assert status["server"]["unwell"] == ["CPU1_FAN"]
+            bmc.state.fan_failing = ""
+            wait_until(lambda: fans() == {"CPU0_FAN": 1650, "CPU1_FAN": 18}, f"the fan's reading did not come back: {fans()}")
     finally:
         bmc.stop()
 

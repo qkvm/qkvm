@@ -13,6 +13,10 @@ the reader gives the loop its turn after every message: what answers on that por
 What a real PC sent over it: nothing, while Windows ran or started; started into its BIOS setup with Serial over LAN asked
 for (the engine's boot options), a graphical BIOS sent the codes that clear a terminal and set it to 80 by 25, and no text.
 So this is built and tried against the stand-in, and nothing on the wall shows it yet (see the README).
+
+Which PC it reaches is asked of its tile first, as for the screen (`checked`: AmtDevice._before_a_session, which a console is
+not made without): the console goes to the address the engine that said which PC it is answered from, and on that very
+connection compares the realm that engine signs in in before anything made of the password goes (amt.signed_in).
 """
 
 from __future__ import annotations
@@ -21,6 +25,7 @@ import asyncio
 import logging
 import struct
 import time
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from . import amt, rfb
@@ -50,6 +55,10 @@ MOST_KEPT = 64 * 1024  # bytes of what the PC wrote that are kept, the newest
 # A serial port at 115200 baud writes about 11 kB a second: what sends far more than that is no serial console.
 MOST_A_SECOND = 256 * 1024
 MESSAGES_A_SECOND = 4000
+OTHER_ENGINE = (
+    "Another engine answers on this PC's redirection port: it signs in in another realm than the engine that said it is this "
+    "tile's PC. Nothing was sent to it: no password, and its serial console is not read."
+)
 
 
 def start_message(sequence: int) -> bytes:
@@ -126,9 +135,14 @@ class SerialConsole:
     be had or ended otherwise. The password is counted as for every sign-in of this PC's (kvm.REJECTED, the same mark as
     its tile's): offered only where no no stands, and a no here is a no there."""
 
-    def __init__(self, spec: DeviceSpec, kept: Kept | None = None) -> None:
+    def __init__(self, spec: DeviceSpec, *, checked: Callable[[], Awaitable[amt.Answered]], kept: Kept | None = None) -> None:
+        """`checked` (required: no console is made that is not bound to it): asked before the console is opened whether the
+        engine at the address is that of the tile's PC (the tile's AmtDevice._before_a_session, as for its screen): KvmError
+        where it is not, or could not be told; else where that engine answered from and the realm it signs in in
+        (amt.Answered), which the console goes to and compares."""
         self.spec = spec
         self.kept = kept or Kept()
+        self._checked = checked
 
     async def run(self, stop: asyncio.Event | None = None, quiet_within: float = QUIET_WITHIN) -> None:
         spec = self.spec
@@ -140,9 +154,15 @@ class SerialConsole:
             host, port, tls = amt.redirection_address(spec.base_url)
         except ValueError:
             raise KvmError("bad_response", "Its redirection port would be its WS-Management port and two, and there is no such port above 65535") from None
+        # Which PC the engine at this address is, asked afresh before anything goes to its redirection port: over plain HTTP,
+        # or with its certificate not checked, another PC that took the address (a new lease), or the other address of a name
+        # with two, would be read here, and have the Digest answer. What the tile says to it is said here.
+        answered = await self._checked()
         context = await amt.redirection_tls(spec) if tls else None
         try:
-            stream = await rfb.open_tcp(host, port, context, CONNECT_WAIT)
+            # To the address the engine that said which PC it is answered from (the name kept for TLS), not to the name
+            # resolved anew.
+            stream = await rfb.open_tcp(answered.address or host, port, context, CONNECT_WAIT, name=host)
         except (OSError, TimeoutError) as ex:
             raise VncDevice._connect_error(ex, spec.tls) from None
         sequence = 1
@@ -158,7 +178,9 @@ class SerialConsole:
         tasks: list[asyncio.Task[Any]] = []
         try:
             async with asyncio.timeout(amt.REDIRECTION_WITHIN):
-                await amt.signed_in(stream, START_SOL, WORDS, spec.username, spec.password, sending, taken=taken)
+                # (On this very connection the engine's realm is compared with that of the engine that said which PC it is,
+                # before anything made of the password goes: see amt.signed_in.)
+                await amt.signed_in(stream, START_SOL, WORDS, spec.username, spec.password, sending, taken=taken, realm=answered.realm)
                 await stream.write(start_message(sequence))
                 sequence += 1
                 for _ in range(amt.MOST_RECORDED + 1):  # ("this session is being recorded" may come first, as for the KVM)
@@ -192,6 +214,8 @@ class SerialConsole:
             await self._end(stream, reading, sequence)
         except TimeoutError:
             raise KvmError("timeout", "The engine did not finish starting its serial console in time", 504) from None
+        except amt.OtherEngine:
+            raise KvmError("another_machine", OTHER_ENGINE) from None
         except rfb.RfbError as ex:
             raise self._ended(offered, ex) from None
         finally:

@@ -1259,6 +1259,27 @@ def test_the_console_said_to_be_ours_again_changes_nothing_for_the_line_that_hol
         bmc.stop()
 
 
+@pytest.mark.parametrize("how", ["a person let in", "switched to another session"])
+def test_a_line_whose_servers_console_is_given_to_somebody_is_told_so_without_a_key_of_its_own(tmp_path: Path, how: str) -> None:
+    # (Register row 19, w13 Open.) The console given to a person at the controller's own page, or switched to another session:
+    # nothing more of the line's goes (above), and the line learned it at its next key or pointer word only, showing
+    # "control on" until then. It is told at once, as a JetKVM's line is when somebody opens its own page.
+    bmc = FakeBmc(BmcState(own_console=True, screen=[console_screen(640, 480, seed=17)])).start()
+    try:
+        with Wall(tmp_path) as wall:
+            line = a_server_line_with_control(wall, bmc)
+            if how == "a person let in":
+                bmc.state.asks.append((ami.SHARING, SOMEBODY))
+            else:
+                bmc.state.says.extend([(ami.SHARING, ami.BECAME_MASTER, b""), (ami.OTHERS, 0, bytes(134))])
+            told = line.word("control", timeout=8)  # (and no key of the line's)
+            assert told["on"] is False and told["code"] == "in_use", told
+            assert "own console" in told["message"]
+            line.close()
+    finally:
+        bmc.stop()
+
+
 def test_a_servers_console_switched_to_another_session_takes_the_keyboard_from_the_line(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     # The console says it was switched to another (SHARING, low byte 6). What the line had down is let go of at once
     # (a key left down repeats; an empty report can at most lift for a moment a key the newcomer holds, which their

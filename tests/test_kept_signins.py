@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from qkvm import kvm, unlock, update, vault
+from qkvm import kvm, security, unlock, update, vault
 from tests.test_totp import switch_on
 from tests.test_unlock import fits, kept_sign_in, let_in
 from tests.test_users import visitor
@@ -145,7 +145,8 @@ def test_a_second_step_whose_signing_out_could_not_be_written_down_is_said_as_a_
 
     data = tmp_path / "data"
     disk = {"held": False}
-    real_open, real_unlink = os.open, os.unlink
+    # (sessions.json is made by security.open_private, its own from its first moment: the full disk is stood in for there.)
+    real_open, real_unlink = security.open_private, os.unlink
 
     def open_unless_held(path: Any, *args: Any, **kwargs: Any) -> int:
         if disk["held"] and str(path).endswith("sessions.json.new"):
@@ -157,7 +158,7 @@ def test_a_second_step_whose_signing_out_could_not_be_written_down_is_said_as_a_
             raise PermissionError(errno.EACCES, "Permission denied")
         real_unlink(path, *args, **kwargs)
 
-    monkeypatch.setattr(os, "open", open_unless_held)
+    monkeypatch.setattr(security, "open_private", open_unless_held)
     monkeypatch.setattr(os, "unlink", unlink_unless_held)
     with wall(data) as admin:
         wait_until(lambda: fits(admin), "never made to fit")

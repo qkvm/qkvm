@@ -1050,6 +1050,10 @@ pre.wrap { white-space: pre-wrap; word-break: break-all; margin: 0 0 14px; }
 .focus-screen:focus { outline: none; }
 /* Held: the picture is the machine's screen, and the pointer over it is the machine's own. */
 .focus-screen.controlling { cursor: default; }
+/* With Control on, the veil (No signal, say) stays where it is and lets the pointer through to the picture under it: a
+   move of the mouse wakes the machine's screen as its own mouse would. Its own buttons are still its own. */
+.focus-screen.controlling .veil { pointer-events: none; }
+.focus-screen.controlling .veil button { pointer-events: auto; }
 .focus-screen.controlling canvas { touch-action: none; }
 
 /* --- under the enlarged picture: what the wall saw of this machine (the history) ---------------------------

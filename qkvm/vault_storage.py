@@ -55,8 +55,13 @@ def _regular_private(path: Path) -> None:
         if found.st_uid != os.getuid() or found.st_mode & 0o077:
             raise StorageError("the vault key must belong to the server account and have permissions 0600 or 0400")
     elif os.name == "nt":
+        from ._folders import keeps_no_permissions
         from ._vault_windows import validate_private
-        validate_private(path)
+
+        # (On a drive that keeps no permissions, FAT or exFAT, there is no owner or ACL to judge: said at every start, not
+        # refused. The round 5 review, M3.)
+        if keeps_no_permissions(path) is None:
+            validate_private(path)
 
 
 def read_key(path: Path) -> bytes:
@@ -87,6 +92,17 @@ def create_key(path: Path) -> bytes:
     """Persist a private key before any vault data is replaced; never replace an existing key."""
     if path.exists() or path.is_symlink():
         return read_key(path)
+    if sys.platform == "win32":
+        # Its folder its owner's alone from its first instant, on every Python (before 3.12.4 mkdir ignores the mode on
+        # Windows): whoever may change the folder can take the key away, or put another in its place.
+        from ._folders import keeps_no_permissions, not_alone, private_folder
+
+        private_folder(path.parent)
+        # One that is found is used as it is found, and judged as on Linux: no key is made where another account may take it
+        # away or put another in its place (the round 4 review, L5). Not on a drive that keeps no permissions at all (FAT,
+        # exFAT), where no setting changes that: said at every start, not refused (the round 5 review, M3).
+        if (why := not_alone(path.parent)) is not None and keeps_no_permissions(path.parent) is None:
+            raise StorageError(f"the vault key directory must belong to the server and not be writable by others ({path.parent} {why})")
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     if sys.platform != "win32":
         parent = path.parent.stat()

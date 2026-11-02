@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import secrets
+import threading
 import struct
 import time
 from collections.abc import AsyncIterator
@@ -59,6 +60,18 @@ class BmcState:
     # ...and what its manager names as the service it hosts (ServiceEntryPointUUID; a real AMI board: the root's). UNSET: the
     # root's; None: not said.
     entry_uuid: object = UNSET
+    root_uuid_signed_only: bool = False  # its root says that number only to a request under one of its sessions
+    close_after_open_root: bool = False  # it closes the connection after answering its root to a request without a session
+    closes_every_connection: bool = False  # it closes the connection after every answer, as a server of HTTP/1.0 did
+    # What was asked on each connection, by the port it came from, in order: "GET /redfish/v1 open" for the root asked without a
+    # session, " cookie" after one that carried its web page's session cookie ("WS /kvm" for the console's upgrade).
+    conversations: dict[int, list[str]] = field(default_factory=dict)
+    tokens_heard: list[str] = field(default_factory=list)  # every session token a request brought it, known to it or not
+    system_takes: float = 0.0  # seconds each read of its computer takes to be answered (a slow board's)
+    # Seconds it keeps a connection open with nothing asked on it (uvicorn's own default; the real slow board kept one 65 s and
+    # more). Read as it starts.
+    keeps_idle: float = 5.0
+    after_open_root: Any = None  # called (once) right after its root was answered to a request without a session: a new lease, say
     firmware: object = "1.42.0"
     # (openbmc layout) What its controller says of its firmware: "both" its version and the image it runs
     # (Links.ActiveSoftwareImage), as bmcweb does where it knows which image runs; "image" the image alone; "neither",
@@ -81,6 +94,7 @@ class BmcState:
     more_fans: int = 0  # so many fans more than the three, each fitted and well (openbmc layout)
     last_fan_unwell: bool = False  # ...but the last of them says it is not well
     fan_takes: float = 0.0  # seconds each fan takes to answer (openbmc layout)
+    fan_failing: str = ""  # the fan (its resource's name, "fan_CPU0_FAN") whose every read is answered 503 (openbmc layout)
     # At one of its moments it answers an error with HTTP 200, as some controllers do, instead of 503: as a
     # record ({"error": {"message": ...}}, the standard's shape) or as a text ({"error": "..."}). None: 503.
     errors_in_200: str | None = None
@@ -146,6 +160,9 @@ class BmcState:
     tokens: dict[str, str] = field(default_factory=dict)  # session token -> session id
     logins: int = 0
     login_status: int = 201  # another number: signing in fails with it, whatever the password
+    # What it names as the place of a session it made (its Location), "{session}" for the session's own id. None: that place
+    # under SessionService/Sessions, as the standard has it.
+    session_location: str | None = None
     signed_out: int = 0
     requests: list[str] = field(default_factory=list)  # every signed-in request, as "GET /path"
     roots_unsigned: int = 0  # how often the service root was read without a session
@@ -172,6 +189,9 @@ class BmcState:
     watching: int = 0  # consoles open right now
     sign_in_takes: float = 0.0  # seconds its web page takes to answer a sign-in, with the session made at once
     root_takes: float = 0.0  # seconds the root of its Redfish service takes to answer (an older AMI firmware: 3.2 s, measured)
+    # Once a signed-in read of this place is answered, it forgets every session, and its root takes this many seconds from then
+    # on (once; a controller that restarts its web service between the last read before a command and the command).
+    forget_after: tuple[str, float] | None = None
     # Seconds after which it ends a console session, saying that its time is up (a real board: half an hour
     # in which no key was pressed). 0: never.
     session_lasts: float = 0.0
@@ -205,6 +225,7 @@ class BmcState:
     kvm_open_at_sign_out: list[int] = field(default_factory=list)  # consoles still open at each sign-out
     graphical_console: bool = True  # (openbmc layout) whether its manager announces the console (False: as romulus's latest build in QEMU)
     manager_fails: int = 0  # its manager answers so many reads with 503 first (one of its moments)
+    chassis_fails: int = 0  # ...and its chassis
     manager_reads: int = 0
     # Every request to an address of AMI's web page (/api/...), whatever the layout, as "POST /api/session". bmcweb (layout
     # "openbmc") has none of them, and answers every request that is not signed in with 401 before it looks for the path.
@@ -225,9 +246,17 @@ def make_fake_bmc(state: BmcState) -> FastAPI:
     def not_there() -> Response:
         return JSONResponse({"error": {"code": "Base.1.5.0.ResourceMissingAtURI", "message": "No such resource"}}, status_code=404)
 
+    def heard_on(client: Any, said: str, cookies: Any) -> None:
+        if client is not None:
+            state.conversations.setdefault(client.port, []).append(said + (" cookie" if "QSESSIONID" in cookies else ""))
+
     @app.middleware("http")
     async def signed_in(request: Request, call_next: Any) -> Any:
         path = request.url.path.rstrip("/")
+        opened = path == v1 and request.method == "GET" and request.headers.get("x-auth-token") not in state.tokens
+        if request.headers.get("x-auth-token"):
+            state.tokens_heard.append(request.headers["x-auth-token"])
+        heard_on(request.client, f"{request.method} {path}" + (" open" if opened else ""), request.cookies)
         if time.monotonic() < max(state.away_until, state.unwell_until):  # restarting, or busy with itself: there, and not ready
             # (Some controllers say so with HTTP 200 and an error body where the resource belongs.)
             said: Any = "Service Unavailable" if state.errors_in_200 == "text" else {"message": "Service Unavailable"}
@@ -243,20 +272,32 @@ def make_fake_bmc(state: BmcState) -> FastAPI:
             if request.headers.get("x-auth-token") not in state.tokens:
                 return JSONResponse({"error": {"code": "Base.1.5.0.NoValidSession", "message": "Sign in first"}}, status_code=401)
             state.requests.append(f"{request.method} {path}")
-        return await call_next(request)
+        reply = await call_next(request)
+        if state.closes_every_connection:
+            reply.headers["Connection"] = "close"
+        if state.forget_after is not None and request.method == "GET" and path == state.forget_after[0].rstrip("/") and not open_to_all:
+            state.tokens.clear()
+            state.root_takes, state.forget_after = state.forget_after[1], None
+        return reply
 
     @app.get(v1)
     @app.get(v1 + "/")
-    async def root() -> dict[str, Any]:
+    async def root(request: Request) -> Response:
         if state.root_takes:
             await asyncio.sleep(state.root_takes)
         # (bmcweb's root names no product and no vendor: OpenBMC is known by its controller, not here.)
         made_by = {"Product": "AMI Redfish Server", "Vendor": "AMI"} if state.layout == "ami" else {"UpdateService": {"@odata.id": f"{v1}/UpdateService"}}
-        return {
-            "RedfishVersion": "1.15.1", **made_by, **({"UUID": state.root_uuid} if state.root_uuid is not None else {}),
+        signed = request.headers.get("x-auth-token") in state.tokens
+        says_number = state.root_uuid is not None and (not state.root_uuid_signed_only or signed)
+        said = {
+            "RedfishVersion": "1.15.1", **made_by, **({"UUID": state.root_uuid} if says_number else {}),
             "Systems": {"@odata.id": f"{v1}/Systems"}, "Chassis": {"@odata.id": f"{v1}/Chassis"},
             "Managers": {"@odata.id": f"{v1}/Managers"}, "Links": {"Sessions": {"@odata.id": f"{v1}/SessionService/Sessions"}},
         }  # fmt: skip
+        if not signed and state.after_open_root is not None:
+            then, state.after_open_root = state.after_open_root, None
+            then()
+        return JSONResponse(said, headers={"Connection": "close"} if state.close_after_open_root and not signed else {})
 
     @app.post(v1 + "/SessionService/Sessions")
     async def sign_in(request: Request) -> Response:
@@ -268,9 +309,11 @@ def make_fake_bmc(state: BmcState) -> FastAPI:
             return JSONResponse({"error": {"message": "Invalid credentials"}}, status_code=401)
         token, session = secrets.token_hex(16), secrets.token_hex(4)
         state.tokens[token] = session
-        return JSONResponse({"Id": session}, status_code=201, headers={"X-Auth-Token": token, "Location": f"{v1}/SessionService/Sessions/{session}"})
+        place = f"{v1}/SessionService/Sessions/{session}" if state.session_location is None else state.session_location.replace("{session}", session)
+        return JSONResponse({"Id": session}, status_code=201, headers={"X-Auth-Token": token, "Location": place})
 
     @app.delete(v1 + "/SessionService/Sessions/{session}")
+    @app.delete(v1 + "/SessionService/Sessions/{session}/")  # (as HPE's iLO writes its places: with a slash at the end)
     async def sign_out(session: str) -> Response:
         state.kvm_open_at_sign_out.append(state.kvm_open)
         for token, known in list(state.tokens.items()):
@@ -300,6 +343,8 @@ def make_fake_bmc(state: BmcState) -> FastAPI:
             return not_there()
         if state.system_unwell:
             return JSONResponse({"error": {"message": "Service Unavailable"}}, status_code=503)
+        if state.system_takes:
+            await asyncio.sleep(state.system_takes)
         if time.monotonic() < state.reads_busy_until:
             await asyncio.sleep(state.reads_busy_until - time.monotonic())  # (busy after a change: answered after the wall stopped waiting)
         if state.power == "Off" and state.back_on_at and time.monotonic() >= state.back_on_at:
@@ -461,6 +506,9 @@ def make_fake_bmc(state: BmcState) -> FastAPI:
             return JSONResponse({"Id": name, "ChassisType": "StorageEnclosure", "Model": "Backplane"})  # no sensors to speak of
         if name != names()[1]:
             return not_there()
+        if state.chassis_fails > 0:
+            state.chassis_fails -= 1
+            return JSONResponse({"error": {"message": "Service Unavailable"}}, status_code=503)
         if state.layout == "openbmc":
             sensors = {"ThermalSubsystem": {"@odata.id": f"{where}/ThermalSubsystem"}, "Sensors": {"@odata.id": f"{where}/Sensors"}}
         else:
@@ -539,6 +587,8 @@ def make_fake_bmc(state: BmcState) -> FastAPI:
             return not_there()
         if state.fan_takes:
             await asyncio.sleep(state.fan_takes)
+        if fan == state.fan_failing:
+            return JSONResponse({"error": {"message": "Service Unavailable"}}, status_code=503)
         return JSONResponse({"Id": fan, **known[fan]})
 
     @app.get(v1 + "/Managers")
@@ -755,6 +805,7 @@ def make_fake_bmc(state: BmcState) -> FastAPI:
 
     @app.websocket("/kvm")
     async def console_stream(websocket: WebSocket) -> None:
+        heard_on(websocket.client, "WS /kvm", websocket.cookies)
         if not state.own_console:
             await websocket.close()
             return
@@ -856,6 +907,8 @@ def make_fake_bmc(state: BmcState) -> FastAPI:
         # this stand-in has not got). Without one: 401, and nothing else is said.
         token = websocket.headers.get("x-auth-token")
         state.kvm_upgrades.append("token" if token else "cookie" if websocket.headers.get("cookie") else "nothing")
+        if token:
+            state.tokens_heard.append(token)
         if token not in state.tokens or state.kvm_refuses:
             try:
                 await websocket.send_denial_response(Response(status_code=401))
@@ -891,13 +944,33 @@ class FakeBmc:
             cert, key = make_device_certificate(tls_dir)
             tls = {"ssl_certfile": str(cert), "ssl_keyfile": str(key)}
         self.url = f"{'https' if tls else 'http'}://127.0.0.1:{self.port}"
-        self._server = uvicorn.Server(uvicorn.Config(make_fake_bmc(self.state), log_level="error", access_log=False, **tls))
+        config = uvicorn.Config(make_fake_bmc(self.state), log_level="error", access_log=False, timeout_keep_alive=self.state.keeps_idle, **tls)
+        self._server = uvicorn.Server(config)
         self._serving = ServerThread("fake controller", lambda: self._server.run(sockets=[self._sock]), lambda: self._server.started)
         self._thread = self._serving.thread
 
     def start(self) -> FakeBmc:
         self._serving.start()
         return self
+
+    def drop_connections(self) -> None:
+        """End every connection it has (as a new lease ends the connections to the server that had the address: what comes on
+        one after it is answered with a reset), and wait until that is done."""
+        done = threading.Event()
+        connections = list(self._server.server_state.connections)
+        loops = {getattr(connection, "loop", None) for connection in connections} - {None}
+        if not loops:
+            return
+
+        def drop() -> None:
+            for connection in connections:
+                transport = getattr(connection, "transport", None)
+                if transport is not None:
+                    transport.abort()
+            done.set()
+
+        next(iter(loops)).call_soon_threadsafe(drop)
+        done.wait(5)
 
     def stop(self) -> None:
         self._server.should_exit = True

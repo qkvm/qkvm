@@ -147,15 +147,18 @@ def test_the_hole_in_the_activity_log_says_how_many_are_missing_on_a_disk_that_f
     log = AuditLog(tmp_path / "audit.log")
     log.write("before", "192.0.2.1")
     log.flush()
-    real_open = Path.open
+    # (audit.log is written through store.private, its own from its first moment: the full disk is stood in for there.)
+    from qkvm import store as written_by
+
+    real_open = written_by.private
     full = {"disk": True}
 
-    def open_on_a_full_disk(self: Path, *args: Any, **kwargs: Any) -> Any:
-        if full["disk"] and self.name == "audit.log" and args[:1] == ("a",):
+    def open_on_a_full_disk(path: Any, mode: str = "w", **how: Any) -> Any:
+        if full["disk"] and Path(path).name == "audit.log" and mode == "a":
             return _on_a_full_disk()  # the file is there and opens; there is no room for one more line
-        return real_open(self, *args, **kwargs)
+        return real_open(path, mode, **how)
 
-    monkeypatch.setattr(Path, "open", open_on_a_full_disk)
+    monkeypatch.setattr(written_by, "private", open_on_a_full_disk)
     for _ in range(5):
         log.write("lost", "192.0.2.1")
     log.flush()
@@ -171,15 +174,18 @@ def test_the_hole_in_the_activity_log_says_how_many_are_missing_on_a_disk_that_f
 
 def test_a_second_hole_in_the_activity_log_is_dated_as_itself(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     log = AuditLog(tmp_path / "audit.log")
-    real_open = Path.open
+    # (audit.log is written through store.private, its own from its first moment: the full disk is stood in for there.)
+    from qkvm import store as written_by
+
+    real_open = written_by.private
     full = {"disk": False}
 
-    def open_unless_full(self: Path, *args: Any, **kwargs: Any) -> Any:
-        if full["disk"] and self.name == "audit.log" and args[:1] == ("a",):
+    def open_unless_full(path: Any, mode: str = "w", **how: Any) -> Any:
+        if full["disk"] and Path(path).name == "audit.log" and mode == "a":
             raise OSError(28, "No space left on device")
-        return real_open(self, *args, **kwargs)
+        return real_open(path, mode, **how)
 
-    monkeypatch.setattr(Path, "open", open_unless_full)
+    monkeypatch.setattr(written_by, "private", open_unless_full)
     real_time = time.time
     clock = {"at": 1_000_000.0}
     monkeypatch.setattr(time, "time", lambda: clock["at"])

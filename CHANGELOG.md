@@ -1,5 +1,121 @@
 # Changes
 
+## 0.2.1
+
+A release of fixes only: a security review of the whole web app, of every device driver and of how the
+settings are kept, an update of every library with a known hole, and the bugs left open in 0.2.0. Nothing new
+is added. Upgrade with `pip install --upgrade qkvm` or `docker pull qkvm/qkvm:0.2.1`; a wall on 0.2.0 needs no
+offline step.
+
+### Upgrading from 0.2.0
+
+- **By pip:** `pip install --upgrade qkvm`, then start qKVM again. The libraries qKVM needs are raised with it
+  (see *Libraries* below).
+- **By Docker:** pull `qkvm/qkvm:0.2.1` and start the container again with the same volumes.
+- **From the app (Settings, Updates):** 0.2.0 refuses the update where the libraries installed beside it are
+  older than 0.2.1 needs, which is most installs; it then says so, and `pip install --upgrade qkvm` is the way.
+  Where it is taken, it starts as any update does.
+- **Going back to 0.2.0** works as before (`pip install qkvm==0.2.0`, or the app's roll-back).
+
+### Security
+
+- **Open console keeps to the wall's own host name.** The enlarged view's *Open console* now follows the same
+  rule as the tile's link: a device page on the host name qKVM is reached under (at another port) is never
+  opened with the wall's sign-in, and the wall refuses to hand out such a link (`same_host`).
+- **The right machine, every time.** A tile now acts only on the machine it was added for, on every road:
+  - a JetKVM's number is compared before every connection, and over plain HTTP before any password goes where
+    the JetKVM shows it to anybody; following a JetKVM onto HTTPS (by itself, or in an edit, also when saved
+    without checking) goes only to that same JetKVM;
+  - a Proxmox guest, an Intel AMT PC and a JetKVM whose number cannot be read when it is added or edited are
+    refused, not saved without it;
+  - a server controller's password, console pass, session and keys go only on a connection on which the
+    controller was just told apart; an AMT PC's screen and serial console go only to the engine that said
+    which PC it is.
+- **Passwords:** AMT's Digest sign-in without `qop` is refused (a listener could recover the password from
+  it). A Redfish sign-out goes only to the session it ended.
+- **A hostile device cannot stall the wall.** Answers from servers are read by a bounded HTTP reader (h11);
+  a JetKVM message larger than any JetKVM sends ends its connection; JetKVM video addresses are tried only
+  at the JetKVM's own address; one slow or hostile VNC-family server can no longer hold up every screen, and
+  what all of them cost together is bounded for the whole wall.
+- **Settings and keys on Windows, as on Linux.** Every folder and file qKVM makes (the data folder, the
+  storage key's folder, the key, the unlock file, the settings, the logs, the history and activity
+  databases, the certificate) is its account's alone from the moment it is made. A folder qKVM finds is never
+  changed: where others may read or change it, the start says so, with the lines that fix it.
+- **No update from a folder others may write.** The starter checks the data folder, every link on the way,
+  and every file of an update before it runs it, on Windows as on Linux.
+- **Files planted while a folder was open are refused.** A file or link with one of qKVM's own names that is a
+  link or belongs to another account stops the start, with the lines that take it over; a `tls` folder that is
+  a link or another account's is never written into.
+- **The unlock file** is judged by who may read or change it (also by its ACL and through a link); a systemd
+  credential is recognised. An unlock key is on the disk before it is used, and a key that does not fit
+  deletes nothing that could recover the settings.
+- **The setup code** is never written into a log others may read.
+- **Sign-in checks do not hold up the wall.** A recovery key or a password is checked beside every change
+  rather than inside the one lock every change takes.
+- **A wall screen's display link** is kept no longer than it is valid, by the wall's clock.
+- **FastAPI's own telemetry** is switched off.
+
+### Fixed
+
+- A JetKVM no longer ends its session when the wall falls behind decoding its video: it goes on from the next
+  key frame, keys and held buttons kept.
+- Nothing stays held: what the wall lets go of at an end it decides is let go of at once, after presses still
+  on their way.
+- A press that never went out says it was not done, on every kind of device, and holds nothing.
+- A Proxmox power command whose answer was lost is said to be perhaps done, so pressing again is asked, not
+  assumed; one rejected token counts once for all its guests; guests on one token are all online at the
+  first look.
+- A server's sensors no longer vanish for ten minutes after one failed read; a fan that keeps failing shows
+  no old reading; Start into BIOS setup reads the power again where a controller answered without a body,
+  and its messages say only what is known.
+- The live view starts when control becomes possible after the view was opened; with Control on, the *No
+  signal* veil lets the pointer through; *Done to it* is kept up to date.
+- A saved action a kind of device cannot run is refused when it is saved.
+- A tile of a kind this version does not know (left by a later version) is kept and never connected to.
+- A lock after wrong guesses is never shortened.
+- `docker stop` and `systemctl stop` write that qKVM stopped.
+- An AMT entry imported without a port takes the AMT ports, as adding does.
+- A wall screen behind a proxy that answers for a restarting wall waits for it and keeps its link.
+- `--data-dir` given twice is refused.
+- Holds and paces that kept a device from being asked too often no longer start again when a tile is edited,
+  re-added or the wall is locked.
+
+### Libraries
+
+qKVM now asks for websockets 17.4 or later, cryptography 50.0.2 or later, dnspython 2.9.0 or later (named for
+the first time), h11 0.16.0 or later, and FastAPI 0.148 or later. The Docker image is built on Python 3.13.18.
+The release pipeline's actions and scanners are updated past their known holes, and the sites are built with
+a pinned wrangler.
+
+### Changed
+
+- A data folder on Windows that others may read is said at every start and left as it is (0.2.0 said nothing);
+  run the lines the start prints to make it yours alone. A folder on a drive without permissions (FAT, exFAT)
+  is said once and used.
+- A server controller that answers HTTP/1.0, or closes the connection after every answer, is signed in to
+  only where its certificate is pinned and its own.
+- A JetKVM reached only through a port forward, a tunnel or a reverse proxy to another host shows no picture.
+- A second `--data-dir` added to the Docker image's own is refused: the image sets the data folder (`/data`).
+
+### Known
+
+- Proxmox guests on one token sign in one after the other at a start (a few seconds for many guests).
+- A press's hold starts again when qKVM itself restarts.
+- On Windows, a file made by 0.2.0 that others may read stays readable until the printed lines are run.
+- A Redfish session token goes on the HTTP library's connections where the controller's certificate is
+  pinned and its own (the certificate binds them there).
+- A slow VNC whole-screen update on a host many times slower than a desktop PC can count as a long step.
+- Where qKVM runs as a Windows service and an administrator runs an offline command (such as
+  `--reset-password`) elevated, the files it writes may belong to that administrator's own account; the
+  service's next start then refuses them and says so on its console only. Run the lines the start prints (they
+  take the files over for the service's account) before starting the service again.
+- A tile edited to another KVM keeps the first KVM's Fingerbot answer and holds for up to an hour (they err on
+  the side of asking less).
+- A console link saved by 0.2.0 whose host is written in an unusual number form makes an edit of that tile
+  refused until the link is written plainly.
+- The first start of 0.2.1 rebuilds the activity log's index from its text files; until it is done, searches
+  read the text files.
+
 ## 0.2.0
 
 Keyboard and mouse in the browser, and more kinds of machine on the wall: PCs with Intel AMT

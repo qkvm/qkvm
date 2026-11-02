@@ -21,6 +21,8 @@ from urllib.parse import urlsplit
 
 from starlette.requests import HTTPConnection, Request
 
+from ._folders import open_private
+
 log = logging.getLogger("qkvm")
 
 COOKIE = "qkvm_session"
@@ -74,6 +76,40 @@ def host_allowed(host_header: str, extra: tuple[str, ...] | list[str] = ()) -> b
     except ValueError:
         pass
     return "." not in host or host.endswith(PRIVATE_SUFFIXES) or host in extra
+
+
+def shares_our_name(url: str, host_header: str, ours: Iterable[str] = ()) -> bool:
+    """Whether the page at `url` is on a host name this wall is looked at under: the one in the Host header a request came
+    by, or one of the names it was given for itself (`ours`: allowed_hosts).
+
+    A browser keeps what signs it in to the wall by host name and not by port: it hands that to any page on such a name,
+    at whatever port (SECURITY.md, "qKVM has a host name of its own"). What cannot be read is not taken for elsewhere. Each
+    host is read as store.device_url writes one (_written): [0:0:0:0:0:0:0:1] is [::1], and a host that looks like numbers
+    Python cannot read (2130706433, which a browser takes for 127.0.0.1) counts as this wall's own.
+    """
+    try:
+        theirs = _written(urlsplit(url).hostname or "")
+        here = _written(urlsplit(f"//{host_header}").hostname or "")
+    except ValueError:
+        return True
+    names = {here}
+    for name in ours:
+        try:
+            names.add(_written(name))
+        except ValueError:
+            pass  # (allowed_hosts holds names; one that cannot be read so is no name a link can share)
+    return not theirs or theirs in names
+
+
+def _written(host: str) -> str:
+    """A host as store.device_url writes it: lower case, no dot at its end, numbers in their one form (ipaddress).
+    ValueError for one that looks like numbers and cannot be read so ("2130706433", "127.1", "0x7f.0.0.1"): a browser may
+    take it for an address all the same."""
+    host = host.strip().rstrip(".").lower().removeprefix("[").removesuffix("]")
+    last = host.rsplit(".", 1)[-1]
+    if ":" in host or last.isdigit() or last.startswith("0x"):
+        return str(ipaddress.ip_address(host))
+    return host
 
 
 def same_origin(request: Request) -> bool:
@@ -345,7 +381,8 @@ class Sessions:
         try:
             # In one piece or not at all, and its owner's alone from the first byte.
             being_written = kept_in.with_name(kept_in.name + ".new")
-            descriptor = os.open(being_written, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            being_written.unlink(missing_ok=True)  # (made anew: on Windows too, whatever the folder gives: _folders.open_private)
+            descriptor = open_private(being_written, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
             with os.fdopen(descriptor, "w", encoding="ascii") as fh:
                 fh.write(text)
                 fh.flush()
@@ -623,7 +660,11 @@ class Limiter:
         count = sum(entry.by_account.values())
         # (The doubling is stopped where it no longer matters: left to run, it outgrows what a number can hold.)
         lock = min(self.LONGEST, self.BASE * 2 ** min(count - self.FREE, 32)) if count >= self.FREE else 0.0
-        entry.locked_until, entry.lock, entry.last = now + lock, lock, now
+        # A lock still running is never ended sooner. The sum can be smaller than the one that set it: a sign-in from
+        # here, let through before the lock began, was right and took its own account's slips off (reset).
+        if now + lock >= entry.locked_until:
+            entry.locked_until, entry.lock = now + lock, lock
+        entry.last = now
 
     def reset(self, ip: str, account: str) -> None:
         """This account signed in from this address: its own slips are forgotten.

@@ -203,7 +203,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.13"
 
@@ -248,7 +248,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.13"
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -716,7 +716,7 @@ jobs:
           awk -v wheel="qkvm-${TAG#v}-py3-none-any.whl" -v source="qkvm-${TAG#v}.tar.gz" '$2 == wheel || $2 == source' "$RUNNER_TEMP/signed/SHA256SUMS" > "$RUNNER_TEMP/packages.sums"
           test "$(wc -l < "$RUNNER_TEMP/packages.sums")" -eq 2
           (cd dist && sha256sum --check --strict "$RUNNER_TEMP/packages.sums")
-      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
 
   # Transfer the scanned bytes; no Dockerfile, dependency installation or image rebuild runs here. The archives are the
   # ones the published release's signed image record names (kept by the tag's run), held to what the scan saw before
@@ -832,12 +832,12 @@ jobs:
             done <<< "$IMAGES"
             echo "END"
           } >> "$GITHUB_OUTPUT"
-      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
-      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         if: env.DOCKERHUB_IMAGE != ''
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}

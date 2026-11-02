@@ -44,6 +44,10 @@ local_free = api(kernel, "LocalFree", [P], P)
 free_sid = api(advapi, "FreeSid", [P], P)
 create_profile = api(userenv, "CreateAppContainerProfile", [wt.LPCWSTR, wt.LPCWSTR, wt.LPCWSTR, P, wt.DWORD, ctypes.POINTER(P)], ctypes.c_long)
 delete_profile = api(userenv, "DeleteAppContainerProfile", [wt.LPCWSTR], ctypes.c_long)
+# A function of its own, not kernel's attribute: whatever sets the argument types of kernel.GetProcessTimes for its own use
+# does not change this one's. It keeps Python's lock (PYFUNCTYPE; one calling convention on 64-bit Windows): it returns in
+# microseconds, and letting the lock go meant waiting to have it back behind whatever else ran in Python meanwhile.
+get_process_times = ctypes.PYFUNCTYPE(wt.BOOL, P, *[ctypes.POINTER(wt.FILETIME)] * 4)(("GetProcessTimes", kernel))
 
 
 def checked(value: Any) -> Any:
@@ -384,6 +388,18 @@ class AppProcess:
             for handle in handles:
                 close_handle(handle)
             free_sid(sid)
+
+    def cpu_seconds(self) -> float | None:
+        """The processor time this worker has used so far, kernel and user, by Windows' count (counted at each tick of the
+        system's clock, 15.6 ms: a request's share of it is right on the whole, not request by request); None once it has
+        ended or where Windows does not say."""
+        with self._state_lock:
+            if self._handle is None:
+                return None
+            created, ended, kernel_time, user_time = wt.FILETIME(), wt.FILETIME(), wt.FILETIME(), wt.FILETIME()
+            if not get_process_times(self._handle, ctypes.byref(created), ctypes.byref(ended), ctypes.byref(kernel_time), ctypes.byref(user_time)):
+                return None
+        return sum((spent.dwHighDateTime << 32 | spent.dwLowDateTime) for spent in (kernel_time, user_time)) / 1e7
 
     def mark_stalled(self) -> None:
         """This worker missed its deadline: its pair is passed over by placements for a while."""

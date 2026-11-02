@@ -11,6 +11,8 @@ import os
 import queue
 import re
 import secrets
+import shlex
+import signal
 import ssl
 import stat
 import sys
@@ -28,12 +30,14 @@ from websockets.frames import Frame
 
 from . import activity, history, live, unlock, vault_migration
 from ._version import __version__
+from ._folders import GENERAL, READ, folder_judged, for_consoles, judged as one_judged, keeps_no_permissions, not_alone, not_ours, open_private, own_folder, private, private_folder, setowner_line
 from ._where import default_data_dir
 from .core import Core
 from .kvm import WarningsOnly
 from .netbind import BindError, normalize, open_sockets, resolve
 from .server import SentOnlyWhile, create_app
-from .store import InstanceLock, ServerSettings, Store, StoreError, holds_nothing, sealed_beside
+from .store import AuditLog, InstanceLock, ServerSettings, Store, StoreError, holds_nothing, sealed_beside
+from .tlscert import NotOurs
 from .update import UpdateError, check_startup_requirements
 from .vault_storage import MAGIC, MigrationRequired
 
@@ -45,7 +49,7 @@ CRASH_WINDOW = 60.0
 # Minimum library versions for the reviewed security/runtime baseline. These floors do not
 # certify that every bundled component is vulnerability-free. The same floors are in
 # pyproject.toml; this warns about environments maintained outside the normal installer.
-SAFE_FROM = {"starlette": (1, 3, 1), "cryptography": (50, 0, 0), "anyio": (4, 14, 2), "idna": (3, 15, 0), "certifi": (2026, 10, 19), "h11": (0, 16, 0), "aiortc": (1, 15, 0), "av": (17, 1, 0)}
+SAFE_FROM = {"starlette": (1, 3, 1), "websockets": (17, 4, 0), "cryptography": (50, 0, 2), "anyio": (4, 14, 2), "idna": (3, 15, 0), "dnspython": (2, 9, 0), "certifi": (2026, 10, 19), "h11": (0, 16, 0), "aiortc": (1, 15, 0), "av": (17, 1, 0)}
 
 
 def _plain_file(path: Path) -> bool:
@@ -101,8 +105,14 @@ def _legacy_vault_update_trial(data_dir: Path) -> bool:
 
 
 def outdated_libraries() -> dict[str, str]:
-    """Installed libraries that are older than SAFE_FROM: the name of each, and a line about it fit for showing."""
+    """Installed libraries that are older than SAFE_FROM: the name of each, and a line about it fit for showing.
+
+    Compared as pip compares versions (PEP 440): a release candidate, an alpha or a dev release of the floor itself is
+    older than it, and has its hole ("17.4" is 17.4.0, not older than it). The first three numbers alone took 17.4rc1 and
+    50.0+local3 to be past their floors. A version that is no version by PEP 440 is not known to be past its floor."""
     from importlib.metadata import PackageNotFoundError, version
+
+    from packaging.version import InvalidVersion, Version
 
     found = {}
     for name, minimum in SAFE_FROM.items():
@@ -110,12 +120,30 @@ def outdated_libraries() -> dict[str, str]:
             installed = version(name)
         except PackageNotFoundError:
             continue
-        numbers = tuple(int(part) for part in re.findall(r"[0-9]+", installed)[:3])
+        floor = ".".join(str(part) for part in minimum)
+        try:
+            older, unread = Version(installed) < Version(floor), False
+        except InvalidVersion:
+            older, unread = True, True
         if name == "aiortc" and installed != "1.15.0":
             found[name] = f"{name} {installed} (video isolation requires reviewed version 1.15.0)"
-        elif numbers < minimum:
-            found[name] = f"{name} {installed} (required minimum {'.'.join(str(part) for part in minimum)})"
+        elif unread:
+            found[name] = f"{name} {installed} ({UNREAD}: not known to be past the required minimum {floor})"
+        elif older:
+            found[name] = f"{name} {installed} (required minimum {floor})"
     return found
+
+
+UNREAD = "not a version by PEP 440"  # (what a line of outdated_libraries says of a version it cannot read)
+
+
+def outdated_headline(outdated: dict[str, str]) -> str:
+    """The line qKVM says at start where outdated_libraries found some: below the required minimum versions, or, where a
+    version could not be read (a distribution's own spelling, 17.4-1ubuntu2), not known to be past them."""
+    which = " ".join(outdated)
+    if any(UNREAD in line for line in outdated.values()):
+        return f"qkvm: these libraries are below the required minimum versions, or not known to be past them - update them with: pip install --upgrade {which}"
+    return f"qkvm: these libraries are below the required minimum versions - update them with: pip install --upgrade {which}"
 
 
 def raise_file_limit() -> None:
@@ -458,6 +486,144 @@ def listen_again_as(settings: ServerSettings, before: tuple[list[str], int, bool
     settings.bind, settings.port, settings.https = list(before[0]), before[1], before[2]
 
 
+# The files qKVM writes in its data folder, each its owner's alone from its first moment (_folders.private). One made before
+# (by 0.2.0, in a folder that gave others its entries) is kept as it is, and a start says that others may read it.
+OWN_FILES = (
+    unlock.OWN, "qkvm.json", "qkvm.bak", "qkvm.log", "qkvm.log.1", "qkvm.log.2", "qkvm.log.3", "audit.log",
+    *(f"audit.log.{number}" for number in range(1, AuditLog.OLD_FILES + 1)), "audit.sqlite", "audit.sqlite-wal", "audit.sqlite-shm",
+    "history.sqlite", "history.sqlite-wal", "history.sqlite-shm", "sessions.json", "watch.json",
+)  # fmt: skip
+
+
+def _read_by_others(folder: Path, names: list[str]) -> str:
+    """How a start names the files of its own that others may read: the log, which holds what a start printed (a setup code
+    among it), said so."""
+    held = " (the log holds what a start printed, a setup code among it)" if any(name.startswith("qkvm.log") for name in names) else ""
+    return f"qkvm: in {folder}, {', '.join(names)} can be read by other users of this computer{held}."
+
+
+_DAMAGED = re.compile(r"qkvm\.damaged-.*\.json")  # settings set aside as damaged, which a start reads (store.Store.remnants)
+
+
+def _own_name(entry: Path) -> bool:
+    """Whether what is at `entry` has a name qKVM gives what it keeps in its data folder: its files, what it makes of them on
+    the way (a file being written, the request to a running copy, the lock), `tls` and `updates`; and what else it reads
+    there (the round 5 review): SQLite's rollback journals (a hot one is played into its database when that is opened), the
+    migration's recovery archive, the settings set aside as damaged. By any case where the file system ignores case: on
+    Windows, and elsewhere where the name qKVM opens leads to this very entry (macOS's)."""
+    own = (
+        *OWN_FILES, "tls", "updates", "qkvm.lock", ASK_FILE, "qkvm.tmp", "qkvm.bak.new", "sessions.json.new", "watch.json.new",
+        "audit.sqlite-journal", "history.sqlite-journal", vault_migration.ARCHIVE,
+    )  # fmt: skip
+    name, lowered = entry.name, entry.name.lower()
+    if name in own or _DAMAGED.fullmatch(name):
+        return True
+    if not (lowered in own or _DAMAGED.fullmatch(lowered)):
+        return False
+    if sys.platform == "win32":
+        return True
+    try:
+        return os.path.samestat(os.lstat(entry), os.lstat(entry.with_name(lowered)))
+    except OSError:
+        return False
+
+
+def _planted(folder: Path) -> list[tuple[Path, str]]:
+    """What is at the top of the data folder and is a link, or another account's (not this one, root; on Windows not this
+    one, SYSTEM, the Administrators), with which of the two: what another account may have put there (_folders.not_ours)."""
+    kinds = {"is a link": "a link", "belongs to another account": "another account's"}
+    try:
+        entries = sorted(folder.iterdir())
+    except OSError:
+        return []
+    return [(entry, kinds[found]) for entry in entries if (found := not_ours(entry)) in kinds]
+
+
+def _log_read_by_others(folder: Path) -> str | None:
+    """Why the log in `folder` (or the file it goes to) may be read by others than its owner, SYSTEM and the Administrators
+    (root), as the start's warning of the data folder's files judges it; None where it may not. Where that cannot be told,
+    it is taken as may: what the setup code is kept out of. (A start of the wall, with the log open.)"""
+    log_file = folder / "qkvm.log"
+    try:
+        files = list(dict.fromkeys((log_file, log_file.resolve())))
+    except (OSError, RuntimeError):
+        return "cannot be looked at"
+    if sys.platform == "win32":
+        for each in files:
+            if (why := not_alone(each, READ)) is not None:
+                return why
+        return None
+    try:
+        if any(_others_read(each) for each in files) and stat.S_IMODE(folder.stat().st_mode) & 0o055:
+            return "can be read by other users of this computer"
+    except OSError:
+        return "cannot be looked at"
+    return None
+
+
+def _lines(advice: str) -> str:
+    """What to do, as a start gives it: on Windows with the console its lines are for (_folders.for_consoles)."""
+    return for_consoles(advice) if sys.platform == "win32" else advice
+
+
+def _removal(entry: Path) -> str:
+    """The line that removes what is at `entry` and not where it leads (a link itself; a folder another account put there
+    with what is in it, links in it removed as links: neither rmdir /S nor rm -r goes through one)."""
+    if sys.platform == "win32":
+        attributes = getattr(os.lstat(entry), "st_file_attributes", 0)
+        if attributes & 0x10:  # FILE_ATTRIBUTE_DIRECTORY: a folder, or a link to one (a junction), which rmdir removes as a link
+            return f'rmdir "{entry}"' if attributes & 0x400 else f'rmdir /S /Q "{entry}"'
+        return f'del "{entry}"'
+    if entry.is_dir() and not entry.is_symlink():
+        return f"rm -r {shlex.quote(str(entry))}"
+    return f"rm {shlex.quote(str(entry))}"
+
+
+def _take_over(entry: Path) -> str:
+    """The line that makes what is at `entry` (not a link) the account qKVM runs as here, and nothing in it: icacls /setowner
+    on Windows, chown elsewhere (no /T, no -R)."""
+    if sys.platform == "win32":
+        return setowner_line(entry)
+    try:
+        import pwd
+
+        name = pwd.getpwuid(os.getuid()).pw_name
+    except (ImportError, KeyError):
+        name = str(os.getuid())
+    return f"chown {shlex.quote(name)} {shlex.quote(str(entry))}"
+
+
+# What each of qKVM's own names holds, by how the name begins: what deleting it loses (the refusal of another account's).
+_HOLDS = (
+    (("qkvm.json", "qkvm.bak", "qkvm.tmp"), "every account and saved password"),
+    (("qkvm.damaged-",), "settings set aside as damaged"),
+    ((vault_migration.ARCHIVE,), "the settings as they were before the migration"),
+    ((unlock.OWN,), "the key that opens the saved passwords at a restart"),
+    (("audit.",), "the activity log"),
+    (("history.",), "the history"),
+    (("qkvm.log",), "the log"),
+    (("sessions.json",), "the sign-ins"),
+    (("watch.json",), "what each device was last known to be"),
+    (("tls",), "the HTTPS certificate browsers know"),
+    (("updates",), "the update installed and the version to go back to"),
+)
+
+
+def _lost(names: list[str]) -> str:
+    """What deleting the files and folders of qKVM's own `names` loses, each with the names that hold it; "" for nothing."""
+    held = [
+        f"{what} ({', '.join(name for name in names if name.lower().startswith(starts))})"
+        for starts, what in _HOLDS
+        if any(name.lower().startswith(starts) for name in names)
+    ]
+    return " and ".join(held) if len(held) < 3 else f"{', '.join(held[:-1])} and {held[-1]}"
+
+
+# What whoever may write the data folder can do: stop qKVM (the file `stop` leaves there) and change what is in it. Not run
+# their code: the starter runs no update from a folder others may write (every file of it judged, r4-I3).
+WHOEVER_WRITES = "Whoever can write there can stop qKVM and change its files; it runs no update from a folder others may write"
+
+
 def _in_full(folder: Path) -> Path:
     """The folder with everything that leads to it, where that can be said: not from a current folder that is gone."""
     try:
@@ -544,6 +710,14 @@ class _OnceAMinute(logging.Filter):
         return True
 
 
+class _PrivateLog(logging.handlers.RotatingFileHandler):
+    """The log, each of its files made its owner's alone from its first moment (_folders.private: it holds the setup code).
+    The files it is moved on to keep what they had; the new one is made so."""
+
+    def _open(self) -> Any:
+        return private(self.baseFilename, self.mode, encoding=self.encoding, errors=self.errors)
+
+
 def setup_logging(data_dir: Path, level: str) -> None:
     """Everything goes to qkvm.log in the data folder (rotated); warnings and worse also reach the terminal.
 
@@ -555,9 +729,7 @@ def setup_logging(data_dir: Path, level: str) -> None:
     global _listener, _others
     stop_logging()
     formatter = logging.Formatter("%(asctime)s %(levelname)-7s %(name)s: %(message)s")
-    to_file = logging.handlers.RotatingFileHandler(
-        data_dir / "qkvm.log", maxBytes=2_000_000, backupCount=3, encoding="utf-8"
-    )
+    to_file = _PrivateLog(data_dir / "qkvm.log", maxBytes=2_000_000, backupCount=3, encoding="utf-8")
     to_file.setFormatter(formatter)
     handlers: list[logging.Handler] = [to_file]
     if sys.stderr is not None:  # there is no terminal when started with pythonw or as a scheduled task
@@ -645,8 +817,29 @@ def _others_read(path: Path) -> bool:
         return False
 
 
+def _stopped_by_sigterm(number: int, _frame: object) -> None:
+    raise KeyboardInterrupt  # (as Python makes of Ctrl+C: see serve)
+
+
 def serve(core: Core, running: InstanceLock | None = None) -> int:
-    """Run the wall, re-opening the listeners whenever the network settings change."""
+    """Run the wall, re-opening the listeners whenever the network settings change.
+
+    SIGTERM (`docker stop`, a service manager, the starter passing it on) ends it as Ctrl+C does. uvicorn takes the
+    signal while it serves, shuts down cleanly and then raises it again, for whoever had it before; nobody had, and the
+    process ended there and then, by the signal: "stopped" never logged, and what still waited to be written to the
+    log lost (register row 23 of 0.2.1). Python makes KeyboardInterrupt of Ctrl+C, which is caught below and in main;
+    this makes the same of SIGTERM, for as long as the wall runs here."""
+    before = None
+    if threading.current_thread() is threading.main_thread():  # (signals can be listened to there only)
+        before = signal.signal(signal.SIGTERM, _stopped_by_sigterm)
+    try:
+        return _serve(core, running)
+    finally:
+        if before is not None:
+            signal.signal(signal.SIGTERM, before)
+
+
+def _serve(core: Core, running: InstanceLock | None) -> int:
     working = None  # where it last listened, and could
     restarted = False
     crashes: list[float] = []
@@ -684,7 +877,8 @@ def serve(core: Core, running: InstanceLock | None = None) -> int:
             except (OSError, ValueError) as ex:
                 log.error("the certificate for HTTPS could not be made or read: %s", ex)
                 had = (core.data_dir / "tls" / "cert.pem", core.data_dir / "tls" / "key.pem")
-                if first or core.tls_files is not None or not all(file.is_file() for file in had):
+                # (Not the pair of before where the folder is refused as another account's or a link: theirs, not the wall's.)
+                if first or core.tls_files is not None or isinstance(ex, NotOurs) or not all(file.is_file() for file in had):
                     # "Could not start", like a data folder that takes no writes: not a version that does not
                     # work, for which the starter would take an installed update back.
                     where = f": {ex.filename}" if isinstance(ex, OSError) and ex.filename else ""
@@ -719,8 +913,18 @@ def serve(core: Core, running: InstanceLock | None = None) -> int:
             say("  First run: open the address above to choose a password.")
             if core.setup_code is not None:
                 say(f"  Setup code (asked for when setting up from another machine): {core.setup_code}")
-                # Also in the log, for a wall started without a terminal. It stops working once setup is done.
-                log.info("first run - setup code for setting up from another machine: %s", core.setup_code)
+                if (readers := _log_read_by_others(core.data_dir)) is None:
+                    # Also in the log, for a wall started without a terminal. It stops working once setup is done.
+                    log.info("first run - setup code for setting up from another machine: %s", core.setup_code)
+                elif sys.stdout is not None and os.environ.get("QKVM_NO_CONSOLE") != "1":  # (its starter has none: __main__)
+                    # Not into a log others may read (one made by 0.2.0 as the folder gave it, kept as it is): whoever reads it
+                    # would set the wall up first. Where it was shown instead is said.
+                    log.info("first run - the setup code was shown where qKVM was started and not written here: qkvm.log %s", readers)
+                else:
+                    log.warning(
+                        "first run - the setup code was shown nowhere: qkvm.log %s, and qKVM was started without a console. "
+                        "Make qkvm.log its owner's alone (the start says how), or start qKVM from a console, and start it again", readers,
+                    )  # fmt: skip
             elif any(urlsplit(url).hostname not in ("127.0.0.1", "localhost", "::1") for url in core.listening):
                 # Easy by default, and said as it is: until then the wall is whoever's comes first.
                 say("  Whoever opens it first chooses that password, so do it now. (Started with --setup-code, qKVM asks for a code printed here first.)")
@@ -732,8 +936,8 @@ def serve(core: Core, running: InstanceLock | None = None) -> int:
         try:
             server.run(sockets=sockets)
         except KeyboardInterrupt:
-            # Ctrl+C. The web server has closed what was open and then handed the signal on, as it does. A
-            # person asked for this: it ends as any other stop does, and not in a page of traceback.
+            # Ctrl+C, or SIGTERM (see serve). The web server has closed what was open and then handed the signal on, as
+            # it does. Somebody asked for this: it ends as any other stop does, and not in a page of traceback.
             core.restart_requested = False
         except Exception:
             # Not expected to happen. Come back up rather than leave the wall dark, unless it keeps happening.
@@ -846,9 +1050,11 @@ def remember(data_dir: Path) -> None:
         if home is None or folder == _in_full(home):
             return
         others = [known for known in known_folders() if known != folder and known.is_dir()]  # one that is gone is forgotten
-        home.mkdir(mode=0o700, exist_ok=True)
+        own_folder(home)
         being_written = home / (KNOWN + ".new")
-        being_written.write_text(json.dumps([str(folder), *(str(other) for other in others)][:50]), encoding="utf-8")
+        being_written.unlink(missing_ok=True)
+        with private(being_written, "x", encoding="utf-8") as fh:
+            fh.write(json.dumps([str(folder), *(str(other) for other in others)][:50]))
         os.replace(being_written, home / KNOWN)
     except OSError:
         pass
@@ -871,7 +1077,7 @@ def leave_request(folder: Path, command: str) -> None:
     be somebody else's, and whoever asks may be allowed more than they are. OSError: it could not be written.
     """
     being_written = folder / f"{ASK_FILE}.{secrets.token_hex(8)}"
-    fd = os.open(being_written, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    fd = open_private(being_written, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0))
     try:
         with os.fdopen(fd, "w", encoding="ascii") as file:
             file.write(command)
@@ -1092,7 +1298,28 @@ def _key_would_go_with_the_container(key: Path) -> str | None:
     )
 
 
-def main(argv: list[str] | None = None) -> int:
+def _keys_folder(data_dir: Path, selected: str | None) -> Path | None:
+    """The folder the storage key is kept in (vault_storage.key_path): <data>.keys, or that of the key given. None where
+    that cannot be said (a key file named inside the data folder, which is refused where the key is read)."""
+    from .vault_storage import key_path
+
+    try:
+        return key_path(data_dir, Path(selected) if selected else None).parent
+    except (OSError, ValueError):  # (StorageError is a ValueError)
+        return None
+
+
+class _Once(argparse.Action):
+    """An option that is given once. --data-dir given twice was read as the first by the starter (__main__.data_dir) and
+    as the last here: an update of one folder was run for the wall of the other. Both refuse it."""
+
+    def __call__(self, parser: argparse.ArgumentParser, namespace: argparse.Namespace, values: Any, option_string: str | None = None) -> None:
+        if getattr(namespace, self.dest, None) is not None:
+            parser.error(f"{'/'.join(self.option_strings)} is given more than once: give it once")
+        setattr(namespace, self.dest, values)
+
+
+def main(argv: list[str] | None = None, starter_said: tuple[str, ...] = ()) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     command = argv.pop(0) if argv and argv[0] in COMMANDS else "start"
     parser = argparse.ArgumentParser(
@@ -1105,7 +1332,7 @@ def main(argv: list[str] | None = None) -> int:
         "`status` says whether there is one and where it listens, `stop` ends it, `restart` has it started again.",
         epilog="Documentation: https://docs.qkvm.com",
     )
-    parser.add_argument("-d", "--data-dir", help="where settings are kept (default: the folder .qkvm in your home folder)")
+    parser.add_argument("-d", "--data-dir", action=_Once, help="where settings are kept (default: the folder .qkvm in your home folder)")
     parser.add_argument(
         "-b",
         "--bind",
@@ -1209,13 +1436,70 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     lock = InstanceLock(data_dir)
     try:
-        # A folder made here is its owner's alone: what is in it is not for the others who use this computer.
-        data_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-        free = lock.acquire(patience=0.5)
+        # A folder made here is its owner's alone: what is in it is not for the others who use this computer. (On Windows by
+        # its ACL, from its first instant.) One that is found is used as it is found, on every system, and what it lets others
+        # do is said below: "Not refused: it may be meant ... But said."
+        made = not data_dir.exists()
+        if sys.platform == "win32":
+            private_folder(data_dir)
+        else:
+            data_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        # The storage key's folder of a data folder made here is made with it, its own, before anything names the folder
+        # (remember, below): made later, with the key, its name was there for another account to take first in a folder above
+        # that is open (the round 4 review, L5).
+        if made and (keys := _keys_folder(data_dir, args.vault_key_file or os.environ.get("QKVM_VAULT_KEY_FILE") or None)) is not None:
+            own_folder(keys)
+        # What has the name of a file or folder of qKVM's own and is a link, or another account's, is not its own: another
+        # account may have put it there while the folder was open, or since (the round 4 review, M2: named only while the
+        # folder was open, and written through: the setup code went into another account's file through a planted
+        # qkvm.log). Refused at every start, as `tls` is, before anything is opened in the folder.
+        # (A link with the name of a copy set aside as damaged is not among them: no copy is read through a link
+        # (store.Store, sealed_beside), and the start that clears them out takes it away, the link alone.)
+        refused = [
+            (entry, kind) for entry, kind in _planted(data_dir) if _own_name(entry) and not (kind == "a link" and _DAMAGED.fullmatch(entry.name.lower()))
+        ]
+        free = False if refused else lock.acquire(patience=0.5)
     except OSError as ex:
         # Usually a folder mounted into a container that belongs to another user than the one qKVM runs as.
         say(f"qkvm: cannot keep settings in {_in_full(data_dir)}: {ex.strerror or ex}", error=True)
-        say("      The folder has to be writable by the user qKVM runs as (in the container: uid 10001).", error=True)
+        if os.environ.get("QKVM_CONTAINER"):
+            say("      The folder has to be writable by the user qKVM runs as (in the container: uid 10001).", error=True)
+        else:
+            say("      The folder has to be one the account qKVM runs as may write (one made by another account, or by an elevated run of the program, may not be).", error=True)
+        return 2
+    if refused:
+        # The lock asked first, without taking it or writing a byte (held_elsewhere: never through a link on POSIX): a copy that
+        # runs wins, and nothing of the refusal is said (the round 5 review, M2: it came first, and its lines deleted a running
+        # service's qkvm.lock; run as printed, a second copy wrote the same folder).
+        try:
+            if lock.held_elsewhere(patience=0.5):
+                refused = []
+        except OSError:
+            pass  # (what is there cannot be looked at: refused as it is)
+    if refused:
+        named = ", ".join(f"{entry.name} ({kind})" for entry, kind in refused)
+        say(f"qkvm: in {os.path.abspath(data_dir)}, {named} {'is' if len(refused) == 1 else 'are'} not qKVM's own: another account may have put {'it' if len(refused) == 1 else 'them'} there, and nothing is written through {'it' if len(refused) == 1 else 'them'}. qKVM was not started.", error=True)
+        # A link is removed (the link alone, never what it leads to), and qKVM makes its own. What another account owns may
+        # be the wall's own (a folder restored with its owners kept, a service's folder where an administrator or root runs a
+        # command): taken over, never deleted (the round 5 review, M1: the lines deleted qkvm.json and qkvm.bak, and with
+        # them every account and saved password).
+        # No line touches qkvm.lock: it is what a copy that runs holds, and one may start between this and the line (M2).
+        lock_kind = next((kind for entry, kind in refused if entry.name.lower() == "qkvm.lock"), None)
+        refused = [(entry, kind) for entry, kind in refused if entry.name.lower() != "qkvm.lock"]
+        links = [entry for entry, kind in refused if kind == "a link"]
+        owned = [entry for entry, kind in refused if kind != "a link"]
+        if lock_kind is not None:
+            stopped = f"qkvm status{f' --data-dir {args.data_dir}' if args.data_dir else ''} says whether one does"
+            say(f"      qkvm.lock is what a copy that runs holds, and no line is given for it: once no copy of qKVM runs with this folder ({stopped}), {'delete the link alone' if lock_kind == 'a link' else 'take it over'}.", error=True)
+        if links:
+            them, lead = ("it", "it leads") if len(links) == 1 else ("them", "they lead")
+            say(f"      Whoever put {them} there may change where {lead}: delete {them} while qKVM is stopped (the link{'' if len(links) == 1 else 's'} alone: what {lead} to is left as it is), and it makes its own ({_lines('; '.join(_removal(entry) for entry in links))}).", error=True)
+        if owned:
+            them = "it" if len(owned) == 1 else "them"
+            lost = _lost([entry.name for entry in owned])
+            keep = f"do not delete {them}, that loses {lost}. " if lost else ""
+            where = "in an elevated console" if sys.platform == "win32" else "as root"
+            say(f"      {'It' if len(owned) == 1 else 'They'} may be the wall's own (a folder restored with its owners kept, a service's): {keep}Take {them} over while qKVM is stopped, {where} ({_lines('; '.join(_take_over(entry) for entry in owned))}), which makes {them} the account qKVM runs as here (where it runs as a service, name the service's account instead); or run qKVM as the account that owns {them}.", error=True)
         return 2
     if not free:
         say(f"qkvm: another copy is already running with {_in_full(data_dir)}{who(lock.holder())}", error=True)
@@ -1224,19 +1508,95 @@ def main(argv: list[str] | None = None) -> int:
     try:
         # The process to stop is the one that started this one, where there is one: it would only start it again.
         lock.say(pid=os.getppid() if os.environ.get("QKVM_CHILD") == "1" else os.getpid(), since=time.time(), version=__version__)
+        # What the start warns of below is written into the log as well, once that is set up: a wall without a console (a
+        # task at log-on, a service) says there why, with what its starter said (`starter_said`: an update not used). The round 5
+        # review, a LOW.
+        warned = list(starter_said)
+
+        def warn(text: str) -> None:
+            say(text, error=True)
+            line = " ".join(text.split()).removeprefix("qkvm: ")
+            if text[:1].isspace() and warned:  # (what to do about the line before: with it)
+                warned[-1] += " " + line
+            else:
+                warned.append(line)
+
         remember(data_dir)
         try:
             if os.name == "posix" and stat.S_IMODE(data_dir.stat().st_mode) & 0o022:
                 # Not refused: it may be meant (a folder shared with a group that looks after the wall). But said.
-                say(f"qkvm: {_in_full(data_dir)} can be written to by other users of this computer.", error=True)
-                say("      Whoever can write there can stop qKVM, and can put there what it runs after an update (chmod go-w makes it yours alone).", error=True)
+                warn(f"qkvm: {_in_full(data_dir)} can be written to by other users of this computer.")
+                warn(f"      {WHOEVER_WRITES} (chmod go-w {shlex.quote(str(_in_full(data_dir)))} makes it yours alone).")
+            no_permissions = keeps_no_permissions(data_dir)  # (FAT, exFAT: the name of the file system; None elsewhere)
+            keys = _keys_folder(data_dir, args.vault_key_file or os.environ.get("QKVM_VAULT_KEY_FILE") or None)
+            keys_too = keys is not None and keys.is_dir() and keeps_no_permissions(keys) is not None
+            if no_permissions is not None:
+                # A drive that keeps no permissions: no setting of a folder or a file there changes who may read and change
+                # them. Said once at every start, plainly; nothing is refused for owners or ACLs there (the round 5 review, M3:
+                # a new wall's key folder was refused, and an existing wall at every start, its own files "another account's").
+                with_key = f", and the storage key in {os.path.abspath(keys)}" if keys is not None and keys_too else ""
+                warn(f"qkvm: {os.path.abspath(data_dir)} is on a drive whose file system ({no_permissions}) keeps no permissions: anybody who uses this computer may read and change what qKVM keeps there{with_key}.")
+                warn(f"      {WHOEVER_WRITES} (keep it on an NTFS drive).")
+            elif sys.platform == "win32":
+                # The same, by the folder's ACL: a folder that is found is left as it is (never changed), and said.
+                if (judged := folder_judged(data_dir)) is not None:
+                    why, advice = judged  # (named as given, not where it leads: the words say which is open, link or folder)
+                    warn(f"qkvm: {os.path.abspath(data_dir)} {why}.")
+                    if why.startswith("cannot be looked at") or " cannot be looked at" in why:
+                        # (Who may write it cannot be told: not said as if others may. The starter runs no update from it.)
+                        warn(f"      Who may write there cannot be told, and no update is run from it ({_lines(advice or GENERAL)}).")
+                    else:
+                        warn(f"      {WHOEVER_WRITES} ({_lines(advice or GENERAL)}).")
+                judged_files = {name: not_alone(data_dir / name, READ) for name in OWN_FILES if (data_dir / name).exists()}
+                readable = [name for name, why in judged_files.items() if why not in (None, "cannot be looked at")]
+                unseen = [name for name, why in judged_files.items() if why == "cannot be looked at"]
+                if unseen:
+                    warn(f"qkvm: in {_in_full(data_dir)}, who may read {', '.join(unseen)} cannot be told: {'its' if len(unseen) == 1 else 'their'} ACL cannot be looked at.")
+                if readable:
+                    # (Each file's own lines, as for the folder: what it takes from the folder, what was granted on it itself.)
+                    lines = dict.fromkeys(said[1] for said in (one_judged(data_dir / name, READ) for name in readable) if said is not None and said[1])
+                    warn(_read_by_others(_in_full(data_dir), readable))
+                    warn(f"      Restrict data-folder access and keep its separate server storage key private ({_lines('; '.join(lines) or GENERAL)}).")
+            if sys.platform == "win32" and not (no_permissions is not None and keys_too):
+                if keys is not None and keys.is_dir() and (judged := folder_judged(keys)) is not None:
+                    why, advice = judged
+                    warn(f"qkvm: {os.path.abspath(keys)}, where the storage key is kept, {why}.")  # (as given, as the data folder)
+                    if why.startswith("cannot be looked at") or " cannot be looked at" in why:
+                        warn(f"      Who may change it cannot be told ({_lines(advice or GENERAL)}).")
+                    else:
+                        warn(f"      Whoever can change it can take the key away or put another in its place, and qKVM does not start ({_lines(advice or GENERAL)}).")
+            # What another account may have put in it stays that account's (whoever owns a file may change its permissions):
+            # named at every start (not only while the folder is open: put there before it was closed, it stays), each entry
+            # at its top that is a link or another account's. (Those with a name of qKVM's own were refused above.)
+            folder_open = (os.name == "posix" and bool(stat.S_IMODE(data_dir.stat().st_mode) & 0o022)) or (sys.platform == "win32" and folder_judged(data_dir) is not None)
+            planted = _planted(data_dir)
+            if planted:
+                named = ", ".join(f"{entry.name} ({kind})" for entry, kind in planted)
+                where = f"in {os.path.abspath(data_dir)}, which others may write," if folder_open else f"in {os.path.abspath(data_dir)},"
+                warn(f"qkvm: {where} {named} may have been put there by somebody else.")
+                warn(f"      Whoever put them there may still read and change them: delete what is not meant ({_lines('; '.join(_removal(entry) for entry, _ in planted))}).")
             if os.name == "posix" and not os.environ.get("QKVM_CONTAINER"):
                 # What qKVM writes there is its owner's alone from the first byte. A folder that came back from
                 # a copy (through a share, out of an archive that kept no modes) is used as it is found.
-                readable = [name for name in (unlock.OWN, "qkvm.json", "qkvm.bak") if _others_read(data_dir / name)]
+                readable = [name for name in OWN_FILES if _others_read(data_dir / name)]
                 if readable and stat.S_IMODE(data_dir.stat().st_mode) & 0o055:
-                    say(f"qkvm: in {_in_full(data_dir)}, {', '.join(readable)} can be read by other users of this computer.", error=True)
-                    say("      Restrict data-folder access and keep its separate server storage key private (chmod -R go-rwx on the folder makes it yours alone).", error=True)
+                    # (The folder and the files named, no -R: nothing it would go into beyond them, through a link or not.)
+                    folder = _in_full(data_dir)
+                    line = f"chmod go-rwx {shlex.quote(str(folder))} && chmod 600 {' '.join(shlex.quote(str(folder / name)) for name in readable)}"
+                    warn(_read_by_others(folder, readable))
+                    warn(f"      Restrict data-folder access and keep its separate server storage key private ({line} makes them yours alone).")
+            # The key of the HTTPS certificate, where others may read it (made by 0.2.0 in a folder that gave others its entries,
+            # kept as it is): whoever read it can pose as this wall. A new pair is made where the folder is gone (the round 4
+            # review, L3).
+            tls = data_dir / "tls"
+            if (tls / "key.pem").is_file() and not_ours(tls) is None:
+                if sys.platform == "win32":
+                    open_key = not_alone(tls / "key.pem", READ) not in (None, "cannot be looked at")
+                else:
+                    open_key = _others_read(tls / "key.pem") and all(stat.S_IMODE(folder.stat().st_mode) & 0o055 for folder in (data_dir, tls))
+                if open_key and no_permissions is None:  # (on a drive that keeps no permissions: said once, above)
+                    warn(f"qkvm: {os.path.abspath(tls / 'key.pem')}, the key of the certificate for HTTPS, can be read by other users of this computer: whoever read it can pose as this wall.")
+                    warn(f"      Delete the tls folder while qKVM is stopped, and a new pair is made, its own ({_lines(_removal(tls))}).")
         except OSError:
             pass
         try:
@@ -1244,6 +1604,8 @@ def main(argv: list[str] | None = None) -> int:
         except OSError:
             pass
         setup_logging(data_dir, args.log_level)
+        for line in warned:
+            log.warning("%s", line, extra=SAID)  # (said above, in words of its own)
         vault_key = args.vault_key_file or os.environ.get("QKVM_VAULT_KEY_FILE") or None
         # A key is made by a migration, and by the start of a wall that has no settings yet.
         # (Not beside files sealed with a key: the key that is not found there is asked for, never made. See sealed_beside.)
@@ -1368,9 +1730,9 @@ def main(argv: list[str] | None = None) -> int:
         log.info("qkvm %s starting, data in %s", __version__, _in_full(data_dir))
         outdated = outdated_libraries()
         if outdated:
-            log.warning("libraries below the required minimum versions: %s", "; ".join(outdated.values()), extra=SAID)
+            log.warning("libraries below the required minimum versions, or not known to be past them: %s", "; ".join(outdated.values()), extra=SAID)
             # By name: upgrading qKVM itself leaves a library alone that still meets what an older qKVM asked for.
-            say(f"qkvm: these libraries are below the required minimum versions - update them with: pip install --upgrade {' '.join(outdated)}", error=True)
+            say(outdated_headline(outdated), error=True)
             for line in outdated.values():
                 say(f"  {line}", error=True)
         raise_file_limit()
@@ -1378,9 +1740,10 @@ def main(argv: list[str] | None = None) -> int:
             if key_made:
                 log.info("made a new unlock key in %s", _in_full(Path(unlock_file)))
                 say(f"qkvm: made a new unlock key in {_in_full(Path(unlock_file))}")
-            if not core.container and unlock.open_to_others(Path(unlock_file)):
-                log.warning("%s can be read by other users of this computer", unlock_file, extra=SAID)
-                say(f"qkvm: {unlock_file} can be read by other users of this computer (chmod 600 makes it yours alone)", error=True)
+            # (Changed by somebody else, it is their key that the next sign-in fits the data folder to: said as well.)
+            if not core.container and (said := unlock.warning(Path(unlock_file))):
+                log.warning("%s", said, extra=SAID)
+                say(f"qkvm: {said}", error=True)
         try:
             told = core.unlock_at_start()
         except OSError as ex:

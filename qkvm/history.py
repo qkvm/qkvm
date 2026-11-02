@@ -32,7 +32,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .store import read_only_uri
+from .store import into_wal, sqlite_open
 
 log = logging.getLogger("qkvm")
 
@@ -444,7 +444,7 @@ class History:
         self._ready.clear()
         for attempt in (1, 2):
             try:
-                conn = sqlite3.connect(self.path, timeout=WRITE_PATIENCE, isolation_level="DEFERRED")
+                conn = sqlite_open(self.path, timeout=WRITE_PATIENCE, isolation_level="DEFERRED")
             except sqlite3.Error as ex:
                 self._say("open", "the history in %s could not be opened: %s", self.path.parent, ex)
                 return
@@ -494,7 +494,7 @@ class History:
             raise _Unreadable(f"quick_check: {_short(verdict, 120)}")
         if version == 0:
             conn.execute("PRAGMA auto_vacuum = INCREMENTAL")  # before the first table: pages freed by a trim can then be given back
-        conn.execute("PRAGMA journal_mode = WAL")  # readers do not wait for the writer, nor it for them
+        into_wal(conn, self.path)  # readers do not wait for the writer, nor it for them (and SQLite makes no file of its own)
         conn.execute("PRAGMA synchronous = NORMAL")  # a power cut may lose the last moments, never the file
         self._limit_wal(conn)
         with conn:
@@ -985,7 +985,7 @@ class History:
         if not self._ready.wait(READ_WAIT):
             raise NotReadable("The history is not open just now. Try again in a moment.")
         try:
-            conn = sqlite3.connect(read_only_uri(self.path), uri=True, timeout=2.0)  # (a data folder on a share too: see there)
+            conn = sqlite_open(self.path, read=True, timeout=2.0)  # (a data folder on a share too: store.read_only_uri)
         except sqlite3.Error as ex:
             raise NotReadable(f"The history could not be read ({_short(str(ex), 80)}). Try again in a moment.") from None
         deadline = time.monotonic() + READ_PATIENCE

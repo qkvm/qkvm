@@ -1317,6 +1317,34 @@ def test_the_search_and_the_filters_narrow_the_wall_and_typing_presses_no_shortc
         dark.stop()
 
 
+def test_a_screen_behind_a_proxy_that_answers_for_the_wall_says_it_waits_and_keeps_its_link(tmp_path: Path, browser: Browser, fakes: list[FakeKvm]) -> None:
+    # Pulled back into 0.2.1 (core round 2, note 6, and the call made there): a screen on the wall that hands its link in
+    # behind a reverse proxy whose wall does not answer (the proxy's 502 or 503, for as long as that lasts) forgot its link at
+    # the first such answer, though the wall had refused nothing; and while it asked again, five seconds at a time, for as
+    # long as that went on, the screen said nothing at all. Now it keeps its link, and says that it waits for the wall.
+    with a_wall(tmp_path, ("Build server", fakes[0])) as (live, admin), looking(browser, live) as screen:
+        key = admin.post("/api/v1/tokens", json={"name": "Hall", "kind": "display"}).json()["token"]
+        answering = [False]
+
+        def proxy(route: Any) -> None:
+            if answering[0]:
+                route.continue_()
+            else:  # the wall behind it does not answer: the proxy answers for it
+                route.fulfill(status=502, content_type="text/html", body="<html><body><h1>502 Bad Gateway</h1></body></html>")
+
+        screen.route("**/api/v1/display", proxy)
+        screen.goto(f"{live.url}/#display&key={key}")
+        waiting = screen.get_by_role("heading", name="Waiting for the wall")
+        expect(waiting).to_be_visible(timeout=15_000)
+        expect(screen.locator("#auth-card")).to_contain_text("It keeps its link and asks again every 5 seconds")
+        assert screen.evaluate("localStorage.getItem('qkvm.display-key')") == key
+        answering[0] = True  # the wall is back behind the proxy
+        expect(screen.locator("#wall article")).to_have_count(1, timeout=20_000)
+        expect(waiting).to_have_count(0)
+        expect(screen.locator("#banner")).to_be_hidden()
+        assert screen.evaluate("localStorage.getItem('qkvm.display-key')") == key
+
+
 def test_a_screen_on_the_wall_opens_with_its_link_and_goes_dark_when_the_link_is_taken_back(tmp_path: Path, browser: Browser, fakes: list[FakeKvm]) -> None:
     with a_wall(tmp_path, ("Build server", fakes[0]), ("Mail server", fakes[1])) as (live, admin), looking(browser, live) as page:
         made = admin.post("/api/v1/tokens", json={"name": "Hall", "kind": "display"})
@@ -2055,3 +2083,31 @@ def test_virtual_machines_on_proxmox_are_picked_from_its_list_and_added(tmp_path
             expect(top(page).get_by_role("textbox", name=re.compile(r"^API token ID"))).to_have_value(TOKEN_ID)
     finally:
         pve.stop()
+
+
+def test_a_console_link_on_the_walls_own_name_with_a_dot_at_its_end_is_not_offered(tmp_path: Path, browser: Browser) -> None:
+    # I2 of the 0.2.1 review: the page and the server spell "the same host" alike. The page compared the link's host as the
+    # browser reads it with the name the wall is looked at under, a dot at the end and all; the server drops that dot. A
+    # link kept by 0.2.0 at "localhost." beside a wall looked at as "localhost" was offered, and with it the sign-in to the
+    # wall. (A link saved from now on is kept without the dot: exchange.console_link. One kept before is read as it is.)
+    from types import SimpleNamespace
+
+    from tests.settings_file import settings_text, write_settings_text
+
+    fake = FakeKvm(FakeState()).start()
+    try:
+        with a_wall(tmp_path, ("Build server", fake)):
+            pass
+        for name in ("qkvm.json", "qkvm.bak"):
+            saved = json.loads(settings_text(tmp_path / name, encoding="utf-8"))
+            saved["devices"][0]["open_url"] = "http://localhost.:9/console"
+            write_settings_text(tmp_path / name, json.dumps(saved), encoding="utf-8")
+        with LiveWall(tmp_path) as live:
+            here = SimpleNamespace(url=live.url.replace("127.0.0.1", "localhost"))
+            with looking(browser, here) as page:  # type: ignore[arg-type]
+                sign_in(page, here)  # type: ignore[arg-type]
+                tile(page, "Build server").get_by_role("button", name="Actions for Build server").click()
+                expect(top(page)).to_contain_text("No link to its console is offered here")
+                expect(top(page).get_by_role("link", name="Open console")).to_have_count(0)
+    finally:
+        fake.stop()

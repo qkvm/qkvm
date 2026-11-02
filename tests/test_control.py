@@ -358,7 +358,8 @@ def test_stop_is_not_taken_for_done_in_the_moment_between_two_runs(tmp_path: Pat
 
 @pytest.mark.skipif(os.name != "posix", reason="who may write a folder is said in other ways on Windows, and not looked at there")
 def test_a_data_folder_that_others_can_write_to_is_said_at_start(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
-    # Whoever can write there can stop the wall, and can put there what it runs after an update.
+    # Whoever can write there can stop the wall and change its files (what it runs after an update is not taken from such a
+    # folder: tests/test_what_the_start_says_of_a_data_folder_others_may_write.py).
     monkeypatch.setattr(uvicorn.Server, "run", served_and_left)
     folder = tmp_path / "open"
     folder.mkdir()

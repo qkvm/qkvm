@@ -15,6 +15,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from ._folders import private
 from .kvm import public_context
 
 log = logging.getLogger("qkvm")
@@ -105,7 +106,8 @@ class Watcher:
             return
         try:
             being_written = self._file.with_name(self._file.name + ".new")
-            with being_written.open("w", encoding="ascii") as fh:
+            being_written.unlink(missing_ok=True)  # (made anew, its owner's alone: _folders.private)
+            with private(being_written, "x", encoding="ascii") as fh:
                 fh.write(text)
                 fh.flush()
                 os.fsync(fh.fileno())  # on the disk: after a power cut, what came back before it is not told as news

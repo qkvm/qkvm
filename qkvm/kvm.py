@@ -79,6 +79,16 @@ def can_do(*words: str | None) -> list[str]:
 MAC = re.compile(r"[0-9A-Fa-f]{2}([:-][0-9A-Fa-f]{2}){5}")
 # Up to eight key names as browsers and kvmd spell them: "ControlLeft,AltLeft,Delete".
 KEYS = re.compile(r"[A-Z][A-Za-z0-9]{1,15}(,[A-Z][A-Za-z0-9]{1,15}){0,7}")
+# The keyboard's Power key shuts a machine down without the question a power action is asked first: no driver sends it
+# (kvmd is told the names as they come and has it; every other has no such name in its table), nor does the live line.
+# A saved action naming it is refused where it is saved, by the API or from a file, as a run refuses it.
+POWER_KEY_REFUSED = "The keyboard's Power key is not sent. A machine's power is under Power."
+
+
+def names_the_power_key(keys: str) -> bool:
+    return "Power" in keys.split(",")
+
+
 MAX_TEXT = 2000  # characters one "type text" action may send
 MAX_PORTS = 16  # inputs of a multi-port KVM the wall will list
 
@@ -136,6 +146,11 @@ PRESS_ANSWERED: contextvars.ContextVar[bool] = contextvars.ContextVar("press_ans
 # on; None where the driver does not say. A request cut off by qKVM stopping while it was False pressed nothing: the KVM was
 # only being asked (whether a Fingerbot is paired, say), and the log says so, not "it may have been done".
 PRESS_SENT: contextvars.ContextVar[bool | None] = contextvars.ContextVar("press_sent", default=None)
+# Whether the request KvmDevice._request was asked to send last can have reached the KVM: False until it is handed to the
+# connection, True from then on, and False again where it failed in a way that shows it never got there (went_out: no
+# connection to the KVM was had in time). Signing in first, the tile retired before the send: it never went out. A power
+# button's click that never went out pressed nothing, and holds nothing (register row 4 of 0.2.1, fx-a N2, w16c).
+REQUEST_OUT: contextvars.ContextVar[bool] = contextvars.ContextVar("request_out", default=False)
 # GL.iNet's Fingerbot, paired with a Comet over Bluetooth, presses a machine's power button with an arm, for a machine
 # that has no ATX board. The Comet says whether one is paired in a `fingerbot` event on its line for events
 # (`{"exist": true}`, and nothing more: a real one, 2026-10-18), and has no route that says it. A press is
@@ -173,16 +188,119 @@ FINGERBOT_LOW = 25
 FINGERBOT_BATTERY_WAIT = 3.0
 
 
+class Paced:
+    """What paces one KVM's power buttons and the questions to its Fingerbot: until when a press with no clear answer may
+    still be pressing (the Fingerbot's, `held_until`; the power board's, `board_until`; time.monotonic()), and the
+    Fingerbot's "none" window: whether one is paired as the KVM said last, when it said so, and when a line opened to ask it
+    heard nothing (FINGERBOT_ASK_AGAIN); and its battery as last answered, when it was asked, and when it may be asked
+    again (FINGERBOT_BATTERY_EVERY)."""
+
+    def __init__(self) -> None:
+        self.held_until = 0.0
+        self.board_until = 0.0
+        self.fingerbot: bool | None = None
+        self.fingerbot_heard_at = float("-inf")
+        self.fingerbot_silent_at = float("-inf")
+        self.battery: int | None = None
+        self.battery_next = 0.0
+        self.battery_asked_at = float("-inf")
+
+    def idle(self, now: float) -> bool:
+        """Whether it paces nothing any more, and holds no word of the KVM's."""
+        return (
+            self.held_until <= now and self.board_until <= now and self.fingerbot is None and now - self.fingerbot_silent_at >= FINGERBOT_ASK_AGAIN
+            and self.battery is None and self.battery_next <= now
+        )  # fmt: skip
+
+
+class _AllPaced:
+    """Every KVM's Paced, kept beside the connections for as long as the program runs (as REJECTED is), not in a client:
+    a client made anew (an edit, at its address or another; the wall locked and opened again; the tile removed and added
+    again at its address) finds what paces its KVM as the client before left it (register row 10 of 0.2.1, fx-a L2,
+    w16c: each of them started afresh, and a press with no clear answer could be followed by another at once). Found by
+    the tile's id and by the KVM's address: a tile edited to another address keeps its id, one removed and added again
+    keeps its address. Not across a restart of the program."""
+
+    MOST = 4096  # entries kept before those that pace nothing any more are let go of
+
+    def __init__(self) -> None:
+        self._by_id: dict[str, Paced] = {}
+        self._by_address: dict[str, Paced] = {}
+
+    def find(self, device_id: str, address: str) -> Paced:
+        """What paces this KVM; a Paced of nothing where nothing does (not kept: write through `of`). One found by the
+        tile's id is kept under the address it is at now as well, and one found by the address under the id: a tile edited
+        to another address, and then removed and added again there, still finds it."""
+        mine = self._by_id.get(device_id) if device_id else None
+        there = self._by_address.get(address)
+        if mine is not None and there is None:
+            self._by_address[address] = mine
+        elif there is not None and mine is None and device_id:
+            self._by_id[device_id] = there
+        return mine or there or Paced()
+
+    def of(self, device_id: str, address: str) -> Paced:
+        """What paces this KVM, kept from now on under its id and its address."""
+        mine = self._by_id.get(device_id) if device_id else None
+        there = self._by_address.get(address)
+        found = mine or there
+        if found is None:
+            if len(self._by_id) + len(self._by_address) > self.MOST:
+                now = time.monotonic()
+                self._by_id = {key: paced for key, paced in self._by_id.items() if not paced.idle(now)}
+                self._by_address = {key: paced for key, paced in self._by_address.items() if not paced.idle(now)}
+            found = Paced()
+        elif mine is not None and there is not None and mine is not there:
+            # A tile edited to an address another tile has: one KVM there, and what paced either paces it from now on.
+            mine.held_until, mine.board_until = max(mine.held_until, there.held_until), max(mine.board_until, there.board_until)
+            if there.fingerbot_heard_at > mine.fingerbot_heard_at:
+                mine.fingerbot, mine.fingerbot_heard_at = there.fingerbot, there.fingerbot_heard_at
+            if there.battery_asked_at > mine.battery_asked_at:
+                mine.battery, mine.battery_next, mine.battery_asked_at = there.battery, there.battery_next, there.battery_asked_at
+            mine.fingerbot_silent_at = max(mine.fingerbot_silent_at, there.fingerbot_silent_at)
+            for keys in (self._by_id, self._by_address):
+                for key in [key for key, paced in keys.items() if paced is there]:
+                    keys[key] = mine
+            found = mine
+        if device_id:
+            self._by_id[device_id] = found
+        self._by_address[address] = found
+        return found
+
+    def clear(self) -> None:
+        self._by_id.clear()
+        self._by_address.clear()
+
+
+PACED = _AllPaced()
+
+
 class FingerbotTurn:
     """One request to a Comet's Fingerbot at a time from this program (a press, a question of its battery), shared by the
     clients of one KVM at one address (see KvmDevice.takes_over); and until when it may still be pressing after a press
     whose answer said neither yes nor no (time.monotonic()), during which nothing more is sent to it. The same for the
-    KVM's power board (`board_until`, see BOARD_ANSWER): the machine's power buttons, which are one."""
+    KVM's power board (`board_until`, see BOARD_ANSWER): the machine's power buttons, which are one. The two times are
+    kept in PACED, beside the connections, where a client made anew finds them."""
 
-    def __init__(self) -> None:
+    def __init__(self, device_id: str = "", address: str = "") -> None:
         self.lock = asyncio.Lock()
-        self.held_until = 0.0
-        self.board_until = 0.0
+        self._where = (device_id, address)
+
+    @property
+    def held_until(self) -> float:
+        return PACED.find(*self._where).held_until
+
+    @held_until.setter
+    def held_until(self, value: float) -> None:
+        PACED.of(*self._where).held_until = value
+
+    @property
+    def board_until(self) -> float:
+        return PACED.find(*self._where).board_until
+
+    @board_until.setter
+    def board_until(self, value: float) -> None:
+        PACED.of(*self._where).board_until = value
 
     def held(self) -> float:
         """Seconds it may still be pressing; 0 where it is not."""
@@ -1573,6 +1691,12 @@ class Device:
         `mr`), "both", or None where that is not known (or the machine takes no mouse). Said to the line's viewers."""
         return POINTER_BOTH if "control" in self.abilities() else None
 
+    def input_taken(self) -> KvmError | None:
+        """Why keyboard and mouse were taken from this program at the machine itself (somebody at its own console has them
+        now): asked by the live line's look, and said to the line that holds them at once, not at its next key. None where
+        they were not (the default; a driver whose status says it tells it there)."""
+        return None
+
     def abilities(self) -> list[str]:
         """What this tile can do, as the last look at the device found it; the driver's own list until there was one."""
         found = (self._status or {}).get("can")
@@ -1653,17 +1777,16 @@ class KvmDevice(Device):
         self._board_news = asyncio.Event()
         self._board_words = 0  # how many it said there, all lines together
         # Whether a Fingerbot is paired with the KVM, as it said last (its `fingerbot` event, on the keepalive's line or on
-        # one opened before a press); None while it has not said. Kept when the line ends: it is how the KVM is set up.
-        self._fingerbot: bool | None = None
-        self._fingerbot_heard_at = float("-inf")  # when it last said so (the same again included)
-        self._fingerbot_silent_at = float("-inf")  # when a line opened to ask it last heard nothing of it (see FINGERBOT_ASK_AGAIN)
+        # one opened before a press), when it said so, and when a line opened to ask it heard nothing: `_fingerbot`,
+        # `_fingerbot_heard_at`, `_fingerbot_silent_at`, kept in PACED (below), where a client made anew finds them.
         self._fingerbot_words = 0  # how often that changed (a look under way when it does is not the last word: see _refresh_status)
         # The Comet talks to its Fingerbot one request at a time (a press sent while another was being taken failed): a
         # press and a question of the battery never go out together from here.
-        self._fingerbot_turn = FingerbotTurn()
-        self._battery: int | None = None  # its battery in percent, as last answered (see FINGERBOT_BATTERY_EVERY)
-        self._battery_next = 0.0  # when it may be asked again
-        self._battery_asked_at = float("-inf")  # when it was last asked
+        self._fingerbot_turn = FingerbotTurn(spec.id, spec.base_url)
+        PACED.find(spec.id, spec.base_url)  # (what paces this KVM, kept under this address too from now on: see _AllPaced.find)
+        # Its battery in percent as last answered (see FINGERBOT_BATTERY_EVERY), when it may be asked again, and when it was last
+        # asked: `_battery`, `_battery_next`, `_battery_asked_at`, kept in PACED with the rest of what paces the Fingerbot: the
+        # listeners opened again make every client anew, and the battery was asked again at once.
         self._battery_task: asyncio.Task[None] | None = None
         self._owed: set[asyncio.Future[None]] = set()  # lines asked for the Fingerbot, being closed in a task of their own
         self._keepalive: asyncio.Task[None] | None = None
@@ -1690,12 +1813,57 @@ class KvmDevice(Device):
         # button (a tile renamed during a hold had the new client ask the battery while the arm was down).
         if isinstance(retired, KvmDevice):
             self._fingerbot_turn = retired._fingerbot_turn
-        # And whether a Fingerbot is paired with it, and its battery, which the KVM says only when a line is opened: a tile
-        # saved anew (another name, its password typed again) lost its Fingerbot's buttons until its picture was watched.
-        if isinstance(retired, KvmDevice) and self._fingerbot is None:
-            self._fingerbot, self._battery, self._battery_next = retired._fingerbot, retired._battery, retired._battery_next
-            self._fingerbot_heard_at, self._fingerbot_silent_at = retired._fingerbot_heard_at, retired._fingerbot_silent_at
-            self._battery_asked_at = retired._battery_asked_at
+        # (Whether a Fingerbot is paired, which the KVM says only when a line is opened, and its battery, which it says only when
+        # it is asked, are in PACED, found by every client of the KVM: see `_fingerbot`, `_battery`.)
+
+    # Whether a Fingerbot is paired, as the KVM said last, and when: kept beside the connections (PACED), not in this client.
+    @property
+    def _fingerbot(self) -> bool | None:
+        return PACED.find(self.spec.id, self.spec.base_url).fingerbot
+
+    @_fingerbot.setter
+    def _fingerbot(self, value: bool | None) -> None:
+        PACED.of(self.spec.id, self.spec.base_url).fingerbot = value
+
+    @property
+    def _fingerbot_heard_at(self) -> float:
+        return PACED.find(self.spec.id, self.spec.base_url).fingerbot_heard_at
+
+    @_fingerbot_heard_at.setter
+    def _fingerbot_heard_at(self, value: float) -> None:
+        PACED.of(self.spec.id, self.spec.base_url).fingerbot_heard_at = value
+
+    @property
+    def _fingerbot_silent_at(self) -> float:
+        return PACED.find(self.spec.id, self.spec.base_url).fingerbot_silent_at
+
+    @_fingerbot_silent_at.setter
+    def _fingerbot_silent_at(self, value: float) -> None:
+        PACED.of(self.spec.id, self.spec.base_url).fingerbot_silent_at = value
+
+    @property
+    def _battery(self) -> int | None:
+        return PACED.find(self.spec.id, self.spec.base_url).battery
+
+    @_battery.setter
+    def _battery(self, value: int | None) -> None:
+        PACED.of(self.spec.id, self.spec.base_url).battery = value
+
+    @property
+    def _battery_next(self) -> float:
+        return PACED.find(self.spec.id, self.spec.base_url).battery_next
+
+    @_battery_next.setter
+    def _battery_next(self, value: float) -> None:
+        PACED.of(self.spec.id, self.spec.base_url).battery_next = value
+
+    @property
+    def _battery_asked_at(self) -> float:
+        return PACED.find(self.spec.id, self.spec.base_url).battery_asked_at
+
+    @_battery_asked_at.setter
+    def _battery_asked_at(self, value: float) -> None:
+        PACED.of(self.spec.id, self.spec.base_url).battery_asked_at = value
 
     def tidy(self) -> None:
         if (self._frames or self._fetching) and time.monotonic() - self._wanted_at > KEEPALIVE_IDLE:
@@ -1772,6 +1940,7 @@ class KvmDevice(Device):
 
         `within`: the time for the whole exchange (see `bounded`); left out, what the request's own waits add up to.
         """
+        REQUEST_OUT.set(False)
         if not urgent:
             self._check_backoff()
 
@@ -1780,6 +1949,7 @@ class KvmDevice(Device):
 
         retried = relogged = False
         while True:
+            REQUEST_OUT.set(False)
             token = self._token or await self._login()
             client = await self._http()
             limit = MAX_PICTURE if path == "/api/streamer/snapshot" else MAX_REPLY
@@ -1787,6 +1957,9 @@ class KvmDevice(Device):
                 request = client.build_request(method, path, headers={"Cookie": f"auth_token={token}"}, **kwargs)
                 if still is not None and not still():
                     raise KvmError("stopped", "It was not done: whoever asked for it may no longer do that", 403)
+                if self._closed:
+                    raise RETIRED.with_traceback(None)  # (as _send says it: not sent)
+                REQUEST_OUT.set(True)
                 resp = await self._send(client, request, limit, within)
             except KvmError as ex:
                 raise failed(ex) from None
@@ -1798,6 +1971,8 @@ class KvmDevice(Device):
                     continue
                 raise failed(_transport_error(ex, self.spec.tls)) from ex
             except httpx.HTTPError as ex:
+                if not went_out(ex):
+                    REQUEST_OUT.set(False)
                 raise failed(_transport_error(ex, self.spec.tls)) from ex
             self._answered()
             if resp.status_code not in (401, 403):
@@ -2229,10 +2404,8 @@ class KvmDevice(Device):
         elif action == "keys":
             if not KEYS.fullmatch(keys):
                 raise KvmError("invalid", "Not a valid key combination", 422)
-            if "Power" in keys.split(","):
-                # (kvmd is told the names as they come, and has the keyboard's Power key, which shuts a machine down without
-                # the question a power action is asked first: the live line does not send it either, nor does any other driver.)
-                raise KvmError("invalid", "The keyboard's Power key is not sent. A machine's power is under Power.", 422)
+            if names_the_power_key(keys):
+                raise KvmError("invalid", POWER_KEY_REFUSED, 422)  # (kvmd is told the names as they come, and has it)
             path, params = "/api/hid/events/send_shortcut", {"keys": keys}
         elif action == "text":
             if not text or len(text) > MAX_TEXT:
@@ -2249,6 +2422,7 @@ class KvmDevice(Device):
             # (Two power buttons of one machine: pressed together, the one undoes the other.)
             raise KvmError("busy", f"Its Fingerbot may still be pressing the power button: its last press got no clear answer. Try again in {int(left) + 1} seconds.", 409)
         if action in HELD:
+            PRESS_SENT.set(False)  # (until its click goes out: see REQUEST_OUT)
             self._board_not_now()
             extra = {"timeout": httpx.Timeout(BOARD_ANSWER, connect=WAITS.connect)}
             try:
@@ -2262,13 +2436,18 @@ class KvmDevice(Device):
         try:
             resp = await self._request("POST", path, urgent=True, params=params, still=still, **extra)
         except asyncio.CancelledError:
-            if action in HELD:
+            if action in HELD and REQUEST_OUT.get():
+                PRESS_SENT.set(True)
                 self._board_may_be_pressing(action)  # (qKVM stopping, or its listeners reopened: cut off while the click was on its way)
             raise
         except KvmError as ex:
             # A KVM that is already going down may never answer its own reboot request.
             if action == "reboot" and ex.code in ("dropped", "timeout"):
                 return
+            if action in HELD and (ex is RETIRED or ex.code in ("timeout", "dropped")) and not REQUEST_OUT.get():
+                # (Signing in first, or waiting for a connection to the KVM, or the tile saved anew before the click was sent:
+                # it never went out, nothing was pressed, and nothing is held.)
+                raise KvmError("action_failed", f"Nothing was pressed: the press did not reach the KVM ({ex.message})") from None
             if action in HELD and (ex is RETIRED or ex.code in ("timeout", "dropped")):
                 # (No answer in time, one that broke off, or the connection taken away meanwhile: the click may have gone out.)
                 self._board_may_be_pressing(action)
@@ -2455,9 +2634,16 @@ class KvmDevice(Device):
                     timeout=httpx.Timeout(FINGERBOT_ANSWER + seconds, connect=WAITS.connect),
                 )  # fmt: skip
             except asyncio.CancelledError:
-                may_be_pressing()  # (qKVM stopping, or its listeners reopened: cut off while the press was on its way)
+                if REQUEST_OUT.get():
+                    may_be_pressing()  # (qKVM stopping, or its listeners reopened: cut off while the press was on its way)
+                else:
+                    PRESS_SENT.set(False)  # (cut off while the wall signed in to the KVM: it never went out)
                 raise
             except KvmError as ex:
+                if (ex is RETIRED or ex.code in ("timeout", "dropped")) and not REQUEST_OUT.get():
+                    # (Signing in first, waiting for a connection to the KVM, or the tile saved anew before the press was
+                    # sent: it never went out, nothing was pressed, and the Fingerbot is not held.)
+                    raise KvmError("action_failed", f"Nothing was pressed: the press did not reach the KVM ({ex.message})") from None
                 if ex is RETIRED or ex.code in ("timeout", "dropped"):
                     may_be_pressing()
                 if ex.code == "timeout":

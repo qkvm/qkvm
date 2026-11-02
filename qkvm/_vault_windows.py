@@ -101,13 +101,16 @@ def validate_private(path: Path) -> None:
         allowed = {current_sid(), "S-1-5-18", "S-1-5-32-544"}
         if not owner or sid_text(owner) not in allowed:
             raise PermissionError("the vault key is owned by another Windows account; use the server account")
+        # OWNER RIGHTS (S-1-3-4) is whoever owns the file, checked just above: Python 3.13 (3.12.4) makes a folder with
+        # mode 0o700 private to SYSTEM, the Administrators and OWNER RIGHTS, and a key restored into it takes those.
+        granted = {*allowed, "S-1-3-4"}
         for index in range(size.count):
             ace = P()
             checked(api(advapi, "GetAce", [P, wt.DWORD, ctypes.POINTER(P)])(dacl, index, ctypes.byref(ace)))
             header = ctypes.string_at(ace, 4)
             if header[1] & 8 or header[0] == 1:  # inherit-only or an access denial
                 continue
-            if header[0] != 0 or sid_text(P(int(ace.value or 0) + 8)) not in allowed:
+            if header[0] != 0 or sid_text(P(int(ace.value or 0) + 8)) not in granted:
                 raise PermissionError("the vault key is accessible to another Windows account; restrict its ACL")
     finally:
         free(descriptor)

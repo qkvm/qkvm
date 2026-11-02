@@ -11,7 +11,7 @@ import math
 import os
 import queue
 import re
-import shutil
+import sqlite3
 import stat
 import sys
 import unicodedata
@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any, BinaryIO
 from urllib.parse import urlsplit
 
+from ._folders import open_private, private
 from .vault_storage import MAGIC, MigrationRequired, StorageCipher, UnsupportedFormat, create_key, key_path, read_key
 
 log = logging.getLogger("qkvm")
@@ -112,9 +113,28 @@ class DeviceRecord:
 
 
 FINGERBOT_STRENGTHS = ("firm", "light")  # (what fingerbot_strength may be; anything else in a file is taken as the first)
+# The kinds of machine this version has a driver for (DeviceRecord.kind). A device of another kind, as a later version
+# that adds one writes it, read after going back to this version, is kept as it is and left alone (core.UnknownKind).
+KINDS = ("kvmd", "jetkvm", "redfish", "amt", "vnc", "proxmox")
 
 # What a server's tile of 0.1.x kept as what the server is: the number its computer gives for itself (redfish.own_number).
 _SERVER_BEFORE = re.compile(r"server:[0-9a-f]{32}")
+
+
+# What a JetKVM's tile of 0.2.0 and before kept as what the JetKVM is: the number it gives for itself (jetkvm.own_number).
+_JETKVM_BEFORE = re.compile(r"jetkvm:[0-9a-f]{32}")
+
+
+def jetkvm_machine_from_before(kind: Any, ident: Any, machine: Any) -> Any:
+    """The JetKVM a tile was added for, where it was written by a version whose JetKVM driver checked none (0.2.0 and before
+    kept no machine for a JetKVM): the number it kept as what the JetKVM is (`ident`), unless it was kept beside its twin
+    ("own:..."). That number is the JetKVM's from then on, so that an upgrade never trusts whatever answers first at its
+    address (see jetkvm.JetKvmDevice._judge). Asked of every JetKVM's tile with none: since 0.2.1 the number is kept wherever
+    it is read, and `ident` is emptied where it is read and is none, so a tile with none and a number in `ident` is from
+    before. Anything else is handed back as it was."""
+    if machine == "" and kind == "jetkvm" and isinstance(ident, str) and _JETKVM_BEFORE.fullmatch(ident):
+        return ident
+    return machine
 
 
 def machine_from_before(kind: Any, ident: Any, machine: Any) -> Any:
@@ -603,11 +623,13 @@ class Store:
                 raise ValueError(f"{what}: \"role\" has to be viewer or operator (no token does what an admin does)")
             if isinstance(record, DeviceRecord):
                 # A VNC server is where vncdevice.vnc_url wrote it, vnc:// or vncs:// (as the Add box, the network
-                # search and an import keep it), and only a VNC server is: every other kind talks HTTP.
-                schemes = ("http", "https", "vnc", "vncs") if record.kind == "vnc" else ("http", "https")
+                # search and an import keep it), and only a VNC server is: every other kind talks HTTP. A kind this
+                # version does not know is at whatever address the version that added it keeps it (an address of its
+                # own, spice:// say): read as no address, the wall did not start after going back to this version.
+                schemes = ("http", "https", "vnc", "vncs") if record.kind == "vnc" else ("http", "https") if record.kind in KINDS else None
                 try:
                     where = urlsplit(record.url)
-                    usable = bool(where.hostname) and where.scheme in schemes and where.port != 0
+                    usable = bool(where.hostname) and (schemes is None or where.scheme in schemes) and where.port != 0
                 except ValueError:
                     usable = False
                 if not usable:
@@ -624,6 +646,8 @@ class Store:
         for record, written in zip(self.devices, data.get("devices", []), strict=True):
             if "machine" not in written:
                 record.machine = machine_from_before(record.kind, record.ident, record.machine)
+            # (And a JetKVM's tile of 0.2.0 and before, which kept its JetKVM's number as what it is and checked none.)
+            record.machine = jetkvm_machine_from_before(record.kind, record.ident, record.machine)
 
     def _load(self) -> None:
         failures = (OSError, ValueError, TypeError, AttributeError, RecursionError, OverflowError)
@@ -660,7 +684,7 @@ class Store:
             if self.cipher is not None and not self.path.read_bytes().startswith(MAGIC):
                 # Even a malformed legacy fragment can contain passwords. Keep its exact
                 # bytes for diagnosis inside the envelope, never as a readable side copy.
-                with aside.open("xb") as saved:
+                with private(aside, "xb") as saved:
                     saved.write(self.cipher.seal(self.path.read_bytes()))
                     saved.flush()
                     os.fsync(saved.fileno())
@@ -708,14 +732,17 @@ class Store:
         with self._writing:
             if self.read_only:
                 raise OSError("a read-only settings snapshot cannot be written")
+            # Made anew, its owner's alone from its first moment (one left by a write that was cut off is not written into:
+            # it may have been made before, as the folder gave it).
+            tmp.unlink(missing_ok=True)
             if self.cipher is None:
-                with tmp.open("w", encoding="utf-8") as fh:
+                with private(tmp, "x", encoding="utf-8") as fh:
                     json.dump(data, fh, indent=2)
                     fh.flush()
                     os.fsync(fh.fileno())
             else:
                 encoded = self.cipher.encode(data)
-                with tmp.open("wb") as fh:
+                with private(tmp, "xb") as fh:
                     fh.write(encoded)
                     fh.flush()
                     os.fsync(fh.fileno())
@@ -723,10 +750,13 @@ class Store:
             _settle(self.path.parent)
             again = self.backup.with_name(self.backup.name + ".new")
             try:
-                shutil.copy2(self.path, again)
-                # On the disk before it takes the place of the last copy: renamed first, a power cut could leave the
-                # name with its data never written (an empty or zero-filled qkvm.bak).
-                with again.open("rb+") as copied:
+                # (Copied by this program and not by the system's copy, which gives a new file the folder's entries.)
+                again.unlink(missing_ok=True)
+                with private(again, "xb") as copied:
+                    copied.write(self.path.read_bytes())
+                    copied.flush()
+                    # On the disk before it takes the place of the last copy: renamed first, a power cut could leave the
+                    # name with its data never written (an empty or zero-filled qkvm.bak).
                     os.fsync(copied.fileno())
                 _replace_settings(again, self.backup)
                 _settle(self.backup.parent)  # (and that rename on the disk too, as the one of the settings above)
@@ -757,8 +787,7 @@ class Store:
         the making, a write that was cut off: each holds the accounts and the saved passwords of its day.
         Whoever erases those, or takes away what a key opened them with, means every copy in the folder.
         """
-        stem, suffix = self.path.stem, self.path.suffix
-        old = [*self.path.parent.glob(f"{stem}.damaged-*{suffix}"), self.backup.with_name(self.backup.name + ".new"), self.path.with_suffix(".tmp"), self.path.parent / "vault-migration.recovery"]
+        old = [*self.kept_to_recover_from(), self.backup.with_name(self.backup.name + ".new"), self.path.with_suffix(".tmp")]
         left = []
         for path in old:
             try:
@@ -772,6 +801,15 @@ class Store:
         if self.backup_is_old:
             left.append(self.backup.name)
         return left
+
+    def kept_to_recover_from(self) -> list[Path]:
+        """What the folder keeps to recover the settings from: the damaged copies set aside, and the migration's archive.
+
+        Removed by clear_out, where everything of the settings as they once were is meant to go (the accounts reset, the
+        key switched off on purpose); never because a key did not fit (core.Core.unlock_at_start).
+        """
+        stem, suffix = self.path.stem, self.path.suffix
+        return [*sorted(self.path.parent.glob(f"{stem}.damaged-*{suffix}")), self.path.parent / "vault-migration.recovery"]
 
     def device(self, device_id: str) -> DeviceRecord | None:
         return next((d for d in self.devices if d.id == device_id), None)
@@ -837,7 +875,7 @@ _LISTENS = re.compile(r"https?://[0-9A-Za-z.:\[\]-]{1,120}/?")
 
 def _locked(path: Path) -> Any | None:
     """Open `path` and take an exclusive lock on it. None if another process holds it."""
-    handle = path.open("ab+")
+    handle = private(path, "ab+")
     try:
         if sys.platform == "win32":
             import msvcrt
@@ -1021,6 +1059,81 @@ def read_only_uri(path: Path) -> str:
     if uri.startswith("file://") and not uri.startswith("file:///"):
         uri = "file:////" + uri[len("file://") :]
     return f"{uri}?mode=rw"
+
+
+# Taken around every opening and closing of a database (sqlite_open, _Private.close): a database's -wal and -shm, which SQLite
+# removes where the last connection to it closes, are made private again before the next opening, and never by SQLite.
+_SQLITE_OPENING = threading.Lock()
+
+
+class _Private(sqlite3.Connection):
+    """A connection that is closed with _SQLITE_OPENING held (see there)."""
+
+    def close(self) -> None:
+        with _SQLITE_OPENING:
+            super().close()
+
+
+def _beside(path: Path) -> None:
+    """On Windows, the -wal and -shm of a database that holds pages, made private where they are not there (SQLite takes
+    them as it finds them: an empty -wal is a WAL with nothing in it, an empty -shm is made anew by the first connection).
+    Not beside an empty database: SQLite removes a -wal it finds there, and makes its own (into_wal makes them after that).
+    On POSIX SQLite makes them with its database's mode, which umask 077 makes 0600."""
+    if sys.platform != "win32":
+        return
+    try:
+        if path.stat().st_size == 0:
+            return
+    except OSError:
+        return
+    for tail in ("-wal", "-shm"):
+        try:
+            os.close(open_private(path.with_name(path.name + tail), os.O_RDWR | os.O_CREAT | os.O_EXCL))
+        except FileExistsError:
+            pass
+
+
+def sqlite_open(path: Path, *, read: bool = False, **how: Any) -> sqlite3.Connection:
+    """sqlite3.connect for a database in the data folder, where no file is made by SQLite itself (the round 4 review, M1:
+    in a found open folder SQLite's files took the folder's entries, and what the wall saw of each machine was everybody's
+    to read). The database is made private where there is none (open_private), its -wal and -shm beside it (_beside), and
+    into_wal takes a new one to WAL without a rollback journal. `read`: opened to be read (read_only_uri: never made).
+    """
+    with _SQLITE_OPENING:
+        if not read:
+            try:
+                os.close(open_private(path, os.O_RDWR | os.O_CREAT | os.O_EXCL))
+            except FileExistsError:
+                pass
+        _beside(path)
+        if read:
+            return sqlite3.connect(read_only_uri(path), uri=True, factory=_Private, **how)
+        conn = sqlite3.connect(path, factory=_Private, **how)
+    try:
+        if path.stat().st_size == 0:
+            # A database just made: whatever is written first (auto_vacuum's page, the header into_wal writes) without a rollback
+            # journal file (into_wal says why).
+            conn.execute("PRAGMA journal_mode = MEMORY").fetchall()
+    except BaseException:
+        conn.close()
+        raise
+    return conn
+
+
+def into_wal(conn: sqlite3.Connection, path: Path) -> None:
+    """PRAGMA journal_mode = WAL, with no file made beside the database but its own -wal and -shm, private (sqlite_open).
+
+    A database not in WAL yet (one just made) is taken there through MEMORY, which SQLite takes through OFF to WAL: the one
+    write that says WAL in its header is made without a rollback journal, which SQLite would have made with the folder's
+    entries. (Only that first write goes without one: a power cut in it leaves a database just made, which a start that
+    finds it damaged makes anew.) Its -wal and -shm are made private after that write, before SQLite opens them at the next
+    read: made before it, beside a database without a page, SQLite removes them and makes its own.
+    """
+    if str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower() != "wal":
+        conn.execute("PRAGMA journal_mode = MEMORY").fetchall()
+        conn.execute("PRAGMA journal_mode = WAL").fetchall()
+    with _SQLITE_OPENING:
+        _beside(path)
 
 
 def open_shared(path: Path) -> BinaryIO:
@@ -1210,7 +1323,7 @@ class AuditLog:
         # moment later was not written yet). A line feed is added; nothing that is there is changed.
         mended = "" if self._ends or self._ended() else "\n"
         try:
-            with self.path.open("a", encoding="utf-8") as fh:
+            with private(self.path, "a", encoding="utf-8") as fh:
                 if mended:
                     fh.write(mended)
                 if told and self.missing is not None:

@@ -725,6 +725,37 @@ def test_a_press_cut_off_by_qkvm_stopping_while_the_kvm_is_asked_pressed_nothing
 # --- from the review of the second round of fixes -------------------------------------------------------------------
 
 
+def test_a_press_that_never_reached_the_kvm_pressed_nothing_and_holds_nothing(tmp_path: Path, quick: dict[str, float], monkeypatch: pytest.MonkeyPatch) -> None:
+    # Register row 4 of 0.2.1 (w16c): no connection to the KVM to be had in time (all of them in use: httpx's PoolTimeout),
+    # and the press was said "may have pressed" and held the Fingerbot for its whole time, though nothing had gone out.
+    monkeypatch.setattr(kvm, "FINGERBOT_ANSWER", 0.3, raising=False)  # (and so the click waits 0.8 s for a connection)
+    monkeypatch.setattr(kvm.KvmDevice, "LIMITS", httpx.Limits(max_connections=1, max_keepalive_connections=1, keepalive_expiry=30.0))
+    fake = FakeKvm(FakeState(fingerbot=True)).start()
+    try:
+        with wall(tmp_path) as client:
+            device = add(client, fake.url)
+            wait_until(lambda: offered(client, device), "the Fingerbot was never offered")
+            fake.state.slow["/api/streamer/snapshot"] = 3.0  # the one connection to the KVM held by a picture that takes long
+            looking = threading.Thread(target=lambda: client.get(f"/api/v1/devices/{device}/snapshot", params={"w": 640, "fresh": 0}))
+            asked = fake.state.asked.count("GET /api/streamer/snapshot")
+            looking.start()
+            wait_until(lambda: fake.state.asked.count("GET /api/streamer/snapshot") > asked, "the picture was never asked for")
+            _, first = press(client, device, "fingerbot_power")
+            assert (first.status_code, first.json()["code"]) == (502, "action_failed"), first.text
+            assert "Nothing was pressed" in first.json()["message"], first.text
+            assert fake.state.presses == []
+            del fake.state.slow["/api/streamer/snapshot"]
+            looking.join(10)
+            assert press(client, device, "fingerbot_power")[1].status_code == 200  # held by nothing
+            assert len(fake.state.presses) == 1
+            wait_until(lambda: len(client.get(hist(device, what="events")).json()["rows"]) == 2, "the presses never reached the history")
+            events = client.get(hist(device, what="events")).json()["rows"]
+            assert [(row["what"], row["ok"]) for row in events] == [("fingerbot_power", False), ("fingerbot_power", True)]
+    finally:
+        fake.state.slow.clear()
+        fake.stop()
+
+
 def test_a_press_never_answered_leaves_the_fingerbot_alone_from_the_504_on(tmp_path: Path, quick: dict[str, float], monkeypatch: pytest.MonkeyPatch) -> None:
     # The time a press may last was counted from before it was sent: a press never answered came back as 504 when that
     # time was all but over, and a script that tried again on 504 pressed a second time a second later. It is counted from
@@ -837,5 +868,55 @@ def test_a_none_said_again_on_the_held_line_keeps_standing(tmp_path: Path, quick
             _, reply = press(client, device, "fingerbot_power")
             assert (reply.status_code, reply.json()["code"]) == (422, "invalid"), reply.text
             assert fake.state.ws_streams.count("0") == 0
+    finally:
+        fake.stop()
+
+
+def test_a_kvm_that_said_it_has_no_fingerbot_is_not_asked_again_by_the_tile_added_anew(tmp_path: Path, quick: dict[str, float]) -> None:
+    # Register row 10 of 0.2.1 (w16c): the "none" window lived in the client and in its successor at the same address. The
+    # tile removed and added again, its client asked again at the next press, on a line of its own that may wake the KVM's
+    # computer, two seconds after the KVM had said there is none.
+    fake = FakeKvm(FakeState()).start()
+    try:
+        with wall(tmp_path) as client:
+            device = add(client, fake.url)
+            wait_until(lambda: watched(client, device) and fake.state.fingerbot_events_sent >= 1, "the KVM never said it has none")
+            time.sleep(0.3)
+            _, reply = press(client, device, "fingerbot_power")
+            assert (reply.status_code, reply.json()["code"]) == (422, "invalid"), reply.text
+            assert client.delete(f"/api/v1/devices/{device}").status_code == 200
+            again = add(client, fake.url, name="Added again")
+            _, reply = press(client, again, "fingerbot_power")
+            assert (reply.status_code, reply.json()["code"]) == (422, "invalid"), reply.text
+            assert fake.state.ws_streams.count("0") == 0, f"{fake.state.ws_streams.count('0')} lines opened to ask it again"
+    finally:
+        fake.stop()
+
+
+def test_its_battery_is_not_asked_again_when_the_listeners_are_opened_again(tmp_path: Path) -> None:
+    # The coordinator's decision on 0.2.1's sweep (beside register row 10): when its battery was asked, and when it may be
+    # asked again (once an hour), lived in the client, and the listeners opened again (a change of the network settings)
+    # make every client anew: the battery was asked again at once, a round trip to the Fingerbot, and said unknown until
+    # then. It is kept beside the connections now, with the rest of what paces the KVM's Fingerbot (kvm.PACED).
+    from qkvm.core import Core
+    from qkvm.server import create_app
+
+    fake = FakeKvm(FakeState(fingerbot=True, fingerbot_battery=12)).start()
+    core = Core(tmp_path)
+    core.unlock_at_start()
+    try:
+        with TestClient(create_app(core), headers=CSRF, client=("127.0.0.1", 50000)) as client:
+            assert client.post("/api/v1/setup", json={"password": PASSWORD}).status_code == 200
+            device = add(client, fake.url)
+            wait_until(lambda: watched(client, device)["fingerbot"] == {"battery": 12, "low": True}, "the battery was never said")
+            assert fake.state.battery_asked == 1
+        with TestClient(create_app(core), headers=CSRF, client=("127.0.0.1", 50000)) as client:  # opened again, the program the same
+            assert client.post("/api/v1/login", json={"password": PASSWORD}).status_code == 200
+            wait_until(lambda: watched(client, device)["fingerbot"] is not None, "the Fingerbot was not offered after the listeners were opened again")
+            for _ in range(10):
+                watched(client, device)
+                time.sleep(0.05)
+            assert fake.state.battery_asked == 1, f"asked {fake.state.battery_asked} times"
+            assert watched(client, device)["fingerbot"] == {"battery": 12, "low": True}
     finally:
         fake.stop()

@@ -824,6 +824,80 @@ def test_a_key_held_by_the_holder_before_is_let_go_of_before_the_next_holders_fi
     played(scene)()
 
 
+def test_a_holders_line_that_closes_while_its_word_waits_for_the_hand_over_is_seen_closed_at_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Register row 9 of 0.2.1 (fx-a N3): the line's read loop awaited Machine.input, whose first word after a hand-over waits
+    # for what the holder before still let go of (up to HAND_OVER_WITHIN, sixteen seconds). Meanwhile the socket was not
+    # read: a viewer that closed was not seen, keyboard and mouse stayed with nobody's line, and the web server's pings were
+    # not answered once the words of a pointer still moving filled what it holds unread. Now the socket is read meanwhile,
+    # as while keyboard and mouse are asked for (`answer_to`), and what comes is taken in turn after it, the pointer's moves
+    # folded; the viewer gone ends the line at once.
+    monkeypatch.setattr(live, "HAND_OVER_WITHIN", 3.0)
+
+    async def scene() -> None:
+        s = Scene()
+        await s.take(s.a)
+        way_a = s.ways[0]
+        await s.machine.input(s.a, {"t": "k", "u": 0xE0, "d": True})
+        way_a.slow_up = 2.0  # A's Ctrl let go of is slow to be taken
+        assert await s.machine.control(s.a, False) == {"t": "control", "on": False}
+        await s.take(s.b)
+        socket = Socket({"t": "k", "u": 0x06, "d": True})
+        socket.came += [{"type": "websocket.receive", "text": json.dumps({"t": "m", "x": x, "y": 10})} for x in range(200)]
+        socket.came.append({"type": "websocket.disconnect", "code": 1001})
+        s.b.ws = socket  # type: ignore[assignment]
+        began = time.monotonic()
+        listening = asyncio.create_task(live.Lines._listen(s.lines, s.b))  # type: ignore[arg-type]
+        while s.b.leaving is None and time.monotonic() - began < 2.5:
+            await asyncio.sleep(0.02)
+        seen_after = time.monotonic() - began
+        assert s.b.leaving == "closed", f"B's viewer had gone for {seen_after:.1f} s, and the line was still B's: {s.b.leaving}"
+        assert seen_after < 1.0, f"seen after {seen_after:.1f} s"
+        assert s.machine.holder is None
+        await asyncio.wait_for(listening, 10)
+        await s.settled()
+        assert not [word for word in s.said if word[0] == "way B" and word[1] in ("key", "pointer")], s.said
+        assert held_down(s.said) == (set(), set()), s.said
+
+    played(scene)()
+
+
+def test_a_holders_pointer_moving_while_its_word_waits_for_the_hand_over_does_not_end_its_line(monkeypatch: pytest.MonkeyPatch) -> None:
+    # (The other half: read meanwhile, two hundred places of a pointer still moving and a few keys are kept, not taken for a
+    # line that floods; and once the hand-over is through they go, in turn, the places folded into the last of each run.)
+    monkeypatch.setattr(live, "HAND_OVER_WITHIN", 3.0)
+
+    async def scene() -> None:
+        s = Scene()
+        await s.take(s.a)
+        way_a = s.ways[0]
+        await s.machine.input(s.a, {"t": "k", "u": 0xE0, "d": True})
+        way_a.slow_up = 0.5
+        assert await s.machine.control(s.a, False) == {"t": "control", "on": False}
+        await s.take(s.b)
+        words: list[dict[str, Any]] = [{"t": "k", "u": 0x06, "d": True}, {"t": "k", "u": 0x06, "d": False}]
+        words += [{"t": "m", "x": x, "y": 10} for x in range(200)]
+        words += [{"t": "k", "u": 0x07, "d": True}, {"t": "k", "u": 0x07, "d": False}]
+        words += [{"t": "m", "x": x, "y": 20} for x in range(200)]
+        socket = Socket(words[0])
+        socket.came += [{"type": "websocket.receive", "text": json.dumps(word)} for word in words[1:]]
+        s.b.ws = socket  # type: ignore[assignment]
+        listening = asyncio.create_task(live.Lines._listen(s.lines, s.b))  # type: ignore[arg-type]
+        deadline = time.monotonic() + 5
+        while ("way B", "pointer", 199, 20, []) not in s.said and time.monotonic() < deadline:
+            await asyncio.sleep(0.02)
+        assert s.b.leaving is None, s.b.leaving
+        b_said = [word[1:] for word in s.said if word[0] == "way B" and word[1] in ("key", "pointer")]
+        assert b_said[:2] == [("key", 0x06, True), ("key", 0x06, False)], b_said
+        assert ("key", 0x07, True) in b_said and b_said[-1] == ("pointer", 199, 20, []), b_said
+        assert s.said.index(("way A", "key", 0xE0, False)) < s.said.index(("way B", "key", 0x06, True)), s.said
+        listening.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await listening
+        await s.settled()
+
+    played(scene)()
+
+
 def test_an_admin_takes_over_the_holder_is_told_who_and_what_they_had_down_is_let_go_of_first() -> None:
     async def scene() -> None:
         s = Scene()

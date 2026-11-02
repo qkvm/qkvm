@@ -36,7 +36,7 @@ import hashlib
 import logging
 import re
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from typing import Any
 from urllib.parse import parse_qs, quote, unquote, urlencode, urlsplit
 
@@ -245,6 +245,19 @@ class Unwell(KvmError):
     """Proxmox answered with an error of its own (HTTP 5xx): one of its moments, as far as can be told, and no refusal."""
 
 
+class AnswerLost(Unwell):
+    """Proxmox, or a proxy in front of it, says that the answer did not come back, not that the request did not arrive (see
+    ANSWER_LOST): for a question one of its moments, as any other error of its own; a command may have been carried out."""
+
+
+# Where Proxmox hands a request on to the node the guest is on (a tile names one node of a cluster), it passes back the codes
+# of its own HTTP library (AnyEvent::HTTP) where that came to nothing: 595 where the node could not be connected to (nothing
+# reached it), 596 where the TLS handshake, the sending of the request or the wait for the head of the answer failed, and 597
+# where reading the body did; a proxy in front of Proxmox answers 502, 503 and 504 the same way. All but 595 can come after
+# the node carried the request out.
+ANSWER_LOST = frozenset({502, 503, 504, 596, 597})
+
+
 SAID_THE_TOKEN = "its words held the API token, and are not shown"
 
 
@@ -304,9 +317,9 @@ def data_of(reply: httpx.Response, what: str) -> Any:
         raise WrongNode("bad_response", f"Proxmox has no such guest there: {said}")
     if reply.status_code in (595, 596):
         # (Proxmox's own numbers: the node it would hand the question on to does not answer.)
-        raise KvmError("unreachable", f"Proxmox cannot reach the node the guest is on: {said}")
+        raise (AnswerLost if reply.status_code in ANSWER_LOST else KvmError)("unreachable", f"Proxmox cannot reach the node the guest is on: {said}")
     if reply.status_code >= 500:
-        raise Unwell("bad_response", f"Proxmox answered {what} with HTTP {reply.status_code}: {said}")
+        raise (AnswerLost if reply.status_code in ANSWER_LOST else Unwell)("bad_response", f"Proxmox answered {what} with HTTP {reply.status_code}: {said}")
     raise KvmError("bad_response", f"Proxmox answered {what} with HTTP {reply.status_code}: {said}")
 
 
@@ -345,6 +358,18 @@ def own_number(config: Any) -> str | None:
 # --- the guest ---------------------------------------------------------------------------------------------------------
 
 
+# Sign-ins under way, by the mark of the token at its Proxmox (ProxmoxGuest._offered): every guest of it on the wall shares
+# one verdict on the token, and one that comes while another's sign-in is out waits for that one's answer (see `_login`).
+_SIGNING_IN: dict[str, asyncio.Future[None]] = {}
+
+# When each guest's console was last forgiven, by kind and address: for the guest seen stopped, and for its process seen to
+# begin again (see ProxmoxConsole). Kept here, beside the ladders they forgive (vncdevice._PACED), and not in the console,
+# which is made anew at every edit of its tile, at a lock and unlock, at a removal and an addition: each new one could
+# forgive at once, and a Proxmox that says "stopped" by turns had the ladder reset as often as the tile was made anew.
+_FORGIVEN: dict[str, tuple[float, float]] = {}
+MOST_FORGIVEN = 2048  # of them; the oldest go first
+
+
 class ProxmoxConsole(DoorScreen):
     """The guest's screen: the console its Proxmox hands out, held while somebody looks (see DoorScreen)."""
 
@@ -369,8 +394,32 @@ class ProxmoxConsole(DoorScreen):
     def __init__(self, spec: DeviceSpec, guest: ProxmoxGuest) -> None:
         super().__init__(spec)
         self._guest = guest
-        self._restart_forgiven_at = float("-inf")
-        self._stopped_forgiven_at = float("-inf")
+
+    @property
+    def _stopped_forgiven_at(self) -> float:
+        """When this guest's console was last forgiven for the guest seen stopped (kept by address: see _FORGIVEN)."""
+        return _FORGIVEN.get(self._paced_as(), (float("-inf"), float("-inf")))[0]
+
+    @_stopped_forgiven_at.setter
+    def _stopped_forgiven_at(self, at: float) -> None:
+        self._forgiven(at, self._restart_forgiven_at)
+
+    @property
+    def _restart_forgiven_at(self) -> float:
+        """When it was last forgiven for the guest's process seen to begin again (kept by address: see _FORGIVEN)."""
+        return _FORGIVEN.get(self._paced_as(), (float("-inf"), float("-inf")))[1]
+
+    @_restart_forgiven_at.setter
+    def _restart_forgiven_at(self, at: float) -> None:
+        self._forgiven(self._stopped_forgiven_at, at)
+
+    def _forgiven(self, stopped: float, restarted: float) -> None:
+        if self._closed:
+            return  # (retired: the console that took its place says when it was forgiven)
+        _FORGIVEN.pop(self._paced_as(), None)  # (the newest last)
+        _FORGIVEN[self._paced_as()] = (stopped, restarted)
+        while len(_FORGIVEN) > MOST_FORGIVEN:
+            del _FORGIVEN[next(iter(_FORGIVEN))]
 
     async def _open(self) -> rfb.Stream:
         """A ticket from Proxmox, and the WebSocket it opens, at once: what follows is RFB."""
@@ -492,12 +541,15 @@ class ProxmoxGuest(Device):
             raise KvmError("invalid", "The user name is to be an API token's ID (user@realm!token) and the password its secret", 422)
         return {"Authorization": f"PVEAPIToken={self.spec.username}={self.spec.password}"}
 
-    async def _login(self) -> None:
+    async def _login(self, until: float | None = None) -> None:
         """Have the token taken once: the first request that carries it is the sign-in, counted as one.
 
         Every request after it carries the token again (Proxmox has no session for a token), and a 401 to any of them
         is answered by signing in once more, counted: a token that was taken back is a no like any other.
-        """
+
+        `until`: the moment the answer is to be in by (a read in the wait for a start, see `_call`): the sign-in is held to it,
+        and is not sent where less is left than a sign-in may take (it then goes at a later look, which has the time: sent all
+        the same, a token taken back in the middle of the wait added a whole sign-in past the wait's bound)."""
         async with self._login_lock:
             if self._signed_in:
                 return
@@ -509,16 +561,44 @@ class ProxmoxGuest(Device):
                 raise KvmError("invalid", "This is not the address of a Proxmox guest", 422)
             headers = self._authorization()
             offered = self._offered()
-            self._not_yet(offered, NO_SAID)
+            # The connection first, and only then whether the token may be offered: every guest of this Proxmox shares one
+            # verdict on it, and the check and the note that it went out are made with nothing waited for between them. With
+            # the connection between them (its certificate fetched on first contact, the system's list read on first use),
+            # every guest that looked at once passed the check before any had gone out, each no was counted, and twelve
+            # guests held the token back an hour where one no holds it a minute (the review's probe p1).
             client = await self._http()
+            # Another guest of this Proxmox signing in with this token just now (at a wall's start, they all look at once): its
+            # answer is waited for, and then this one goes on as it went (let in: it signs in itself, as ever; told no: it is
+            # told no too, sent nothing). Held back meanwhile, each of them said "no_sign_in" at its first look: eleven of twelve
+            # tiles flashed a problem. (Waited for within `until`, as a sign-in of its own would be.)
+            while (under_way := _SIGNING_IN.get(offered)) is not None and not under_way.done():
+                await asyncio.wait({under_way}, timeout=None if until is None else max(0.0, until - time.monotonic()))
+                if not under_way.done():
+                    raise KvmError("no_sign_in", "Proxmox does not take the token just now, and the wait it was asked in has no time left for a sign-in")
             request = client.build_request("GET", f"{self._origin}{API}/version", headers={**headers, "Accept": "application/json"}, timeout=sign_in_waits())
+            within = None
+            if until is not None:
+                waits = request.extensions.get("timeout") or {}
+                least = (waits.get("pool") or 0.0) + (waits.get("connect") or 0.0) + kvm.CONNECT_MARGIN  # (what `bounded` gives any request)
+                left = until - time.monotonic()
+                if left < least:
+                    raise KvmError("no_sign_in", "Proxmox does not take the token just now, and the wait it was asked in has no time left for a sign-in")
+                within = min(left, (waits.get("connect") or 0.0) + (waits.get("read") or 0.0) + kvm.TRANSFER_TIME)
+            self._not_yet(offered, NO_SAID)
             before = REJECTED.sent(offered)
+            signing_in = _SIGNING_IN[offered] = asyncio.get_running_loop().create_future()
             try:
-                reply = await self._send(client, request, MAX_REPLY)
+                reply = await self._send(client, request, MAX_REPLY, within)
             except httpx.HTTPError as ex:
                 raise self._came_to_nothing(offered, _transport_error(ex, self.spec.tls), NO_SAID, before, went_out(ex)) from ex
             except KvmError as ex:
                 raise self._came_to_nothing(offered, ex, NO_SAID, before) from None
+            finally:
+                # (Its answer is noted before anything waits on: whoever waited finds the verdict, whatever it was. Not
+                # waited for past this sign-in's own end, however it ended.)
+                signing_in.set_result(None)
+                if _SIGNING_IN.get(offered) is signing_in:
+                    del _SIGNING_IN[offered]
             self._answered()
             if reply.status_code == 401:
                 self._login_error = KvmError("auth_failed", "Proxmox does not take the saved API token - check the token's ID and secret")
@@ -563,7 +643,7 @@ class ProxmoxGuest(Device):
 
         retried = relogged = False
         while True:
-            await self._login()
+            await self._login(until)
             client = await self._http()
             request = client.build_request(method, f"{self._origin}{API}{path}", headers={**self._authorization(), "Accept": "application/json"}, data=data, params=params)
             if still is not None and not still():
@@ -816,13 +896,20 @@ class ProxmoxGuest(Device):
         said = {"model": f"VM {self._vmid} on {self._node}", "version": f"Proxmox VE {self._version}" if self._version else None, "hostname": plain(status.get("name"), 60)}
         try:
             config = await self._guest("GET", "config", "read this guest's settings", urgent=True)
-        except KvmError:
+        except KvmError as ex:
+            if ex is RETIRED:
+                raise
             if self.spec.machine:
                 # Not read just now: that says nothing of the number, which is not "it gives none". An edit keeps what the
                 # tile is known by (None, as every driver that could not read its number says), and every power command
                 # and console asks again before anything is sent.
                 return {**said, "ident": None}
-            config = None  # (nothing to know it by: it is known by its address, and by the first number it gives)
+            # None remembered: the guest is being added, or an edit with its token's secret typed is to take the virtual
+            # machine that has the number now. Which one that is could not be read, and nothing is taken: taken as "none",
+            # the tile kept no number, and took the next virtual machine made under the guest's number on first use (one
+            # whose "Hold power" stopped another VM: the review's probe p3). Said, and the next try takes it; "Save anyway"
+            # (where it could not be reached) keeps what the tile was known by (see the server's connect).
+            raise KvmError(ex.code, f"Which virtual machine has this guest's number could not be told: {ex.message}", ex.status) from None
         seen = own_number(config)
         await self._judge(seen)
         return {**said, "ident": seen}
@@ -1024,7 +1111,14 @@ class ProxmoxGuest(Device):
         if action == "atx_reset" and not running:
             raise KvmError("action_failed", "The guest is stopped: there is nothing to reset")
         verb = POWER_VERBS.get(action) or ("shutdown" if running else "start")
-        said = await self._guest("POST", f"status/{verb}", f"{verb} this guest", urgent=True, again=False, still=still)
+        try:
+            said = await self._guest("POST", f"status/{verb}", f"{verb} this guest", urgent=True, again=False, still=still)
+        except AnswerLost as ex:
+            # Its answer did not come back, and the command may have been carried out (said as not done, the history kept it
+            # as not pressed, and "Retry failed" pressed it again): said as a press with no answer is, as for a server.
+            self._status_at = 0.0
+            self._refresh_soon()
+            raise KvmError("timeout", f"Proxmox's answer to the command did not come back ({ex.message}): it may have been done. Look at the guest before trying again.", 504) from None
         if not isinstance(said, str) or not UPID.fullmatch(said):
             raise KvmError("bad_response", "Proxmox did not say that it took the power command")
         self._status_at = 0.0  # what the tile says is out of date now,
@@ -1130,11 +1224,17 @@ class ProxmoxGuest(Device):
             self._refresh_soon()
 
 
-async def guests(base_url: str, username: str, password: str, *, typed: bool, tls: str = "pinned", cert_pem: str | None = None) -> tuple[list[dict[str, Any]], int, str | None]:
+async def guests(
+    base_url: str, username: str, password: str, *, typed: bool, tls: str = "pinned", cert_pem: str | None = None, numbers_of: Collection[int] = (),
+) -> tuple[list[dict[str, Any]], int, str | None]:
     """The virtual machines a token may see on a Proxmox, for somebody adding them: (guests, containers left out, the
     certificate it showed: remembered on this first contact, for this call alone). Each guest: vmid, node, name,
     status, and `url`, its address as the wall keeps it. `typed`: a person typed the token just now, and it is tried
-    whatever was said to it before (as a password typed for a device is). KvmError where Proxmox does not list them."""
+    whatever was said to it before (as a password typed for a device is). KvmError where Proxmox does not list them.
+
+    `numbers_of`: the guests (by number) whose settings are read as well, for the number each gives for itself (`own`,
+    own_number's: None where it gives none). Left out where they could not be read. (The guests whose number a tile on
+    the wall has: a VM made under the number of a guest that was deleted is not that tile's guest.)"""
     found = address_of(base_url)
     spec = DeviceSpec(id="", name="", base_url=found.origin, username=username, password=password, tls=tls, cert_pem=cert_pem, kind="proxmox")
     if typed:
@@ -1142,6 +1242,13 @@ async def guests(base_url: str, username: str, password: str, *, typed: bool, tl
     asker = ProxmoxGuest(spec)
     try:
         listed, containers = await asker.listing()
+        for guest in listed:
+            if guest["vmid"] in numbers_of:
+                try:
+                    reply = await asker._call("GET", f"/nodes/{guest['node']}/qemu/{guest['vmid']}/config", urgent=True, vital=False)
+                    guest["own"] = own_number(data_of(reply, "read a guest's settings"))
+                except KvmError:
+                    pass  # (not read: what the list says of it goes by its number, as before)
     finally:
         await asker.close()
     for guest in listed:

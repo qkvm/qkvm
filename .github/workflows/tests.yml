@@ -27,7 +27,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: ${{ matrix.python }}
       - name: Install
@@ -43,7 +43,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.13"
       - name: Install
@@ -75,7 +75,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.13"
       - name: Install
@@ -96,7 +96,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.13"
       - name: Install the servers
@@ -117,7 +117,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.13"
       - name: Build the wheel
@@ -146,7 +146,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.13"
       # The very install and build the release makes (release.yml, the job build): the same tools pinned by hash,
@@ -190,14 +190,15 @@ jobs:
   #     loopback (its own main binds every interface), with its requirements pinned here since it does not;
   #   sushy-tools 2.2.0 (Apache-2.0) with its fake systems driver: the standard's shapes, and power that switches
   #     one to eleven seconds after it was told to.
-  # The versions of the libraries pinned for the emulators are what ran on a developer's PC on 2026-10-14.
+  # The versions of the libraries pinned for the emulators are what ran on a developer's PC on 2026-10-14, but for
+  # pyOpenSSL (25.3.0) and multipart (1.3.0), raised past their known holes on 2026-11-01: untried with the emulators until this job runs.
   controllers:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.13"
       - name: Install
@@ -206,8 +207,8 @@ jobs:
         run: |
           python -m venv /tmp/emulators
           /tmp/emulators/bin/pip install --quiet sushy-tools==2.2.0 Flask==3.1.3 Werkzeug==3.1.9 requests==2.34.2 urllib3==2.8.0 \
-            grequests==0.7.0 gevent==26.9.0 multipart==1.3.0 \
-            Flask-RESTful==0.3.10 aniso8601==10.0.1 pytz==2025.2 six==1.17.0 StringGenerator==0.4.4 pyOpenSSL==25.3.0 hvac==2.3.0 json-merge-patch==0.2
+            grequests==0.7.0 gevent==26.9.0 multipart==1.3.1 \
+            Flask-RESTful==0.3.10 aniso8601==10.0.1 pytz==2025.2 six==1.17.0 StringGenerator==0.4.4 pyOpenSSL==26.4.0 hvac==2.3.0 json-merge-patch==0.2
           git clone --quiet --depth 1 --branch 1.3.0 https://github.com/DMTF/Redfish-Mockup-Server /tmp/mockup-server
           test "$(git -C /tmp/mockup-server rev-parse HEAD)" = 23d21f9a3610f6b6fbb71ffc941296b159a524d2
           git clone --quiet --depth 1 --branch v1.1.0 https://github.com/HewlettPackard/ilo-redfish-emulator /tmp/ilo
@@ -265,7 +266,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.13"
       - name: Install
@@ -311,7 +312,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.13"
       - name: Install

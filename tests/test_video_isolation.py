@@ -37,6 +37,28 @@ def test_real_sandboxes_are_separate_and_closed_sessions_cannot_restart() -> Non
         second.close()
 
 
+def test_a_session_counts_what_its_worker_worked_by_the_systems_count() -> None:
+    # What counts towards LONG_STEP for a picture is what its worker worked: by the system's count of the worker's processor
+    # time (VideoSession.cpu_seconds, read where the wait begins and ends), not by the clock of the thread that waited.
+    frame = video.RGBFrame(640, 480, bytes(range(256)) * (640 * 480 * 3 // 256))
+    session = video.VideoSession()
+    try:
+        encoded = video.encode_jpeg(frame, None, 2, session)
+        worker = session._worker
+        assert worker is not None
+        counted = worker.cpu_seconds()
+        assert counted is not None and counted > 0  # (starting it took some: the system says so)
+        same, used = session.cpu_seconds()
+        assert same is worker and used is not None
+        for _ in range(40):
+            video.decode_jpeg(encoded, 640, 480, session)
+        later, used_later = session.cpu_seconds()
+        assert later is worker and used_later is not None and used_later >= used
+    finally:
+        session.close()
+    assert worker.cpu_seconds() is None  # (ended: nothing to count)
+
+
 def test_rfb_connections_never_share_native_decoder_state() -> None:
     from qkvm import rfb
 
@@ -46,10 +68,12 @@ def test_rfb_connections_never_share_native_decoder_state() -> None:
 
     clients = [rfb.Client(SimpleNamespace(close=close_stream)) for _ in range(2)]
     try:
+        # (Each picture as a server's JPEG is decoded: in its own video session, by rfb.decode_jpeg, which Client._decoded
+        # runs in the server's own thread. Since 0.2.1 the drawing threads' _draw_tight decodes none.)
         for client in clients:
             client.width = client.height = 16
             client.rgb = bytearray(16 * 16 * 3)
-            list(client._draw_tight(0, 0, 16, 16, rfb._Bytes(b"\x90" + jpeg)))
+            rfb.decode_jpeg(jpeg, 16, 16, client._video_decoder)
         workers = [client._video_decoder._worker for client in clients]
         assert all(worker is not None for worker in workers)
         old0, keep1 = workers[0]._process.pid, workers[1]._process.pid
@@ -58,10 +82,10 @@ def test_rfb_connections_never_share_native_decoder_state() -> None:
         # gets a fresh isolated worker of its own on the next frame (it does not keep failing), with
         # a new process that is neither the dead one nor the other server's.
         workers[0].close()
-        list(clients[0]._draw_tight(0, 0, 16, 16, rfb._Bytes(b"\x90" + jpeg)))
+        rfb.decode_jpeg(jpeg, 16, 16, clients[0]._video_decoder)
         respawned = clients[0]._video_decoder._worker._process.pid
         assert respawned not in (old0, keep1)
-        list(clients[1]._draw_tight(0, 0, 16, 16, rfb._Bytes(b"\x90" + jpeg)))
+        rfb.decode_jpeg(jpeg, 16, 16, clients[1]._video_decoder)
         assert clients[1]._video_decoder._worker._process.pid == keep1  # the other server's worker is untouched
     finally:
         for client in clients:
@@ -106,6 +130,9 @@ def test_a_repeatedly_dying_session_worker_is_not_respawned_in_a_tight_loop(monk
         def __init__(self) -> None:
             starts.append(clock[0])
             self._process = object()
+
+        def cpu_seconds(self) -> float | None:
+            return None  # (a stand-in that cannot tell: the session counts the request by the clock)
 
         def request(self, *args: object, **kwargs: object) -> tuple[int, int, int, bytes]:
             self._process = None  # dies on use, as Worker.request does when it closes itself
@@ -153,6 +180,9 @@ def test_a_worker_that_dies_every_other_request_is_not_restarted_every_half_seco
         def __init__(self) -> None:
             starts.append(clock[0])
             self._process = object()
+
+        def cpu_seconds(self) -> float | None:
+            return None  # (a stand-in that cannot tell: the session counts the request by the clock)
 
         def request(self, *args: object, **kwargs: object) -> tuple[int, int, int, bytes]:
             calls[0] += 1
@@ -202,6 +232,9 @@ def test_a_request_refused_before_it_reaches_the_worker_is_no_death(monkeypatch:
         def __init__(self) -> None:
             starts.append(self)
             self._process = object()
+
+        def cpu_seconds(self) -> float | None:
+            return None  # (a stand-in that cannot tell: the session counts the request by the clock)
 
         def request(self, *args: object, **kwargs: object) -> tuple[int, int, int, bytes]:
             raise video.VideoError("incorrect RGB size")  # raised before the worker is reached: it lives on
@@ -272,13 +305,16 @@ def test_bad_worker_header_is_rejected_before_payload_read(header: bytes) -> Non
     assert reads == [video.HEADER.size]
 
 
-def test_decoder_backlog_ends_without_blocking() -> None:
+def test_decoder_backlog_never_blocks_nor_builds() -> None:
+    # (Until 0.2.1 a backlog ended decoding, and with it the connection: it is let go of now, up to the next key frame, and
+    # decoding goes on. See tests/test_a_jetkvm_over_hidrpc.py, e3.)
     pending = video.BoundedDecoderQueue()
     task = (SimpleNamespace(mimeType="video/h264"), SimpleNamespace(data=b"x"))
     for _ in range(100):
         pending.put(task)
-    assert pending.stopped and pending.qsize() == 1
-    assert pending.get_nowait() is None
+        assert pending.qsize() <= pending.maxsize
+    assert not pending.stopped and pending.qsize() == 0 and pending.let_go == 100
+    assert pending.awaiting_key_frame
 
 
 def test_codec_hook_has_no_fallback() -> None:
@@ -844,6 +880,9 @@ def test_a_missed_deadline_marks_the_workers_pair_and_its_restart_avoids_that_pa
         def __init__(self, **kwargs: object) -> None:
             made.append(kwargs)
             self.pair, self._process = 4, object()
+
+        def cpu_seconds(self) -> float | None:
+            return None  # (a stand-in that cannot tell: the session counts the request by the clock)
 
         def request(self, *args: object, **kwargs: object) -> tuple[int, int, int, bytes]:
             self._process = None  # it dies on its first request

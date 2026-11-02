@@ -24,8 +24,10 @@ def reveal_control(page, ident):
 @pytest.mark.parametrize("width,height", [(1485, 1000), (1140, 900), (900, 1400), (820, 900), (640, 900), (390, 844), (320, 720)])
 def test_compact_controls_and_video_fit(tmp_path: Path, browser: Browser, width: int, height: int) -> None:  # noqa: F811
     fake = FakeKvm(FakeState()).start()
+    # (Its console reached by another name than the wall's: on the wall's own, Open console is not there at all.)
+    elsewhere = fake.url.replace("127.0.0.1", "localhost") + "/"
     try:
-        with a_wall(tmp_path, ("Build server", fake)) as (live, _), looking(browser, live, viewport={"width": width, "height": height}) as page:
+        with a_wall(tmp_path, ("Build server", fake), open_url=elsewhere) as (live, _), looking(browser, live, viewport={"width": width, "height": height}) as page:
             sign_in(page, live)
             home_header = page.locator(".top").bounding_box()
             tile(page, "Build server").click()

@@ -32,7 +32,8 @@ def fast(monkeypatch: pytest.MonkeyPatch) -> None:
 def held_disk(monkeypatch: pytest.MonkeyPatch) -> dict[str, bool]:
     """sessions.json can be neither written anew nor removed while disk['held'] (a folder gone read-only)."""
     disk = {"held": False}
-    real_open, real_unlink = os.open, os.unlink
+    # (sessions.json is made by security.open_private, its own from its first moment: the full disk is stood in for there.)
+    real_open, real_unlink = security.open_private, os.unlink
 
     def open_unless_held(path: Any, *args: Any, **kwargs: Any) -> int:
         if disk["held"] and str(path).endswith("sessions.json.new"):
@@ -44,7 +45,7 @@ def held_disk(monkeypatch: pytest.MonkeyPatch) -> dict[str, bool]:
             raise PermissionError(errno.EACCES, "Permission denied")
         real_unlink(path, *args, **kwargs)
 
-    monkeypatch.setattr(os, "open", open_unless_held)
+    monkeypatch.setattr(security, "open_private", open_unless_held)
     monkeypatch.setattr(os, "unlink", unlink_unless_held)
     return disk
 

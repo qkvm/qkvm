@@ -105,9 +105,15 @@ class PveState:
     tasks_hidden: bool = False  # the token may not read how a task stands (403)
     hostile: str = ""  # a way to misbehave: see make_fake_proxmox
     unwell_until: float = 0.0  # until then (time.monotonic()), every question is answered 500
+    # A power command is carried out, and its answer lost on its way back: answered with this HTTP status instead (0: it is
+    # not). Proxmox's own for a request it hands on to another node (596: TLS, sending, or waiting for the head of the
+    # answer; 597: reading its body), or a proxy's in front of it (502, 503, 504). 595: the node could not be connected to,
+    # and nothing is carried out.
+    power_answer: int = 0
     # What happened, for the tests to look at.
     requests: list[str] = field(default_factory=list)  # "GET /path" of every request that carried the token
     refused: int = 0  # requests answered 401
+    refused_paths: list[str] = field(default_factory=list)  # ...and what each asked for ("GET /version": a sign-in)
     tickets: list[Ticket] = field(default_factory=list)
     tasks: list[dict[str, Any]] = field(default_factory=list)  # each: upid, type, vmid, status ("running", "OK", or why not)
     upgrades: int = 0
@@ -151,6 +157,7 @@ def make_fake_proxmox(state: PveState, stopping: asyncio.Event | None = None) ->
         if request.url.path.startswith(API):
             if not signed(request.headers):
                 state.refused += 1
+                state.refused_paths.append(f"{request.method} {request.url.path[len(API):]}")
                 if state.refuse_after:
                     await asyncio.sleep(state.refuse_after)
                 return Response(status_code=401)
@@ -280,6 +287,8 @@ def make_fake_proxmox(state: PveState, stopping: asyncio.Event | None = None) ->
             return guest
         if verb not in ("start", "stop", "shutdown", "reset", "reboot", "suspend", "resume"):
             return refusal(501, f"Method 'POST /nodes/{node}/qemu/{vmid}/status/{verb}' not implemented")
+        if state.power_answer == 595:
+            return JSONResponse({"data": None}, status_code=595)  # (the node it is for could not be connected to: nothing reached it)
         handed = guest.ha and verb in ("start", "stop", "shutdown")
         kind = ("hastart" if verb == "start" else "hastop") if handed else f"qm{verb}"
         runs = state.task_takes and not handed
@@ -303,6 +312,8 @@ def make_fake_proxmox(state: PveState, stopping: asyncio.Event | None = None) ->
             loop.call_later(state.task_takes, ended)
         else:
             carried_out()
+        if state.power_answer:
+            return JSONResponse({"data": None}, status_code=state.power_answer)
         return JSONResponse({"data": made["upid"]})
 
     @app.get(API + "/nodes/{node}/tasks/{upid}/status")

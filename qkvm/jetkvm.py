@@ -17,8 +17,9 @@ Its owner chooses, at the device's own page, whether it has a password and wheth
 HTTPS beside it. The wall talks to it over HTTPS wherever it offers that, remembers its certificate
 on first contact as it does a Comet's, and follows when the choice is changed later: onto HTTPS,
 by itself. Never back onto plain HTTP by itself: there nothing is checked any more, neither who
-answers nor who listens, and that it was the owner who switched HTTPS off is only the word of
-whatever answers now. The tile says so, and a person decides (see `_ask_the_other_way`).
+listens nor who answers (but for the number it gives for itself once signed in, see `_same_jetkvm`),
+and that it was the owner who switched HTTPS off is only the word of whatever answers now. The tile
+says so, and a person decides (see `_ask_the_other_way`).
 
 WebRTC is the `aiortc` package, which is installed with qKVM. It is loaded when the first JetKVM is
 connected to and not before: it brings a video decoder, and a wall without a JetKVM has no use for one.
@@ -29,17 +30,21 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import contextvars
 import hashlib
 import importlib.util
+import ipaddress
 import json
 import logging
 import re
+import socket
 import struct
 import time
 import zlib
 from collections import deque
 from collections.abc import Callable
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 from websockets.asyncio.client import ClientConnection
@@ -125,6 +130,11 @@ WAY_ASK = 6.0  # signing in over plain HTTP waits this long, at most, to hear wh
 # this many may wait to go. (Longer than a lost packet costs: one message in flight is sent again after a second.)
 TAKE_WITHIN = 5.0
 MOST_WAITING = 256
+# An action that types waits this long for the live line's keys still on their way to go first, and is refused (busy) where
+# they take longer (see `act`). Its own bound, and not TAKE_WITHIN, which is how long one of those keys is given to be
+# answered: the two are not one wait, and the one made longer for a JetKVM or a computer that answers slowly made the
+# other as long (raised to ten seconds in a test, the refused action outlasted the test's client).
+LIVE_KEYS_WAIT = 5.0
 MOST_STEP = 127  # the most a relative move or a turn of the wheel says in one report (a signed byte)
 # Keys and the mouse go over the binary `hidrpc` channel where the JetKVM answers its handshake (see `_choose_road`):
 # it is asked this often, for this long from the channel's opening, before keys go over JSON-RPC instead (an older
@@ -145,6 +155,10 @@ HID_ASKS_AGAIN = 10
 KEEP_ALIVE_EVERY = 0.03
 MOST_BUFFERED = 16384  # bytes of hidrpc messages waiting in the wall to go out, beyond which the connection is made anew
 MOST_HID_MESSAGE = 64  # what the JetKVM says on hidrpc is a handful of bytes; anything longer is not read
+# What the JetKVM says on the channel it is asked over (JSON-RPC: answers, and events such as videoInputState) is a few hundred
+# bytes, its list of machines saved for Wake-on-LAN a few kilobytes. A message longer than this, which is what the wall says it
+# takes (aiortc's a=max-message-size, 64 KiB), is not read, and ends the connection (see `_on_message`).
+MOST_RPC_MESSAGE = 65536
 LET_GO_WAIT = 0.5  # before the wall closes a connection with something down: how long it waits for the letting go to leave
 LET_GO_SETTLE = 0.05  # ...and then, for the JetKVM to have done it (it does each message within milliseconds)
 NOTHING_DOWN = (0, ())  # the keyboard with nothing down: (modifier bits, keys)
@@ -152,6 +166,21 @@ NOTHING_DOWN = (0, ())  # the keyboard with nothing down: (modifier bits, keys)
 # (the owner's standard for such holds). A JetKVM nobody has watched for a minute sends its first picture some five
 # seconds after it is connected to; one that is held shows it at once when somebody looks again.
 UNWATCHED = 300.0
+# Which JetKVM answers at a tile's address (see JetKvmDevice._same_jetkvm): while another one does, it is asked again this
+# often, and not at every look.
+SAME_JETKVM_EVERY = 60.0
+# What a tile says, and a key, a text or a button is answered with, where the JetKVM at its address is not the one it was
+# added for.
+ANOTHER_JETKVM = (
+    "Another JetKVM answers at this address: it gives another number for itself than the JetKVM this tile was added for. "
+    "Nothing is done to it: no key, no power button, no connection to its screen. If it is this tile's JetKVM now, edit the "
+    "tile and type its password (one without a password: remove the tile and add it again)."
+)
+NO_JETKVM_NUMBER = (
+    "The JetKVM at this address does not say which it is, and the JetKVM this tile was added for did. Nothing is done to it: "
+    "no key, no power button, no connection to its screen. If it is this tile's JetKVM now, edit the tile and type its "
+    "password (one without a password: remove the tile and add it again)."
+)
 
 # JPEG quantizer per size (2 is the best the encoder does): screen text needs it.
 QUANTIZER = {"480": 3, "640": 3, "960": 2, FULL: 2}
@@ -190,6 +219,10 @@ _BLANK = _dark_pixel()
 # A report waiting to go to a JetKVM over JSON-RPC: its method, its parameters, whether a later one may be folded into it,
 # and the check of whoever said it (None: a letting go).
 Waiting = tuple[str, dict[str, Any], bool, Callable[[], bool] | None]
+
+# Whether the look under way is one for the alerts' sake (see `probe`), which is nobody watching: told by the look's own
+# context, and not by a count on the device, which took a tile's look that came beside an alerts' look for nobody watching too.
+_LOOKING_FOR_ALERTS: contextvars.ContextVar[bool] = contextvars.ContextVar("qkvm_jetkvm_looking_for_alerts", default=False)
 
 # Video connections left to close by themselves (see `_run`), held until they have: nothing else holds an unfinished
 # close once whoever waited for it has stopped or given up, and the garbage collector would throw it away halfway.
@@ -251,8 +284,34 @@ async def offered_at(address: str) -> dict[str, Any] | None:
     return said if isinstance(said, dict) and "isSetup" in said else None
 
 
+async def number_to_anybody(address: str) -> tuple[int | None, str | None]:
+    """What a JetKVM at `address` says at /device to anybody who asks, with no session: (its HTTP status, the number it gives
+    for itself, as own_number makes it); (None, None) where nothing answers. One without a password says its number so (401
+    where it has one: it says it only to whoever is signed in). Asked over plain HTTP, where no certificate is judged."""
+    try:
+        async with httpx.AsyncClient(verify=unverified_context(), timeout=httpx.Timeout(3.0, connect=1.5), trust_env=False) as client:
+            reply = await bounded(client, client.build_request("GET", f"{address}/device"), MAX_PROBE, 5.0)
+            said = read_json(reply) if reply.status_code == 200 else None
+    except (httpx.HTTPError, ValueError, KvmError):
+        return None, None
+    return reply.status_code, own_number(said)
+
+
 def webrtc_available() -> bool:
     return importlib.util.find_spec("aiortc") is not None
+
+
+def own_number(said: Any) -> str | None:
+    """The number a JetKVM gives for itself (its deviceId, in what it says at /device), as a mark to know it by at whichever
+    address; None where it gives none worth the name. Kept as a digest, since the number itself is nobody's business."""
+    number = said.get("deviceId") if isinstance(said, dict) else None
+    if not isinstance(number, str) or not 8 <= len(number) <= 64 or len(set(number)) < 4:
+        return None
+    return "jetkvm:" + hashlib.sha256(number.encode()).hexdigest()[:32]
+
+
+class _SessionRefused(Exception):
+    """The JetKVM does not take the session presented to it (HTTP 401): signed in afresh, or said why not (`_signalling`)."""
 
 
 def key_report(keys: str) -> tuple[int, list[int]]:
@@ -297,6 +356,25 @@ def text_reports(text: str, layout: str = US) -> list[tuple[int, list[int]]]:
             raise KvmError("invalid", f"Nothing was typed: character {place} of the text cannot be typed on the {LAYOUT_NAMES[layout]} keyboard layout this JetKVM's computer is set to", 422)
         reports.extend((step >> 8, [step & 0xFF]) for step in steps)
     return reports
+
+
+def allowed_candidate(candidate: str, allowed: frozenset[Any]) -> bool:
+    """Whether a network address a JetKVM offers for its video connection (an ICE candidate, "candidate:..." as it sends it) is
+    one the wall sends its connectivity checks to: over UDP, written as an address (not a name: a name ending in .local was
+    looked up with mDNS), and one of `allowed`, the addresses the JetKVM is reached at (see JetKvmDevice._candidate_addresses).
+
+    Every address offered was tried before, whatever it named: whatever answers at a JetKVM's address (it serves plain HTTP
+    out of its box) could aim the wall's checks at any host and port it liked. A real JetKVM offers the address it is reached
+    at among its own (it gathers one on each of its interfaces), and the wall needs no other: it gives the JetKVM no server
+    to learn others from (no STUN or TURN), and an address the JetKVM's checks come from is learnt from them as they come."""
+    parts = candidate.split()
+    if len(parts) < 8 or not parts[0].startswith("candidate:") or parts[2].lower() != "udp" or parts[6] != "typ":
+        return False
+    try:
+        address = ipaddress.ip_address(parts[4])
+    except ValueError:
+        return False
+    return address in allowed
 
 
 def with_candidates(sdp: str, candidates: list[str]) -> str:
@@ -346,9 +424,16 @@ class _Session:
 
     def __init__(self) -> None:
         self.video_worker: Any = None
+        self.decoding: Any = None  # what the video goes through to be decoded (video.BoundedDecoderQueue): it says why it stopped
+        self.asking: asyncio.Task[None] | None = None  # the JetKVM asked for a key frame (decoding fell behind: `_ask_key_frame`)
+        self.behind_said = False  # ...and that was written to the log (once a connection)
+        # When the JetKVM's video stream ended on a connection still up (see `_watch`): given HAND_OVER_GRACE for the
+        # hand-over or the connection's end to say what it is, and then taken for a JetKVM that stopped sending video.
+        self.video_ended_at: float | None = None
         self.pc: Any = None
         self.rpc: Any = None
         self.ready = asyncio.Event()  # the data channel is open: the device can be talked to
+        self.ready_at = 0.0  # ...since when (its first picture is waited for from then: see `_hold`)
         self.done = asyncio.Event()
         self.error: KvmError | None = None
         self.taken = False  # another viewer connected and the device dropped us
@@ -386,6 +471,7 @@ class _Session:
         # Why the wall ends this connection itself, to make a new one (keys that may be done late, out of turn: see
         # `JetKvmDevice._make_anew`). Not the JetKVM's fault: it is not counted as down for it.
         self.anew: str | None = None
+        self.wake = asyncio.Event()  # set where the wall ends this connection itself: its loop (`_hold`) looks at once
         # Which way keys and the mouse go over this connection: "hidrpc" or "rpc", once the JetKVM answered the hidrpc
         # handshake or did not (`_choose_road`); `keys_ready` once that is decided and what was owed sent (no key goes
         # before). The hidrpc channel, its being open, and the JetKVM's answer to the handshake.
@@ -413,6 +499,7 @@ class _Session:
         self.echoes_due: deque[tuple[tuple[int, tuple[int, ...]], asyncio.Future[None]]] = deque()
         self.layout: str | None = None  # the keyboard layout the JetKVM says its computer uses, once asked (`_layout`)
         self.had_down = False  # something of ours was down, or may have been, when this connection ended
+        self.offered = False  # the offer of this video connection went out (it takes the JetKVM's one viewer)
 
     @property
     def live(self) -> bool:
@@ -448,8 +535,10 @@ class JetKvmDevice(Device):
         self._session: _Session | None = None
         self._task: asyncio.Task[None] | None = None
         self._displaced = False  # someone took the picture; wait to be asked back
-        self._looking_on = 0  # looks under way that are not somebody watching (the alerts' rounds)
         self._told: str | None = None  # what a connection last showed it to be: with a picture, without, not letting us in
+        # The last video connection offered came to nothing (see `_came_to_nothing`): what a tile says, and offers no other,
+        # until a person asks for the JetKVM (`_connected`'s `asked`) and a connection comes about.
+        self._offer_failed: KvmError | None = None
         self._retry_at = 0.0
         self._wanted_at = 0.0
         self._encode_locks = {size: asyncio.Lock() for size in (*TIERS, FULL)}
@@ -462,6 +551,11 @@ class JetKvmDevice(Device):
         # first (see `_settle_owed`): a JetKVM lets go of the keyboard when a connection ends, never of a mouse button.
         self._leftover = _Leftover()
         self._said_no_hid = False  # the log has said that this one takes keys over JSON-RPC only
+        # Another JetKVM answers at the address (see `_same_jetkvm`): what is said, and nothing sent, meanwhile.
+        self._other: KvmError | None = None
+        # The number the JetKVM that answers gave for itself, as last asked (own_number): "" where it gives none, None where it
+        # was not read (what `identify` says, see the server's connect).
+        self._seen: str | None = None
 
     def takes_over(self, retired: Device) -> None:
         # Somebody opened the JetKVM's own console and so took its one viewer: the wall stepped aside, and
@@ -483,7 +577,9 @@ class JetKvmDevice(Device):
                 await self._answers_due(session, presses_only=True)
             elif session is not None and not session.done.is_set():
                 # Ended on purpose (the tile edited or removed, the wall locking itself or stopping): what it has down is
-                # let go of first, and given a moment to leave (a JetKVM keeps a mouse button down past the end).
+                # let go of first, and given a moment to leave (a JetKVM keeps a mouse button down past the end). Over JSON-RPC
+                # after the presses in its hands are answered (`_presses_answered`).
+                await self._presses_answered(session)
                 await self._let_go_before_closing(session, wait=True)
         finally:  # (stopped meanwhile, the rest of closing is done all the same)
             # (Not when it is that very task that retires this client: it has followed the JetKVM to its other address.)
@@ -505,6 +601,16 @@ class JetKvmDevice(Device):
                 raise self._login_error.with_traceback(None)
             if not self.spec.password:
                 return None  # a JetKVM set to "no password" lets everyone in
+            if not self.spec.base_url.startswith("https://"):
+                # Over plain HTTP the password goes in the clear to whatever answers. A JetKVM without a password says which it
+                # is to anybody (and one with a password to nobody but whoever is signed in): asked first, and where it says it,
+                # it is judged before anything goes (another one is sent nothing, see `_judge`), and, as one that lets anybody
+                # in, asked for no session at all. (Where it says nothing, the sign-in goes, and the number is asked after it.)
+                seen = await self._number_to_anybody()
+                if seen is not None:
+                    await self._judge(seen)
+                    self._open_access = True
+                    return None
             offered = REJECTED.what("login", self.spec)
             self._not_yet(offered, JET_NO_SAID)
             client = await self._http()
@@ -576,23 +682,112 @@ class JetKvmDevice(Device):
             return not_set_up()
         if self.spec.password:
             return KvmError("auth_failed", "The JetKVM keeps rejecting the session")
+        if self.spec.machine:
+            # (Its JetKVM let anybody in when the tile was added: one that asks for a password now may be its own, its owner
+            # having switched one on, or another one that took its address. Which, it says only once signed in.)
+            return KvmError(
+                "no_password",
+                "The JetKVM at this address asks for a password now, and this tile has none saved: it may be another JetKVM than "
+                "the one this tile was added for, which had none. Type its password only if it is this tile's JetKVM.",
+            )
         return KvmError("no_password", "This JetKVM asks for a password and none is saved")
 
-    async def _own_number(self) -> str | None:
-        """The number this JetKVM gives for itself, as a mark to know it by at whichever address; None where it gives none.
+    # --- which JetKVM answers: the number it gives for itself, against the one remembered ----------------------------
+    # A JetKVM serves plain HTTP out of its box, and nothing there tells one from another but what it says; a fleet often has
+    # one password, and a JetKVM takes its address from DHCP. After a new lease another JetKVM answered at a tile's address,
+    # and the tile connected to its screen and sent it every key, text and press. So the number it gives for itself (its
+    # deviceId) is remembered when the tile is added (DeviceSpec.machine, kept in the settings) and asked before every video
+    # connection is offered, under the session the connection is then arranged with: every key, text and press goes over a
+    # connection, and a connection is to the JetKVM it was arranged with (its keys are agreed over that signalling). A JetKVM
+    # says the number only to whoever is signed in, so its sign-in is the one thing that goes before it is known; nothing after
+    # it does. (Over plain HTTP the password goes in the clear to whatever answers at the address in any case; over HTTPS the
+    # certificate remembered for it is checked first.)
 
-        Only ever compared with another: it is kept as a digest, since the number itself is nobody's business.
-        """
+    async def _own_number(self, token: str | None) -> str | None:
+        """The number the JetKVM that answers gives for itself (own_number), asked under `token`; None where it gives none (an
+        older one that has no /device). _SessionRefused where it does not take the token; KvmError where it could not be
+        asked."""
+        client = await self._http()
+        try:
+            reply = await self._send(client, client.build_request("GET", "/device", headers=self._cookie(token)), MAX_REPLY)
+        except httpx.HTTPError as ex:
+            raise _transport_error(ex, self.spec.tls) from ex
+        if reply.status_code == 401:
+            raise _SessionRefused
+        if reply.status_code == 404:
+            return None
+        try:
+            said = read_json(reply) if reply.status_code == 200 else None
+        except ValueError:
+            said = None
+        if not isinstance(said, dict):
+            raise KvmError("bad_response", f"The JetKVM did not say which it is (HTTP {reply.status_code})")
+        return own_number(said)
+
+    async def _number_to_anybody(self) -> str | None:
+        """The number the JetKVM that answers says at /device with no session (own_number): one without a password says it to
+        anybody. None where it says none so (one with a password answers 401), or could not be asked."""
         try:
             client = await self._http()
-            reply = await self._send(client, client.build_request("GET", "/device", headers=self._cookie(self._token)), MAX_REPLY)
+            reply = await self._send(client, client.build_request("GET", "/device"), MAX_REPLY)
             said = read_json(reply) if reply.status_code == 200 else None
         except (httpx.HTTPError, ValueError, KvmError):
             return None
-        number = said.get("deviceId") if isinstance(said, dict) else None
-        if not isinstance(number, str) or not 8 <= len(number) <= 64 or len(set(number)) < 4:
-            return None
-        return "jetkvm:" + hashlib.sha256(number.encode()).hexdigest()[:32]
+        return own_number(said)
+
+    async def _same_jetkvm(self, token: str | None, taking: bool = False) -> None:
+        """Ask the JetKVM that answers which it is, under the session a connection is about to be arranged with, and judge
+        that (`_judge`): before every video connection, and for an edit or an addition (identify). KvmError "another_machine"
+        where it is another one, or says none where one is remembered; the error of the asking where it could not be asked
+        and one is remembered. Where none is remembered, a question that came to nothing is "no number" for a connection:
+        there is nothing to tell it apart from, and it is used as before. Not where the number is being taken (`taking`: an
+        addition, or an edit with the password typed, see identify): which JetKVM that is could not be told, and nothing is
+        taken (taken as "none", the tile kept no number, and took the next JetKVM to answer there on first use). _SessionRefused
+        where it does not take `token`."""
+        try:
+            seen = await self._own_number(token)
+        except KvmError as ex:
+            if self.spec.machine or self._closed:
+                raise self._failed(ex) from None
+            if taking:
+                raise KvmError(ex.code, f"Which JetKVM answers at this address could not be told: {ex.message}", ex.status) from None
+            self._seen = None  # (not read just now: what is kept of it stays as it is)
+            return
+        self._seen = seen or ""  # ("": it was asked, and gives none)
+        await self._judge(seen)
+
+    async def _judge(self, seen: str | None) -> None:
+        """Whether the JetKVM that answers is the one this tile was added for, by the number it gives for itself (`seen`; None:
+        none). Nothing where it is; KvmError "another_machine" where it is not, or says none where one is remembered.
+
+        Where none is remembered (a tile kept beside its twin, one whose JetKVM said no number when it was added, one from a
+        file without it), the first one seen is remembered from then on, and said in the log: trust on first use, as for a
+        certificate."""
+        remembered = self.spec.machine
+        if seen is None:
+            if remembered:
+                raise self._another(NO_JETKVM_NUMBER)
+            return
+        if not remembered:
+            self.spec.machine = seen
+            log.info("%s: the JetKVM at this address is known by the number it gives for itself from now on", self.label)
+            if self.on_known is not None and not self._closed:
+                await self.on_known("", seen)
+            return
+        if seen != remembered:
+            raise self._another(ANOTHER_JETKVM)
+        if self._other is not None:
+            log.info("%s: the JetKVM this tile was added for answers at its address again", self.label)
+            self._other = None
+
+    def _another(self, words: str) -> KvmError:
+        """Note that the JetKVM at the address is not this tile's: what is said from now on, until it is again."""
+        if self._other is None or self._other.message != words:
+            # (Said with the address it is said of: a client that only asks, for an edit or a move, asks at another than its tile's.)
+            log.warning("%s (%s): %s", self.label, urlsplit(self.spec.base_url).netloc, words)
+        self._other = KvmError("another_machine", words)
+        self._told = "error"  # (what a look that makes no connection says too: see `probe`)
+        return self._other
 
     # --- over HTTPS or plain HTTP: wherever it answers -----------------------
 
@@ -628,14 +823,48 @@ class JetKvmDevice(Device):
                 # with a password or without: over plain HTTP nothing is checked any more, the certificate
                 # remembered for it would be let go of, and whoever can keep one port quiet for two minutes
                 # and then answer on it would have the tile, with nobody asked. A person changes the address.
+                # Said only where its HTTPS itself does not answer: a look is "offline" too where only its video connection
+                # never comes about (see `_note_offer`), and the tile told one whose HTTPS answered all along to go plain.
+                if await offered_at(self.spec.base_url) is not None:
+                    self._down_since = None  # (it answers at its address: what was "away" is over)
+                    return
                 self._plain_only = twin
                 return
             await self.on_move(twin)
         except Exception:  # what is saved could not be changed: said, and asked about again later
             log.exception("%s: following it to %s failed", self.label, twin)
 
-    async def _signalling(self) -> ClientConnection:
-        """Open the channel over which a video connection is arranged, logging in (again) if needed."""
+    async def _candidate_addresses(self) -> frozenset[Any]:
+        """The addresses the JetKVM is reached at here, where its video connection is checked for (allowed_candidate): its
+        host as written, or what its name resolves to. For one on this very computer (at a loopback address: a stand-in, a
+        development setup), this computer's own addresses as well, which are what it offers."""
+        host = urlsplit(self.spec.base_url).hostname or ""
+        found: set[Any] = set()
+        try:
+            found.add(ipaddress.ip_address(host))
+        except ValueError:
+            try:
+                infos = await asyncio.get_running_loop().getaddrinfo(host, None, type=socket.SOCK_DGRAM)
+            except OSError:
+                infos = []
+            for *_, place in infos:
+                try:
+                    found.add(ipaddress.ip_address(str(place[0]).split("%", 1)[0]))
+                except ValueError:
+                    pass
+        if any(address.is_loopback for address in found):
+            from aioice.ice import get_host_addresses  # (what the WebRTC library itself offers from this computer)
+
+            for address in get_host_addresses(True, True):
+                try:
+                    found.add(ipaddress.ip_address(address.split("%", 1)[0]))
+                except ValueError:
+                    pass
+        return frozenset(found)
+
+    async def _signalling(self, taking: bool = False) -> ClientConnection:
+        """Open the channel over which a video connection is arranged, logging in (again) if needed. `taking`: for identify,
+        where the number the JetKVM gives is taken (see `_same_jetkvm`)."""
         if not self.spec.base_url.startswith("https://"):
             # Before anything secret goes to it over plain HTTP (its password, or the session that stands for it):
             # whether it offers HTTPS by now. If it does, the wall moves there, and this client is retired with
@@ -650,6 +879,9 @@ class JetKvmDevice(Device):
             token = await self._login()
             await self._http()  # makes sure the TLS settings are known
             try:
+                # Which JetKVM answers, asked under the session the connection is then arranged with, before it is: another
+                # one is offered no connection, and so is sent no key, no text and no press (see `_same_jetkvm`).
+                await self._same_jetkvm(token, taking)
                 ws = await ws_connect(
                     url,
                     additional_headers=self._cookie(token),
@@ -658,9 +890,9 @@ class JetKvmDevice(Device):
                     close_timeout=1,  # a device that is gone gets no ten seconds to say goodbye in
                     max_size=2**20,
                 )
-            except InvalidStatus as ex:
+            except (InvalidStatus, _SessionRefused) as ex:
                 self._answered()
-                if ex.response.status_code != 401:
+                if isinstance(ex, InvalidStatus) and ex.response.status_code != 401:
                     raise KvmError("bad_response", f"The JetKVM refused (HTTP {ex.response.status_code})") from None
                 if relogged or not self.spec.password:
                     refused = await self._rejected()
@@ -691,7 +923,9 @@ class JetKvmDevice(Device):
         if not webrtc_available():
             raise MISSING_DRIVER.with_traceback(None)
         self._down_error = None  # a person is waiting: try now
-        ws = await self._signalling()  # proves the address and the password; takes nobody's picture
+        # (Proves the address and the password, and takes nobody's picture. Where no number is remembered it is being taken, by an
+        # addition or an edit with the password typed: one that could not be read is no number to take.)
+        ws = await self._signalling(taking=True)
         self._answered()
         version = None
         try:
@@ -703,7 +937,8 @@ class JetKvmDevice(Device):
             pass
         finally:
             await ws.close()
-        return {"model": "JetKVM", "version": version, "hostname": None, "ident": await self._own_number()}
+        # (Asked as the signalling was opened, and judged against the number remembered for the tile: see `_same_jetkvm`.)
+        return {"model": "JetKVM", "version": version, "hostname": None, "ident": self._seen}
 
     # --- the WebRTC session --------------------------------------------------
 
@@ -722,15 +957,20 @@ class JetKvmDevice(Device):
             return session.error
         return None
 
-    async def _connected(self, urgent: bool = False) -> _Session:
-        """The live session, connecting first if need be. Raises KvmError when there is none to be had."""
+    async def _connected(self, urgent: bool = False, asked: bool = False) -> _Session:
+        """The live session, connecting first if need be. Raises KvmError when there is none to be had.
+
+        `urgent`: a key, a text or a button. `asked`: a person asks for the JetKVM's picture (its live view). Either offers a
+        connection where the last one offered came to nothing; a tile's look does not (see `_note_offer`)."""
         if self._displaced:
             raise IN_USE.with_traceback(None)
-        if not self._looking_on:
+        if not _LOOKING_FOR_ALERTS.get():
             self._wanted_at = time.monotonic()
         session = self._session
         if session is not None and session.live and not session.taken:
             return session
+        if self._offer_failed is not None and not (urgent or asked):
+            raise self._offer_failed.with_traceback(None)
         if urgent:
             self._down_error = None
         else:
@@ -773,13 +1013,19 @@ class JetKvmDevice(Device):
             await self._hold(session)
         except KvmError as ex:
             session.error = self._failed(ex)
-            if ex.code not in DOWN_CODES:  # those have their own, growing, back-off
+            if ex.code == "another_machine":
+                # Another JetKVM answers at the address: asked again now and then, not at every look (a button pressed
+                # asks at once, and is refused as long as it is so).
+                self._retry_at = time.monotonic() + SAME_JETKVM_EVERY
+            elif ex.code not in DOWN_CODES:  # those have their own, growing, back-off
                 self._retry_at = time.monotonic() + RETRY_PAUSE
+            self._note_offer(session)
         except asyncio.CancelledError:
             raise
         except Exception as ex:  # whatever the WebRTC stack throws must not take the wall down
             self._unexpected("the video connection failed", ex)
             session.error = self._failed(KvmError("dropped", "The video connection to the JetKVM failed"))
+            self._note_offer(session)
         finally:
             # What this connection has down is let go of while it is still open, where nobody else has taken its viewer
             # (the ends that come from within it say it in `_hold` and wait for it to leave; this one does not wait).
@@ -808,6 +1054,8 @@ class JetKvmDevice(Device):
                     future.set_exception(self._cut_off(session))
             for watcher in session.watchers:
                 watcher.cancel()
+            if session.asking is not None:
+                session.asking.cancel()
             if session.sending is not None:
                 session.sending.cancel()  # (the device lets go of what this connection had down when it ends: seen on a real one)
             session.outbox.clear()
@@ -833,6 +1081,22 @@ class JetKvmDevice(Device):
                         await asyncio.shield(closing)
                 except TimeoutError:
                     log.warning("%s: the video connection is taking its time to close", self.label)
+
+    def _note_offer(self, session: _Session) -> None:
+        """Where the offer of this connection went out and it never came about (UDP blocked between the two, ICE failing, no
+        answer): note it, so that a tile offers no other (see `_connected` and `snapshot`). Each offer takes the JetKVM's one
+        viewer from whoever has it, its own page included, and over a connection that never opened the wall never hears that
+        somebody else had it: a tile on screen offered one at every round of its back-off, about every half minute, for as
+        long as it was shown (the desktop's item 9; its rule of 2026-10-31, kept here as well). What a person asks for offers
+        again: the enlarged view, the live view, a key or a button, "Show here". A connection that came about clears it."""
+        error = session.error
+        if session.offered and not session.ready.is_set() and error is not None and not self._closed and not self._displaced:
+            self._offer_failed = KvmError(
+                error.code,
+                f"No video connection to the JetKVM came about ({error.message}). Its tile does not offer another by itself, "
+                "as each takes the JetKVM's one viewer from whoever has it: open it large to try again",
+                error.status,
+            )
 
     async def _hold(self, session: _Session) -> None:
         """Connect as the JetKVM's own page would, then stay for as long as the wall is watched."""
@@ -860,7 +1124,9 @@ class JetKvmDevice(Device):
             pc = session.pc = RTCPeerConnection(RTCConfiguration(iceServers=[]))
             video = pc.addTransceiver("video", direction="recvonly")
             receiver: Any = video.receiver
-            receiver._RTCRtpReceiver__decoder_queue = BoundedDecoderQueue(session.video_worker)
+            receiver._RTCRtpReceiver__decoder_queue = session.decoding = BoundedDecoderQueue(
+                session.video_worker, ask_key_frame=lambda: self._ask_key_frame(session, receiver)
+            )
             # JetKVM sends H.264. Do not negotiate unused native video decoders;
             # RTX retransmits the selected codec and does not add another decoder.
             capabilities = RTCRtpReceiver.getCapabilities("video")
@@ -886,10 +1152,20 @@ class JetKvmDevice(Device):
             await pc.setLocalDescription(await pc.createOffer())
             offer = {"type": "offer", "sdp": pc.localDescription.sdp}
             await ws.send(json.dumps({"type": "offer", "data": {"sd": _pack(offer)}}))
+            session.offered = True
             heard = Listening(ws, 2**20)
             answer, candidates = await _await_answer(heard)
+            # Only the addresses it is reached at here are tried (see allowed_candidate), whether they come with the answer
+            # or after it.
+            allowed = await self._candidate_addresses()
+            lines = answer.replace("\r\n", "\n").strip("\n").split("\n")
+            offered = [line[2:] for line in lines if line.startswith("a=candidate:")] + candidates
+            kept = [candidate for candidate in offered if allowed_candidate(candidate, allowed)]
+            if len(kept) < len(offered):
+                log.info("%s: %d of the %d network addresses the JetKVM offered for its video are not where it is reached here, and are not tried", self.label, len(offered) - len(kept), len(offered))
+            bare = "\r\n".join(line for line in lines if not line.startswith("a=candidate:")) + "\r\n"
             await pc.setRemoteDescription(
-                RTCSessionDescription(sdp=with_candidates(answer, candidates), type="answer")
+                RTCSessionDescription(sdp=with_candidates(bare, kept), type="answer")
             )
 
             deadline = time.monotonic() + CONNECT_TIMEOUT
@@ -904,18 +1180,33 @@ class JetKvmDevice(Device):
                     return
                 if session.anew is not None:
                     log.info("%s: the connection is made anew: %s", self.label, session.anew)
+                    await self._presses_answered(session)
                     await self._let_go_before_closing(session, wait=True)
                     return
                 # A device that reboots or loses power says no goodbye, and the connection takes half a
                 # minute to notice by itself. Until then the last picture would pass for the screen.
                 # (Where the JetKVM has said its screen is back since its last picture, that picture is from before the
                 # screen went, however old: the first one of the screen is waited for from that moment, PICTURE_AFTER_SIGNAL.)
+                # (And where no picture has come on this connection at all, its first one is waited for PICTURE_AFTER_SIGNAL from
+                # the connection's opening, as after a screen that came back: a connection opened with a signal that never sent
+                # one waited until nobody had watched for five minutes, its tile saying "Waiting for the first picture".)
                 if session.signal_at > session.frame_at:
                     stalled = time.monotonic() - session.signal_at > PICTURE_AFTER_SIGNAL
+                elif session.frame is None:
+                    stalled = session.ready.is_set() and time.monotonic() - session.ready_at > PICTURE_AFTER_SIGNAL
                 else:
-                    stalled = session.frame is not None and time.monotonic() - session.frame_at > FRAME_STALE
+                    stalled = time.monotonic() - session.frame_at > FRAME_STALE
+                if stalled and session.frame is not None and getattr(session.decoding, "awaiting_key_frame", False):
+                    # Its video comes, and is let go of up to a key frame it does not send when asked: not a JetKVM that stopped
+                    # sending video, nor one that is down. Made anew: a new connection begins with one (the review's P1).
+                    self._make_anew(session, "it sent no key frame when asked for one")
+                    continue
                 if stalled and session.ready_said is not False and session.lost is None:
-                    session.lost = KvmError("dropped", "The JetKVM stopped sending video")
+                    session.lost = KvmError("dropped", "The JetKVM sent no picture" if session.frame is None else "The JetKVM stopped sending video")
+                ended = session.video_ended_at
+                if ended is not None and time.monotonic() - ended > HAND_OVER_GRACE and session.lost is None:
+                    # Its video stream ended, and neither a hand-over nor the connection's end has said why since.
+                    session.lost = KvmError("dropped", "The JetKVM ended its video")
                 if session.lost is not None:
                     raise session.lost
                 if pc.connectionState in ("failed", "closed"):
@@ -928,10 +1219,12 @@ class JetKvmDevice(Device):
                     await self._let_go_before_closing(session, wait=True)
                     return  # nobody is looking at the wall: give the device its viewer slot back
                 if not signalling:
-                    await asyncio.sleep(1)
+                    with contextlib.suppress(TimeoutError):
+                        async with asyncio.timeout(1):
+                            await session.wake.wait()  # (a second, or until the wall ends it: see `_make_anew`)
                     continue
                 try:
-                    message = _parse(await heard.message(1))
+                    message = _parse(await _heard_or_woken(heard, session.wake))
                 except TimeoutError:
                     continue
                 except ConnectionClosed:
@@ -940,7 +1233,9 @@ class JetKvmDevice(Device):
                 data = message.get("data")
                 if message.get("type") == "new-ice-candidate" and isinstance(data, dict):
                     text, mid, line = as_text(data.get("candidate")), data.get("sdpMid"), data.get("sdpMLineIndex")
-                    if text.startswith("candidate:"):
+                    if text.startswith("candidate:") and not allowed_candidate(text, allowed):
+                        log.debug("%s: a late network address the JetKVM offered is not where it is reached here, and is not tried", self.label)
+                    elif text.startswith("candidate:"):
                         try:
                             candidate = candidate_from_sdp(text.split(":", 1)[1])
                             candidate.sdpMid = mid if isinstance(mid, str) else None
@@ -998,6 +1293,21 @@ class JetKvmDevice(Device):
             return session.lost.with_traceback(None)
         return KvmError("dropped", "The connection to the JetKVM ended")
 
+    def _ask_key_frame(self, session: _Session, receiver: Any) -> None:
+        """Decoding fell behind the JetKVM's video (a busy computer), and what waited was let go of (video.BoundedDecoderQueue):
+        the JetKVM is asked for a key frame, as a browser asks for one where it lost a picture (an RTCP picture loss
+        indication), and its picture goes on from that. The connection stays, and with it the keys, the buttons held and
+        the viewer. (Asked from where the receiver puts what it put together, in the loop; one ask out at a time.)"""
+        if session.done.is_set() or session.taken or (session.asking is not None and not session.asking.done()):
+            return
+        if not session.behind_said:
+            session.behind_said = True
+            log.warning("%s: qKVM fell behind decoding the JetKVM's video (a busy computer): its picture goes on from the next key frame", self.label)
+        rtx = getattr(receiver, "_RTCRtpReceiver__rtx_ssrc", {})  # (what retransmissions come as, by what they retransmit)
+        sources = [ssrc for ssrc in list(getattr(receiver, "_RTCRtpReceiver__active_ssrc", {}))[:8] if ssrc not in rtx]
+        if sources:
+            session.asking = asyncio.get_running_loop().create_task(_picture_lost(receiver, sources))
+
     def _on_track(self, session: _Session, track: Any) -> None:
         if track.kind == "video":
             session.watchers.append(asyncio.create_task(self._watch(session, track)))
@@ -1024,11 +1334,36 @@ class JetKvmDevice(Device):
                 session.frame = frame
                 session.frame_at = received_at
         except MediaStreamError:
-            if not session.done.is_set() and not session.taken:
-                session.lost = KvmError("no_stream", "Secure video processing stopped", 503)
-                session.done.set()
+            # The track ends where decoding stops, whatever stopped it (see video.BoundedDecoderQueue.ended).
+            if session.done.is_set() or session.taken:
+                return
+            why = getattr(session.decoding, "ended", None)
+            if why == "ended":
+                # The stream ended at the other end: the JetKVM ended it (as it does as it closes a connection, a second after
+                # it handed its viewer over), or the connection ended. No doing of the decoder's, and not said as one: the
+                # hand-over, the channel's close or the connection's end is what the connection ends for (see `_hold`), and
+                # a hand-over heard after that is still heard as one (said "Secure video processing stopped", a JetKVM that
+                # handed over or closed was taken for a decoder that failed). Where none comes, it ended its video.
+                session.video_ended_at = time.monotonic()
+                return
+            # (Where decoding falls behind, it goes on from the next key frame: see `_ask_key_frame`. Nothing ends for that.)
+            said = "The JetKVM sent a piece of video too large to decode: the connection is made anew" if why == "too_large" else "Secure video processing stopped"
+            session.lost = KvmError("no_stream", said, 503)
+            session.done.set()
+            session.wake.set()  # (the connection's loop looks at once, and lets go: the review's R16)
 
     def _on_message(self, session: _Session, message: Any) -> None:
+        if isinstance(message, (str, bytes, bytearray)) and len(message) > MOST_RPC_MESSAGE:
+            # Larger than the wall said it takes, and than anything a JetKVM says. The WebRTC library hands over a message of
+            # any size, and reading it held the loop (a 32 MiB one: seconds, and its memory kept as the video's state): it is
+            # not read, and the connection is ended, as one that sends what is no answer. (What it asked meanwhile is answered
+            # with "may have been done": those calls went out.)
+            if session.lost is None and not session.done.is_set():
+                session.lost = KvmError("bad_response", f"The JetKVM sent a message of more than {MOST_RPC_MESSAGE // 1024} KiB on the channel it is asked over")
+                log.warning("%s: %s; the connection is ended", self.label, session.lost.message)
+                session.wake.set()  # (the connection's loop looks at once, and lets go: the review's R16)
+            session.heard.set()
+            return
         if not isinstance(message, str):
             return
         try:
@@ -1114,7 +1449,9 @@ class JetKvmDevice(Device):
 
     def _opened(self, session: _Session) -> None:
         """The channel the JetKVM is asked over is open: the connection is up, and which way keys go is found out."""
+        session.ready_at = time.monotonic()
         session.ready.set()
+        self._offer_failed = None  # (a connection came about: a tile asks again as ever, where this one ends)
         session.watchers.append(asyncio.create_task(self._choose_road(session)))
 
     async def _choose_road(self, session: _Session) -> None:
@@ -1485,6 +1822,7 @@ class JetKvmDevice(Device):
                 if rel_down:
                     channel.send(b"\x06\x00\x00\x00")
             except Exception:  # (closed meanwhile: what the JetKVM keeps is let go of on the next connection, first)
+                self._leftover.down = True
                 return None
             session.held.clear()
             if kb_down:
@@ -1495,7 +1833,14 @@ class JetKvmDevice(Device):
             # second and more later: what went over hidrpc it has done or never will.)
             channel = session.rpc
             kb_too = kb_down and session.road == "hidrpc"
-            if not (abs_down or rel_down or kb_too) or channel is None or channel.readyState != "open":
+            if not (abs_down or rel_down or kb_too):
+                return None
+            if channel is None or channel.readyState != "open":
+                # Nothing can go: the connection is closed, and with it the JetKVM's keyboard is let go of, never a mouse
+                # button. Owed to the next connection of the wall's, first, also where the JetKVM's own page took the viewer
+                # (its hand-over heard only after the connection closed): the next is made by "Show here", which takes the
+                # viewer back, and lets go before anything else.
+                self._leftover.down = True
                 return None
             if kb_too:
                 session.held.clear()
@@ -1508,6 +1853,11 @@ class JetKvmDevice(Device):
             session.abs_sent = (place[0], place[1], 0)
         if rel_down:
             session.rel_buttons = 0
+        if not session.live or session.rpc is None or session.rpc.readyState != "open":
+            # Handed to a connection that is ending (the channel it is asked over has closed: a channel that still reads
+            # "open" takes what it is handed and sends it nowhere): it may never arrive. Owed to the next connection too, which
+            # says "nothing down" first (once more, where it did arrive).
+            self._leftover.down = True
         return channel
 
     async def _let_go_before_closing(self, session: _Session, wait: bool) -> None:
@@ -1586,7 +1936,9 @@ class JetKvmDevice(Device):
         Nothing else of ours goes to a JetKVM after the hand-over (see `act` and `_say_in_turn`).
         """
         if not session.live:
-            raise KvmError("dropped", "The JetKVM closed the connection")
+            # (Said with why: the wall closing the tile, its making the connection anew, the JetKVM dropping out, or the end.
+            # Said "The JetKVM closed the connection" whatever it was, a text stopped as its tile was edited blamed the JetKVM.)
+            raise self._ended(session)
         if session.taken:
             # (Its own page has the viewer: nothing more of ours goes to it. The letting go of what may have been pressed
             # after the hand-over does not come through here.)
@@ -1658,12 +2010,12 @@ class JetKvmDevice(Device):
             # connection, and with it the JetKVM's one viewer, for as long as alerts are switched on.
             # (Read here and now, not through status(): that hands back what was known and reads anew in a
             # task of its own, after this look is over and no longer there to say what it was for.)
-            self._looking_on += 1
+            looking = _LOOKING_FOR_ALERTS.set(True)
             try:
                 await self._refresh_status()
                 return str((self._status or {}).get("state") or "offline")
             finally:
-                self._looking_on -= 1
+                _LOOKING_FOR_ALERTS.reset(looking)
         try:
             client = await self._http()
             reply = await self._send(client, client.build_request("GET", "/device/status"), MAX_PROBE, PROBE_TIME)
@@ -1671,12 +2023,20 @@ class JetKvmDevice(Device):
             reply = None
         if reply is None or reply.status_code != 200:
             self._told = None  # gone: what it showed before says nothing about when it is back
+            # (Nor that it was heard not long ago: a tile's look that finds no connection to be had asks again whether it is
+            # there, rather than take it to be, and says what this says. See `_read_status`.)
+            self._heard_at = None
             self._look_the_other_way(down=True)  # ...unless it is only its HTTPS that is gone
             return "error" if self._plain_only is not None else "offline"
         self._plain_only = self._down_since = None  # there: how long it was away before is over and done with
         self._last_ok, self._heard_at = time.time(), time.monotonic()  # heard from, whatever a connection to it would come to
         if self._displaced:
             return "busy"  # there, and somebody else has its picture: nothing to tell anybody
+        if self._offer_failed is not None:
+            # There, and the last video connection offered came to nothing (a tile offers no other: see `_note_offer`): the
+            # problem its tile shows. Said "online", the alerts said nothing of it, and the history, which keeps what each
+            # look at the tile says beside what this says, went from the one to the other at every look.
+            return "error"
         # There, and that is all it says without a connection. What the last connection showed (no picture,
         # a password it would not take) is taken to be so still: calling it "online" in between would report
         # a picture as back each time somebody stops looking at the wall, and as lost each time they return.
@@ -1691,7 +2051,8 @@ class JetKvmDevice(Device):
         state = await self.probe()
         known = self._status if self._status is not None and self._status.get("state") == state else None
         seen = None if self._last_ok is None else max(0, round(time.time() - self._last_ok))
-        return {"can": can_do(*self.can), **(known or {"state": state, "error": None, "kind": self.kind}), "last_seen_ago": seen}
+        said = self._offer_failed.as_dict() if state == "error" and self._offer_failed is not None else None  # (in the tile's words)
+        return {"can": can_do(*self.can), **(known or {"state": state, "error": said, "kind": self.kind}), "last_seen_ago": seen}
 
     # --- snapshots ----------------------------------------------------------
 
@@ -1701,6 +2062,10 @@ class JetKvmDevice(Device):
             raise IN_USE.with_traceback(None)
         session = self._session
         if session is None or not session.live:
+            if self._offer_failed is not None and not big:
+                # (The last connection offered came to nothing: a tile offers no other, its enlarged view does. See
+                # `_note_offer`.)
+                raise self._offer_failed.with_traceback(None)
             # Connecting takes a second or two; the tile asks again rather than wait here.
             self._check_backoff()
             refused = self._refused()
@@ -1740,7 +2105,16 @@ class JetKvmDevice(Device):
             # Take the picture back. Whoever has the JetKVM's console open loses it.
             self._displaced = False
             self._status_at = 0.0
-            await self._connected(urgent=True)
+            try:
+                await self._connected(urgent=True)
+            except KvmError as ex:
+                if ex.code != "in_use" or self._closed:
+                    raise
+                # Asked as a connection the wall was making anew ended, and the JetKVM's own page took the viewer from that
+                # connection meanwhile: "Show here" takes it back from that page, as at any other moment (it was refused
+                # with "in use", in a corner the page's button cannot reach on purpose). Once.
+                self._displaced = False
+                await self._connected(urgent=True)
             await self._refresh_status()  # the tile should not go on saying "in use"
             return
         reports: list[tuple[int, list[int]]] = []
@@ -1760,7 +2134,13 @@ class JetKvmDevice(Device):
         elif action not in ("reboot", "jiggler_on", "jiggler_off", "atx_power", "atx_power_long", "atx_reset"):
             raise KvmError("invalid", "A JetKVM cannot do that", 422)
 
-        session = await self._connected(urgent=True)
+        try:
+            session = await self._connected(urgent=True)
+        except KvmError as ex:
+            if ex.code not in ("timeout", "dropped"):
+                raise
+            # No connection was to be had, so nothing of this went out, whatever the wait came to (see `_not_sent`).
+            raise _not_sent(action, ex) from None
         why = "the JetKVM did not say which keyboard layout its computer uses"
         try:
             if action == "text":
@@ -1785,7 +2165,7 @@ class JetKvmDevice(Device):
         if reports and session.sending is not None and not session.sending.done():
             # What a live line said last (the keys it had down, let go of as it gave the keyboard back) goes first:
             # done by the JetKVM in among these, it would land in the text, or let go of a key held for a combination.
-            await asyncio.wait({session.sending}, timeout=TAKE_WITHIN)
+            await asyncio.wait({session.sending}, timeout=LIVE_KEYS_WAIT)
             if not session.sending.done():
                 raise KvmError("busy", "Keys from the live view are still on their way to this JetKVM. Try again in a moment.", 409)
             if still is not None and not still():  # (asked again after the wait)
@@ -1807,6 +2187,10 @@ class JetKvmDevice(Device):
                     if session.taken:
                         # Somebody opened its own page: the rest would be typed at their keyboard.
                         raise _taken_while(typed, len(reports))
+                    if self._closed or not session.live:
+                        # The connection ended (while this waited for its turn, or between two keys): nothing more goes, and
+                        # what was down was let go of as it ended. Said as the hidrpc road says it, not as "may have been done".
+                        raise _ended_while(typed, len(reports), self._ended(session))
                     answered = let_go = False
                     try:
                         # (Where the JetKVM does this press after handing its viewer over, `_call` lets go of it.)
@@ -1823,9 +2207,10 @@ class JetKvmDevice(Device):
                             raise _taken_while(typed + 1, len(reports))
                         let_go = True
                         await self._call(session, "keyboardReport", {"modifier": 0, "keys": []})  # nothing releases by itself
-                    except BaseException:
+                    except BaseException as ex:
                         # The key may be down and nothing has said that it was let go: a key held down repeats on
                         # the machine for as long as nobody says otherwise.
+                        unsent = isinstance(ex, KvmError) and ex.code == "dropped"  # (`_call` says so only of a call never sent)
                         if answered and not let_go:
                             self._let_go(session)  # (whoever asked went away during the pause: said once, unanswered)
                         elif not answered:
@@ -1835,12 +2220,20 @@ class JetKvmDevice(Device):
                             # ended too: the JetKVM lets go of every key of the viewer it has when a connection of that
                             # viewer ends. (Refused by the JetKVM, or never sent, it pressed nothing: ended all the same.)
                             self._make_anew(session, "a key it was sent was not answered in time")
+                            if unsent and isinstance(ex, KvmError):
+                                raise _ended_while(typed, len(reports), ex) from None  # (this key never went: not pressed)
+                        elif unsent and isinstance(ex, KvmError):
+                            # The key was pressed, and its letting go could not go: the connection is ending, and the JetKVM
+                            # lets go of the keyboard as it ends. Done where it was the last; else stopped after it.
+                            if typed + 1 == len(reports):
+                                break
+                            raise _ended_while(typed + 1, len(reports), ex) from None
                         raise
                     await asyncio.sleep(KEY_PAUSE)
         elif action == "wol":
-            await self._call(session, "sendWOLMagicPacket", {"macAddress": mac})
+            await self._press(session, action, "sendWOLMagicPacket", {"macAddress": mac})
         elif action in ("jiggler_on", "jiggler_off"):
-            await self._call(session, "setJigglerState", {"enabled": action == "jiggler_on"})
+            await self._press(session, action, "setJigglerState", {"enabled": action == "jiggler_on"})
         elif action.startswith("atx_"):
             try:
                 extension = await self._call(session, "getActiveExtension")
@@ -1857,13 +2250,25 @@ class JetKvmDevice(Device):
             press = {"atx_power": "power-short", "atx_power_long": "power-long", "atx_reset": "reset"}[action]
             if session.taken:  # (its own page took the viewer while the extension was asked about: not pressed)
                 raise IN_USE.with_traceback(None)
-            await self._call(session, "setATXPowerAction", {"action": press})
+            await self._press(session, action, "setATXPowerAction", {"action": press})
         elif action == "reboot":
             try:
-                await self._call(session, "reboot", {"force": True})
+                await self._press(session, action, "reboot", {"force": True})
             except KvmError as ex:
-                if ex.code not in ("dropped", "timeout"):  # it may be gone before it can answer
+                # It may be gone before it can answer: a restart that went out and had no answer is taken as done. (One that
+                # did not go out is not done: said as "dropped", it was taken as done as well.)
+                if ex.code != "timeout":
                     raise
+
+    async def _press(self, session: _Session, action: str, method: str, params: dict[str, Any]) -> Any:
+        """The one call an action presses with (a power button, a restart, Wake-on-LAN, keep-awake). Where it did not go out
+        (`_call` says "dropped" of a call that was never sent, and of nothing else), it was not done, and is said so."""
+        try:
+            return await self._call(session, method, params)
+        except KvmError as ex:
+            if ex.code == "dropped":
+                raise _not_sent(action, ex) from None
+            raise
 
     def _let_go_of(self, session: _Session, method: str, params: dict[str, Any]) -> None:
         """Say, without waiting for an answer, that nothing is down any more of what this report pressed: the keyboard
@@ -1917,10 +2322,16 @@ class JetKvmDevice(Device):
         KvmError where no picture is to be had: somebody else has the JetKVM's one viewer, it refuses, it is down.
         """
         self._wanted_at = time.monotonic()
-        session = await self._connected()
+        session = await self._connected(asked=True)  # (a person opened its live view)
         if self.picture_awaited():
             return None, 0.0  # (a picture from before the JetKVM said its screen was back: not the screen)
         return session.frame, session.frame_at
+
+    def screen_back_since(self, at: float) -> bool:
+        """Whether the JetKVM has said its screen is back since `at` (a frame's time, time.monotonic()): a picture made of a
+        frame from before is not the screen, whatever came after it (the live line's last picture, see live.JetSource)."""
+        session = self._session
+        return session is not None and session.signal_at > at
 
     def picture_awaited(self) -> bool:
         """Whether the JetKVM has said its screen is back since the last picture of it: what is in hand is from before."""
@@ -2080,6 +2491,25 @@ class JetKvmDevice(Device):
         if session.anew is None and not session.done.is_set():
             session.anew = why
             session.outbox.clear()
+            # What it has down is let go of now, as the end is decided (a modifier or a mouse button the JetKVM keeps until
+            # told otherwise), and the connection's loop looks at once (it looked once a second): the end takes effect with it.
+            # Over JSON-RPC not while a press is in the JetKVM's hands: the loop lets go after its answer (`_presses_answered`).
+            if not session.taken and not self._presses_in_hand(session):
+                self._send_let_go(session)
+            session.wake.set()
+
+    def _presses_in_hand(self, session: _Session) -> bool:
+        """Whether, over JSON-RPC, presses of ours are in the JetKVM's hands (sent, not answered; or given up on, and not
+        answered yet). It does every call in a task of its own: a letting go sent beside one could be done before it."""
+        return session.road != "hidrpc" and session.rpc is not None and bool(session.pressing or session.given_up)
+
+    async def _presses_answered(self, session: _Session) -> None:
+        """Before the wall lets go on an end it decides (made anew, the outbox overflowing, the tile closed): over JSON-RPC,
+        the presses still in the JetKVM's hands are given their answers first, HAND_OVER_GRACE at the most, as at a hand-over
+        (`_answers_due`). Sent at once, the letting go overtook a press, and the button, which a JetKVM never lets go of by
+        itself, stayed down (the JetKVM/Proxmox review, R16)."""
+        if self._presses_in_hand(session):
+            await self._answers_due(session, presses_only=True)
 
     async def all_said(self) -> None:
         """Wait until what was said for the live line has gone and been answered, or given up on (TAKE_WITHIN each);
@@ -2110,18 +2540,28 @@ class JetKvmDevice(Device):
     async def _read_status(self, again: bool = True) -> dict[str, Any]:
         """How the JetKVM is. `again`: where the wall itself makes the connection anew under the questions, they may be
         asked once more over the new one (see below)."""
+        if self._closed:
+            # Retired (its tile edited or removed, the wall locking itself or stopping): nothing new is heard of the JetKVM, and
+            # nothing is said of it but what was known (said "offline" from the end of the connection it had, it was a JetKVM
+            # gone that nobody had heard go).
+            return self._status or {"state": "connecting", "error": RETIRED.as_dict(), "kind": self.kind}
         try:
             session = await self._connected()
         except KvmError as ex:
+            if ex is RETIRED or self._closed:
+                return self._status or {"state": "connecting", "error": RETIRED.as_dict(), "kind": self.kind}
             there = False
-            if ex.code in ("auth_failed", "no_password", "not_set_up", "no_sign_in", "bad_response"):
+            # The last video connection offered came to nothing, and a tile offers no other (see `_note_offer`). Said "offline"
+            # (the code of how it ended) while the JetKVM answered, the look the alerts and the history take said "online".
+            offer_failed = ex is self._offer_failed
+            if offer_failed or ex.code in ("auth_failed", "no_password", "not_set_up", "no_sign_in", "bad_response"):
                 gone = await self._gone_meanwhile("/device/status")
                 ex, there = gone or ex, gone is None
             if ex.code == "in_use":
                 state = "busy"
             elif ex.code in ("auth_failed", "no_password", "not_set_up"):
                 state = "auth"
-            elif ex.code in ("cert_mismatch", "cert_invalid", "missing_driver", "no_sign_in") or (there and ex.code == "bad_response"):
+            elif ex.code in ("cert_mismatch", "cert_invalid", "missing_driver", "no_sign_in", "another_machine") or (there and (ex.code == "bad_response" or offer_failed)):
                 state = "error"
             else:
                 state = "offline"
@@ -2134,7 +2574,7 @@ class JetKvmDevice(Device):
                 # any kind was taken for two minutes of silence, and its tile said that it answers over plain
                 # HTTP only.
                 self._plain_only = self._down_since = None
-            if state == "auth" or ex.code in ("cert_mismatch", "cert_invalid", "missing_driver", "plain_only"):
+            if state == "auth" or ex.code in ("cert_mismatch", "cert_invalid", "missing_driver", "plain_only", "another_machine"):
                 # What lasts until somebody does something about it, and so is taken to be so still by a look
                 # that makes no connection. A sign-in that came to nothing once is not that: kept, the round
                 # that sends alerts went on saying "has a problem" for as long as nobody opened the wall.
@@ -2164,13 +2604,14 @@ class JetKvmDevice(Device):
             # the JetKVM going away: a busy computer met it.) Asked again over the new connection, once; but not by a
             # look for the alerts, which makes no connection (it would take the JetKVM's one viewer), nor on a client being
             # retired: there what was known stands, or "connecting" where nothing was.
-            if again and not self._looking_on and not self._closed:
+            if again and not _LOOKING_FOR_ALERTS.get() and not self._closed:
                 return await self._read_status(again=False)
             return self._status or {"state": "connecting", "error": RETIRED.as_dict(), "kind": self.kind}
         if isinstance(video, KvmError) and video.code in ("timeout", "dropped"):
             # It does not answer on a connection that is supposed to be open: the connection is dead, and
             # what was last heard over it says nothing about now.
             session.lost = session.lost or KvmError("dropped", "The JetKVM stopped answering")
+            session.wake.set()  # (the connection's loop looks at once, and lets go: the review's R16)
             return {"state": "offline", "error": session.lost.as_dict(), "kind": self.kind}
         self._answered()
         atx: Any = None
@@ -2184,8 +2625,13 @@ class JetKvmDevice(Device):
         if isinstance(video, dict) and session.video_events == events:
             _video_said(session, video)
         video = session.video
+        # Whether there is a signal: as the newest of what it said, and where that does not say, the last yes or no it said (as
+        # the tile and the stall rule read it); only where it never said, the picture. (Falling back to "has a picture" at once,
+        # a JetKVM that said no and then never a yes or no again was online over a blank tile.)
         ready = flag(video.get("ready"))
-        if ready is None:  # the device has not said: believe the picture
+        if ready is None:
+            ready = session.ready_said
+        if ready is None:  # the device has never said: believe the picture
             ready = session.frame is not None
         attached = None if not isinstance(usb, str) else usb == "configured"
         self._told = "online" if ready else "no_signal"
@@ -2255,6 +2701,35 @@ def _presses(method: str, params: dict[str, Any]) -> bool:
     return False
 
 
+async def _picture_lost(receiver: Any, sources: list[int]) -> None:
+    """Ask for a key frame of each of these video sources (an RTCP picture loss indication), as the receiver itself does where
+    it finds a picture lost (see JetKvmDevice._ask_key_frame)."""
+    for ssrc in sources:
+        try:
+            await receiver._send_rtcp_pli(ssrc)
+        except Exception:  # (a connection that is ending: there is nobody to ask)
+            return
+
+
+async def _heard_or_woken(heard: Listening, wake: asyncio.Event) -> Any:
+    """The next signalling message, within a second (TimeoutError where none begins); TimeoutError at once where `wake` is set
+    meanwhile (the wall ends the connection: what is read is of no use any more, and the reading is stopped)."""
+    if wake.is_set():
+        raise TimeoutError
+    reading = asyncio.ensure_future(heard.message(1))
+    waking = asyncio.ensure_future(wake.wait())
+    try:
+        await asyncio.wait({reading, waking}, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        waking.cancel()
+        if not reading.done():
+            reading.cancel()
+            await asyncio.gather(reading, return_exceptions=True)
+    if reading.cancelled():
+        raise TimeoutError
+    return reading.result()
+
+
 async def _drained(channel: Any, within: float) -> None:
     """Wait until what was handed to a data channel has left the wall (gone on to the network), `within` at the most."""
     if channel is None or channel.readyState != "open" or channel.bufferedAmount <= 0:
@@ -2274,6 +2749,15 @@ def _retrieved(future: asyncio.Future[None]) -> None:
     """(A future nobody may wait for, failed: its failure is taken, so that nothing says it was never looked at.)"""
     if not future.cancelled():
         future.exception()
+
+
+def _not_sent(action: str, why: KvmError) -> KvmError:
+    """An action none of which went out: the connection it was to go over was not to be had (its video connection never came
+    about, it took too long, it was ending), or the call that presses could not be sent. Not done, and said so in words of its
+    own: said as "timeout" or "dropped", the page showed it as "No answer. It may have been done" and left it out of "Retry
+    failed", and the history kept a power press as unknown. (Only a press that went out and had no answer may have been
+    done: see `_cut_off`.)"""
+    return KvmError("action_failed", f"{'Nothing was typed' if action == 'text' else 'It was not done'}: {why.message}")
 
 
 def _taken_while(done: int, of: int) -> KvmError:

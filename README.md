@@ -701,7 +701,7 @@ back at any moment. Neither can change settings, accounts, devices or other toke
 takes a person.
 
 **A link for a wall screen.** Open it once in the browser of that screen. The browser keeps
-it, shows the wall as a display, and when qKVM has been restarted it comes back in by
+it (until the link runs out or is taken back), shows the wall as a display, and when qKVM has been restarted it comes back in by
 itself: nobody has to stand at the screen with a keyboard after a power cut. It can look at
 the machines it was made for, and no more than look. (The pictures are back by themselves
 as well: qKVM carries on after a restart, see [Keeping it running](#keeping-it-running).
@@ -776,12 +776,12 @@ with the statuses it comes with; the ones the requests below answer:
 | 401 | `unauthorized` (sign in first; in the middle of things: the session ended, sign in again and do not loop), `bad_password`, `bad_code`, `code_required`, `bad_key`, `bad_recovery` | the session |
 | 403 | `forbidden` (the header), `not_allowed` (the role, or a token), `totp_required` (set the second step up first), `suspended`, `stopped` (whoever asked lost the right while it was under way) | |
 | 404 | `not_found` (also: a machine this account was not given), `no_picture`, `no_console`, `no_live` (no live picture of this machine) | |
-| 409 | `busy` (something else is being done to that machine), `changed`, `no_text`, `in_use`, `console_held`, `enabled`, `not_enabled`, `not_started`, `not_initialized`, `no_second_step`, `no_password` (the account has no password here: it is signed in by the identity proxy) | the state of things |
+| 409 | `busy` (something else is being done to that machine), `changed`, `no_text`, `in_use`, `console_held`, `enabled`, `not_enabled`, `not_started`, `not_initialized`, `no_second_step`, `no_password` (the account has no password here: it is signed in by the identity proxy), `same_host` (a device's page on a host name qKVM is looked at under), `unknown_kind` (a tile of a kind of machine this version does not know, kept from a later version: nothing is sent to it; it can be removed) | the state of things |
 | 411, 413 | `length_required` (a body sent without its length), `too_large` (a body over 64 KiB, or a file over what a file may be) | the request |
 | 422 | `invalid`, `name_required`; for a file: `not_a_file`, `damaged`, `newer`, `passphrase_needed`, `wrong_passphrase`, `too_large` | the request |
 | 429 | `rate_limited`, with `Retry-After` in seconds, which is meant; `busy` (too many passwords being checked at once: try again shortly) | |
 | 500, 501 | `internal` (the details are in the wall's log); `missing_driver` (a JetKVM, where the Python that runs qKVM lacks the aiortc package qKVM is installed with) | the wall's |
-| 502 | the device's: `unreachable`, `dropped`, `auth_failed`, `no_password`, `not_set_up`, `cert_mismatch`, `cert_invalid`, `plain_only`, `another_machine` (another machine answers at the address than the one the tile was added for, a PC with Intel AMT by its PlatformGUID, a server by its UUID and its controller's, or has its guest's number on its Proxmox, by the guest's SMBIOS UUID: nothing was sent; 422 from an edit), `bad_response`, `action_failed`, `console_time_up` | the device |
+| 502 | the device's: `unreachable`, `dropped`, `auth_failed`, `no_password`, `not_set_up`, `cert_mismatch`, `cert_invalid`, `plain_only`, `another_machine` (another machine answers at the address than the one the tile was added for, a PC with Intel AMT by its PlatformGUID, a JetKVM by its own number (which it says once signed in), a server by its UUID and its controller's, or has its guest's number on its Proxmox, by the guest's SMBIOS UUID: nothing was sent; 422 from an edit), `bad_response`, `action_failed`, `console_time_up` | the device |
 | 503 | `no_stream` (not yet: ask again), `no_sign_in` (the device answers, and does not sign qKVM in), `locked` (qKVM cannot open the saved passwords just now), `busy` (no memory to check a password with) | |
 | 504 | `timeout`: no answer from the device | |
 | 507 | `not_saved`: the change could not be written down (a full disk), and was taken back | the wall's disk |
@@ -805,13 +805,13 @@ wherever something is written down; `locked`; and the device's own wherever a de
 | `GET /api/v1/session` | nobody | | `initialized` (false: nobody has set this wall up, which is done on its page), `authenticated`, `user` (the account, below, or null), `ask_name` (true: more than one account, and signing in needs the name), `recovery` (a recovery key exists), `recovery_created` (to an admin: when, in seconds since 1970; otherwise null), `setup_code_required`, `min_password`, `unlocks_at_start`. Started with `--sso-header`: `sso` (`on`, `name`, `known`), and whoever the proxy signed in is signed in here by this answer, cookie included |
 | `POST /api/v1/login` | nobody | `password`*, `name` (where `ask_name`), `code` (where asked for), `remember` (30 days) | `ok`, `user`, and the cookie. 401 `bad_password`; 401 `code_required`: the password was right and the account has a second step, send the same request again with `code`; 401 `bad_code`; 403 `suspended`; 409 `not_initialized`; 409 `no_second_step` (the key of the account's second step does not open any more: `qkvm --disable-2fa` where qKVM runs); 422 `name_required`; 429 `rate_limited` |
 | `POST /api/v1/logout` | viewer, a person | `scope`: "this" (default), "others" (the account's other sessions), "all" | `ok`; the cookie is cleared, except for "others". 507 `not_saved`: signed out all the same, and a restart may undo it |
-| `POST /api/v1/password` | viewer, a person | `current`*, `new`* (10 to 256 characters) | `ok`; the account's other sessions end. 401 `bad_password`; 409 `no_password` |
+| `POST /api/v1/password` | viewer, a person | `current`*, `new`* (10 to 256 characters) | `ok`; the account's other sessions end. 401 `bad_password`; 409 `no_password`; 409 `changed` (the account was changed while its password was checked: nothing was done) |
 | `POST /api/v1/totp/begin` | viewer, a person | `password`* | `secret` (the key, in groups of four), `uri` (`otpauth://...`, for a QR code), `qr` (that code drawn, a text per row, "1" for a dark module). 409 `enabled`; 401 `bad_password` |
 | `POST /api/v1/totp/enable` | viewer, a person | `code`* (from the app, for the key just shown) | `ok`, `user`, `recovery_codes` (ten one-time codes, shown this once); the account's other sessions end. 409 `not_started`; 401 `bad_code` |
-| `POST /api/v1/totp/codes` | viewer, a person | `password`* | `ok`, `user`, `recovery_codes` (ten new ones; the old stop working). 409 `not_enabled`; 401 `bad_password` |
-| `POST /api/v1/totp/disable` | viewer, a person | `password`* | `ok`, `user`. 401 `bad_password` |
+| `POST /api/v1/totp/codes` | viewer, a person | `password`* | `ok`, `user`, `recovery_codes` (ten new ones; the old stop working). 409 `not_enabled`; 401 `bad_password`; 409 `changed` (as for `/password`) |
+| `POST /api/v1/totp/disable` | viewer, a person | `password`* | `ok`, `user`. 401 `bad_password`; 409 `changed` (as for `/password`) |
 | `POST /api/v1/recover` | nobody | `recovery_key`*, `new_password`*, `name` (where there are several accounts) | `ok`; every session of that account ends. 401 `bad_recovery`; 409 `not_initialized`; 422 `name_required`; 429 `rate_limited` |
-| `POST /api/v1/display` | nobody | `key`* | `ok`, `user` (`token` true), and the cookie. 401 `bad_key`: the link was taken back or has run out |
+| `POST /api/v1/display` | nobody | `key`* | `ok`, `user` (`token` true), `expires` (when the link runs out, in seconds since 1970; null: when it is taken back), `expires_in` (how many seconds that is from now, by the wall's clock: a screen counts those, whatever its own clock says; null as for `expires`), and the cookie. 401 `bad_key`: the link was taken back or has run out |
 | `GET /api/v1/about` | viewer | | `version`, `licence`; to an admin also what it runs on |
 | `GET /api/v1/wall` | viewer | | `interval` (seconds between two pictures of a tile, as set for this wall), `live` (the form of the live line this qKVM speaks, as a number: 2; a program that speaks another form asks for no live picture, see [Live view and control](#live-view-and-control)), `devices` (the machines this account may see, each as below). Never waits for a device |
 | `GET /api/v1/status` | viewer | | by device `id`, how each is (below), from what is known: it waits for no device, except up to a second and a half for one's very first look |
@@ -822,7 +822,7 @@ wherever something is written down; `locked`; and the device's own wherever a de
 | `GET /api/v1/actions` | operator | | `actions`: each `id`, `name`, `kind` ("keys" or "text"), `keys`, `enter`, `danger`, `changed` (how often it was edited). Never the text a saved action types |
 | `GET /api/v1/devices/{id}/wol` | operator | | `targets`: each `mac`, `name` (what the device calls it, which a KVM fills with the address where it has no name; empty where it has nothing). A machine without `wol` in `can` answers an empty list. 404 `not_found`; the device's |
 | `POST /api/v1/devices/{id}/actions` | operator | `action`*, and what that one needs (the table below); `batch` (any id of letters, digits and "-", up to forty: ties several requests together as one act in the activity log) | `ok`, `note` (null; or "already on", "already off" for a server that was so; or "pressed, but the computer is still off", "held, but the computer is still on", "pressed; its board has not said since", "pressed; not seen: its connection ended" (the tile was edited or removed, or the wall locked itself; and "held; ..." of the same) for a KVM's power button whose change its board did not show: it was pressed). 404 `not_found` (also: the saved action is gone); 409 `busy` (with `by`, the name of whoever has the machine's keyboard and mouse over a live line, where that is why: an account's, or a token's with "(token)"; to an admin in person the message adds that they can take them over in the live view: an action never takes over by itself); 409 `conflict` (it waited for the last holder of the keyboard to be let go of, and meanwhile the tile was changed or taken off the wall: nothing was sent); 409 `changed` (the saved action was edited since it was listed); 409 `no_text`; 403 `not_allowed` (a token and a saved text); 403 `stopped`; 422 `invalid` (also: an action this machine cannot do); 502 `action_failed` (the device refused); 504 `timeout` and 502 `dropped` (it may have been done); the device's. Every action is written to the activity log with the account |
-| `POST /api/v1/devices/{id}/console` | operator, a person | `{}` | `url`: a way into a server's own console, signed in, good for one use, for the browser of whoever asked; it is in no log, and is not to be kept. 403 `not_allowed` (a token); 404 `not_found`; 404 `no_console` (no such way in from this device); the device's |
+| `POST /api/v1/devices/{id}/console` | operator, a person | `{}` | `url`: a way into a server's own console, signed in, good for one use, for the browser of whoever asked; it is in no log, and is not to be kept. 403 `not_allowed` (a token); 404 `not_found`; 404 `no_console` (no such way in from this device); 409 `same_host` (the browser reaches the device by a host name qKVM is looked at under, the one this request came by or one in `allowed_hosts`: it would hand the device its sign-in to qKVM, and nothing is asked of the device); the device's |
 | `PUT /api/v1/wall/order` | admin | `ids`* (device ids, first to last; the rest keep their order after them) | `ok`, `ids` (the whole order, as it is now, for every browser). 507 `not_saved` |
 | `POST /api/v1/devices/remove` | admin | `ids`* (1 to 5000 device ids, within the 64 KiB a body may have; one given twice is one machine) | takes every one of them off the wall, or none: `ok`, `removed` (their ids, in the wall's order). Each one's saved password and history go with it, and each gets a line of its own in the activity log (`device_removed`), as one removed on its own does. An action on its way to one of them is answered as one cut off by an edit of the tile (it may have been done), and a live line to one is told `gone`, the keys it held let go of first. 404 `not_found` with `unknown` (the ids that are not on the wall: nothing was removed); 507 `not_saved` (nothing was removed, and nothing on them was cut off) |
 | `GET /api/v1/tokens` | admin | | `tokens`: each `id`, `name`, `kind` ("api" or "display"), `role`, `devices` (ids, or null for all), `groups`, `created`, `expires` (null: never), `used` (null: not yet). Never the token itself |
@@ -1271,7 +1271,10 @@ How a JetKVM is reached is its owner's choice, made at the device's own page (*S
   plain HTTP answers, that is said, and the address is yours to type with `http://`. A
   JetKVM added over plain HTTP says so in the list of what was added.
 - **When that is changed later, the tile follows.** A JetKVM on the wall over plain HTTP is
-  asked every ten minutes whether it offers HTTPS by now, and moved there when it does. It
+  asked every ten minutes whether it offers HTTPS by now, and moved there when it does, where
+  what answers there is that JetKVM: a certificate no other tile has, and the number it gives
+  for itself the tile's (anything else there, a gateway's port that leads to another device
+  say, is not followed, and the log says so). It
   is asked as well before qKVM signs in to it, and before a password you type for it is
   sent or a saved one is used in an edit, so that none goes out unencrypted where HTTPS is on
   offer. Each move is in the activity log. The other way round nothing moves by itself: a
@@ -1283,6 +1286,14 @@ How a JetKVM is reached is its owner's choice, made at the device's own page (*S
   one that has none. A password switched on at the device later shows on its tile as
   *Login failed*, with **Update login** to type it in. A JetKVM fresh from its box, where
   nobody has chosen yet how it is signed in to, lets nobody in and is said to be that.
+- **The JetKVM it was added for, and no other.** qKVM remembers the number a JetKVM gives for
+  itself when it is added, and asks it again before every video connection, over which every
+  key, text and press goes: another JetKVM that took its address (a new lease) is sent none of
+  them, and its tile says so. One without a password says its number to anybody, and is asked
+  before anything goes. One with a password says it only to whoever is signed in, so over plain
+  HTTP its password goes, unencrypted, before it can be told apart from another JetKVM with the
+  same password. That is why HTTPS is the better choice: there the certificate remembered for
+  it is checked before the password goes.
 - **Loopback-only mode** (*Settings*, *Advanced* on the device) shuts everything but the
   device itself out, qKVM included.
 
@@ -1296,7 +1307,13 @@ Three things are different from a Comet, and they come from the device:
   when qKVM logs in, a browser logged in to that JetKVM has to log in again, and the
   other way round. qKVM logs in once and keeps its session for as long as it can.
 - **It must be reachable directly**, on the LAN or over a VPN such as Tailscale. JetKVM
-  Cloud only works from a browser signed in with Google, so qKVM cannot go through it.
+  Cloud only works from a browser signed in with Google, so qKVM cannot go through it. Its
+  picture comes over a connection to the very address qKVM reaches it at: of the network
+  addresses a JetKVM offers for its video, qKVM tries only that one (whatever answers at a
+  JetKVM's address could otherwise have qKVM send its checks to any host it named). A JetKVM
+  reached through a reverse proxy, a forwarded port, an SSH tunnel, a route through NAT or a
+  4via6 route offers addresses of its own, none of them the one qKVM reaches it at, and gives
+  no picture there: its tile says that no video connection came about.
 
 The picture is decoded on the computer running qKVM, and a JetKVM sends video at the rate
 of the screen it watches. Measured with a 1920×1200 screen at 60 frames a second, one JetKVM
@@ -1438,7 +1455,8 @@ screen is in the console that the controller's own web page opens, and qKVM take
 - It keeps out of the way of whoever works at the console. Somebody who opens the controller's
   own console while the wall has it is let in at once, keys and all, and the wall goes on
   looking. Whatever a live line had down on the server is let go of first, and the line has the
-  keyboard no more: its next key is refused with `in_use`. Keys go only once the
+  keyboard no more: it is told so within a second (`in_use`), and a key of its own meanwhile is
+  refused the same way. Keys go only once the
   controller has said that the console is the wall's; a console that another session still
   holds is shown, and nothing is typed into it. When somebody has the console first, the controller asks them whether a newcomer
   may look; the wall does not leave that question on their screen. It leaves the moment it is
@@ -1492,9 +1510,12 @@ what else a server's tile gives:
   (its large view opens to show the setup screen), not a bulk run, and is written in the log.
   A boot override another tool set (a network boot, or one for every boot) is not replaced,
   nor is a server touched that is switching on or shutting down just then: the button says so
-  and does nothing. Once the override may be set, the button says whether it is: where the
+  and does nothing (and where the override was set already before the press, that it still is).
+  Once the override may be set, the button says whether it is: where the
   controller refuses the restart for certain, or its answer to the override itself is lost, the
-  override is set back to off, so no ordinary boot lands in the setup; where the restart may
+  override is set back to off, so no ordinary boot lands in the setup (where it showed off already
+  when it was set back, before a change of the press's that may still be made, that is said as a
+  maybe); where the restart may
   have gone through (its answer lost, an error of the controller's own, or an answer a command
   does not have), or a server switched on is not seen to come on, it is left set and the
   button says so. The clearing reads first and leaves an override another tool has set by
@@ -1505,20 +1526,24 @@ what else a server's tile gives:
   restart goes out). Where it is read back, the power that read shows decides what goes out: a
   server switched on meanwhile (at its button, by another tool) is restarted, and one that began
   to change its state is left alone and the override cleared again. After a 204, which is what
-  the board this was tried on answers, nothing is read before the power command (that board
-  answers no read for about a minute after the change): a server read off before the change and
-  switched on by somebody during it is sent *On*, which a server that is on takes as nothing to
-  do, so the button says done, nothing restarts, and the override waits for that server's next
-  boot. A server switched on into its setup is waited for that minute and the usual 25 seconds
+  the board this was tried on answers, the change is not read back, and the power is read once
+  before the power command, for five seconds at the most, and decides as above. That board
+  answers no read for about a minute after the change: where that read gets no answer, the power
+  read before the change decides, and a server read off then and switched on by somebody during
+  the change is sent *On*, which a server that is on takes as nothing to do, so the button says
+  done, nothing restarts, and the override waits for that server's next boot. A server switched
+  on into its setup is waited for that minute and the usual 25 seconds
   after it before the button says it did not come on. A restart that the controller accepts is
   not seen done (the server is on
   before and after): the override stays set until the server boots, and the large view shows
-  whether it did. A press that has not come to its restart within two minutes goes no further:
-  nothing is restarted, and the override is cleared again. Nothing under way is cut off for
-  that: a request is waited out within its own time, and a clearing goes to its end, so the
-  answer can take several minutes on a controller that is slow at every step (some ten at the
-  very worst). The page waits four, then says it had no answer and that the setup boot may be
-  set; the activity log has how it ended.
+  whether it did. A press that has not come to its restart within two minutes goes no further
+  (where the restart would go on a new connection, with the time that connection may take to
+  spare): nothing is restarted, and the override is cleared again. Nothing under way is cut off
+  for that: a request is waited out within its own time, and a clearing goes to its end, so the
+  answer can take several minutes on a controller that is slow at every step (some ten, and
+  more where it has to be signed in to again or a read is asked again on the way). The page
+  waits four, then says it had no answer and that the setup boot may be set; the activity log
+  has how it ended.
 - **Locator light on** lights the server up, front and back, for whoever is standing in
   front of the rack looking for it. The tile says so for as long as the light is on.
 - **Open console** leads to the controller's own page, where its remote console is. Where
@@ -1674,8 +1699,11 @@ What a PC's tile gives:
   edit the tile and type its password. A tile with no number yet (added while its PC could not
   be reached, or from a file without it) takes the first one it sees, as a certificate is
   remembered on first contact. An account that may not read the hardware asset information
-  gets no number, nor does an engine that cannot say it; such a PC is not told apart this way,
-  and works as before. That an engine takes only its own nonces is how Digest is meant to
+  gets no number, nor does an engine that has no such thing to say; such a PC is not told apart
+  this way, and works as before. Where the number could not be read as the PC is added, or as
+  its tile is edited with the password typed (a fault of the engine's own, an answer qKVM makes
+  nothing of), that is said and nothing is saved: the next try takes it. That an engine takes
+  only its own nonces is how Digest is meant to
   work, and was tried on a real engine (see [Limits](#limits)).
 - **Start into BIOS setup.** *Start into BIOS setup* arms the firmware setup for the next boot,
   once (Intel's `AMT_BootSettingData` with `BIOSSetup`, made the next boot by
@@ -1688,8 +1716,9 @@ What a PC's tile gives:
   whether or not qKVM boots it; and where it could not be armed in full, or the power change
   is refused for certain (a refusal, or a SOAP fault), qKVM clears it again, so no ordinary boot
   lands in the setup (it reads first, and does not write over a boot option that destroys data
-  which another tool armed by then: that is said instead; a setup boot armed already before the
-  press is left as it was, and said). Where the power change's answer is lost or cannot be read,
+  which another tool armed by then: that is said instead; where it reads not armed, nothing is
+  cleared, and that is said; a setup boot armed already before the press is left as it was, and
+  said, also where nothing was armed). Where the power change's answer is lost or cannot be read,
   or a PC switched on is not seen to come on, the boot is left armed and the button says so;
   a reset the engine takes is not seen done, and the boot stays armed until the PC boots. A
   PC that is changing its power state just then is left alone. A press that has not come to its
@@ -1879,11 +1908,19 @@ What works, and how:
   connected at once all the same. (A server that stops answering is one that is down, as
   above.) What a server's pictures cost to draw is shared out,
   since a few kilobytes can cost seconds of drawing: every server's pictures are drawn in the
-  same two threads, a few milliseconds at a time, one server's in half of a
-  thread's time at the most and every server's together in three quarters (each may take a second's
-  worth at once). A server whose pictures cost much to draw is shown more slowly, and the others,
-  and the rest of qKVM, go on: their pictures wait a few milliseconds at a time behind its own, some
-  tens where a JPEG or a stream of a large screen is decoded in one go.
+  same two threads, a few milliseconds at a time, and reading what the servers send is counted
+  with it, one server's in half of the program's time at the most and every server's together in
+  three quarters (each may take a second's worth at once). JPEGs are decoded in their server's own
+  worker and drawn in a thread of that server's own, as many at a time as a tenth of a second
+  takes, and its share counts what the worker worked. A server whose
+  pictures cost much to draw is shown more slowly, and the others, and the rest of qKVM, go on:
+  their pictures wait a few milliseconds at a time behind its own, some tens where a stream of a
+  large screen is inflated in one go. One whose pictures take a second or more to decode or draw,
+  more than three times in a minute, is treated as one that sent what qKVM does not take (above).
+  What every server's updates hold at once, beyond their screens, is held to 512 MB, and any one
+  server's to a quarter of it (a rectangle that needs more alone, and one server at a time): an
+  update that does not fit waits for others to be drawn, and one that fits does not wait behind it
+  unless it has waited ten seconds.
 
 VNC support was typed from RFC 6143 and from TightVNC's description of its encoding, and tried
 against a stand-in server written for the purpose, which speaks every version, both ways of
@@ -2577,10 +2614,34 @@ These three only look: they run nothing that lies in the folder they are asked a
 installed update either), make and change nothing in it, and take nothing a file in it says
 at its word. `stop` and `restart` leave one small file there, which the running copy picks
 up. That is also the whole of who may stop qKVM: **whoever can write to its data folder**,
-and whoever can write there can put there what qKVM runs after an update as well. Keep the
-folder writable by the account qKVM runs as and by nobody else; on Linux and macOS qKVM
-says so at start when it is not, and on Windows it is for you to look (a folder under your
-own profile is yours alone; one made elsewhere, on another drive say, often is not).
+and whoever can write there can change its files as well. Keep the
+folder writable by the account qKVM runs as and by nobody else; qKVM says so at start when it
+is not, with what to do, and runs no update from a folder others may write. What qKVM makes
+is yours alone from its first moment: on Windows the data folder, `<data folder>.keys` beside
+it (where the storage key is kept), the key and every file it writes in them are yours,
+SYSTEM's and the Administrators'. A folder it finds is used as it is found and never changed,
+by any command, on Windows as on Linux (made elsewhere, on another drive say, or reached
+through a junction): every start says what it lets others do, with the line that changes it,
+for you to run. On Windows the lines are for Command Prompt, and the start says so; where a path
+holds a `$` or a backtick, which PowerShell would read as something else, it gives the
+PowerShell form as well (each path in single quotes, a removal by PowerShell's own
+`Remove-Item -LiteralPath`, a link by `[System.IO.Directory]::Delete`, never through `cmd /c`).
+For a folder open to others:
+
+```
+icacls "D:\qkvm-data" /inheritance:r /grant:r "PC\you:(OI)(CI)F" "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F"
+```
+
+with the account qKVM runs as in place of `PC\you`. It sets the folder's own entries, which
+what is in it takes from it; it has no `/T`, which would follow a junction inside out of the
+folder. An entry given on the folder itself stays through that line: the start names it and
+gives its own, `icacls "D:\qkvm-data" /remove:g *S-1-5-...`. A link on the way (a junction to
+the folder, say) is set by a line of its own with `/L`, the link and not where it leads, and
+the folder it leads to by its own. A folder another account owns is that account's to change:
+in an elevated console, `icacls "D:\qkvm-data" /setowner "PC\you"` gives it to the account
+qKVM runs as and `takeown /F "D:\qkvm-data"` to the console's own, neither into what is in it;
+or run qKVM as that account. A drive formatted FAT or exFAT keeps no permissions at all: keep
+the data folder on NTFS.
 
 Stopping it this way is the same as Ctrl+C: connections are closed, the log says so.
 `qkvm status` ends with status 0 when qKVM runs and 3 when it does not, for a script. Where
@@ -2640,7 +2701,7 @@ or from published source, and tried on a stand-in laid out like it.
 | Servers through Redfish, AMI MegaRAC controllers | Real boards of two makers: see below |
 | Servers through Redfish, Dell iDRAC9 | Dell's own capture of an iDRAC9 (firmware 7.20.10.05, from `dell/iDRAC-Redfish-Scripting`), served by DMTF's Redfish-Mockup-Server 1.3.0: sign-in and out, status, temperatures and fans, the locator light, the power actions it offers; no real iDRAC yet |
 | Servers through Redfish, HPE iLO 5 | HPE's own `ilo-redfish-emulator` v1.1.0 (an iLO 5 on a DL360 Gen10 Plus): the same, and the power actions carried out; no real iLO yet |
-| Servers through Redfish, OpenBMC | Built from bmcweb's source (its names, the newer shape of the sensors, where its console is and the console `/kvm/0` itself, its firmware inventory) and tried on a stand-in laid out like it, the console's pictures included, and against OpenBMC's own romulus image in QEMU (a build of its master branch of October 2026) on a Linux machine: signing in, the controller and its firmware's version, the server's power, where its console is, and the console's sign-in with the session (refused without one); that image has no console, so no picture came from a real OpenBMC; the run in QEMU is written for every push and has not been seen on GitHub yet |
+| Servers through Redfish, OpenBMC | Built from bmcweb's source (its names, the newer shape of the sensors, where its console is and the console `/kvm/0` itself, its firmware inventory) and tried on a stand-in laid out like it, the console's pictures included, and against OpenBMC's own romulus image in QEMU (a build of its master branch of October 2026) on a Linux machine: signing in, the controller and its firmware's version, the server's power, where its console is, and the console's sign-in with the session (refused without one); that image has no console, so no picture came from a real OpenBMC; the run in QEMU is written for every push and passed on GitHub |
 | Virtual machines on Proxmox VE | A real Proxmox VE 9.2 (a throwaway one, with Alpine Linux guests): the guests a token may see listed and added, a running guest's screen on the tile, enlarged and live, letters typed at its login prompt and taken back, a stopped guest switched on, asked to shut down (not heard: nothing in it answers ACPI) and stopped, twenty guests' consoles held at once, a guest deleted and another made under its number refused; a stand-in for what was not met there (a guest moved to another node, a token that lacks a right, Proxmox misbehaving). Containers are not shown |
 | Virtual machines on libvirt, QEMU, Unraid | As VNC servers (above): a libvirt guest's console (libvirt 11.3, QEMU 10.0, no password) was looked at so, its name and its screen; Unraid's VM form was read in its documentation, not tried |
 | An iDRAC's own VNC server | As a VNC server, `vncs://` where its encryption is on: built from Dell's documentation, not tried |
@@ -2664,8 +2725,8 @@ or from published source, and tried on a stand-in laid out like it.
   a press at once and held the button on (its `busy` said half a second whatever the hold;
   `wait=1` was answered with an error and pressed nothing); and told whoever asked while it
   answered somebody else that there was no board. What the wall does with each is said under
-  *Using it* and in `FOR-THE-DESKTOP-APP.md`. One PC is one: another computer's power light may be
-  wired otherwise, and a stock PiKVM's board was not tried.
+  *Using it*. One PC is one: another computer's power light may be wired otherwise, and a stock
+  PiKVM's board was not tried.
 - The same Comet's board was then heard on its line for events, as the wall now hears it: the
   Comet read its board for that line about every second and a quarter and said it there when it
   had changed (once, and nothing more for as long as nothing changed), "on" four and a half seconds
@@ -2837,7 +2898,10 @@ or from published source, and tried on a stand-in laid out like it.
   KVM that is off in the MEBx or absent, the plain port and the network search were tried against
   the stand-in only, and so was telling another PC at the address apart (a session to the screen,
   which has a sign-in of its own on the redirection port, is opened a moment after its question
-  which PC answers and is not bound to it). *Start into BIOS setup* sends every boot property
+  which PC answers, to the address the answer to that question came from, and is refused where
+  the engine on it signs in in another realm, before the password goes; every engine has one
+  Digest realm, and a real one was not asked to show it on both ports). *Start into BIOS
+  setup* sends every boot property
   the engine reported, each at its own safe value (the deprecated `SecureErase` as false
   included): a board from firmware Release 20 on, where assigning it is an error, has not been
   met. One
@@ -2913,9 +2977,11 @@ or from published source, and tried on a stand-in laid out like it.
   restart and the clearing wait up to a minute for their answer (a look waits 20 seconds).
   Switching an off server on into its setup was not tried on the real board (its timings were
   given to the stand-in instead). Nor was a server switched on by somebody during the change: on
-  the 204 path, which that board takes, such a server is sent *On*, which it takes as nothing
-  to do, and the override waits for its next boot (the stand-in takes *On* to a server that is
-  on as nothing to do, as a real controller is expected to).
+  the 204 path, which that board takes, its power is read once before the power command (five
+  seconds at the most), and such a server is restarted where that read is answered; that board
+  answered no read for a minute after the change, and then such a server is sent *On*, which it
+  takes as nothing to do, and the override waits for its next boot (the stand-in takes *On* to a
+  server that is on as nothing to do, as a real controller is expected to).
 - *The server it was added for* (see [Servers](#servers)) was tried on that same real board for
   the case that matters there, that the right server is never refused: a tile kept by qKVM 0.1
   took its server's number from what it kept, took its controller's at the first look, and was
@@ -2928,8 +2994,46 @@ or from published source, and tried on a stand-in laid out like it.
   seconds to a quarter of a minute on that board) to each sign-in, which is once and then when
   the controller's session has run out. The first sign-in after an upgrade from 0.1, where
   only the computer's number is known, is not checked before the password goes (the computer
-  is, before anything is sent to it). The console's own sign-in goes a moment after the
-  computer was asked, and is not bound to that question as a command is to its session (it is
+  is, before anything is sent to it). The password of every sign-in goes on a connection of
+  qKVM's own, on which the controller's open service root is read and its number compared
+  first; so does the console's own sign-in, a moment after the computer was asked, and with
+  it the console's pass, the console itself (AMI's on that same connection, OpenBMC's on one
+  of its own, compared first) and the sign-out of the console's web page. A real AMI MegaRAC
+  kept one TLS connection open across a read of its Redfish root and a read of its web page
+  (two reads without a sign-in, 2026-11-01); its console's upgrade on a connection that
+  carried a sign-in before it has not been seen on a real board yet. A controller that closes
+  the connection after every answer (one that answers in HTTP/1.0 does: such an answer keeps no
+  connection for another request) has each of these sent on a connection made afresh right
+  after the compare, checked against its certificate, where that is pinned and no other tile
+  shows it; over plain HTTP, with its certificate not checked, or with one another tile shows
+  too, it gets no console, and where its number is remembered is not sent the password, and its
+  tile says why (both tried against the stand-in only). The session a sign-in opens is a token
+  that every later read and every button carries (the sign-out of that session too). Over plain
+  HTTP, with the certificate not checked, or with one another tile shows too, it goes only on
+  connections of qKVM's own, each compared as it is made and kept while the controller keeps
+  it open, 30 seconds idle at the most (a NAT or a firewall may forget one that sits idle
+  without a word), with a second kept ready so that a press does not wait behind a look's slow
+  answer; not for a controller that closed one kept ready before it was used, which closes idle
+  connections within moments: that one pays one root read for each look and press. With a
+  certificate this tile alone has pinned, it goes on the HTTP library's connections, which that certificate binds to the
+  controller that holds its key; a certificate its maker put on every board, where no other of
+  those boards is on a tile here, cannot be told from the controller's own, and there the token
+  may still reach another board of that make after a new lease (which refuses it: the sign-in
+  that follows is compared). Where the controller says no number at all, its computer, asked
+  under the session, is what tells, and that question carries the token. A console is opened
+  on a connection of qKVM's own that waits, compared as it was made (one of those above, or
+  the sign-in's), which is the console's from then on, and the sign-out of its web page, which
+  runs by itself, goes on one that waits too. Where none waits (the controller closed them,
+  or the tile was added a moment ago and had nothing to compare them with), each reads the
+  controller's root first, the opening beside the question which server answers: on the board
+  that shows its root in 12 to 20 seconds, that much more without a picture between two
+  consoles. Against the stand-in with a root of 15 seconds and a console that ran out every
+  20 seconds, a controller that kept idle connections as that board did had the console back
+  within a third of a second each time; one that closes them after five seconds, in 15.
+  Retiring a server whose console is open waits five seconds for that sign-out; where it must
+  read a root slower than that, the sign-out goes on by itself while qKVM runs, and at qKVM's
+  end the web session is left to run out on the controller. The computer is not
+  bound to the question before the console's sign-in as a command is to its session (it is
   asked again after that sign-in, before the console is opened). Not known: whether a real
   controller still gives its computer's number while the server is off after the controller
   itself lost power (a board learns it from the server's firmware as it starts); where it does
@@ -2942,8 +3046,9 @@ or from published source, and tried on a stand-in laid out like it.
   first time is answered "changed by someone else just now", and goes through when made again.
 - Carrying on after a restart with an unlock file was tried with the program itself, in the
   container both ways described above, and as a systemd service that is given the file by
-  its path. Handing the file over as a systemd credential (`LoadCredential`) is how systemd
-  means it to be done and is what is recommended above, but it has not been tried yet.
+  its path. Handing the file over as a systemd credential (`LoadCredential`), which is how
+  systemd means it to be done and is what is recommended above, was tried on 2026-10-26 on
+  Ubuntu 24.04 with systemd 255 and `DynamicUser`, and works.
 - Where every browser reaches qKVM from one and the same address and no proxy says who is
   who (ports published by Docker Desktop arrive that way), the lock after wrong passwords
   applies to all of them at once.

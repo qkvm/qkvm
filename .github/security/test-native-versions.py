@@ -7,6 +7,7 @@ import importlib.util
 import io
 import json
 from pathlib import Path
+import re
 import tempfile
 import unittest
 
@@ -23,10 +24,16 @@ def load(name, module):
 GATE = load("check-native-versions.py", "native_gate")
 COLLECTOR = load("native-versions.py", "native_collector")
 MINIMUMS = json.loads((HERE / "native-minimums.json").read_text(encoding="utf-8"))
+DOCKERFILE = HERE.parent.parent / "Dockerfile"
 
-# What the image of 0.2.0 said of itself on both architectures (python -P - < native-versions.py, 2026-10-26).
+# The base image the Dockerfile builds on, by digest, and the CPython in it: python:3.13-slim as Docker Hub served it on
+# 2026-11-01 (docker buildx imagetools inspect, read only), PYTHON_VERSION 3.13.18 in its config on amd64 and arm64.
+BASE_IMAGE = ("python:3.13-slim", "sha256:2d44738ebf4ce5f63b9d9ea871e9c7cfdc0426f7b0c97cac915fd88ded1d86bb", "3.13.18")
+
+# What the image of 0.2.0 said of itself on both architectures (python -P - < native-versions.py, 2026-10-26), but for
+# CPython: the base image's since 0.2.1 (BASE_IMAGE below), which the image takes as it is.
 SHIPPED = {
-    "cpython": "3.13.16",
+    "cpython": "3.13.18",
     "ffmpeg": "8.1.1",
     "libvpx": "v1.16.0",
     "libopus": "libopus 1.6.1",
@@ -51,6 +58,15 @@ class NativeVersions(unittest.TestCase):
                 versions, blocked = self.evaluate(recorded(arch), arch=arch)
                 self.assertEqual(blocked, [])
                 self.assertEqual(set(versions), set(SHIPPED))
+
+    def test_the_image_builds_on_the_base_whose_cpython_is_the_minimum(self):
+        # The base of 0.2.0 carried 3.13.16, without 3.13.18's fixes (Expat's CVE-2026-77214 and CVE-2026-102633, the
+        # eMudhra intermediates refused by ssl, tarfile): the base image and the minimum move together, in one change.
+        tag, digest, cpython = BASE_IMAGE
+        froms = re.findall(r"^FROM\s+(\S+)", DOCKERFILE.read_text(encoding="utf-8"), flags=re.M)
+        self.assertEqual(froms[0], f"{tag}@{digest}")
+        self.assertEqual(MINIMUMS["components"]["cpython"]["minimum"], cpython)
+        self.assertEqual(SHIPPED["cpython"], cpython)
 
     def test_the_kept_minimums_are_what_the_image_ships_today(self):
         # Raised on purpose only, with its reason; never lowered to let an older library through.

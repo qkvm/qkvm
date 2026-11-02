@@ -28,15 +28,17 @@ import re
 import time
 from dataclasses import dataclass, field
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 from cryptography import x509
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives import serialization
 
 from . import alerts
-from .kvm import KEYS, MAX_TEXT
-from .store import FINGERBOT_STRENGTHS, Store, as_a_line, device_url, machine_from_before
+from .amt import at_its_port
+from .kvm import KEYS, MAX_TEXT, POWER_KEY_REFUSED, names_the_power_key
+from .store import FINGERBOT_STRENGTHS, Store, as_a_line, device_url, jetkvm_machine_from_before, machine_from_before
+from .store import KINDS as STORE_KINDS
 from .vault import Vault, VaultLocked
 from .proxmox import address_of as proxmox_address
 from .proxmox import guest_url
@@ -53,7 +55,7 @@ MOST_DEVICES = 2000
 MOST_ACTIONS = 500
 MIN_PASSPHRASE = 10  # as for an account's password
 SEALED_FOR = f"export {VERSION}"  # what the content is sealed for: it is not a device's password, and opens as nothing else
-KINDS = ("kvmd", "jetkvm", "redfish", "amt", "vnc", "proxmox")
+KINDS = STORE_KINDS  # (an entry of another kind is refused: a later version's file is not for this one)
 TLS = ("pinned", "system", "insecure")
 PARTS = ("devices", "actions", "alerts", "wall")
 # What a device says it is (server.IDENT), as a driver gives it. Not the marks this program makes itself:
@@ -133,7 +135,22 @@ def console_link(text: str) -> str:
     if parts.username is not None or parts.password is not None:
         # The link is handed to every account that may look at the tile.
         raise ValueError("the console link must not have a user name or password in it")
-    return text
+    # Its host as a device's address is written (device_url): small letters, no dot at the end, numbers one way, and none
+    # that the system reads as another host than it looks like. The page and the server each say whether the link is on a
+    # name this wall is looked at under (a browser would hand that page the sign-in to the wall), and read 2130706433, 127.1
+    # or a dot at the end otherwise; from one written so, both read the same host (I2 of 0.2.1). What follows is as typed.
+    netloc = parts.netloc
+    if not netloc.isascii():
+        try:
+            host = (parts.hostname or "").encode("idna").decode("ascii")
+        except UnicodeError:
+            raise ValueError("the console link's host is not a host name") from None
+        netloc = host if parts.port is None else f"{host}:{parts.port}"
+    try:
+        where = urlsplit(device_url(f"{parts.scheme}://{netloc}"))
+    except ValueError:
+        raise ValueError("the console link's host is not one a browser and qKVM would read alike") from None
+    return urlunsplit((parts.scheme, where.netloc, parts.path, parts.query, parts.fragment))
 
 
 # --- writing ----------------------------------------------------------------------------------------------------
@@ -455,6 +472,10 @@ def _devices(said: Any, left_out: list[str]) -> list[Device]:
                 url = guest_url(where.origin, where.node, where.vmid)
             else:
                 url = vnc_url(address) if is_vnc(address) else device_url(address)  # (a VNC server's address says so by itself)
+                if entry.get("kind") == "amt" and urlsplit(address.strip()).port is None:
+                    # Written without a port, an engine is at its own (16993 with TLS, 16992 plain), as an add or an edit
+                    # takes it: at 443 or 80 no engine answers, and its redirection port would not be known.
+                    url = device_url(at_its_port(url))
             name = _short(entry.get("name", ""), 80)
             username = _short(entry.get("username", "admin"), 64)
             group = _short(entry.get("group", ""), 200)
@@ -486,6 +507,8 @@ def _devices(said: Any, left_out: list[str]) -> list[Device]:
             if "machine" not in entry:
                 # (A server's, from a file of 0.1.x, which kept it as what the server is: taken as its machine, as at an upgrade.)
                 machine = machine_from_before(kind, ident, machine)
+            # (And a JetKVM's, from a file of 0.2.0 or before, which kept none for a JetKVM: its number, as at an upgrade.)
+            machine = jetkvm_machine_from_before(kind, ident, machine)
             device = Device(
                 name=name or urlsplit(url).netloc[:80],  # (no longer than a name may be, as the form names one that is added without a name)
                 url=url,
@@ -531,6 +554,8 @@ def _actions(said: Any, left_out: list[str]) -> list[Action]:
             if kind == "keys":
                 if not isinstance(keys, str) or not KEYS.fullmatch(keys):
                     raise ValueError("its keys are not keys this version knows")
+                if names_the_power_key(keys):
+                    raise ValueError(POWER_KEY_REFUSED[0].lower() + POWER_KEY_REFUSED[1:])
                 text = ""
             elif kind == "text":
                 if not isinstance(text, str) or not text or len(text) > MAX_TEXT:

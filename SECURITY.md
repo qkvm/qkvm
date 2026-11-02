@@ -30,8 +30,11 @@ and what happened. A way to reproduce it helps most.
   envelope without the storage key. Keep the data and storage-key backups separately.
   Copying both defeats this storage boundary. `--locked-start` additionally requires an
   account password or owner recovery path to open the inner credential key after startup.
-- Whoever can write to the data folder can stop qKVM, and can put there what it runs after an
-  update: that folder is the program's, as much as its settings'.
+- Whoever can write to the data folder can stop qKVM; the account qKVM runs as and the
+  computer's administrators can also put there what it runs after an update: that folder is
+  the program's, as much as its settings'. qKVM runs no update from a folder anybody else may
+  write, and a data folder it finds open to others is never changed: every start says so,
+  with what to do.
 - The network between qKVM and a KVM may be hostile; that is why certificates are remembered.
   The network between a browser and qKVM should be trusted, or HTTPS switched on.
 - An admin is trusted with everything, including where alerts are sent.
@@ -193,9 +196,14 @@ without anybody signing in. There are three ways, chosen when qKVM is started:
   still required to load the protected settings; after restart, a successful account
   sign-in is additionally required before devices are reached.
 
-Changing the inner automatic-unlock mode takes the key that was in use out of `qkvm.json`, out of
-`qkvm.bak` and out of the folder at that start, after which a copy of that key opens nothing:
-but not out of copies of the whole folder made before.
+Switching the inner automatic-unlock key off (`--locked-start`) takes the key that was in use out
+of `qkvm.json`, out of `qkvm.bak` and out of the folder at that start, after which a copy of that
+key opens nothing: but not out of copies of the whole folder made before. Starting with another
+key than the one in use (another unlock file, or a key of its own made anew) takes it out of
+`qkvm.json` and `qkvm.bak`; what the folder keeps to recover from (`vault-migration.recovery`, the
+damaged copies set aside) is kept, and named at that start, since a key that does not fit is as
+often an accident (a wrong file given once, a key a power cut emptied). Remove those by hand where
+the change was meant.
 
 ## What qKVM connects to
 
@@ -260,8 +268,9 @@ process. The application sends bounded video data over pipes; it does not send
 KVM addresses, passwords, session cookies, unlock keys or its environment. Native
 frames remain in the worker. Replies use a fixed binary format with dimensions,
 operation and size checks before payload allocation; Python object deserialization
-is not used. A failed, overloaded or timed-out worker stops video without falling
-back to native decoding in the credential-holding application.
+is not used. A failed or timed-out worker stops video, and where decoding falls
+behind, what waits for the worker is let go of up to the next key frame; neither
+falls back to native decoding in the credential-holding application.
 
 On Linux x86-64 and ARM64, the worker loads trusted runtime code before applying a
 seccomp syscall allowlist. It then cannot open files, create sockets, processes or

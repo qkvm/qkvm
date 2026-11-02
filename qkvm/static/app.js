@@ -150,6 +150,9 @@ const ACTION_PATIENCE = 150000;  // ms
 // Start into BIOS setup over a slow controller: two minutes to come to its restart (SETUP_WITHIN), and what is under way
 // then (a request, a clearing of the boot override) is finished before it answers, so that the answer can say what is left.
 const SETUP_PATIENCE = 240000;  // ms
+// An addition is waited for as long as a slow server controller takes to be told apart and signed in to (more than
+// the usual 30 s on a real one: the wall added it while the page said it took too long, and it was added again).
+const ADD_PATIENCE = 180000;  // ms
 
 // The words the wall shows for a state, a device's trouble or a kind of device, what a tile can be asked
 // (`can`), and every code the wall answers with: read from one file, static/words.json, which the other
@@ -980,7 +983,7 @@ function addDevicesForm(onAdded) {
     try {
       const { device, about } = await api('POST', 'api/v1/devices', {
         url, username: username.value, password: password.value, group: groupName.value, force, keep_both: keepBoth, kind: what.value,
-      });
+      }, ADD_PATIENCE);
       const model = [about.model, about.version].filter(Boolean).join(' ');
       row.className = 'ok';
       // Said where it is so: what is typed and seen there, and the device's password, are not encrypted on the way.
@@ -1030,8 +1033,12 @@ function addDevicesForm(onAdded) {
       ? `${address}: ${count} virtual machine${count === 1 ? '' : 's'} the token may see. Tick the ones to put on the wall:`
       : `${address}: the token may see no virtual machine there. It needs VM.Audit on them (on their pool, say).`;
     const picks = said.guests.map(guest => {
-      const box = h('input', { type: 'checkbox', disabled: Boolean(guest.known_as) });
-      const how = guest.known_as ? `on the wall as ${guest.known_as}` : `${guest.node}${guest.status ? ` · ${guest.status}` : ''}`;
+      // (A VM made under the number of a guest that was deleted is not that guest's tile: said so, and its box stays off while
+      // that tile has the number.)
+      const box = h('input', { type: 'checkbox', disabled: Boolean(guest.known_as || guest.new_under) });
+      const how = guest.known_as ? `on the wall as ${guest.known_as}`
+        : guest.new_under ? `a new VM under the number of ${guest.new_under}, whose guest it is not: remove that tile to add this one`
+          : `${guest.node}${guest.status ? ` · ${guest.status}` : ''}`;
       return { guest, box, row: check(box, `${guest.vmid} · ${guest.name}`, how) };
     });
     const added = h('ul', { class: 'results' });
@@ -1740,16 +1747,25 @@ function consoleLink(device) {
   return sharesOurName(device) ? '' : device.open_url;
 }
 
+// As the server reads it (security.shares_our_name, exchange.console_link): the host as the browser reads it, numbers
+// one way, small letters, and a dot at the end of a name dropped on both sides. "localhost." is the name "localhost", and a
+// browser hands it the sign-in to a wall looked at as "localhost" (I2 of 0.2.1).
 function sharesOurName(device) {
+  const bare = name => name.toLowerCase().replace(/\.+$/, '');
   try {
-    return new URL(device.open_url).hostname === location.hostname;
+    return bare(new URL(device.open_url).hostname) === bare(location.hostname);
   } catch {
     return false;
   }
 }
 
 async function openSignedIn(event, tile) {
-  if (!tile?.status?.console || !can('operator')) return;
+  // Where no link is offered (consoleLink), no way in either: the pass would take the device's page to the same name.
+  if (!tile || !consoleLink(tile.device)) {
+    event.preventDefault();
+    return;
+  }
+  if (!tile.status?.console || !can('operator')) return;
   event.preventDefault();
   if (enteringConsole) return;  // a second click while the first is being answered would have a second pass made out
   enteringConsole = true;
@@ -2856,6 +2872,7 @@ const EVENTS = {
   wall_arranged: 'Order of the tiles set',
   user_suspended: 'Account suspended', user_resumed: 'Account no longer suspended', user_signed_out: 'Account signed out everywhere',
   live_opened: 'Live view opened', live_closed: 'Live view closed', console_failed: 'Console not opened',
+  activity_left_out: 'Entries not written',
   activity_exported: 'Activity log downloaded', accounts_reset: 'Accounts and saved passwords erased',
 };
 const ACTION_NAMES = {
@@ -3616,6 +3633,14 @@ function liveViewDetail(entry) {
   ];
 }
 
+// Said as the listeners end (qKVM stopping, or its network settings changed): what an account's allowance left out, and no
+// later entry of it had said yet.
+function leftOutDetail(entry) {
+  if (entry.event !== 'activity_left_out' || !entry.unsaid) return [];
+  const of = { live: 'live views', console_opened: 'consoles opened', console_failed: 'consoles not opened' }[entry.of] || entry.of;
+  return [`${entry.unsaid} ${entry.unsaid === 1 ? 'entry' : 'entries'} of this account's ${of} not written: more than are kept an hour`];
+}
+
 function consoleDetail(entry) {
   if (entry.event !== 'console_opened' && entry.event !== 'console_failed') return [];
   return [entry.unsaid && `${entry.unsaid} earlier ${entry.unsaid === 1 ? 'entry' : 'entries'} of this account's consoles not written: more than are kept an hour`];
@@ -3647,7 +3672,7 @@ async function activityTab(refresh, does) {
     liveControlDetail(entry),
     entry.keys && keysLabel(entry.keys), entry.chars && `${entry.chars} characters`, entry.mac,
     entry.batch && 'bulk run', entry.version && `version ${entry.version}`, entry.note, entry.error, entry.url,
-    ...liveViewDetail(entry), ...consoleDetail(entry), exportedOf(entry, names),
+    ...liveViewDetail(entry), ...consoleDetail(entry), ...leftOutDetail(entry), exportedOf(entry, names),
   ].filter(Boolean).join(' · ');
   const line = entry => h('tr', {},
     h('td', { class: 'when' }, new Date(entry.time * 1000).toLocaleString()),
@@ -5783,8 +5808,11 @@ function renderFocus() {
   const [state, message] = stateOf(status, focus.view);
   $('#focus-name').textContent = tile.device.name;
   $('#focus-name').title = tile.device.name;
+  // Not there at all where no link is offered (a page on this wall's own host name): the actions say why.
   const open = $('#focus-open');
-  if (consoleLink(tile.device)) open.href = consoleLink(tile.device);
+  const link = consoleLink(tile.device);
+  open.hidden = !link;
+  if (link) open.href = link;
   else open.removeAttribute('href');
   $('#focus-bar').dataset.state = state;
   $('#focus .focus-title').dataset.state = state;
@@ -5804,6 +5832,14 @@ function renderFocus() {
   fillPorts($('#focus-ports'), tile);
   renderLive();
   renderControl();
+  // A machine that can be had live only after its view opened (a guest started, a PC with Intel AMT or its KVM switched
+  // on, BIOS setup on a PC that was off) has its line started then, as at the opening: it stayed on stills, with no
+  // keyboard and no "Live again" (register row 3 of 0.2.1). Only as it becomes possible: a line that ended while it was
+  // possible all along is the person's to start again.
+  const live = canDo(tile, 'live');
+  const became = live && focus.liveWas === false && !focus.live;
+  focus.liveWas = live;
+  if (became) startLive(focus.id);
 }
 
 // How much of the picture this view needs: its own width in screen pixels, and few pictures while nobody sees the tab.
@@ -6275,6 +6311,25 @@ function historyOpened(id) {
       await sleep(known ? HISTORY_EVERY : Math.min(HISTORY_EVERY, 5000 * 2 ** (misses - 1)));
     }
   })();
+  if (!can('admin')) return;
+  (async () => {
+    // What was done to it, asked again every DONE_EVERY, not with the history once a minute: something done to it a moment
+    // ago, from here or from anywhere, is there within seconds. Its ages count on every second meanwhile, from the entries
+    // in hand: drawn once a minute, "13 s ago" was said for a minute (register row 8 of 0.2.1).
+    let asked = Date.now();
+    while (run === historyRun) {
+      await sleep(1000);
+      if (run !== historyRun) break;
+      for (const when of $('#focus-history').querySelectorAll('.done-when[data-time]')) {
+        when.textContent = ago(Math.max(0, Date.now() / 1000 - Number(when.dataset.time)));
+      }
+      const shown = historyShown;
+      if (Date.now() - asked < DONE_EVERY || shown?.id !== id || !shown.done) continue;
+      asked = Date.now();
+      const done = await askDone(id);
+      if (done != null && run === historyRun && historyShown === shown) showDone(shown, done);
+    }
+  })();
 }
 
 function historyClosed() {
@@ -6292,15 +6347,7 @@ async function refreshHistory(id, run) {
   // What was done to it, beside: for those who may read the activity log. Asked beside the history (each is read in turns
   // of its own), and drawn when it comes: the history does not wait for it. (Live views left out: whoever has it enlarged
   // has one open, and the three lines would soon be nothing but looks.)
-  const doing = can('admin')
-    ? api('GET', `api/v1/audit?device=${encodeURIComponent(id)}&limit=${DONE_ASKED}`).then(found => {
-      if (!Array.isArray(found?.entries)) return null;
-      return {
-        entries: found.entries.filter(entry => entry.event !== 'live_opened' && entry.event !== 'live_closed').slice(0, DONE_SHOWN),
-        looked: found.entries.length,
-      };
-    }).catch(() => null)  // includes an unreadable answer, before waiting for the history alongside it
-    : Promise.resolve(null);
+  const doing = can('admin') ? askDone(id) : Promise.resolve(null);
   try {
     summary = await api('GET', `api/v1/devices/${id}/history`);
     if (summary.sensors.length) samples = await api('GET', `api/v1/devices/${id}/history?what=samples&every=${HISTORY_SPAN}&limit=${HISTORY_POINTS}`);
@@ -6320,7 +6367,30 @@ async function refreshHistory(id, run) {
 // The last few entries of the activity log that are of this machine (who did what to it), beside its history.
 const DONE_SHOWN = 3;
 const DONE_ASKED = 100;  // entries asked for, of which live views are left out
+const DONE_EVERY = 10000;  // ms between two askings while the view is open (the history is looked at once a minute)
 const doneBefore = id => (historyShown?.id === id ? historyShown.done : null);
+
+// What was done to this machine, as the activity log has it: null where it could not be read this time.
+function askDone(id) {
+  return api('GET', `api/v1/audit?device=${encodeURIComponent(id)}&limit=${DONE_ASKED}`).then(found => {
+    if (!Array.isArray(found?.entries)) return null;
+    return {
+      entries: found.entries.filter(entry => entry.event !== 'live_opened' && entry.event !== 'live_closed').slice(0, DONE_SHOWN),
+      looked: found.entries.length,
+    };
+  }).catch(() => null);  // includes an unreadable answer, before waiting for the history alongside it
+}
+
+// What was done to it, asked again: drawn in place of the column's own, the history and its graphs left as they are.
+function showDone(shown, done) {
+  const box = $('#focus-history');
+  if (box.hidden || box.dataset.id !== shown.id) return;
+  historyShown = { ...shown, done };
+  const section = doneSection(shown.id, done);
+  const before = box.querySelector('.history-done');
+  if (before) before.replaceWith(section);
+  else box.append(section);
+}
 
 function doneSection(id, done) {
   const list = h('ol', { class: 'done-list' });
@@ -6335,7 +6405,7 @@ function doneSection(id, done) {
         : entry.event === 'alert' ? `Alert: ${LABELS[entry.was] || entry.was} to ${LABELS[entry.state] || entry.state}`
           : eventLabel(entry);
     list.append(h('li', { title: new Date(entry.time * 1000).toLocaleString() },
-      h('span', { class: 'done-when' }, ago(Math.max(0, Date.now() / 1000 - entry.time))), ' ', h('b', {}, entry.user || 'qKVM'), ` ${what}`));
+      h('span', { class: 'done-when', dataset: { time: entry.time } }, ago(Math.max(0, Date.now() / 1000 - entry.time))), ' ', h('b', {}, entry.user || 'qKVM'), ` ${what}`));
   }
   const all = h('button', { type: 'button', class: 'link', onclick: () => { activityFor = id; settingsDialog('activity'); } }, 'All of it');
   return h('section', { class: 'history-done', 'aria-label': 'Done to this machine' }, h('p', { class: 'done-head' }, h('b', {}, 'Done to it'), all), list);
@@ -6918,22 +6988,66 @@ function takeDisplayKey() {
   return given[1];
 }
 
+// The key of a display link is kept no longer than the link is valid by the WALL's clock: until the wall refuses it, and,
+// while this page runs, no longer than the seconds the wall said the link had left when the key was handed in
+// (`expires_in`), counted on the page's own steady clock from then. Never by this screen's time of day: a small computer
+// without a clock chip comes back from a power cut with a time far off, and forgot a key that was still good.
+let displayKeyTimer = 0;
+
+function forgetDisplayKey() {
+  clearTimeout(displayKeyTimer);
+  prefs.set('display-key', '');
+}
+
+function keepDisplayKeyFor(seconds) {
+  clearTimeout(displayKeyTimer);
+  if (typeof seconds !== 'number') return;  // a link until it is taken back
+  const until = performance.now() + seconds * 1000;
+  const wait = () => {
+    const left = until - performance.now();
+    if (left <= 0) {
+      forgetDisplayKey();
+      return;
+    }
+    displayKeyTimer = setTimeout(wait, Math.min(left, 2 ** 30));  // (a timer waits less than 25 days at the most)
+  };
+  wait();
+}
+
 // Hand the kept display link in for a session. False: there is none, or it is not valid any more.
 async function openDisplay() {
-  const key = prefs.get('display-key', '');
-  if (!key) return false;
   for (;;) {
+    const key = prefs.get('display-key', '');
+    if (!key) return false;
     try {
-      setMe((await api('POST', 'api/v1/display', { key })).user);
+      const opened = await api('POST', 'api/v1/display', { key });
+      keepDisplayKeyFor(opened.expires_in);
+      setMe(opened.user);
       return true;
     } catch (ex) {
-      if (ex.code !== 'network' && ex.code !== 'timeout') {
-        prefs.set('display-key', '');  // taken back, or run out: a person has to sign in, or bring a new link
+      // Forgotten only where the wall itself refuses it (taken back, run out, or no key at all): a person has to sign in, or
+      // bring a new link. Any other answer (a reverse proxy's 502 or 503 while the wall behind it restarts, no answer at all)
+      // is no refusal of the wall's: this screen keeps its link, says that it waits, and asks again.
+      if (ex.code === 'bad_key' || ex.code === 'invalid') {
+        forgetDisplayKey();
         return false;
       }
-      await sleep(5000);  // qKVM is on its way back up: this screen waits for it
+      waitingForTheWall(ex.message);
+      await sleep(5000);
     }
   }
+}
+
+// Said on a screen on the wall while its link is handed in again and the wall does not let it in yet: over the wall it
+// shows, or in place of the sign-in where it shows none yet. Asked again five seconds at a time, it said nothing, for as
+// long as a proxy answered for a wall that was gone (pulled back into 0.2.1). The wall, once there, takes its place.
+function waitingForTheWall(why) {
+  const text = `Waiting for the wall to let this screen in (${why}). It keeps its link and asks again every 5 seconds.`;
+  if (!$('#shell').hidden) {
+    setBanner(text);
+    return;
+  }
+  showAuth('plain', h('h2', {}, 'Waiting for the wall'), h('p', { class: 'muted' }, text));
 }
 
 // A page belongs to one version of the program. Where an update was installed from another browser, or the
@@ -6978,7 +7092,7 @@ async function signOut() {
     if (ex.code !== 'not_saved') return;
     await sleep(8000);  // signed out all the same: time to read why a restart might undo it, then the page shows it
   }
-  prefs.set('display-key', '');  // signed out by hand, a wall screen stays out
+  forgetDisplayKey();  // signed out by hand, a wall screen stays out
   location.reload();
 }
 

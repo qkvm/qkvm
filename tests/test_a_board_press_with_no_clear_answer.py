@@ -165,6 +165,53 @@ def test_a_tile_saved_anew_while_its_press_is_out_leaves_the_board_alone_in_the_
         fake.stop()
 
 
+def test_a_press_that_never_went_out_says_nothing_was_pressed_and_holds_nothing(quick: dict[str, float], monkeypatch: pytest.MonkeyPatch) -> None:
+    # Register row 4 of 0.2.1 (fx-a N2, w16c): a press refused before its click reached the KVM was said "may have pressed"
+    # and held the board (and a Fingerbot on the same machine) for seconds, though nothing had gone out: the tile saved anew
+    # (or the wall letting go of the KVM) before it was sent, or no connection to the KVM to be had in time (all of them in
+    # use, httpx's PoolTimeout). Now it says nothing was pressed, and the next press goes out at once.
+    monkeypatch.setattr(kvm, "WAITS", kvm.httpx.Timeout(8.0, connect=4.0, pool=0.5))  # (a question waits half a second for a connection)
+    monkeypatch.setattr(kvm.KvmDevice, "LIMITS", kvm.httpx.Limits(max_connections=1, max_keepalive_connections=1, keepalive_expiry=30.0))
+    fake = a_board()
+
+    async def run() -> None:
+        spec = DeviceSpec("dev", "A Comet", fake.url, "admin", "secret")
+        old = KvmDevice(spec)
+        await old.status()
+        await old.close()  # saved anew (retired) just before the press goes out
+        with pytest.raises(KvmError) as retired:
+            await old.act("atx_power")
+        assert retired.value.code == "action_failed" and "Nothing was pressed" in retired.value.message, retired.value.message
+        new = KvmDevice(spec)
+        new.takes_over(old)  # (what holds the board is shared with the client that replaces it)
+        try:
+            await new.status()
+            await new.act("atx_power")  # held by nothing: pressed at once
+            assert fake.state.actions == ["atx power"]
+            # Every connection to the KVM in use (a picture that takes long): the click waits for one, and gets none.
+            fake.state.slow["/api/streamer/snapshot"] = 3.0
+            picture = asyncio.ensure_future(new.snapshot(640))
+            while "GET /api/streamer/snapshot" not in fake.state.asked:
+                await asyncio.sleep(0.02)
+            with pytest.raises(KvmError) as no_connection:
+                await new.act("atx_reset")
+            assert no_connection.value.code == "action_failed" and "Nothing was pressed" in no_connection.value.message, no_connection.value.message
+            assert fake.state.actions == ["atx power"]
+            del fake.state.slow["/api/streamer/snapshot"]
+            with contextlib.suppress(KvmError):
+                await picture
+            await new.act("atx_reset")  # held by nothing
+            assert fake.state.actions == ["atx power", "atx reset"]
+        finally:
+            await new.close()
+
+    try:
+        asyncio.run(run())
+    finally:
+        fake.state.slow.clear()
+        fake.stop()
+
+
 def test_a_press_cut_off_while_its_click_is_out_leaves_the_board_alone(quick: dict[str, float], monkeypatch: pytest.MonkeyPatch) -> None:
     # (qKVM stopping, or its listeners reopened: the request is stopped while the click is on its way. Whatever comes next
     # through the same connection to the KVM waits as after any press with no clear answer.)
@@ -192,4 +239,40 @@ def test_a_press_cut_off_while_its_click_is_out_leaves_the_board_alone(quick: di
         asyncio.run(run())
     finally:
         fake.state.slow_action = 0.0
+        fake.stop()
+
+
+def test_a_board_that_may_be_pressing_stays_left_alone_through_a_client_made_anew(tmp_path: Path, quick: dict[str, float], monkeypatch: pytest.MonkeyPatch) -> None:
+    # Register row 10 of 0.2.1 (fx-a L2): the hold lived in the client and in its successor at the same address, so that the
+    # wall locked and opened again (the last person signed out, somebody signs in), an edit to another address of the KVM,
+    # or the tile removed and added again, made a client that pressed at once, a second after a press with no clear answer.
+    from tests.test_wall import PASSWORD
+
+    monkeypatch.setattr(kvm, "BOARD_ANSWER", 30.0, raising=False)  # (held for longer than everything below takes)
+    fake = a_board(atx_reply=(502, "<html><body>502 Bad Gateway</body></html>"))
+    try:
+        with wall(tmp_path, locked_start=True) as client:  # (no key of its own: the last person to sign out locks it)
+            device = add(client, fake.url)
+            wait_until(lambda: client.get("/api/v1/status").json()[device]["atx"]["enabled"] is True, "the board was never seen")
+            _, first = press(client, device, "atx_power")
+            assert (first.status_code, first.json()["code"]) == (504, "timeout"), first.text
+            fake.state.atx_reply = None
+            # The wall locked and opened again.
+            assert client.post("/api/v1/logout", json={}).status_code == 200
+            assert not client.core.vault.unlocked  # type: ignore[attr-defined]
+            assert client.post("/api/v1/login", json={"password": PASSWORD}).status_code == 200
+            _, after_lock = press(client, device, "atx_power")
+            assert (after_lock.status_code, after_lock.json()["code"]) == (409, "busy"), after_lock.text
+            # Edited to another address of the same KVM.
+            elsewhere = fake.url.replace("127.0.0.1", "localhost")
+            assert client.put(f"/api/v1/devices/{device}", json={"url": elsewhere, "name": "Renamed", "password": "secret"}).status_code == 200
+            _, after_edit = press(client, device, "atx_power")
+            assert (after_edit.status_code, after_edit.json()["code"]) == (409, "busy"), after_edit.text
+            # Removed, and added again at the address it had.
+            assert client.delete(f"/api/v1/devices/{device}").status_code == 200
+            again = add(client, elsewhere, name="Added again")
+            _, after_add = press(client, again, "atx_power")
+            assert (after_add.status_code, after_add.json()["code"]) == (409, "busy"), after_add.text
+            assert fake.state.actions == ["atx power"], fake.state.actions
+    finally:
         fake.stop()

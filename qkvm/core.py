@@ -7,22 +7,25 @@ import hashlib
 import json
 import logging
 import os
+import re
 import secrets
 import time
+from collections import deque
 from collections.abc import Awaitable, Callable, Iterable
 from pathlib import Path
 from typing import Any
 
 
 from . import activity, unlock
+from ._folders import own_folder
 from .alerts import Watcher
 from .forward import Syslog
 from .history import FILE as HISTORY_FILE
 from .history import History
-from .kvm import Device, DeviceSpec, KvmDevice, saved_mark
+from .kvm import Device, DeviceSpec, KvmDevice, KvmError, Snapshot, saved_mark
 from .netbind import lan_ip, tailscale_ip
 from .security import Limiter, Sessions, proxy_networks
-from .store import FINGERBOT_STRENGTHS, AuditLog, DeviceRecord, Store, UserRecord, activity_file_bytes
+from .store import FINGERBOT_STRENGTHS, KINDS, AuditLog, DeviceRecord, Store, UserRecord, activity_file_bytes
 from .tlscert import certificate_fingerprint, ensure_certificate
 from .update import GITHUB_API, Updater
 from .vault import NoMemory, Vault
@@ -52,7 +55,7 @@ class Core:
         locked_start: bool = False,
         vault_key_file: Path | None = None,
     ) -> None:
-        data_dir.mkdir(parents=True, exist_ok=True)
+        own_folder(data_dir)  # (its own from its first instant, where it makes it: _folders.own_folder)
         # Validate the external storage key before touching automatic-unlock keys or sessions.
         # A missing key or an unmigrated legacy vault must never become a fresh setup.
         self.store = Store(data_dir / "qkvm.json", vault_key_file=vault_key_file, protected=True)
@@ -110,6 +113,14 @@ class Core:
             # or switched a second step on, in a run that could write none of that down.)
             self.sessions.forget_kept()
         self.limiter = Limiter()
+        # What the activity log's allowances count, per account (live views: live.Lines; a server's console opened or not had:
+        # server.py), kept with the program, not with the listeners: reopened, they started every count afresh, and gave
+        # every account its whole allowance again (register row 22 of 0.2.1).
+        self.live_said: dict[str, tuple[float, float, int]] = {}
+        # ...and the takings and givings back of keyboard and mouse each account made within the last minute (live.Lines,
+        # MOST_CONTROL_A_MINUTE), which pace them: kept with the program too, not started afresh with the listeners.
+        self.control_said: dict[str, deque[float]] = {}
+        self.console_said = {event: activity.Allowance(lambda: activity.CONSOLE_SAID_AN_HOUR) for event in ("console_opened", "console_failed")}
         # What each machine was last seen as, for alerts: kept over a restart, and over the listeners being reopened.
         self.watcher = Watcher(data_dir / "watch.json")
         # What the wall saw of each machine, kept for a while (see history.py): opened by its own thread once the wall serves.
@@ -231,7 +242,9 @@ class Core:
             self.sessions.forget_kept(for_good=False)
             return "the saved passwords could not be opened at this start (is there memory to spare?): nothing is watched until somebody signs in"
         if key is None:
-            old = self._unfit()
+            # (A key that does not fit is no reason to lose what the folder keeps to recover from: it is often an accident, a
+            # wrong file given once or a key a power cut emptied. Only what this key would have fitted goes.)
+            old = self._unfit(keep=True)
             self.sessions.forget_kept(for_good=False)
             if self.own_key:
                 log.warning("the key in the data folder does not open it: it is another one than the one that was in use")
@@ -244,23 +257,40 @@ class Core:
         log.info("the saved passwords were opened with %s", "the key in the data folder" if self.own_key else "the unlock file")
         return None
 
-    def _unfit(self) -> str:
+    def _unfit(self, keep: bool = False) -> str:
         """Take out of the data folder what a key opened it with. Returns what is to be said if that was not done in full ("" if it was).
 
         The second copy of the settings is renewed with every save (store.write), so one save takes it out of
         both; older copies that lie in the folder (a damaged file set aside, a write that was cut off) are
         removed. Where one of them could be neither renewed nor taken away, it still holds what the old key
         opens, and somebody has to be told.
+
+        `keep`: the key did not fit (another file was given, or a power cut emptied the key). What the folder keeps to
+        recover from (store.kept_to_recover_from) is not removed for that: it is named instead, for whoever meant the
+        change to remove by hand.
         """
         self.store.unlock = None
         self.store.save()
-        left = self.store.clear_out()
-        if not left:
-            return ""
-        names = ", ".join(left)
-        log.error("%s still holds what the key before opened this folder with, and could not be renewed or removed", names)
-        one = len(left) == 1
-        return f" {names} in the data folder could not be removed, and still hold{'s' if one else ''} what the key before opened it with: remove {'that file' if one else 'those files'} by hand."
+        if keep:
+            left = [self.store.backup.name] if self.store.backup_is_old else []
+            kept = [path.name for path in self.store.kept_to_recover_from() if path.is_file()]
+        else:
+            left, kept = self.store.clear_out(), []
+        said = ""
+        if left:
+            names = ", ".join(left)
+            log.error("%s still holds what the key before opened this folder with, and could not be renewed or removed", names)
+            one = len(left) == 1
+            said = f" {names} in the data folder could not be removed, and still hold{'s' if one else ''} what the key before opened it with: remove {'that file' if one else 'those files'} by hand."
+        if kept:
+            names = ", ".join(kept)
+            log.warning("%s kept in the data folder to recover from: it may still open with the key before", names)
+            one = len(kept) == 1
+            said += (
+                f" {names} in the data folder {'is' if one else 'are'} kept to recover from, and may still open with the key before:"
+                f" remove {'it' if one else 'them'} by hand if that key was given up on purpose."
+            )
+        return said
 
     def request_restart(self) -> None:
         """Re-open the listeners with the current settings."""
@@ -353,7 +383,45 @@ def driver_for(kind: str) -> type[Device]:
         from .proxmox import ProxmoxGuest  # a virtual machine on Proxmox VE
 
         return ProxmoxGuest
-    return KvmDevice
+    if kind == "kvmd":
+        return KvmDevice
+    return UnknownKind
+
+
+def unknown_kind(kind: str) -> KvmError:
+    """What is said of a tile of a kind of machine this version has no driver for, and to whoever asks something of it."""
+    named = f" ({kind})" if re.fullmatch(r"[a-z0-9_-]{1,24}", kind) else ""
+    return KvmError(
+        "unknown_kind",
+        f"A kind of machine this version of qKVM does not know{named}: kept as it is, for the version that added it, and nothing is sent to it",
+        409,
+    )
+
+
+class UnknownKind(Device):
+    """A tile of a kind of machine this version has no driver for: one a later version added, read after going back to
+    this one (register row 2 of 0.2.1, r1-upgrade F5). Given kvmd's driver, its saved password was posted to its address
+    as a KVM's sign-in. It is left alone now: nothing is asked of its address or sent to it, its saved password is not
+    opened (DeviceManager.spec), the server refuses an edit of it, and its tile says why. It is kept in the settings as it
+    is, for the version that made it; removing it works as for any tile."""
+
+    picture = False  # (so no picture is asked for)
+
+    async def identify(self) -> dict[str, Any]:
+        raise unknown_kind(self.spec.kind)
+
+    async def snapshot(self, width: int, fresh: float | None = None, big: bool = False) -> Snapshot:
+        raise unknown_kind(self.spec.kind)
+
+    async def act(self, action: str, *, mac: str = "", keys: str = "", text: str = "", port: int = 0, still: Callable[[], bool] | None = None) -> None:
+        raise unknown_kind(self.spec.kind)
+
+    async def console(self) -> str:
+        raise unknown_kind(self.spec.kind)
+
+    async def _read_status(self) -> dict[str, Any]:
+        said = unknown_kind(self.spec.kind)
+        return {"state": "error", "error": {"code": said.code, "message": said.message}}
 
 
 class DeviceManager:
@@ -380,7 +448,7 @@ class DeviceManager:
     def spec(self, record: DeviceRecord, password: str | None = None) -> DeviceSpec:
         if password is None:
             password = ""
-            if record.secret:
+            if record.secret and record.kind in KINDS:  # (a kind this version does not know is sent nothing: never opened)
                 # (None: sealed under an older key, or damaged. Treated as "no password saved": the tile
                 # says that its login is to be given again, and the rest of the wall is there.)
                 password = self.core.vault.read(record.secret, record.id) or ""

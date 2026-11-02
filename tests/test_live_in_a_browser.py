@@ -174,7 +174,7 @@ class LiveStandIn(LiveWall):
         self.url = f"http://127.0.0.1:{self.port}"
         app = create_app(Core(data))
         self._wire(app)
-        self._server = uvicorn.Server(uvicorn.Config(app, log_level="error", access_log=False))
+        self._server = uvicorn.Server(uvicorn.Config(app, **{**cli.SERVER_OPTIONS, "log_level": "error"}))  # (served as the program serves: cli.Line)
         self._thread = threading.Thread(target=self._server.run, kwargs={"sockets": [self._sock]}, daemon=True)
 
     def __enter__(self) -> LiveStandIn:
@@ -347,7 +347,7 @@ class WallBeforeTheLine(LiveWall):
             kept = {name: value for name, value in answer.headers.items() if name.lower() != "content-length"}
             return JSONResponse(said, status_code=200, headers=kept)
 
-        self._server = uvicorn.Server(uvicorn.Config(app, log_level="error", access_log=False))
+        self._server = uvicorn.Server(uvicorn.Config(app, **{**cli.SERVER_OPTIONS, "log_level": "error"}))  # (served as the program serves: cli.Line)
         self._thread = threading.Thread(target=self._server.run, kwargs={"sockets": [self._sock]}, daemon=True)
 
 
@@ -442,6 +442,20 @@ def picture_box(page: Page) -> dict[str, float]:
 # --- the tests ----------------------------------------------------------------------------------------------------
 
 
+def test_the_stand_in_walls_serve_their_lines_as_the_program_does(tmp_path: Path) -> None:
+    # Register row 27 of 0.2.1 (w2c Open 6): the stand-in walls served with uvicorn's own WebSocket protocol, not the
+    # program's (cli.Line). A line whose viewer had said goodbye, and whose answer still waited to be taken, made uvicorn's
+    # stop say goodbye on it again, which the library refuses (InvalidState, "connection is closing"), and the stop went no
+    # further: the browser tests' "now and then" thread warning, and a stand-in left running. cli.Line.shutdown drops such
+    # a line instead (as W2b found on the program's own server). The stand-ins now serve as the program does: its
+    # protocols, its waits, its stop within three seconds.
+    for wall in (LiveStandIn(tmp_path / "a", [(True, b"")], "jpeg", 640, 480, 0.0), WallBeforeTheLine(tmp_path / "b")):
+        config = wall._server.config
+        assert config.ws is cli.Line and config.http is cli.SERVER_OPTIONS["http"], type(wall).__name__
+        assert config.timeout_graceful_shutdown == cli.SERVER_OPTIONS["timeout_graceful_shutdown"]
+        wall._sock.close()
+
+
 @pytest.fixture
 def fakes() -> Any:
     made = [FakeKvm(FakeState()).start(), FakeKvm(FakeState(colour=(135, 74, 32), hostname="mail")).start()]
@@ -511,6 +525,33 @@ def test_the_live_picture_is_drawn_and_a_key_arrives_as_its_usage(tmp_path: Path
             page.keyboard.press("Escape")
             expect(page.locator("#focus")).to_be_hidden()
             until(page, lambda: line.over, "the line was not closed with the view")
+    finally:
+        stand_in.__exit__()
+
+
+def test_with_control_on_and_no_signal_the_pointer_goes_through_the_veil_to_the_machine(tmp_path: Path, browser: Browser, fakes: list[FakeKvm]) -> None:  # noqa: F811
+    # Register row 7 of 0.2.1 (r2-devices F6; the coordinator's decision): with Control taken in the live view of a machine
+    # whose screen sleeps (No signal), the veil over the picture took the pointer, and moving the mouse could not wake the
+    # machine as its own mouse would. With Control on, the veil stays where it is, and lets the pointer through.
+    film = h264_film()
+    stand_in, _ = a_live_wall(tmp_path, fakes, pictures=film, codec="h264", width=320, height=240, pace=10)
+    try:
+        with looking(browser, stand_in, viewport={"width": 1280, "height": 720}) as page:
+            sign_in(page, stand_in)
+            enlarged(page, "Machine 1")
+            page.wait_for_function("() => Number(document.querySelector('#focus-live').dataset.drawn) >= 2")
+            line = take_control(page, stand_in)
+            box = picture_box(page)
+            fakes[0].state.signal = False  # the machine's screen sleeps
+            expect(page.locator("#focus")).to_have_attribute("data-state", "no_signal", timeout=PATIENCE)
+            expect(page.locator("#focus-veil")).to_be_visible()
+            x, y = box["left"] + box["x"] + box["w"] / 2, box["top"] + box["y"] + box["h"] / 2
+            under = page.evaluate("([x, y]) => document.elementFromPoint(x, y).id || document.elementFromPoint(x, y).className", [x, y])
+            assert under == "focus-canvas", f"what lies under the pointer in the middle of the picture: {under!r}"
+            before = len(line.said("m"))
+            page.mouse.move(x, y)
+            page.mouse.move(x + 40, y + 30)
+            until(page, lambda: len(line.said("m")) > before, f"the pointer's move did not reach the machine: {line.words[-5:]}")
     finally:
         stand_in.__exit__()
 
@@ -882,6 +923,29 @@ def test_a_jpeg_picture_that_comes_before_the_view_has_a_size_is_drawn_once_it_h
             }""")
             assert abs(middle[0] - 220) <= 12 and middle[1] <= 45 and middle[2] <= 45, middle
             assert line.sent == [1]
+    finally:
+        stand_in.__exit__()
+
+
+def test_a_machine_that_can_be_had_live_after_its_view_opened_gets_its_line_then(tmp_path: Path, browser: Browser, fakes: list[FakeKvm]) -> None:  # noqa: F811
+    # Register row 3 of 0.2.1 (s2-demo 2): the page started the live line only as the large view opened. A machine that
+    # could be had live only later (a guest started, a PC with Intel AMT or its KVM switched on, BIOS setup on a PC that
+    # was off) stayed on stills, with no keyboard and no "Live again", until the view was opened again. Now its line is
+    # started once the wall says it has one.
+    film = h264_film()
+    stand_in, ids = a_live_wall(tmp_path, fakes, pictures=film, codec="h264", width=320, height=240, pace=10)
+    stand_in.no_live.add(ids["Machine 1"])
+    try:
+        with looking(browser, stand_in) as page:
+            sign_in(page, stand_in)
+            enlarged(page, "Machine 1")
+            expect(page.locator("#focus-live")).to_have_text("No live picture: stills")
+            page.wait_for_timeout(300)
+            assert stand_in.passes_asked == []
+            stand_in.no_live.discard(ids["Machine 1"])  # it can be had live from now on, and the next look says so
+            expect(page.locator("#focus-live")).to_contain_text("Live · H.264", timeout=PATIENCE)
+            expect(page.locator("#focus-control")).to_be_visible()
+            assert stand_in.passes_asked == [ids["Machine 1"]]
     finally:
         stand_in.__exit__()
 

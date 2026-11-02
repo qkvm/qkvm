@@ -269,24 +269,32 @@ def test_one_cookie_set_twice_is_no_sign_in_and_not_an_error_of_the_program() ->
 
 
 def test_a_jetkvm_that_sets_its_cookie_twice_signs_nobody_in() -> None:
+    # (Counted: the requests that carry the password, the sign-in. Since F3 a plain JetKVM is first asked, without a session
+    # and without the password, for the number it gives anybody: that request is no sign-in. And nothing at all goes out at
+    # the second and third tries.)
     signed_in = 0
+    sent: list[str] = []
 
     def reply(request: httpx.Request) -> httpx.Response:
         nonlocal signed_in
-        signed_in += 1
+        sent.append(f"{request.method} {request.url.path}")
+        if b'"secret"' in request.content:
+            signed_in += 1
         return said(200, cookies=("authToken=aaaa; Path=/", "authToken=bbbb; Path=/device"))
 
     async def run() -> None:
         device = jetkvm.JetKvmDevice(DeviceSpec("d", "odd", "http://device", "", "secret", tls="insecure", kind="jetkvm"))
         device._client = answers(reply)
-        for _ in range(3):
+        for attempt in range(3):
+            before = len(sent)
             with pytest.raises(KvmError) as refused:
                 await device._login()
             assert refused.value.code == "no_sign_in" and "Login failed" in refused.value.message
+            assert not attempt or len(sent) == before, f"sent again although the device had just shown it signs nobody in: {sent[before:]}"
         await device.close()
 
     asyncio.run(run())
-    assert signed_in == 1
+    assert signed_in == 1, "the password went out again although the device had just shown it signs nobody in"
 
 
 def test_a_session_that_is_refused_as_soon_as_it_is_given_is_not_asked_for_every_second() -> None:

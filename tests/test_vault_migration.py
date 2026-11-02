@@ -356,6 +356,36 @@ def test_windows_refuses_a_key_granted_to_everyone(tmp_path: Path) -> None:
     assert keyfile.read_bytes() == raw  # a permissive key is refused, never silently replaced
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows ACL enforcement")
+def test_windows_takes_a_key_restored_into_a_folder_made_private_as_python_makes_it(tmp_path: Path) -> None:
+    # Python 3.13 (and 3.12.4) on Windows makes a folder with mode 0o700 (as create_key makes the .keys folder) private as
+    # D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;OW): OWNER RIGHTS (S-1-3-4) stands for the owner. A key copied back
+    # into it from its separate backup takes those entries, and was refused as "accessible to another Windows account"
+    # (storage review of 0.2.0, storage\probes\win_key_restore_probe.py). Whose the file is, is checked by itself: OWNER
+    # RIGHTS is that owner, nobody else. Made so here, whatever this Python's mkdir does.
+    import shutil
+    import subprocess
+
+    backup = tmp_path / "backup" / "vault.key"
+    key = create_key(backup)
+    keys = tmp_path / "data.keys"
+    keys.mkdir()
+    made = subprocess.run(
+        ["icacls", str(keys), "/inheritance:r", "/grant:r", "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F", "*S-1-3-4:(OI)(CI)F"],
+        capture_output=True, text=True,
+    )  # fmt: skip
+    assert made.returncode == 0, made.stdout + made.stderr
+    restored = keys / "vault.key"
+    shutil.copyfile(backup, restored)  # (a copy takes the folder's entries, as a person's restore does)
+    entries = subprocess.run(["icacls", str(restored)], capture_output=True, text=True).stdout
+    assert "OWNER RIGHTS" in entries or "S-1-3-4" in entries, entries
+    assert read_key(restored) == key
+    # And somebody else in that folder still is somebody else.
+    assert subprocess.run(["icacls", str(restored), "/grant", "*S-1-5-11:(R)"], capture_output=True).returncode == 0
+    with pytest.raises(PermissionError, match="another Windows account"):
+        read_key(restored)
+
+
 def test_corrupt_archive_or_changed_legacy_input_never_gets_discarded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     data, keyfile = tmp_path / "data", tmp_path / "keys" / "vault.key"
     legacy(data)

@@ -19,22 +19,27 @@ meant. Every read has a time it must come within, and a message as a whole has o
 unasked (some push full frames at their own pace and ignore the incremental flag) is read all the same,
 and let go of without being drawn while nobody wants pictures. And what it costs is shared out: the event
 loop is let go of every few milliseconds however much has arrived, and the drawing threads, in which every
-server's pictures are drawn, take one server's a slice at a time and within a share of their time.
+server's pictures are drawn, take one server's a slice at a time; reading and drawing take one server's share
+of the program's time and every server's together no more than theirs; a JPEG is waited for in a thread of
+its server's own; and what every server's updates hold at once is held to HELD_ALL.
 """
 
 from __future__ import annotations
 
 import asyncio
+import bisect
+import itertools
 import logging
 import re
 import socket
 import ssl
 import struct
 import time
+import types
 import zlib
-from collections.abc import Callable, Iterator
+from collections.abc import Awaitable, Callable, Generator, Iterator
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any
+from typing import Any, TypeVar
 
 from cryptography.hazmat.decrepit.ciphers.algorithms import TripleDES
 from cryptography.hazmat.primitives.ciphers import Cipher, modes
@@ -108,16 +113,167 @@ DRAWING_SHARE = 0.5  # seconds of a drawing thread a server's pictures may take 
 DRAWING_BURST = 1.0  # ...and at once, after a while of taking less (a first screen, a page that changed)
 # ...and every server's together (at once, as one server's): the threads draw in Python, which runs one thread at a time, and
 # what they do not take is the event loop's (every page, tile and live line). Three costly servers at their share each left
-# it a quarter of the time or less.
+# it a quarter of the time or less. Reading what the servers send, on the event loop itself, is charged to the same shares
+# (to its server's and to every server's), in what it held the loop for: four servers within every limit of their own
+# kept it busy 98% of the time while only their drawing was. Reading and drawing wait for these shares by one rule, and
+# for every server's in turn (see `Client._turn`): waited for by two (a reader slept once and read on, the drawing waited
+# until the share was above nought), servers that only flooded what is read kept every other server's drawing out.
 DRAWING_ALL = 0.75
 # Seconds a thread draws for one server before the next piece of work in line is let in. Slices of 20 ms, two threads at
 # them, kept the event loop waiting 30 to 70 ms now and then (measured): Python hands its one thread on every 5 ms, and
 # the loop is one of three asking.
 DRAWING_SLICE = 0.005
+# A step is a tile or a few rows: milliseconds, and tens of them for a large screen. A JPEG is decoded in its server's own
+# video worker, and one of tens of thousands of scans, a few kilobytes, decodes for up to video.WORK_WITHIN: it is waited
+# for and drawn in a thread of its server's own (`_pictures`, a run of pictures at a time), never in a drawing thread every server
+# shares, and charged to its server in full (every server's share, the program's time, only what the waiting thread did).
+# Every server's share is charged a slice of drawing that took long up to STEP_ALLOWANCE past the slice; the rest is its
+# server's alone. (Waited for in a drawing thread and charged to every server, such a
+# picture stopped every VNC, AMT, Proxmox and OpenBMC screen for as long again, at each one.)
+STEP_ALLOWANCE = 0.1
+# Seconds of a server's pictures decoded in one hop to its own thread at least, more where its own share has more: a batch
+# of a 4K desktop's, as a rule. (Held to what its share had at that moment, near nought once it was in use, a hop was
+# three pictures of a millisecond or two, and a turn and a hop each cost a 4K desktop beside three others a quarter of
+# its updates.) Its own share is charged all of it: no more is decoded, on the whole, than its share.
+PICTURES_AT_ONCE = 0.1
+# ...and charged to its server's share what its worker worked over the hop, by the system's count of the worker's processor
+# time, where the hop took COUNTED_FROM or more; else what it took by the clock. By the clock, a hop held every wait of the
+# thread for Python's lock behind the other servers' reading and drawing: on a wall of four, a 4K desktop's pictures took
+# 2.6 ms each where its worker worked 1.3, its share was used up by those waits, and it was drawn three updates a second
+# where 0.2.0 drew four. Not under COUNTED_FROM: Windows counts a process's time at each tick of its clock (15.6 ms), and
+# a few milliseconds of work that begin after a tick can read nought; over several ticks, pictures one after another
+# begin where they may.
+COUNTED_FROM = 0.05
+# ...and a server whose pictures, or slices, take LONG_STEP or more (beyond starting its video worker) more than
+# MOST_LONG_STEPS times within LONG_STEPS_WITHIN is refused: held to its share, it still kept a video worker at work for
+# seconds at a time, for as long as it was connected. (Two seconds: a 5K screen's whole-screen ZRLE inflate is a step of
+# 156 ms on a desktop PC, and a Raspberry Pi class host is 5 to 10 times slower.)
+LONG_STEP = 2.0
+MOST_LONG_STEPS = 3
+LONG_STEPS_WITHIN = 60.0
 STEP_PIXELS = 4096  # pixels of a Tight rectangle drawn in one step (a slice ends between steps): rows of them
 _HEXTILE_MORE = 1005  # rows of Hextile tiles going on with the rectangle before them (its colours carry over); no encoding has this number
 _DRAWERS = ThreadPoolExecutor(max_workers=2, thread_name_prefix="rfb")  # the threads that draw, and nothing else runs on them
-_ALL = [DRAWING_BURST, 0.0]  # seconds of the drawing threads every server together may take now, and when that was so
+_ALL = [DRAWING_BURST, 0.0]  # seconds of the program every server's drawing and reading together may take now, and when that was so
+
+
+class _Turn:
+    """A server's place in line for every server's share (see `_Line`)."""
+
+    __slots__ = ("key", "wake")
+
+    def __init__(self, key: tuple[float, int], wake: asyncio.Future[None]) -> None:
+        self.key = key  # (the server's place, see `_Line`; when it came)
+        self.wake = wake  # set when it may be first in line
+
+
+class _Line:
+    """The servers that wait for every server's share (`_ALL`) to be above nought, in the order of what each has had of it
+    (start-time fair queueing): a server's place is what its turns have taken, each the share it took in advance (a slice,
+    a breath) or the work it was where that is more (`Client._placed`), or the place of the last server let in (`given`),
+    whichever is more. One whose place is lower than others' is let in before them, and of two of one place the one that
+    came first: a server that has just had its turn comes after every one that has had no more than it, none waits for
+    good, and one that was away comes in at `given`, never before it, whatever it did not take meanwhile; a server that
+    wants a turn now and then (an ordinary screen's drawing) is let in at the next turn, before servers that want every
+    turn they can have. The work is the thread's own time, never the clock's: by the clock, a slice that took long while
+    the drawing threads waited for Python's lock behind the readers sent its server to the back of the line for as many
+    turns again (a probe's ordinary screen waited 0.8 s). By turns alone, a run of JPEGs of some 35 ms of the program was
+    a turn as a slice of 5 is. What turns take in the end is every server's share's, in full (see `Client._turn`)."""
+
+    def __init__(self) -> None:
+        self.waiting: list[_Turn] = []  # in order of their keys: the first in line waits for the share, the others for it to go on
+        self.given = 0.0  # the place of the last server let in
+        self.came = itertools.count()
+
+
+_LINE = _Line()
+# Bytes every server's updates together may hold at once, beyond their screens: what was read of a rectangle and is not
+# drawn yet, and what it inflates or is decoded to while it is drawn (counted as three times its bytes, which are copied
+# on their way, and what they come to). (One update of the largest screen held 3.4 times its 48 MB on its way to it, and
+# four such servers at once raised the program by 467 MB; more would have raised it more.) An update that does not fit
+# waits, holding nothing.
+HELD_ALL = 512 * 1024 * 1024
+_T = TypeVar("_T")
+
+
+def _held_one() -> int:
+    """What one server's update holds of HELD_ALL at the most, what it gathered and the rectangle it reads: a quarter. A
+    server's update may take a minute to come, holding its room all the while, and two or three slow ones holding half each
+    left no room for anybody else's. A rectangle that needs more than a quarter by itself (the largest screens: up to 246 MB
+    in ZRLE) is held only alone, and by one server at a time, counted in full (up to half of HELD_ALL, more than any
+    rectangle needs): two slow ones of those filled the room."""
+    return HELD_ALL // 4
+
+
+# Seconds an update may wait for room while others that fit are given it before it: from then on room is set aside for it
+# as it is let go of, and those that fit are given only what is left beside it. (Passed for good, a rectangle that needs
+# more than a quarter, beside four slow servers that each let go of a quarter and asked for it again at once, waited until
+# their streams ended: some 100 s.)
+ROOM_PASSED_FOR = 10.0
+
+
+class _Room:
+    """An update that waits for room in HELD_ALL: its size, whether it is a rectangle larger than one server may hold with
+    others (`_held_one`), whose, what is set once the room is its own (`_Held.hand_on`), and since when it waits."""
+
+    __slots__ = ("client", "given", "large", "since", "size")
+
+    def __init__(self, size: int, large: bool, client: object, given: asyncio.Future[None]) -> None:
+        self.size, self.large, self.client, self.given = size, large, client, given
+        self.since = time.monotonic()
+
+
+class _Held:
+    """What every server's updates hold together (`held`, bytes, at most HELD_ALL); the server whose rectangle larger than
+    `_held_one` is held (`large`), one at a time; and the updates that wait for room, in the order they came. Room that is let
+    go of is handed on at once to those that wait, in that order, each that fits now (one that does not fit is passed by
+    those after it that do, and keeps its place); an update that asks while others wait is given room at once where it
+    fits, as one that waits would be: none waits behind another that does not fit. But one that has waited ROOM_PASSED_FOR
+    is passed no more: room is set aside for it (`set_aside`), and those after it, or that ask, are given only what is left
+    beside it. And room a server lets go of in its update serves its own next request first (see `Client._room`)."""
+
+    def __init__(self) -> None:
+        self.held = 0
+        self.large: object | None = None
+        self.waiting: list[_Room] = []
+
+    def fits(self, size: int, large: bool, aside: int = 0) -> bool:
+        return self.held + size + aside <= HELD_ALL and (not large or self.large is None)
+
+    def set_aside(self, before: _Room | None = None) -> int:
+        """Room set aside for those that have waited ROOM_PASSED_FOR or more, ahead of `before` in line (or all of them)."""
+        now = time.monotonic()
+        aside = 0
+        for room in self.waiting:
+            if room is before:
+                break
+            if not room.given.done() and now - room.since >= ROOM_PASSED_FOR:
+                aside += room.size
+        return aside
+
+    def take(self, size: int, large: bool, client: object) -> None:
+        self.held += size
+        if large:
+            self.large = client
+
+    def let_go(self, size: int, client: object, holds: bool, hand_on: bool = True) -> None:
+        """`size` bytes of `client`'s let go of; `holds`: whether it holds any still (else its large rectangle is over);
+        `hand_on`: whether it is handed on to those that wait now (not where it serves its own server's request first)."""
+        self.held -= size
+        if not holds and self.large is client:
+            self.large = None
+        if hand_on:
+            self.hand_on()
+
+    def hand_on(self) -> None:
+        for room in list(self.waiting):
+            if not room.given.done() and self.fits(room.size, room.large, self.set_aside(before=room)):
+                self.waiting.remove(room)
+                self.take(room.size, room.large, room.client)
+                room.given.set_result(None)
+
+
+_HELD = _Held()
 READ_WAIT = 8.0  # seconds the next piece of a message has to arrive in, once the message has begun
 WRITE_WAIT = 8.0  # seconds a server has to take what is sent to it
 MESSAGE_WITHIN = 60.0  # seconds a message may take to arrive in full (a 4K screen in Raw is 32 MB)
@@ -314,10 +470,11 @@ def _keep_alive(sock: Any) -> None:
         pass  # (it is a courtesy; the connection works without it)
 
 
-async def open_tcp(host: str, port: int, tls: ssl.SSLContext | None, within: float) -> TcpStream:
-    """A connection to `host`:`port`, over TLS where a context is given. OSError (an SSL error is one) when none is to be had."""
+async def open_tcp(host: str, port: int, tls: ssl.SSLContext | None, within: float, name: str | None = None) -> TcpStream:
+    """A connection to `host`:`port`, over TLS where a context is given. OSError (an SSL error is one) when none is to be had.
+    `name`: the server's name for TLS (what its certificate is checked against), where `host` is one of its addresses."""
     async with asyncio.timeout(within):
-        reader, writer = await asyncio.open_connection(host, port, ssl=tls, server_hostname=host if tls is not None else None)
+        reader, writer = await asyncio.open_connection(host, port, ssl=tls, server_hostname=(name or host) if tls is not None else None)
     sock = writer.get_extra_info("socket")
     if sock is not None:
         _keep_alive(sock)
@@ -544,20 +701,97 @@ def _packed(indices: bytes, palette: list[bytes], bits: int, width: int, height:
     return b"".join(rows)
 
 
+def _all_wait() -> float:
+    """Every server's share (`_ALL`), brought up to now: the seconds to wait before any server takes more of it."""
+    now = time.monotonic()
+    _ALL[0] = min(DRAWING_BURST, _ALL[0] + (now - _ALL[1]) * DRAWING_ALL)
+    _ALL[1] = now
+    return -_ALL[0] / DRAWING_ALL
+
+
 def _once(work: Callable[..., Any], *args: Any) -> Iterator[None]:
     """One piece of work as one step of a drawing (see Client._drawn)."""
     work(*args)
     yield
 
 
-def _advance(steps: Iterator[None], most: float) -> tuple[bool, float]:
-    """In a drawing thread: `steps` taken until they are all done (True), or until `most` seconds have gone (False); and the
-    seconds that took. A step is a tile or a few rows: a slice ends at most a step after its time."""
-    began = time.perf_counter()
+def _advance(steps: Iterator[None], most: float) -> tuple[bool, float, float]:
+    """In a drawing thread: `steps` taken until they are all done (True), or until `most` seconds have gone (False); the
+    seconds that took by the clock (what the shares are charged); and the work it was, the thread's own time
+    (time.thread_time: what LONG_STEP counts). A step is a tile or a few rows: a slice ends at most a step after its time.
+
+    By the clock, a stall that held Python's lock meanwhile (the event loop's, a collection of garbage), or a starved
+    container, is in the slice: charged to the shares, which is a slower drawing for a while, never more than a share; but
+    counted towards LONG_STEP it refused a server that was well. The thread's own time is not the charge: on Windows it is
+    counted at each tick of the system's clock (15.6 ms), and slices of a millisecond or two that begin after a tick read
+    nought (84 of 84 of an ordinary server's, measured), where a step of a second cannot."""
+    began, working = time.perf_counter(), time.thread_time()
     for _ in steps:
         if time.perf_counter() - began >= most:
-            return False, time.perf_counter() - began
-    return True, time.perf_counter() - began
+            return False, time.perf_counter() - began, time.thread_time() - working
+    return True, time.perf_counter() - began, time.thread_time() - working
+
+
+def _worked(session: VideoSession, worker: object, used: float | None, starting: float, took: float) -> float:
+    """What a session's worker worked over a wait that began with `worker` and `used` (VideoSession.cpu_seconds) and
+    `starting`, and took `took` by the clock: the worker's processor time meanwhile by the system's count, where it is the same
+    worker at both ends and the system says; else the clock, less what starting a worker took. What LONG_STEP counts (a stall
+    that holds Python's lock is in the clock, not in the worker's time)."""
+    now, used_now = session.cpu_seconds()
+    if worker is not None and now is worker and used is not None and used_now is not None and session.starting == starting:
+        return used_now - used
+    return took - (session.starting - starting)
+
+
+def _awaited_on(inner: Generator[Any, Any, bytes], waiting: Any) -> Generator[Any, Any, bytes]:
+    """What `yield from inner` does, where `inner` has yielded `waiting` already (see `Client._from_network`)."""
+    while True:
+        try:
+            message = yield waiting
+        except BaseException as ex:  # (a stop, or the end of the reader: passed on to the read)
+            step: Callable[[Any], Any] = inner.throw
+            given: Any = ex
+        else:
+            step, given = inner.send, message
+        try:
+            waiting = step(given)
+        except StopIteration as done:
+            result: bytes = done.value
+            return result
+
+
+def _is_jpeg(entry: tuple[int, int, int, int, int, bytes]) -> bool:
+    """Whether a rectangle handed on to be drawn is a Tight JPEG."""
+    return entry[0] == TIGHT and entry[5][0] >> 4 == 0x9
+
+
+def _draw_pictures(client: Client, run: list[tuple[int, int, int, int, int, bytes]], most: float) -> tuple[list[tuple[float, float]], float, RfbError | None]:
+    """In a server's own thread: a run of its Tight JPEGs, each decoded in its video worker and drawn (where somebody still
+    looks), the streams its control byte says reset first, in order, until all are done or what they took by the clock
+    reaches `most`. For each done, what it took by the clock in this thread (what its server's share is charged) and what of
+    that was starting a worker (VideoSession.starting); this thread's own time (time.thread_time: what of the program the
+    hop took, what every server's share is charged); and the error that ended them, if one did (that one counted too)."""
+    session = client._video_decoder
+    took: list[tuple[float, float]] = []
+    spent, working = 0.0, time.thread_time()
+    for _, x, y, width, height, data in run:
+        starting, began = session.starting, time.perf_counter()
+        error = None
+        try:
+            client._reset_tight(data[0])
+            picture = decode_jpeg(data[1:], width, height, session)
+            if client.drawing:
+                client._blit(x, y, width, height, picture)
+        except RfbError as ex:
+            error = ex
+        seconds = time.perf_counter() - began
+        took.append((seconds, session.starting - starting))
+        if error is not None:
+            return took, time.thread_time() - working, error
+        spent += seconds
+        if spent >= most:
+            break
+    return took, time.thread_time() - working, None
 
 
 def decode_jpeg(data: bytes, width: int, height: int, session: VideoSession | None = None) -> bytes:
@@ -635,9 +869,19 @@ class Client:
         self._writing = asyncio.Lock()
         self._second = 0.0
         self._messages = self._rectangles = self._resizes = self._work = 0
-        self._breathed = time.perf_counter()  # when the event loop was last let go of (see `_breathe`)
+        self._since = time.perf_counter()  # when this reader last took the event loop back (see `_breathe`)
+        self._held_loop = 0.0  # seconds it held the loop before that, since it last let go of it
+        self._paid = 0.0  # seconds of the shares taken in advance, at its last turn, for what it holds the loop for next
+        self._place = 0.0  # where it comes in line next: what its turns have taken in advance (see `_Line`)
+        self._waited = 0.0  # seconds it was away from the server's bytes: drawing, or waiting for its share (see `_away`)
+        self._pending = 0  # bytes of HELD_ALL held for the rectangle being read (see `_room`)...
+        self._gathered = 0  # ...and for those gathered to be drawn
+        self._keeping = False  # it makes room for its own next request (see `_room`)...
+        self._freed = 0  # ...and has let go of this much meanwhile
         self._credit = DRAWING_BURST  # seconds of the drawing threads this server's pictures may take now (see `_drawn`)
         self._credit_at = time.monotonic()
+        self._long_steps: list[float] = []  # when its pictures or slices took LONG_STEP or more, within LONG_STEPS_WITHIN
+        self._decoding: ThreadPoolExecutor | None = None  # the thread that waits for this server's video worker (see `_pictures`)
 
     # --- the handshake ------------------------------------------------------------------------------------
 
@@ -768,17 +1012,21 @@ class Client:
         try:
             await self.stream.close()
         finally:
+            lane, self._decoding = self._decoding, None
+            if lane is not None:
+                lane.shutdown(wait=False)  # (its thread ends with the picture it waits for, if any)
             await asyncio.to_thread(self._video_decoder.close)
 
     # --- what the server sends ------------------------------------------------------------------------------
 
     async def serve(self) -> None:
         """Read the server's messages for as long as the connection lasts. Ends with an RfbError, always."""
+        self._since, self._held_loop = time.perf_counter(), 0.0
         while True:
             await self._breathe()
             kind = await self._kind()
             self._count(messages=1)
-            deadline = self.clock() + MESSAGE_WITHIN
+            deadline = self._now() + MESSAGE_WITHIN
             if kind == UPDATE:
                 await self._update(deadline)
             elif kind == COLOUR_MAP:
@@ -810,6 +1058,27 @@ class Client:
         if self._work > max(MOST_SCREENS_A_SECOND * self.width * self.height, LEAST_WORK_A_SECOND):
             raise RfbError(LIMIT, "the server sends more pixels in a second than its screen could change")
 
+    @types.coroutine
+    def _from_network(self, reading: Awaitable[bytes]) -> Generator[Any, Any, bytes]:
+        """What `reading` brings from the server, telling the time this reader held the event loop from the time it let it
+        go. Where the read lets the loop go (it waits for the server's bytes, and the loop is the rest of the program's, or
+        idle), this reader's time up to then is noted (`_held_loop`), and its time starts again where it takes the loop back
+        (`_since`), however short the wait; a read that found its bytes there already did not let the loop go, and its time
+        is this reader's, in full. (By how long a read took instead, a millisecond or more for a wait: on a fast link most
+        waits are shorter, and most of the link's time was charged to the server and to every server's share, as if it read
+        all the while.)"""
+        inner = reading.__await__()
+        try:
+            waiting = inner.send(None)
+        except StopIteration as done:  # (its bytes were there: it did not let the loop go)
+            result: bytes = done.value
+            return result
+        self._held_loop += time.perf_counter() - self._since  # (it lets the loop go: this reader's time up to here)
+        try:
+            return (yield from _awaited_on(inner, waiting))
+        finally:
+            self._since = time.perf_counter()
+
     async def _kind(self) -> int:
         """The first byte of the next message: out of what was read ahead first (a Hextile rectangle is read ahead a chunk
         at a time, and the messages after it may have come in that chunk), else waited for as long as it takes (a server
@@ -819,34 +1088,63 @@ class Client:
             kind = held[0]
             del held[:1]
             return kind
-        return (await self.stream.read(1, None))[0]
+        return (await self._from_network(self.stream.read(1, None)))[0]
 
     async def _read(self, size: int, deadline: float) -> bytes:
         """Exactly `size` bytes: out of what was read ahead first, then from the network."""
         held = self._held
         if not held:
-            return await self.stream.read(size, min(READ_WAIT, deadline - self.clock()))
+            return await self._from_network(self.stream.read(size, min(READ_WAIT, deadline - self._now())))
         if len(held) >= size:
             taken = bytes(held[:size])
             del held[:size]
             return taken
         first, self._held = bytes(held), bytearray()
-        return first + await self.stream.read(size - len(first), min(READ_WAIT, deadline - self.clock()))
+        return first + await self._from_network(self.stream.read(size - len(first), min(READ_WAIT, deadline - self._now())))
 
     async def _more(self, size: int, deadline: float) -> None:
         """What is read ahead made `size` bytes at least, a chunk at a time: for the one encoding that says its lengths only
         tile by tile."""
         held = self._held
         while len(held) < size:
-            held += await self.stream.read_some(CHUNK, min(READ_WAIT, deadline - self.clock()))
+            held += await self._from_network(self.stream.read_some(CHUNK, min(READ_WAIT, deadline - self._now())))
+
+    def _now(self) -> float:
+        """The clock a server's deadlines are kept by: `clock`, less the time this reader was away from its bytes (drawing
+        them, or waiting for its share of the program's time or memory), which is not the server's."""
+        return self.clock() - self._waited
+
+    async def _away(self, waiting: Awaitable[_T]) -> _T:
+        """`waiting`, while this reader is away from the server's bytes (drawing them, or waiting for its share of the
+        program's time or memory): neither the server's time, against its deadlines, nor this reader's, on the event loop."""
+        self._held_loop += time.perf_counter() - self._since
+        began = self.clock()
+        try:
+            return await waiting
+        finally:
+            self._waited += self.clock() - began
+            self._since = time.perf_counter()
 
     async def _breathe(self) -> None:
         """Let the rest of the program have the event loop, where this reader has held it for BREATHE. What has arrived is
         read without waiting for anything, and a message of 65,535 rectangles, or of rows of Hextile tiles, held every other
-        tile, page and live line for as long as it took (seconds, of a few kilobytes)."""
-        if time.perf_counter() - self._breathed >= BREATHE:
-            await asyncio.sleep(0)
-            self._breathed = time.perf_counter()
+        tile, page and live line for as long as it took (seconds, of a few kilobytes).
+
+        What it held the loop for is charged to this server's share and every server's (DRAWING_SHARE, DRAWING_ALL), as its
+        drawing is, and it waits for its turn by the rule its drawing does (`_turn`), while what the server sends waits in
+        the network: however many servers there are, and however fast this machine is, the rest of the program has the rest
+        of the loop, and every server's drawing its turn."""
+        now = time.perf_counter()
+        held = self._held_loop + now - self._since
+        if held < BREATHE:
+            return
+        self._held_loop, self._since = 0.0, now
+        unpaid, self._paid = held - self._paid, 0.0  # (what its last turn did not take in advance)
+        self._charged(unpaid, unpaid)
+        self._placed(unpaid, 0.0)
+        if not await self._turn(BREATHE):
+            await self._away(asyncio.sleep(0))  # (its turn at once: the rest of the program has the loop for a moment all the same)
+        self._paid = BREATHE
 
     async def _drop(self, size: int, deadline: float) -> None:
         while size > 0:
@@ -858,31 +1156,46 @@ class Client:
     async def _update(self, deadline: float) -> None:
         (count,) = struct.unpack(">xH", await self._read(3, deadline))
         self._count(rectangles=count)
-        drawn = False
-        pixels = 0  # to draw, in this update
         batch: list[tuple[int, int, int, int, int, bytes]] = []  # (encoding, x, y, width, height, data)
         batched = 0
 
-        async def in_thread(steps: Iterator[None]) -> None:
-            # The time the drawing takes, and waits for its turn, is not the server's: the message's deadline moves on by as much.
-            nonlocal deadline
-            began = self.clock()
-            await self._drawn(steps)
-            deadline += self.clock() - began
-
+        # (The time the drawing takes, and waits for its turn, is not the server's: `_drawn` is away from its bytes.)
         async def flush() -> None:
             nonlocal batched
             if batch:
                 rectangles, batch[:] = list(batch), []
                 batched = 0
-                await in_thread(self._drawing(rectangles))
+                await self._draw_batch(rectangles)
+            self._let_go(pending=False)
 
         async def gather(entry: tuple[int, int, int, int, int, bytes]) -> None:
             nonlocal batched
             batch.append(entry)
+            self._gathered, self._pending = self._gathered + self._pending, 0
             batched += len(entry[5]) + ENTRY_BYTES
             if batched >= BATCH_BYTES:
                 await flush()
+
+        def room(size: int) -> Awaitable[None]:
+            return self._room(size, flush)
+
+        try:
+            await self._update_rectangles(count, deadline, flush, gather, room)
+        finally:
+            self._let_go(pending=True)
+
+    async def _update_rectangles(
+        self,
+        count: int,
+        deadline: float,
+        flush: Callable[[], Awaitable[None]],
+        gather: Callable[[tuple[int, int, int, int, int, bytes]], Awaitable[None]],
+        room: Callable[[int], Awaitable[None]],
+    ) -> None:
+        """The `count` rectangles of an update, read and handed on to be drawn (`gather`, `flush`), with room in HELD_ALL for
+        what they hold (`room`)."""
+        drawn = False
+        pixels = 0  # to draw, in this update
 
         for _ in range(count):
             await self._breathe()
@@ -890,7 +1203,10 @@ class Client:
             if encoding == DESKTOP_SIZE:
                 self._count(resizes=1)
                 await flush()
-                await in_thread(self._fitting(width, height))  # (a screen's worth of copying)
+                if 0 < width <= LARGEST_SIDE and 0 < height <= LARGEST_SIDE and width * height <= MOST_PIXELS:
+                    await room(3 * width * height)  # (the new screen, beside the old one while what is kept is copied)
+                await self._drawn(self._fitting(width, height))  # (a screen's worth of copying)
+                self._let_go(pending=True)
                 continue
             if encoding not in self.encodings or encoding < 0:
                 raise RfbError(PROTOCOL, f"a rectangle in an encoding this program did not ask for ({encoding})")
@@ -904,7 +1220,7 @@ class Client:
             if encoding == RAW:
                 self._count(work=max(area, RECTANGLE_WORK))
                 await flush()
-                deadline = await self._raw(x, y, width, height, deadline)
+                await self._raw(x, y, width, height, deadline)
                 continue
             if encoding == COPY_RECT:
                 self._count(work=max(area, RECTANGLE_WORK))
@@ -931,9 +1247,9 @@ class Client:
                 continue
             if encoding == ZRLE:
                 self._count(work=max(area, RECTANGLE_WORK))
-                data = await self._zrle_bytes(width, height, deadline)
+                data = await self._zrle_bytes(width, height, deadline, room)
             else:
-                data = await self._tight_bytes(width, height, deadline)
+                data = await self._tight_bytes(width, height, deadline, room)
                 if data[0] >= 0x80:
                     cost = area // CHEAP  # a fill, or a JPEG
                 elif data[0] & 0x40 and data[1] == 2:
@@ -942,7 +1258,8 @@ class Client:
                     cost = area
                 self._count(work=max(cost, RECTANGLE_WORK))
             # Let go of unseen while nobody wants pictures, except what has a zlib stream to keep in step (ZRLE,
-            # Tight: a Tight rectangle of any kind may reset the streams), which is taken apart and not drawn.
+            # Tight: a Tight rectangle of any kind may reset the streams), which is taken apart and not drawn. A JPEG is
+            # gathered as it came, and decoded with the rest of its batch's (see `_pictures`).
             await gather((encoding, x, y, width, height, data))
         await flush()
         if drawn:
@@ -954,11 +1271,10 @@ class Client:
         self.updates += 1
         self.updated.set()
 
-    async def _raw(self, x: int, y: int, width: int, height: int, deadline: float) -> float:
-        """Raw pixels, read and drawn a few rows at a time: a screen of them is never held twice. The message's deadline
-        after it (the time the drawing threads took is not the server's)."""
+    async def _raw(self, x: int, y: int, width: int, height: int, deadline: float) -> None:
+        """Raw pixels, read and drawn a few rows at a time: a screen of them is never held twice."""
         if width == 0:
-            return deadline
+            return
         row = self._pixel_bytes * width
         rows_at_once = max(1, CHUNK // row)
         done = 0
@@ -968,13 +1284,10 @@ class Client:
             pixels = await self._read(rows * row, deadline)
             if self.drawing and self.pixels == RGB565:
                 # (Four times the work of the other format's: in the drawing threads, as the other encodings are drawn.)
-                began = self.clock()
                 await self._drawn(_once(self._draw_raw, x, y + done, width, rows, pixels))
-                deadline += self.clock() - began
             elif self.drawing:
                 self._blit(x, y + done, width, rows, self._as_rgb(pixels))
             done += rows
-        return deadline
 
     def _draw_raw(self, x: int, y: int, width: int, rows: int, pixels: bytes) -> None:
         self._blit(x, y, width, rows, self._as_rgb(pixels))
@@ -1011,11 +1324,12 @@ class Client:
         del held[:at]
         return top, rows
 
-    async def _zrle_bytes(self, width: int, height: int, deadline: float) -> bytes:
+    async def _zrle_bytes(self, width: int, height: int, deadline: float, room: Callable[[int], Awaitable[None]]) -> bytes:
         (length,) = struct.unpack(">I", await self._read(4, deadline))
         tiles = -(-width // 64) * -(-height // 64)
         if length > 4 * width * height + 64 * tiles + ZLIB_SLACK:
             raise RfbError(LIMIT, f"a tile stream of {length} bytes for a rectangle of {width} by {height}, which is more than it could hold")
+        await room(3 * length + 4 * width * height + 385 * tiles + 16)  # (what `_draw_zrle` inflates it to, at the most)
         return await self._whole(length, deadline)
 
     async def _whole(self, length: int, deadline: float) -> bytes:
@@ -1036,7 +1350,7 @@ class Client:
                 length |= (await self._read(1, deadline))[0] << 14
         return length
 
-    async def _tight_bytes(self, width: int, height: int, deadline: float) -> bytes:
+    async def _tight_bytes(self, width: int, height: int, deadline: float, room: Callable[[int], Awaitable[None]]) -> bytes:
         """The bytes of a Tight rectangle: its control byte, and what the method of that byte says follows."""
         if width > TIGHT_WIDEST:
             raise RfbError(PROTOCOL, f"a Tight rectangle {width} pixels wide, which its own rules do not allow")
@@ -1048,6 +1362,7 @@ class Client:
             length = await self._compact_length(deadline)
             if length > 3 * width * height + ZLIB_SLACK:
                 raise RfbError(LIMIT, f"a JPEG of {length} bytes for a rectangle of {width} by {height}, which is more than it could hold")
+            await room(3 * length + 3 * width * height)  # (and the picture it is decoded to)
             return control + await self._whole(length, deadline)
         if method >= 0x8:
             raise RfbError(PROTOCOL, f"a Tight rectangle of a kind this program does not read (method {method})")
@@ -1073,6 +1388,7 @@ class Client:
             length = await self._compact_length(deadline)
             if length > plain + ZLIB_SLACK:
                 raise RfbError(LIMIT, f"a Tight stream of {length} bytes for {plain} bytes of pixels, which is more than it could hold")
+            await room(3 * length + plain)  # (and what it inflates to)
             pieces.append(await self._whole(length, deadline))
         return b"".join(pieces)
 
@@ -1085,29 +1401,196 @@ class Client:
         Every server's pictures are drawn in the same two threads. After a slice, the next piece of work in line (another
         server's, as like as not) goes first; a server that has used up its share (DRAWING_SHARE of every second,
         DRAWING_BURST at once) waits until it has one again, while what it sends waits in the network (nothing more is read
-        of it meanwhile); and so does every server while all of them together have used up theirs (DRAWING_ALL). Nothing
-        is refused for what it costs to draw: a server that is well and sends costly pictures is shown more slowly, and one
-        that is not cannot keep the others from being drawn, nor the event loop from the rest. (Drawn whole, a few kilobytes
-        of Tight's gradient kept a thread for seconds, and three such servers kept both, and the loop waiting.)"""
+        of it meanwhile); and so does every server while all of them together have used up theirs (DRAWING_ALL). A step
+        that takes far longer than a slice is charged to every server's share up to STEP_ALLOWANCE, and in full to its own.
+        Nothing is refused for what it costs to draw, but steps that take LONG_STEP again and again: a server that is well
+        and sends costly pictures is shown more slowly, and one that is not cannot keep the others from being drawn, nor
+        the event loop from the rest. (Drawn whole, a few kilobytes of Tight's gradient kept a thread for seconds, and three
+        such servers kept both, and the loop waiting.)"""
         loop = asyncio.get_running_loop()
         while True:
-            now = time.monotonic()
-            self._credit = min(DRAWING_BURST, self._credit + (now - self._credit_at) * DRAWING_SHARE)
-            self._credit_at = now
-            _ALL[0] = min(DRAWING_BURST, _ALL[0] + (now - _ALL[1]) * DRAWING_ALL)
-            _ALL[1] = now
-            wait = max(-self._credit / DRAWING_SHARE, -_ALL[0] / DRAWING_ALL)
-            if wait > 0:
-                await asyncio.sleep(wait)
-                continue
             # Counted as it is handed on (whoever asks meanwhile sees it), and put right by what it took once it is done.
-            self._credit -= DRAWING_SLICE
-            _ALL[0] -= DRAWING_SLICE
-            done, took = await loop.run_in_executor(_DRAWERS, _advance, steps, DRAWING_SLICE)
-            self._credit += DRAWING_SLICE - took
-            _ALL[0] += DRAWING_SLICE - took
+            await self._turn(DRAWING_SLICE)
+            done, took, worked = await self._away(loop.run_in_executor(_DRAWERS, _advance, steps, DRAWING_SLICE))
+            self._charged(took - DRAWING_SLICE, min(took, DRAWING_SLICE + STEP_ALLOWANCE) - DRAWING_SLICE)
+            self._placed(worked, DRAWING_SLICE)
+            if worked >= LONG_STEP:
+                self._took_long()
             if done:
                 return
+
+    def _own_wait(self) -> float:
+        """This server's share, brought up to now: the seconds it has to wait before taking more of it."""
+        now = time.monotonic()
+        self._credit = min(DRAWING_BURST, self._credit + (now - self._credit_at) * DRAWING_SHARE)
+        self._credit_at = now
+        return -self._credit / DRAWING_SHARE
+
+    def _charged(self, own: float, every: float) -> None:
+        """`own` seconds charged to this server's share, `every` to every server's."""
+        self._credit -= own
+        _ALL[0] -= every
+
+    def _placed(self, work: float, taken: float) -> None:
+        """A turn that took `taken` in advance was `work`, the thread's own time: where that is more, the server's place in
+        line moves on by the rest (see `_Line`). (On Windows a thread's own time is counted at each tick of the clock, 15.6
+        ms: a slice of a millisecond or two may read nought, and moves its server by what it took in advance, as before.)"""
+        if work > taken:
+            self._place += work - taken
+
+    async def _turn(self, taking: float) -> bool:
+        """This server's share and its turn at every server's, waited for by one rule wherever this server takes the
+        program's time (reading on the event loop, drawing in the drawing threads, waiting for its video worker); `taking`
+        seconds of both are then taken in advance, and put right by what was taken in the end. Whether it waited.
+
+        Its own share first, alone (no other server waits for it meanwhile); then, where others wait already or every
+        server's share is used up, in line (`_Line`): the first waits until every server's share is above nought, each
+        after it until it is first. A server comes after every one that has had no more turns than it, and before every
+        one that has had more: servers that keep every server's share used up (some that only flood what is read) take
+        turns among themselves, and a server whose drawing needs a slice now and then is let in at the next turn, not
+        after all of theirs."""
+        waited = False
+        while (wait := self._own_wait()) > 0:
+            waited = True
+            await self._away(asyncio.sleep(wait))
+        place = max(self._place, _LINE.given)
+        if _LINE.waiting or _all_wait() > 0:
+            waited = True
+            loop = asyncio.get_running_loop()
+            turn = _Turn((place, next(_LINE.came)), loop.create_future())
+            bisect.insort(_LINE.waiting, turn, key=lambda each: each.key)
+            try:
+                while True:
+                    if _LINE.waiting[0] is not turn:
+                        await self._away(turn.wake)  # (until the one before it goes on, or stops waiting)
+                        turn.wake = loop.create_future()
+                    elif (wait := _all_wait()) > 0:
+                        await self._away(asyncio.sleep(wait))
+                    else:
+                        break
+            finally:
+                first = _LINE.waiting[0] is turn
+                _LINE.waiting.remove(turn)
+                if first and _LINE.waiting and not _LINE.waiting[0].wake.done():
+                    _LINE.waiting[0].wake.set_result(None)  # (the next in line: it sees what this one takes below before it runs)
+        _LINE.given, self._place = place, place + taking
+        self._charged(taking, taking)
+        return waited
+
+    async def _draw_batch(self, rectangles: list[tuple[int, int, int, int, int, bytes]]) -> None:
+        """A batch of rectangles drawn, in the order they came, run by run: a run of Tight JPEGs, where somebody looks, in this
+        server's own thread (`_pictures`); any other run in the drawing threads (`_drawn`)."""
+        drawing = self.drawing
+        at = 0
+        while at < len(rectangles):
+            pictures = drawing and _is_jpeg(rectangles[at])
+            end = at + 1
+            while end < len(rectangles) and (drawing and _is_jpeg(rectangles[end])) == pictures:
+                end += 1
+            if pictures:
+                await self._pictures(rectangles[at:end])
+            else:
+                await self._drawn(self._drawing(rectangles[at:end]))
+            at = end
+
+    async def _pictures(self, run: list[tuple[int, int, int, int, int, bytes]]) -> None:
+        """A run of Tight JPEGs decoded in this server's video worker and drawn, in a thread of this server's own (however
+        long its worker takes, up to video.WORK_WITHIN a picture, no other server's pictures wait for it), each in one step,
+        as 0.2.0 decoded and drew each in a drawing thread. Never in a drawing thread every server shares.
+
+        A turn and a hop to that thread for as many of the run's pictures as are done in PICTURES_AT_ONCE, or in what this
+        server's own share has where that is more (DRAWING_BURST at the most): for a batch of them all, as a rule. What they
+        took is charged to this server's share (what its worker worked, by the system's count, where the hop took
+        COUNTED_FROM or more; else the clock); every server's share, the program's time, is charged what the thread itself
+        did (its own time, up to STEP_ALLOWANCE a turn), for the worker is a process of its own; a picture of LONG_STEP or
+        more is counted against it, as far as what its worker worked says (see `_worked`). (A turn, a
+        hop and a slice's place in line a picture: a 4K desktop's 128 pictures a refresh were some 150 turns where 0.2.0 had
+        some 28 slices, and beside other servers it was drawn two to four times less often. Every server's share charged the
+        clock of a batch's pictures instead, two 4K JPEG desktops beside a 4K Tight and a 4K ZRLE one left these 1.9 and 1.0
+        updates a second where 0.2.0 drew 4.9 and 1.6. Drawn in the drawing threads after they were decoded, a batch cost a
+        4K desktop beside three others another wait for those threads.) A turn moves its server's place in line as a slice
+        does, for a run."""
+        if self._decoding is None:
+            self._decoding = ThreadPoolExecutor(max_workers=1, thread_name_prefix="rfb-jpeg")
+        loop = asyncio.get_running_loop()
+        session = self._video_decoder
+        while run:
+            await self._turn(DRAWING_SLICE)
+            worker, used, starting = *session.cpu_seconds(), session.starting
+            took, held, error = await self._away(loop.run_in_executor(self._decoding, _draw_pictures, self, run, max(PICTURES_AT_ONCE, self._credit)))
+            seconds = sum(clock for clock, _ in took)
+            worked = _worked(session, worker, used, starting, seconds)
+            self._charged((worked if seconds >= COUNTED_FROM else seconds) - DRAWING_SLICE, min(held, STEP_ALLOWANCE) - DRAWING_SLICE)
+            self._placed(held, DRAWING_SLICE)
+            # A picture of LONG_STEP or more by the clock (starting a worker aside) counts, as far as what the worker worked
+            # over the hop says it could have been one: a stall that holds Python's lock is in the clock, not in that.
+            longest = [clock - started for clock, started in took if clock - started >= LONG_STEP]
+            for _ in range(min(len(longest), int(worked // LONG_STEP))):
+                self._took_long()
+            if error is not None:
+                raise error
+            run = run[len(took) :]
+
+    async def _room(self, size: int, gathered: Callable[[], Awaitable[None]]) -> None:
+        """Room for `size` more bytes held by this update (the rectangle about to be read, until it is gathered), out of
+        HELD_ALL and this server's quarter of it (`_held_one`; a rectangle larger than that alone, see `_Held`). Where it
+        would hold more than its quarter, or where there is no room, what this update gathered is drawn and let go of first
+        (`gathered`); where there is no room then, it waits, holding nothing, until room let go of is handed on to it, in
+        the order those that wait came, while an update that fits is given room at once whoever waits (none waits behind
+        another that does not fit, nor for another that waits). The time it waits is not the server's.
+
+        What it lets go of meanwhile serves this request first, and only then is the rest handed on: four slow servers each
+        holding a quarter took what an ordinary server let go of by drawing what it gathered, and it waited for the next
+        slow message, again and again within one update (round 2 review: 7.4 s an update where it was 1.9). An update
+        that has waited ROOM_PASSED_FOR is passed no more by those that fit (see `_Held`); what a server lets go of within
+        its update may still serve that update first, which ends within MESSAGE_WITHIN."""
+        size = min(size, HELD_ALL // 2)
+        large = size > _held_one()
+        self._freed, self._keeping = 0, True
+        try:
+            if large or self._gathered + self._pending + size > _held_one():
+                await gathered()  # (held alone, or within its quarter)
+            if not _HELD.fits(size, large, _HELD.set_aside()) and not (size <= self._freed and _HELD.fits(size, large)):
+                await gathered()
+        finally:
+            self._keeping = False
+        own = size <= self._freed and _HELD.fits(size, large)  # (what it let go of serves it first)
+        if own or _HELD.fits(size, large, _HELD.set_aside()):
+            _HELD.take(size, large, self)
+            _HELD.hand_on()  # (and what it let go of beyond that goes on to those that wait)
+        else:
+            _HELD.hand_on()
+            room = _Room(size, large, self, asyncio.get_running_loop().create_future())
+            _HELD.waiting.append(room)
+            try:
+                await self._away(room.given)  # (handed on with the room taken: see `_Held.hand_on`)
+            except BaseException:
+                if room in _HELD.waiting:
+                    _HELD.waiting.remove(room)
+                elif room.given.done() and not room.given.cancelled():
+                    _HELD.let_go(size, self, self._gathered + self._pending > 0)  # (given, and not taken up)
+                raise
+        self._pending += size
+
+    def _let_go(self, pending: bool) -> None:
+        """What this update's gathered rectangles held of HELD_ALL, once they are drawn; and with `pending`, the one being
+        read too (the update is over, however it ended). Handed on at once to those that wait for it."""
+        let_go = self._gathered + (self._pending if pending else 0)
+        self._gathered = 0
+        if pending:
+            self._pending = 0
+        if let_go:
+            if self._keeping:  # (it makes room for its own next request: that comes first, see `_room`)
+                self._freed += let_go
+            _HELD.let_go(let_go, self, self._pending > 0, hand_on=not self._keeping)
+
+    def _took_long(self) -> None:
+        """A picture or a slice of this server's took LONG_STEP or more: noted, and the server refused after MOST_LONG_STEPS."""
+        now = time.monotonic()
+        self._long_steps = [at for at in self._long_steps if now - at < LONG_STEPS_WITHIN]
+        self._long_steps.append(now)
+        if len(self._long_steps) > MOST_LONG_STEPS:
+            raise RfbError(LIMIT, "the server's pictures take far too long to draw, again and again")
 
     def _blit(self, x: int, y: int, width: int, height: int, rgb: bytes) -> None:
         row, stride = 3 * width, 3 * self.width
@@ -1140,7 +1623,7 @@ class Client:
             self._blit(x, y + top, width, count, b"".join(rows))
 
     def _drawing(self, rectangles: list[tuple[int, int, int, int, int, bytes]]) -> Iterator[None]:
-        """A batch of rectangles drawn, in the order they came, a step at a time: between tiles, and between rows."""
+        """A run of rectangles drawn, in the order they came, a step at a time: between tiles, and between rows."""
         for encoding, x, y, width, height, data in rectangles:
             if encoding in (HEXTILE, _HEXTILE_MORE):
                 yield from self._draw_hextile(x, y, width, height, _Bytes(data), fresh=encoding == HEXTILE)
@@ -1251,12 +1734,20 @@ class Client:
         if plain.left():
             raise RfbError(PROTOCOL, "a tile stream longer than its tiles")
 
-    def _draw_tight(self, x: int, y: int, width: int, height: int, data: _Bytes) -> Iterator[None]:
-        """A Tight rectangle, rows of STEP_PIXELS a step (its stream inflated first, whether it is drawn or not)."""
-        control = data.byte()
+    def _reset_tight(self, control: int) -> None:
+        """The streams a Tight rectangle's control byte says to start afresh."""
         for i in range(4):
             if control & (1 << i):
                 self._tight[i] = zlib.decompressobj()
+
+    def _draw_tight(self, x: int, y: int, width: int, height: int, data: _Bytes) -> Iterator[None]:
+        """A Tight rectangle, rows of STEP_PIXELS a step (its stream inflated first, whether it is drawn or not). A JPEG is
+        decoded and drawn in its server's own thread (`_pictures`), and comes here only where nobody looked when its batch was
+        drawn: it is never decoded here, and where somebody began to look meanwhile the screen is marked stale, and the next
+        request asks for all of it. (Decoded here, in a drawing thread every server shares, one took it for up to
+        video.WORK_WITHIN.)"""
+        control = data.byte()
+        self._reset_tight(control)
         method = control >> 4
         if method == 0x8:
             if self.drawing:
@@ -1265,7 +1756,7 @@ class Client:
             return
         if method == 0x9:
             if self.drawing:
-                self._blit(x, y, width, height, decode_jpeg(data.take(data.left()), width, height, self._video_decoder))
+                self.stale = True
             yield
             return
         filter_id = data.byte() if control & 0x40 else 0
