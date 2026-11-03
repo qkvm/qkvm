@@ -1,5 +1,34 @@
 # Changes
 
+## 0.2.2
+
+Fixes found on a real wall after 0.2.1. Nothing new is added. Upgrade with `pip install --upgrade qkvm` or
+`docker pull qkvm/qkvm:0.2.2`; from 0.2.1 the app's own update installs it in place.
+
+### Fixed
+
+- **An update that cannot be installed in place is said when it is found.** The wall checks a new release's
+  requirements as soon as it finds it. Where the libraries installed beside qKVM are too old for it, Settings, Updates
+  says so plainly, with the exact command for this install (pip run by the Python qKVM runs under, or the container's
+  lines) and a Copy button, and offers no Install button and asks no password; where it needs a newer Python, it
+  says which. (0.2.0 offered Install, asked the password, and only then refused.) Checking a release never holds up
+  the wall's own rounds, and gives up after two minutes; an install refused anyway refreshes the page.
+- **The row of keys under Control takes its own place.** It no longer covers the top of the machine's screen: the
+  whole picture is shown below it, and clicks land where they point.
+- **Every button in a row has its icon**: Fullscreen in the enlarged view, the keys under Control (Ctrl+Alt+Del, Win,
+  Alt+Tab, Alt+F4, PrtSc, Type text, Relative mouse), and every Copy button.
+- **A PC with Intel AMT: its KVM is switched on and off from Actions**, whichever applies (switching it on was only on
+  the Health view before). The Health view's button stays.
+- A server console's web page is signed out of on its own connection where the server is known by its computer alone.
+
+### Known
+
+- A manual *Check for updates* waits for GitHub's answer for as long as GitHub takes to give it.
+- A Windows path with unusual quote characters may need its printed command adjusted by hand.
+
+- A server whose console is AMI's and whose controller does not give its own number may keep the console's web session
+  until it runs out on the controller, where the Redfish session is given back first.
+
 ## 0.2.1
 
 A release of fixes only: a security review of the whole web app, of every device driver and of how the

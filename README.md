@@ -2342,8 +2342,9 @@ for your password again.
   `qkvm --roll-back` does the same by hand. (The move from 0.1.x to 0.2.0 is made with pip or a
   new image instead: see below.)
 - **It only replaces the program's own files.** The installed Python and libraries must meet
-  the new release's requirements. If a package is missing or its version is incompatible,
-  the app refuses the update and asks you to use `pip install --upgrade qkvm`. That works at
+  the new release's requirements. qKVM checks them when it finds the release: if a package is
+  missing or its version is incompatible, it offers no install and shows the pip command for
+  your installation instead (`/opt/qkvm/bin/python -m pip install --upgrade qkvm`, say). That works at
   any other time as well; qKVM runs whichever of the two is newer. An installed update checks
   these requirements again before opening the data folder.
 - **A container is updated by replacing its image**, not from inside: the app tells you when

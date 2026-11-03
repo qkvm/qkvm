@@ -598,8 +598,8 @@ pre.wrap { white-space: pre-wrap; word-break: break-all; margin: 0 0 14px; }
   outline: none;
 }
 #clock { min-width: 5.6em; text-align: right; color: var(--muted); font-variant-numeric: tabular-nums; }
-#fullscreen .i-exit, :root.is-fullscreen #fullscreen .i-enter { display: none; }
-:root.is-fullscreen #fullscreen .i-exit { display: block; }
+#fullscreen .i-exit, :root.is-fullscreen #fullscreen .i-enter, #focus-fullscreen .i-exit, :root.is-fullscreen #focus-fullscreen .i-enter { display: none; }
+:root.is-fullscreen #fullscreen .i-exit, :root.is-fullscreen #focus-fullscreen .i-exit { display: block; }
 
 .banner {
   display: flex;
@@ -1213,6 +1213,8 @@ dialog.settings .dialog-body { display: grid; grid-template-columns: 212px minma
 /* Something that is shown once, with the button that copies it: the box takes the room there is. */
 .once { display: flex; gap: 8px; margin: 0 0 16px; }
 .once input { flex: 1; min-width: 0; }
+.note .once.command { margin: 8px 0; }
+.note .once.command:last-child { margin-bottom: 0; }
 /* What a list is narrowed by, above it. */
 .toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin: 0 0 14px; }
 .toolbar input[type="search"] { flex: 0 1 320px; height: 32px; padding: 0 10px; }
@@ -1462,8 +1464,12 @@ dialog.settings .dialog-body { display: grid; grid-template-columns: 212px minma
 #focus-details .focus-history { max-height: none; overflow: visible; margin: 0; padding: 10px 0 0; background: transparent; }
 .focus-ports { padding: 4px 12px; }
 
-/* The input row has its own overflow menu, and stays the same height in every state. */
-.focus-control-panel { position: absolute; top: 100%; left: 0; right: 0; display: flex; flex-wrap: nowrap; align-items: center; gap: 8px; height: 42px; box-sizing: border-box; padding: 6px 12px; background: var(--panel); border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); box-shadow: 0 2px 5px #0002; }
+/* The input row has its own overflow menu, and stays the same height in every state. It takes its own place under the
+   bar (the bar's margin, while it is shown): the picture fits in the room that is left, and no part of the machine's
+   screen lies under it. (Laid over the picture, it hid the screen's top: the office wall, 2026-11-02.) */
+.focus { --keys-row-height: 42px; }
+.focus.keys-shown > .focus-bar { margin-bottom: var(--keys-row-height); }
+.focus-control-panel { position: absolute; top: 100%; left: 0; right: 0; display: flex; flex-wrap: nowrap; align-items: center; gap: 8px; height: var(--keys-row-height); box-sizing: border-box; padding: 6px 12px; background: var(--panel); border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
 .focus-control-panel > * { flex: none; }
 .focus-control-panel button, .focus-control-panel summary.btn { min-height: 28px; padding: 4px 10px; font-size: 12px; white-space: nowrap; }
 .focus-control-panel > button { height: 28px; }

@@ -24,15 +24,17 @@ import logging
 import os
 import platform
 import re
+import shlex
 import shutil
 import secrets
+import sys
 import time
 import zipfile
 import zlib
 from collections.abc import Callable
 from dataclasses import dataclass
 from email.parser import Parser
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -66,16 +68,50 @@ DEFAULT_REPO = "qkvm/qkvm"
 RELEASE_KEYS: tuple[str, ...] = ("R9V9vqrwqFnxx4j6mf0ZSG7Af5PTFILqZd1Qc6F1JpI=",)
 
 PACKAGE = "qkvm"
+# What updates a copy that runs in a container, as the README says it: with compose, and without (then the container is
+# removed and run again). Said by the server, not written into the page: the page is the demo's too, which names no image.
+IMAGE_COMMANDS = ("docker compose pull && docker compose up -d", "docker pull qkvm/qkvm")
 MAX_WHEEL = 30_000_000  # bytes; the real thing is well under one megabyte
 MAX_UNPACKED = 60_000_000
 MAX_MEMBERS = 2000  # files in a package; this program is some fifty
 MAX_HOPS = 5  # times a download may be sent on to another address
 MAX_ANSWER = 1_000_000  # bytes of what GitHub says about a release; it is a few thousand
+JUDGE_WITHIN = 120.0  # seconds a release's judging may take, its package's download with it (see Updater._judge)
 REPO = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}")
 
 
 class UpdateError(Exception):
     """An update could not be found, trusted or installed. The message is fit to show."""
+
+
+def upgrade_command(executable: str | None = None, *, windows: bool | None = None) -> str:
+    """The command that installs the newest release over this copy with pip, typed on the computer it runs on: pip, run by
+    the Python this copy runs under (`executable`, `windows`: that Python, and whether it is on Windows; this one's)."""
+    executable = sys.executable if executable is None else executable
+    windows = os.name == "nt" if windows is None else windows
+    command = "-m pip install --upgrade qkvm"
+    if not executable:
+        return f"python {command}"  # (a Python that cannot say where it is)
+    if not windows:
+        return f"{shlex.quote(executable)} {command}"
+    path = PureWindowsPath(executable)
+    if path.name.lower() == "pythonw.exe":
+        path = path.with_name("python.exe")  # (the one beside it, which says what it does: pythonw has no window to say it in)
+    if re.fullmatch(r"[A-Za-z0-9_.:\\/-]+", str(path)):
+        return f"{path} {command}"
+    # PowerShell, the shell Windows opens: a quoted program is run with '&', and nothing in single quotes is expanded.
+    return "& '{}' {}".format(str(path).replace("'", "''"), command)
+
+
+class Unfit(UpdateError):
+    """A release this copy cannot take in place: the Python it runs under, or a library beside it, is not what the release
+    needs (or the release's requirements cannot be read). `reason` says what; the message, what and how to install it.
+    `pip`: whether pip, run by this copy's Python, installs it (not where it needs another Python: there pip keeps the
+    version there is, and no command is named)."""
+
+    def __init__(self, reason: str, *, pip: bool = True) -> None:
+        super().__init__(f"{reason} Install the new version with pip instead: {upgrade_command()}" if pip else reason)
+        self.reason, self.pip = reason, pip
 
 
 class NoLongerAllowed(Exception):
@@ -127,11 +163,12 @@ def _checksum_for(sums: bytes, name: str) -> str:
 
 
 def _check_requirements(metadata: str) -> None:
-    """An update replaces only this program: the installed Python and active dependencies must already satisfy it."""
-    use_pip = "Install the new version with pip instead: pip install --upgrade qkvm"
+    """An update replaces only this program: the installed Python and active dependencies must already satisfy it.
+
+    Unfit where they do not (and where that cannot be told): its message names the command that installs it with pip."""
     headers = Parser().parsestr(metadata)
     if headers.defects or len(headers.get_all("Requires-Python", [])) > 1:
-        raise UpdateError(f"The release has invalid dependency metadata. {use_pip}")
+        raise Unfit("The release has invalid dependency metadata.")
     # Core metadata permits folded headers; the package description after the blank line is not metadata.
     def unfolded(value: str) -> str:
         return " ".join(value.splitlines()).strip()
@@ -140,7 +177,7 @@ def _check_requirements(metadata: str) -> None:
         python_spec = SpecifierSet(unfolded(headers.get("Requires-Python", "")))
         python_version = Version(platform.python_version())
         if not python_spec.contains(python_version, prereleases=True):
-            raise UpdateError(f"This version needs Python {python_spec}; this copy runs {python_version}. {use_pip}")
+            raise Unfit(f"This version needs Python {python_spec}; this copy runs {python_version}.", pip=False)
         for value in headers.get_all("Requires-Dist", []):
             requirement = Requirement(unfolded(value))
             # The app installs no optional extras. Evaluate the whole marker: a literal substring such as
@@ -150,15 +187,15 @@ def _check_requirements(metadata: str) -> None:
             if requirement.url or requirement.extras:
                 # A name/version cannot prove the origin of a direct URL, or that an extra's dependencies
                 # are installed. Leave those installations to pip instead of accepting incomplete proof.
-                raise UpdateError(f"This version needs an installation of '{requirement.name}' that the in-app updater cannot verify. {use_pip}")
+                raise Unfit(f"This version needs an installation of '{requirement.name}' that the in-app updater cannot verify.")
             try:
                 installed = Version(importlib.metadata.version(requirement.name))
             except importlib.metadata.PackageNotFoundError:
-                raise UpdateError(f"This version needs the Python package '{requirement.name}', which is not installed. {use_pip}") from None
+                raise Unfit(f"This version needs the Python package '{requirement.name}', which is not installed.") from None
             if not requirement.specifier.contains(installed, prereleases=True):
-                raise UpdateError(f"This version needs '{requirement.name}{requirement.specifier}'; installed is {installed}. {use_pip}")
+                raise Unfit(f"This version needs '{requirement.name}{requirement.specifier}'; installed is {installed}.")
     except (InvalidRequirement, InvalidSpecifier, InvalidVersion, UndefinedComparison, KeyError, RecursionError):
-        raise UpdateError(f"The release's dependency requirements could not be verified. {use_pip}") from None
+        raise Unfit("The release's dependency requirements could not be verified.") from None
 
 
 def check_startup_requirements(package: Path, version: str) -> None:
@@ -210,38 +247,53 @@ def _write_private(path: Path, data: bytes) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def unpack(wheel: bytes, version: str, destination: Path) -> None:
-    """Unpack a release wheel into `destination`, refusing anything that is not what a release looks like."""
+def _opened(wheel: bytes) -> zipfile.ZipFile:
     try:
-        archive = zipfile.ZipFile(io.BytesIO(wheel))
+        return zipfile.ZipFile(io.BytesIO(wheel))
     except zipfile.BadZipFile:
         raise UpdateError("The download is not a valid package") from None
-    with archive:
-        members = [m for m in archive.infolist() if not m.is_dir()]
-        if len(members) > MAX_MEMBERS or sum(m.file_size for m in members) > MAX_UNPACKED:
-            raise UpdateError("The package is larger than expected")
-        for member in members:
-            parts = member.filename.split("/")
-            inside = parts[0] == PACKAGE or parts[0].endswith(".dist-info")
-            # No absolute paths, no climbing out, no drive letters, nothing outside the two known folders.
-            if not inside or "" in parts or ".." in parts or "\\" in member.filename or ":" in member.filename:
-                raise UpdateError("The package contains files it should not")
-            # And no name that Windows takes for another one ("cli.py." is cli.py there): written after the
-            # file that was checked, it would take its place.
-            if any(part != part.rstrip(". ") for part in parts):
-                raise UpdateError("The package contains files it should not")
-        names = {m.filename for m in members}
-        if len({name.lower() for name in names}) != len(members):  # the same name twice, or twice but for its capitals
+
+
+def metadata_of(wheel: bytes, version: str) -> str:
+    """A release package's dependency metadata, checked as `unpack` checks the package: UpdateError where it is no release."""
+    with _opened(wheel) as archive:
+        return _examined(archive, version)[1]
+
+
+def _examined(archive: zipfile.ZipFile, version: str) -> tuple[list[zipfile.ZipInfo], str]:
+    """A release package's files and its dependency metadata, refusing anything that is not what a release looks like."""
+    members = [m for m in archive.infolist() if not m.is_dir()]
+    if len(members) > MAX_MEMBERS or sum(m.file_size for m in members) > MAX_UNPACKED:
+        raise UpdateError("The package is larger than expected")
+    for member in members:
+        parts = member.filename.split("/")
+        inside = parts[0] == PACKAGE or parts[0].endswith(".dist-info")
+        # No absolute paths, no climbing out, no drive letters, nothing outside the two known folders.
+        if not inside or "" in parts or ".." in parts or "\\" in member.filename or ":" in member.filename:
             raise UpdateError("The package contains files it should not")
-        if f"{PACKAGE}/cli.py" not in names or f"{PACKAGE}/_version.py" not in names:
-            raise UpdateError("The package is not this program")
-        declared = re.search(r'__version__\s*=\s*"([^"]+)"', archive.read(f"{PACKAGE}/_version.py").decode("utf-8", "replace"))
-        if declared is None or parse_version(declared.group(1)) != parse_version(version):
-            raise UpdateError("The package is not the version the release says it is")
-        metadata = [n for n in names if n.endswith(".dist-info/METADATA")]
-        if len(metadata) != 1:
-            raise UpdateError("The package must contain exactly one dependency metadata file")
-        _check_requirements(archive.read(metadata[0]).decode("utf-8", "replace"))
+        # And no name that Windows takes for another one ("cli.py." is cli.py there): written after the
+        # file that was checked, it would take its place.
+        if any(part != part.rstrip(". ") for part in parts):
+            raise UpdateError("The package contains files it should not")
+    names = {m.filename for m in members}
+    if len({name.lower() for name in names}) != len(members):  # the same name twice, or twice but for its capitals
+        raise UpdateError("The package contains files it should not")
+    if f"{PACKAGE}/cli.py" not in names or f"{PACKAGE}/_version.py" not in names:
+        raise UpdateError("The package is not this program")
+    declared = re.search(r'__version__\s*=\s*"([^"]+)"', archive.read(f"{PACKAGE}/_version.py").decode("utf-8", "replace"))
+    if declared is None or parse_version(declared.group(1)) != parse_version(version):
+        raise UpdateError("The package is not the version the release says it is")
+    metadata = [n for n in names if n.endswith(".dist-info/METADATA")]
+    if len(metadata) != 1:
+        raise UpdateError("The package must contain exactly one dependency metadata file")
+    return members, archive.read(metadata[0]).decode("utf-8", "replace")
+
+
+def unpack(wheel: bytes, version: str, destination: Path) -> None:
+    """Unpack a release wheel into `destination`, refusing anything that is not what a release looks like."""
+    with _opened(wheel) as archive:
+        members, metadata = _examined(archive, version)
+        _check_requirements(metadata)
 
         staging = destination.with_name(destination.name + ".tmp")
         shutil.rmtree(staging, ignore_errors=True)
@@ -291,6 +343,14 @@ class Updater:
         self.latest: Release | None = None
         self.checked_at: float | None = None
         self.installed: str | None = None  # the version waiting for a restart
+        # Whether this copy can take the newest release in place, judged when it is found (see _judge): the version judged,
+        # and why it cannot, where it cannot (and whether pip on this Python installs it: Unfit.pip). A container is replaced
+        # as a whole and judges nothing.
+        self.container = os.environ.get("QKVM_CONTAINER") == "1"
+        self.judged: str | None = None
+        self.unfit: str | None = None
+        self.by_pip = True
+        self._metadata: tuple[Release, str] | None = None  # the judged release's metadata, from its checked package
         self._running = False  # one check or install at a time (a plain flag: this object outlives event loops)
 
     @property
@@ -300,8 +360,21 @@ class Updater:
             return False
         return parse_version(self.latest.version) > parse_version(self.current)
 
+    @property
+    def installable(self) -> bool:
+        """Does this copy install a release by itself at all? (Without a key, only where it was started to.)"""
+        return bool(self.keys) or self.allow_unsigned
+
+    @property
+    def in_place(self) -> bool | None:
+        """Can the newest release be installed here, in place? None: not known (not judged, or it could not be)."""
+        if self.latest is None or self.judged != self.latest.version:
+            return None
+        return self.unfit is None
+
     def view(self) -> dict[str, Any]:
         latest = self.latest
+        in_place = self.in_place
         return {
             "current": self.current,
             "repo": self.repo,
@@ -311,7 +384,12 @@ class Updater:
             "available": self.available,
             "installed": self.installed,
             "signed": bool(self.keys),
-            "installable": bool(self.keys) or self.allow_unsigned,
+            "installable": self.installable,
+            "in_place": in_place,
+            "unfit": self.unfit if in_place is False else None,
+            # What installs it with pip instead, on the computer this copy runs on: none where it needs another Python.
+            "command": upgrade_command() if in_place is not False or self.by_pip else None,
+            "image_commands": list(IMAGE_COMMANDS),  # and what updates a container (said by the server: see IMAGE_COMMANDS)
             "latest": latest
             and {"version": latest.version, "notes": latest.notes, "url": latest.url, "published": latest.published},
         }
@@ -368,12 +446,14 @@ class Updater:
         try:
             async with await self._client() as client:
                 status, said = await self._fetch(client, f"{self.api}/repos/{self.repo}/releases/latest", MAX_ANSWER)
-            if status == 404:
-                self.latest = None  # the repository has no releases yet
-            elif status != 200:
-                raise UpdateError(f"GitHub answered with an error ({status})")
-            else:
-                self.latest = self._release(json.loads(said))
+                if status == 404:
+                    self.latest = None  # the repository has no releases yet
+                elif status != 200:
+                    raise UpdateError(f"GitHub answered with an error ({status})")
+                else:
+                    self.latest = self._release(json.loads(said))
+                    if self.latest is not None and self.available and self.installable and not self.container:
+                        await self._judge(client, self.latest)
         except UpdateError as ex:
             self._failed(ex)
         except (httpx.HTTPError, ValueError, KeyError, TypeError, AttributeError, RecursionError):
@@ -383,6 +463,50 @@ class Updater:
         self.checked_at = time.time()
         self.state = "idle"
 
+    async def _judge(self, client: httpx.AsyncClient, release: Release) -> None:
+        """Whether this copy can take `release` in place: what its installation checks, but for writing it, made when it is
+        found, so that what cannot be installed here is never offered (0.2.0 asked for the password, and only then said
+        that the update needed a newer library). The package is fetched and checked as `install` does, once per release;
+        the requirements are asked at every look (a library upgraded meanwhile counts). Never raises: where it could not
+        be judged, `error` says why and nothing is offered. Within JUDGE_WITHIN: a package that comes slower than that is not
+        judged, and asked for again at the next check (each read has 20 s, and the whole had no end on a slow line)."""
+        self.judged = self.unfit = None
+        try:
+            if self._metadata is None or self._metadata[0] != release:
+                async with asyncio.timeout(JUDGE_WITHIN):
+                    wheel = await self._fetch_verified(client, release)
+                    self._metadata = (release, await asyncio.to_thread(metadata_of, wheel, release.version))
+            _check_requirements(self._metadata[1])
+        except Unfit as ex:
+            self.judged, self.unfit, self.by_pip = release.version, ex.reason, ex.pip
+        except UpdateError as ex:
+            self.error = f"Version {release.version} could not be checked against this copy: {ex}"
+            log.warning("update: %s", self.error)
+        except TimeoutError:
+            self.error = f"Version {release.version} could not be checked against this copy: its package did not come within {JUDGE_WITHIN:g} s (it is asked for again at the next check)"
+            log.warning("update: %s", self.error)
+        except Exception as ex:
+            # (Whatever else the download or the reading of the package raises: the HTTP library's errors and its InvalidURL,
+            # which is none of them; the unpacking's BadZipFile, zlib.error, EOFError, LZMAError and the like.)
+            self.error = f"Version {release.version} could not be checked against this copy: its package could not be fetched or read"
+            log.warning("update: %s (%s)", self.error, type(ex).__name__)
+        else:
+            self.judged = release.version
+
+    async def _fetch_verified(self, client: httpx.AsyncClient, release: Release) -> bytes:
+        """The release's package, checked against its checksum list, and that list against a release key where there is one."""
+        if release.sums_url is None:
+            raise UpdateError("The release has no checksums, so the download cannot be verified")
+        sums = await self._download(client, release.sums_url, 64_000)
+        if self.keys:
+            if release.signature_url is None:
+                raise UpdateError("The release is not signed")
+            verify_signature(sums, await self._download(client, release.signature_url, 4_000), self.keys)
+        wheel = await self._download(client, release.wheel_url, MAX_WHEEL)
+        if hashlib.sha256(wheel).hexdigest() != _checksum_for(sums, release.wheel_name):
+            raise UpdateError("The download does not match its checksum")
+        return wheel
+
     def _begin(self, state: str) -> None:
         if self._running:
             raise UpdateError("An update check or installation is already under way")
@@ -390,7 +514,8 @@ class Updater:
         self.state, self.error = state, None
 
     def _failed(self, error: UpdateError) -> None:
-        self.state, self.error = "failed", str(error)
+        # (What stands in the way of a release this copy cannot take is said by `unfit`, with how to install it instead: once.)
+        self.state, self.error = "failed", None if isinstance(error, Unfit) else str(error)
         log.warning("update: %s", error)
         raise error
 
@@ -451,17 +576,8 @@ class Updater:
                     "does not install one by itself. Install the new version by hand, or start qKVM with "
                     "--allow-unsigned-updates."
                 )
-            if release.sums_url is None:
-                raise UpdateError("The release has no checksums, so the download cannot be verified")
             async with await self._client() as client:
-                sums = await self._download(client, release.sums_url, 64_000)
-                if self.keys:
-                    if release.signature_url is None:
-                        raise UpdateError("The release is not signed")
-                    verify_signature(sums, await self._download(client, release.signature_url, 4_000), self.keys)
-                wheel = await self._download(client, release.wheel_url, MAX_WHEEL)
-            if hashlib.sha256(wheel).hexdigest() != _checksum_for(sums, release.wheel_name):
-                raise UpdateError("The download does not match its checksum")
+                wheel = await self._fetch_verified(client, release)
             if still is not None and not still():
                 raise NoLongerAllowed("It was not installed: whoever asked for it may no longer do that")
             await asyncio.to_thread(self._activate, release.version, wheel)
@@ -469,6 +585,8 @@ class Updater:
             self.state = "idle"  # (nothing was written, and nothing failed)
             raise
         except UpdateError as ex:
+            if isinstance(ex, Unfit):  # (what the page says from now on: not offered, and how to install it instead)
+                self.judged, self.unfit, self.by_pip = release.version, ex.reason, ex.pip
             self._failed(ex)
         except httpx.HTTPError:
             self._failed(UpdateError("The download was interrupted"))

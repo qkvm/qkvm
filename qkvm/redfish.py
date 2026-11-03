@@ -1040,6 +1040,7 @@ class RedfishDevice(Device):
         self._lines = _Lines(self)  # (what carries its session's token, where the certificate does not bind a connection: see `_request`)
         self._token: str | None = None
         self._session: str | None = None  # where to sign out again
+        self._giving_back: str | None = None  # the session close() gives back, once it is put aside (see `_compare_on`)
         self._login_lock = asyncio.Lock()
         self._login_error: KvmError | None = None
         self._login_retry_at = 0.0
@@ -1137,6 +1138,8 @@ class RedfishDevice(Device):
         await stopped([self._status_task, *self._flights])
         self._lines.abort_busy()  # (and what is under way on its own lines, as on the HTTP library's: see `_send`)
         token, session, client = self._token, self._session, self._client
+        if not already:  # (a second close() finds none, and the first one's web page sign-out may be comparing still)
+            self._giving_back = token  # (what the web page's sign-out, under way beside this, compares under: see `_compare_on`)
         self._token = self._session = None
         goodbyes: list[Any] = []
         if self._leaving:
@@ -1842,7 +1845,10 @@ class RedfishDevice(Device):
         elif server and not signing_in:
             # (The computer is asked under the session: where the controller says no number, nothing else tells. Where it is
             # is read on this very line where it is not known yet: through `_request` it would wait for this line to be made.)
-            token = token or self._token or await self._login()
+            # A sign-out of the console's web page that makes its line as the tile retires (`_leave_its_web_page`, under way
+            # beside close()) compares under the session being given back: the tile's own is put aside by then, and a retired
+            # tile signs in no more. (As `_give_back` does: 0.2.1's sign-out fix.)
+            token = token or self._token or self._giving_back or await self._login()
             place = self._places.get("system") or await self._system_on(line, token, read)
             answer = await self._on_the_line(line, "GET", place, {"Accept": "application/json", "X-Auth-Token": token}, within=read, again=False)
             try:

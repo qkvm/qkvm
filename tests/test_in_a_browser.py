@@ -396,6 +396,101 @@ def test_a_tile_is_enlarged_and_left_again_by_the_keyboard(tmp_path: Path, brows
             expect(page.locator("#focus")).to_be_hidden()
 
 
+ICONS_OF = """(row) => [...row.querySelectorAll(':scope > button, :scope > a.btn')].filter(e => e.getClientRects().length).map(e => {
+  const shown = [...e.querySelectorAll('svg.icon')].filter(svg => svg.getClientRects().length);
+  const box = shown[0]?.getBoundingClientRect();
+  return [e.id, shown.length, box ? [Math.round(box.width), Math.round(box.height)] : null];
+})"""
+
+
+def test_every_button_at_the_top_right_of_the_enlarged_view_has_its_icon_fullscreen_too(tmp_path: Path, browser: Browser, fakes: list[FakeKvm]) -> None:
+    # The office wall, 2026-11-02: Fullscreen was the one button there without an icon. Each has one, of the same set and
+    # size as its neighbours; Fullscreen's says which way it goes, as the wall's own button does.
+    with a_wall(tmp_path, ("Build server", fakes[0]), open_url="http://localhost:1/") as (live, _), looking(browser, live, viewport={"width": 1485, "height": 1000}) as page:
+        sign_in(page, live)
+        tile(page, "Build server").click()
+        expect(page.locator("#focus")).to_be_visible()
+        expect(page.locator("#focus-control")).to_be_visible()
+        page.wait_for_function("() => consoleOverflowFrame === 0")
+        expect(page.locator("#focus-more")).to_be_hidden()  # (all of them in the row, at this width)
+        found = page.locator(".focus-tools").evaluate(ICONS_OF)
+        assert {ident for ident, _, _ in found} >= {"focus-prev", "focus-next", "focus-control", "focus-actions", "focus-open", "focus-fullscreen", "focus-close"}, found
+        assert [(ident, count) for ident, count, _ in found if count != 1] == [], found
+        assert len({tuple(size) for _, _, size in found}) == 1, found
+        assert page.locator("#focus-fullscreen svg.icon").evaluate_all("icons => icons.filter(i => i.getClientRects().length).map(i => i.classList.contains('i-enter'))") == [True]
+        # In fullscreen it shows the way back out.
+        page.locator("#focus-fullscreen").click()
+        page.wait_for_function("() => document.fullscreenElement !== null")
+        assert page.locator("#focus-fullscreen svg.icon").evaluate_all("icons => icons.filter(i => i.getClientRects().length).map(i => i.classList.contains('i-exit'))") == [True]
+        page.locator("#focus-fullscreen").click()
+        page.wait_for_function("() => document.fullscreenElement === null")
+
+
+BUTTONS_OF = """(row) => [...row.querySelectorAll('button')].filter(e => e.getClientRects().length).map(e => {
+  const shown = [...e.querySelectorAll('svg.icon')].filter(svg => svg.getClientRects().length);
+  const box = shown[0]?.getBoundingClientRect();
+  return [e.textContent.trim(), shown.length, box ? [Math.round(box.width), Math.round(box.height)] : null];
+})"""
+
+
+def each_with_its_icon(row: Locator) -> list[str]:
+    """Every button shown in `row` has one icon, all of them of one size: what they are called."""
+    found = row.evaluate(BUTTONS_OF)
+    assert found and [(name, count) for name, count, _ in found if count != 1] == [], found
+    assert len({tuple(size) for _, _, size in found}) == 1, found
+    return [name for name, _, _ in found]
+
+
+def test_every_button_in_the_row_of_keys_and_beside_every_copy_has_its_icon(tmp_path: Path, browser: Browser, fakes: list[FakeKvm]) -> None:
+    # The owner's rule: every button in a row of buttons has its icon. Under Control, Keyboard had one and the seven beside it
+    # none; Copy had none beside a recovery key, the one-time codes (nor "I have kept them") or a token. Each has its own
+    # now, of the set and size of its neighbours'.
+    with LiveWall(tmp_path / "first") as live, looking(browser, live) as page:
+        page.goto(live.url)
+        both = page.locator("#auth-card input[type=password]")
+        both.nth(0).fill(PASSWORD)
+        both.nth(1).fill(PASSWORD)
+        page.get_by_role("button", name="Continue").click()
+        expect(page.get_by_role("heading", name="Keep your recovery key")).to_be_visible()
+        assert each_with_its_icon(page.get_by_role("button", name="Copy").locator("xpath=..")) == ["Copy", "Save as a file"]
+
+    with a_wall(tmp_path / "wall", ("Build server", fakes[0])) as (live, _), looking(browser, live, viewport={"width": 1700, "height": 1000}) as page:
+        sign_in(page, live)
+        tile(page, "Build server").click()
+        page.locator("#focus-control").click()
+        expect(page.locator("#focus-keys")).to_be_visible()
+        page.wait_for_function("() => consoleOverflowFrame === 0")
+        expect(page.locator("#focus-keys-more")).to_be_hidden()  # (all of them in the row, at this width)
+        assert each_with_its_icon(page.locator("#focus-keys")) == ["Keyboard", "Ctrl+Alt+Del", "Win", "Alt+Tab", "Alt+F4", "PrtSc", "Type text...", "Relative mouse"]
+        page.keyboard.press("ControlRight")
+        expect(page.locator("#focus-keys")).to_be_hidden()
+        page.keyboard.press("Escape")
+        expect(page.locator("#focus")).to_be_hidden()
+
+        pane = settings(page, "tokens")
+        pane.get_by_role("button", name="Token for a script").click()
+        form = top(page)
+        form.locator('input[placeholder^="Nightly"]').fill("A script that looks")
+        form.get_by_role("button", name="Make the token").click()
+        expect(form.get_by_label("Token", exact=True)).to_be_visible()
+        assert each_with_its_icon(form.get_by_role("button", name="Copy").locator("xpath=..")) == ["Copy"]
+        form.get_by_role("button", name="I have it").click()
+        page.keyboard.press("Escape")
+        expect(page.locator("dialog[open]")).to_have_count(0)
+
+        page.locator("#me-toggle").click()
+        page.locator("#my-security").click()
+        top(page).locator("[role=tabpanel]").get_by_role("button", name="Add a second step").click()
+        form = top(page)
+        form.locator("input[type=password]").fill(PASSWORD)
+        form.get_by_role("button", name="Continue").click()
+        expect(form.locator("svg.qr")).to_be_visible()
+        form.get_by_label("Code", exact=True).fill(code_for(form.locator("input.mono").input_value()))
+        form.get_by_role("button", name="Turn on").click()
+        expect(form.locator("pre.codes")).to_be_visible()
+        assert each_with_its_icon(form.get_by_role("button", name="Copy").locator("xpath=..")) == ["Copy", "Save as a file", "I have kept them"]
+
+
 def test_a_kvm_is_added_from_the_wall(tmp_path: Path, browser: Browser, fakes: list[FakeKvm]) -> None:
     with a_wall(tmp_path) as (live, _), looking(browser, live) as page:
         sign_in(page, live)
@@ -486,6 +581,104 @@ def test_an_update_installed_and_waiting_for_a_restart_is_said_under_a_starter_t
         else:
             expect(pane.locator("div.note")).to_have_text(["Version 9.9.9 is installed. Restart qKVM to start using it."])
         expect(pane).not_to_contain_text("You have the newest version")
+
+
+def test_an_update_this_copy_cannot_take_in_place_is_not_offered_and_the_command_that_installs_it_is_shown(tmp_path: Path, browser: Browser) -> None:
+    # 0.2.0 offered "Install 0.2.1" and asked for the password before it said that the update needs a newer library than
+    # this copy has (the office wall, 2026-11-02). That is known now when the update is found: no Install button and no
+    # password box, but what stands in the way and the command that installs it for this copy, with a button that copies it.
+    command = "/opt/qkvm/bin/python -m pip install --upgrade qkvm"
+    with a_wall(tmp_path) as (live, admin), looking(browser, live, permissions=["clipboard-read", "clipboard-write"]) as page:
+        newer = {
+            **admin.get("/api/v1/update").json(), "repo": "owner/wall", "checked_ago": 5, "available": True, "installable": True,
+            "signed": True, "latest": {"version": "9.9.9", "notes": "", "url": "", "published": ""}, "command": command,
+        }  # fmt: skip
+        shown = {"status": {**newer, "in_place": False, "unfit": "This version needs 'websockets>=17.4'; installed is 17.3."}}
+        page.route("**/api/v1/update", lambda route: route.fulfill(json=shown["status"]) if route.request.method == "GET" else route.continue_())
+        sign_in(page, live)
+        pane = settings(page, "updates")
+
+        def again() -> None:
+            top(page).locator('[role=tab][data-tab="about"]').click()
+            top(page).locator('[role=tab][data-tab="updates"]').click()
+            expect(pane.locator("p.loading")).to_have_count(0)
+
+        note = pane.locator("div.note")
+        expect(note).to_have_count(1)
+        expect(note).to_contain_text(
+            "Version 9.9.9 cannot be installed from here. This version needs 'websockets>=17.4'; installed is 17.3. "
+            "Install it with pip on the computer qKVM runs on, then restart qKVM:"
+        )
+        expect(note.locator("input")).to_have_value(command)
+        expect(pane.get_by_role("button", name=re.compile("Install"))).to_have_count(0)
+        expect(page.locator("dialog[open] input[type=password]")).to_have_count(0)
+        copy = note.get_by_role("button", name="Copy")
+        expect(copy.locator("svg.icon")).to_have_count(1)  # (every button in a row of them has its icon)
+        copy.click()
+        told(page, "Copied")
+        assert page.evaluate("navigator.clipboard.readText()") == command
+
+        # One that needs another Python (0.2.2's review): pip, run by this copy's, would keep the version there is. Which
+        # Python it needs is said, and no command.
+        shown["status"] = {**newer, "in_place": False, "unfit": "This version needs Python >=3.99; this copy runs 3.11.9.", "command": None}
+        again()
+        expect(note).to_have_text("Version 9.9.9 cannot be installed from here. This version needs Python >=3.99; this copy runs 3.11.9.")
+        expect(note.locator("input")).to_have_count(0)
+        expect(pane.get_by_role("button", name=re.compile("Install|Copy"))).to_have_count(0)
+
+        # A container is updated by its image: the lines that do it, each with its own button.
+        shown["status"] = {**newer, "container": True, "in_place": None, "unfit": None}
+        again()
+        expect(note.locator("input")).to_have_count(2)
+        assert note.locator("input").evaluate_all("boxes => boxes.map(box => box.value)") == ["docker compose pull && docker compose up -d", "docker pull qkvm/qkvm"]
+        expect(note.get_by_role("button", name="Copy").locator("svg.icon")).to_have_count(2)
+        expect(pane.get_by_role("button", name=re.compile("Install"))).to_have_count(0)
+
+        # One that could not be judged is not offered either, and the page says why.
+        shown["status"] = {**newer, "in_place": None, "unfit": None, "error": "Version 9.9.9 could not be checked against this copy: The release is not signed"}
+        again()
+        expect(pane.locator("div.note.bad")).to_have_text("Version 9.9.9 could not be checked against this copy: The release is not signed")
+        expect(pane.get_by_role("button", name=re.compile("Install"))).to_have_count(0)
+
+        # Where it can be taken in place, it is offered as before.
+        shown["status"] = {**newer, "in_place": True, "unfit": None}
+        again()
+        expect(pane.locator("div.note")).to_have_count(0)
+        pane.get_by_role("button", name="Install 9.9.9").click()
+        expect(top(page).locator("input[type=password]")).to_be_visible()
+
+
+def test_an_install_refused_on_requirements_closes_its_box_and_the_view_says_why_once(tmp_path: Path, browser: Browser) -> None:
+    # (0.2.2's review.) A library changed between the look and the installation, and the installation was refused on the
+    # requirements: the box said why, and the view behind it still offered the install until the tab was opened again (and
+    # then said the reason twice). The box closes, and the view says it once: what stands in the way, and the command.
+    command = "/opt/qkvm/bin/python -m pip install --upgrade qkvm"
+    reason = "This version needs 'websockets>=17.4'; installed is 17.3."
+    with a_wall(tmp_path) as (live, admin), looking(browser, live) as page:
+        newer = {
+            **admin.get("/api/v1/update").json(), "repo": "owner/wall", "checked_ago": 5, "available": True, "installable": True,
+            "signed": True, "latest": {"version": "9.9.9", "notes": "", "url": "", "published": ""}, "command": command,
+        }  # fmt: skip
+        shown = {"status": {**newer, "in_place": True, "unfit": None}}
+
+        def refused(route: Any) -> None:
+            shown["status"] = {**newer, "state": "failed", "in_place": False, "unfit": reason, "error": None}  # (as the wall has it now)
+            route.fulfill(status=502, json={"code": "unfit", "message": f"{reason} Install the new version with pip instead: {command}"})
+
+        page.route("**/api/v1/update", lambda route: route.fulfill(json=shown["status"]) if route.request.method == "GET" else route.continue_())
+        page.route("**/api/v1/update/install", refused)
+        sign_in(page, live)
+        pane = settings(page, "updates")
+        pane.get_by_role("button", name="Install 9.9.9").click()
+        top(page).locator("input[type=password]").fill(PASSWORD)
+        top(page).get_by_role("button", name="Install", exact=True).click()
+        expect(page.locator("dialog[open]")).to_have_count(1)  # (Settings alone)
+        note = pane.locator("div.note")
+        expect(note).to_have_count(1)
+        expect(note).to_contain_text(f"Version 9.9.9 cannot be installed from here. {reason} Install it with pip")
+        expect(note.locator("input")).to_have_value(command)
+        expect(pane.get_by_role("button", name=re.compile("Install"))).to_have_count(0)
+        assert page.locator("body").inner_text().count("installed is 17.3") == 1
 
 
 MADE_OF = """(pane) => {
@@ -1911,6 +2104,44 @@ def test_a_pc_with_intel_amt_says_what_it_is_and_why_its_screen_is_not_shown_and
             top(page).get_by_role("button", name="Switch off", exact=True).click()
             told(page, "Its KVM is off")
             until(page, lambda: pc.state.changes[2:] == [("CIM_KVMRedirectionSAP", "3")], f"the PC was told {pc.state.changes}")
+    finally:
+        pc.stop()
+
+
+def test_a_pcs_kvm_is_switched_on_and_off_in_one_place_under_actions(tmp_path: Path, browser: Browser) -> None:
+    # The office wall, 2026-11-02: "Switch off its KVM" was under Actions, "Switch on its KVM" only on the Health view.
+    # Actions offers whichever applies, with the same question and the same entry in the activity log.
+    pc = FakeAmt(AmtState(kvm="disabled", listener=False)).start()
+    try:
+        with a_wall(tmp_path, ("A PC", pc)) as (live, admin), looking(browser, live) as page:  # type: ignore[arg-type]
+            sign_in(page, live)
+            pc_tile = tile(page, "A PC")
+            expect(pc_tile.locator(".panel-why")).to_contain_text("Its KVM is switched off on its management engine", timeout=40_000)
+            page.get_by_role("button", name="Actions for A PC").click()
+            box = top(page)
+            expect(box.get_by_role("button", name="Switch on its KVM")).to_be_visible()
+            expect(box.get_by_role("button", name="Switch off its KVM")).to_have_count(0)
+            expect(box.get_by_role("button", name="Switch on its KVM").locator("svg.icon")).to_have_count(1)
+            box.get_by_role("button", name="Switch on its KVM").click()
+            asked = top(page)
+            expect(asked).to_contain_text("This changes a setting of the PC: its management engine will let whoever has its password see its screen")
+            assert pc.state.changes == []  # (asked first: nothing is changed before the yes)
+            asked.get_by_role("button", name="Switch on", exact=True).click()
+            told(page, "Its KVM is on")
+            until(page, lambda: pc.state.changes == [("CIM_KVMRedirectionSAP", "2"), ("AMT_RedirectionService", "ListenerEnabled=true")], f"the PC was told {pc.state.changes}")
+            expect(page.locator("dialog[open]")).to_have_count(0)
+            expect(pc_tile).to_have_class(re.compile(r"\bhas-frame\b"), timeout=40_000)
+            # Now it is on: the same place offers the way back, and only that.
+            page.get_by_role("button", name="Actions for A PC").click()
+            box = top(page)
+            expect(box.get_by_role("button", name="Switch off its KVM")).to_be_visible()
+            expect(box.get_by_role("button", name="Switch on its KVM")).to_have_count(0)
+            box.get_by_role("button", name="Switch off its KVM").click()
+            top(page).get_by_role("button", name="Switch off", exact=True).click()
+            told(page, "Its KVM is off")
+            until(page, lambda: pc.state.changes[2:] == [("CIM_KVMRedirectionSAP", "3")], f"the PC was told {pc.state.changes}")
+            switched = [(entry["event"], entry.get("on")) for entry in admin.get("/api/v1/audit").json()["entries"] if entry["event"] == "kvm_switched"]
+            assert sorted(switched) == [("kvm_switched", False), ("kvm_switched", True)], switched
     finally:
         pc.stop()
 

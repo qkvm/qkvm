@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import dataclasses
 import logging
+import threading
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -23,7 +24,8 @@ from tests.aspeed_frames import Frame
 from tests.fake_kvm import FakeKvm
 from tests.fake_redfish import BmcState, FakeBmc
 from tests.test_users import account, browser
-from tests.test_wall import add, snap, wait_until, wall
+from tests.test_hardening import LiveWall
+from tests.test_wall import CSRF, add, snap, wait_until, wall
 
 
 @pytest.fixture(autouse=True)
@@ -2353,6 +2355,54 @@ def test_retiring_a_server_whose_console_is_open_on_a_slow_controller_keeps_clos
         bmc.stop()
 
 
+@pytest.mark.parametrize("closes", [1, 2])
+def test_the_web_page_of_a_server_known_by_its_computer_alone_is_signed_out_of_as_its_tile_retires(monkeypatch: pytest.MonkeyPatch, closes: int) -> None:
+    # (Found by 0.2.1's sign-out fix, 223178ab, which made `_give_back` compare so.) A tile retired while its console is open,
+    # no compared line of the tile's waiting (the controller closed them): the web page's sign-out makes a line and compares
+    # it as it is made. A server known by its computer alone (its controller says no number) is compared by reading the
+    # computer under the tile's session; close() had put that session aside already, the compare asked for a sign-in, which a
+    # retired tile refuses, and the web page's session was left on the controller. It is compared under the session being
+    # given back. (And closed twice at once, 0.2.2's review: the second close() found no session, put that aside in its
+    # place, and the first one's sign-out compared under none.)
+    monkeypatch.setattr(redfish, "LOOK_EVERY", 1000.0)
+    bmc = FakeBmc(BmcState(own_console=True, screen=a_screen(), root_uuid=None, keeps_idle=1.0)).start()
+    machine = redfish.own_number({"UUID": bmc.state.uuid})
+
+    async def scene() -> tuple[int, int, int]:
+        device = redfish.RedfishDevice(kvm.DeviceSpec(id="ab12", name="db-01", base_url=bmc.url, username="admin", password="secret", kind="redfish", machine=machine))
+        compare = device._compare_on
+
+        async def on_a_slow_connection(line: Any, signing_in: bool = False, token: str | None = None) -> bool:
+            if device._closed:
+                # (A line takes a moment to be made as the tile retires, as over TLS to a slow board: close() puts the session
+                # aside meanwhile. On this PC the sign-out's line was there before it did, and compared under the tile's own.)
+                await asyncio.sleep(0.3)
+            return await compare(line, signing_in, token)
+
+        device._compare_on = on_a_slow_connection  # type: ignore[method-assign]
+        assert (await device.status())["state"] == "online"
+        for _ in range(200):
+            with contextlib.suppress(kvm.KvmError):
+                await device.snapshot(640)
+                break
+            await asyncio.sleep(0.1)
+        await asyncio.sleep(1.5)  # (the lines that waited are closed by the controller meanwhile)
+        at_close = len(bmc.state.web_sessions)
+        await asyncio.gather(*(device.close() for _ in range(closes)))
+        for _ in range(50):  # (the program goes on: the sign-out with it)
+            if bmc.state.web_signed_out:
+                break
+            await asyncio.sleep(0.1)
+        return at_close, bmc.state.web_signed_out, len(bmc.state.web_sessions)
+
+    try:
+        assert machine and bmc.state.root_uuid is None
+        assert asyncio.run(scene()) == (1, 1, 0)
+        assert bmc.state.signed_out == 1 and bmc.state.tokens == {}  # (and the Redfish session is given back as well)
+    finally:
+        bmc.stop()
+
+
 def test_a_lines_connection_and_its_tls_handshake_each_have_the_connect_time(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     # (The second review's smaller point, 0.2.1.) The HTTP library gives a connection's TCP and its TLS handshake the connect
     # time each (4 s to a controller); a line gave them that time together, and a slow board whose two each take most of it
@@ -2989,3 +3039,64 @@ def test_a_controller_whose_redfish_root_is_slow_is_still_known_for_one_when_it_
         assert asyncio.run(server_module.detect_kind(server.url, True)) == ("redfish", server.url)
     finally:
         server.stop()
+
+
+# --- how often a device is looked at, whoever asks how it is -------------------------------------------------------
+
+
+def test_no_number_of_clients_asking_for_the_status_has_a_device_looked_at_more_often_than_its_pace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # 0.2.1's release: an emulator's log showed a server's controller read about ten times a second while a client asked
+    # the wall for /api/v1/status in a tight loop. That was the tests' own pace (this file's `fast`, which
+    # test_controllers.py takes in: LOOK_EVERY = 0, every question about a server's status has it read again, and
+    # wait_until asks twenty times a second). At a wall's own pace a question is answered from the last look, and starts
+    # one only where that look is older than the device's pace, one at a time: eight clients asking as fast as they can
+    # have each device looked at no more often than that. Counted at the stand-ins, a server's and a KVM's.
+    pace = 1.0
+    monkeypatch.setattr(redfish, "LOOK_EVERY", pace)
+    monkeypatch.setattr(kvm, "STATUS_TTL", pace)
+    bmc, fake = FakeBmc().start(), FakeKvm().start()
+    try:
+        with LiveWall(tmp_path) as live, httpx.Client(base_url=live.url, headers=CSRF, timeout=30) as admin:
+            assert admin.post("/api/v1/setup", json={"password": "correct horse battery"}).status_code == 200
+            server = admin.post("/api/v1/devices", json={"url": bmc.url, "username": "admin", "password": "secret"})
+            board = admin.post("/api/v1/devices", json={"url": fake.url, "password": fake.state.password})
+            assert server.status_code == 201 and board.status_code == 201, (server.text, board.text)
+            ids = [server.json()["device"]["id"], board.json()["device"]["id"]]
+            wait_until(lambda: all(admin.get("/api/v1/status").json()[i]["state"] == "online" for i in ids), "not both online", timeout=15)
+
+            def looks() -> tuple[int, int]:
+                """The looks each stand-in had: the server's computer, and the KVM's video, are read once in each."""
+                system = sum(1 for asked in list(bmc.state.requests) if asked.startswith("GET /redfish/v1/Systems/") and asked.count("/") == 4)
+                return system, sum(1 for asked in list(fake.state.asked) if asked == "GET /api/streamer")
+
+            asked = [0]
+            stop = threading.Event()
+            failed: list[Exception] = []
+
+            def ask() -> None:
+                try:
+                    with httpx.Client(base_url=live.url, headers=CSRF, cookies=admin.cookies, timeout=30) as client:
+                        while not stop.is_set():
+                            said = client.get("/api/v1/status")
+                            assert said.status_code == 200, said.text[:300]
+                            asked[0] += 1
+                except Exception as ex:  # (an assert in a thread of its own fails nothing by itself: said below)
+                    failed.append(ex)
+
+            before, began = looks(), time.monotonic()
+            clients = [threading.Thread(target=ask, daemon=True) for _ in range(8)]
+            for client in clients:
+                client.start()
+            time.sleep(4.0)
+            stop.set()
+            for client in clients:
+                client.join(timeout=30)
+            after, took = looks(), time.monotonic() - began
+            most = int(took / pace) + 2  # (one under way when they began, and one as they ended)
+            assert not failed, failed
+            assert asked[0] > 100, asked  # (they did ask as fast as they could)
+            assert after[0] - before[0] <= most and after[1] - before[1] <= most, (before, after, took, asked)
+            assert after[0] - before[0] >= 2 and after[1] - before[1] >= 2, (before, after)  # (and each was looked at, at its pace)
+    finally:
+        bmc.stop()
+        fake.stop()

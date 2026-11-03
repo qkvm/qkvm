@@ -54,7 +54,7 @@ from .security import (
     sso_name,
 )
 from .store import FINGERBOT_STRENGTHS, KINDS, ROLES, ActionRecord, AuditLog, DeviceRecord, TokenRecord, UserRecord, as_a_line, device_url
-from .update import NoLongerAllowed, UpdateError
+from .update import NoLongerAllowed, Unfit, UpdateError
 from .vault import NoMemory, Vault, VaultLocked, new_recovery_key, tidy_recovery_key
 
 log = logging.getLogger("qkvm")
@@ -1162,8 +1162,20 @@ def create_app(core: Core) -> FastAPI:
         log.info("%s opens this data folder from the next start on", "the key in the data folder" if core.own_key else "the unlock file")
 
     moved_to: tuple[list[str], list[str]] | None = None  # where the names led at the last look, if elsewhere than now
+    release_check: asyncio.Task[None] | None = None  # the release check a round set going (see check_for_updates)
+
+    async def check_for_updates() -> None:
+        """The daily release check: set going by a round, never waited for by one. It downloads the release's package to
+        judge it (update.Updater._judge), on a line that may be slow, and the round is what locks the saved passwords."""
+        try:
+            await core.updater.check()
+        except UpdateError:
+            core.updater.checked_at = time.time()  # try again tomorrow, not every half minute
+        except Exception:  # (said, as when it was a part of the round)
+            log.exception("the release check failed")
 
     async def keep_house() -> None:
+        nonlocal moved_to, release_check
         # (Not while the first account is being made: its key is there before anybody is signed in with it,
         # and taken away in that moment, setup would end signed in to a wall whose saved passwords are shut.)
         if core.vault.unlocked and len(core.sessions) == 0 and not keep_unlocked() and not setting_up.locked():
@@ -1173,12 +1185,8 @@ def create_app(core: Core) -> FastAPI:
         manager.tidy()
         updater = core.updater
         stale = updater.checked_at is None or time.time() - updater.checked_at > UPDATE_CHECK_EVERY
-        if store.server.update_check and updater.repo and stale and updater.state != "ready":
-            try:
-                await updater.check()
-            except UpdateError:
-                updater.checked_at = time.time()  # try again tomorrow, not every half minute
-        nonlocal moved_to
+        if store.server.update_check and updater.repo and stale and updater.state != "ready" and (release_check is None or release_check.done()):
+            release_check = asyncio.create_task(check_for_updates())
         if core.missing or (core.addresses and any(name in ("lan", "tailscale") for name in core.bind)):
             # An address we were asked to serve by name. It may not have been up at start (Tailscale,
             # usually), and it may be another one by now: a new lease from the router, another network.
@@ -1271,6 +1279,8 @@ def create_app(core: Core) -> FastAPI:
         indexed.start()  # (once, as the history: at the first start after an upgrade it is made from the text files there)
         tasks = [asyncio.create_task(job()) for job in (housekeeping, watch, outbox.run, history_looks)]
         yield
+        if release_check is not None:
+            tasks.append(release_check)  # (a release check: nothing of it is owed)
         for task in tasks:
             task.cancel()
         if background:
@@ -3971,7 +3981,8 @@ def create_app(core: Core) -> FastAPI:
                 # Why it failed is for whoever may still ask (the activity log has it): to one who lost the right while it
                 # was under way, it is said as above. (Left open by W4's agent.)
                 return fail(403, "stopped", "It was not installed: whoever asked for it may no longer do that")
-            return fail(502, "update_failed", str(ex))
+            # ("unfit": the release needs what this copy has not, and the Updates view says what and how to install it instead.)
+            return fail(502, "unfit" if isinstance(ex, Unfit) else "update_failed", str(ex))
         if not still_theirs():
             # Lost the right while the package was being written (asked just before; a thread is not stopped half way): it is
             # installed, and takes effect at the next start. qKVM is not restarted for whoever may no longer ask for that, and

@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import dataclasses
 import json
 import os
+import platform
+import re
 import stat
 import subprocess
 import sys
@@ -190,6 +193,188 @@ def test_signed_update_requires_compatible_installed_dependencies(
     installed["uvicorn"] = "0.54.0"
     assert run(update.install()) == "0.2.0"
     assert json.loads((tmp_path / "data" / "updates" / "current.json").read_text())["version"] == "0.2.0"
+
+
+def test_an_update_this_copy_cannot_take_in_place_is_said_when_it_is_found_with_the_command_that_installs_it(
+    github: FakeGitHub, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 0.2.0 offered "Install 0.2.1", asked for the password, and only then said that 0.2.1 needs websockets>=17.4 where
+    # 17.3 is installed (the office wall, 2026-11-02). The check the installation makes is made when the update is found,
+    # on the signed package itself, and what is said then names the command that installs it for this copy.
+    key_file = tmp_path / "signing.key"
+    public = release.keygen(key_file)
+    github.publish("9.9.9", make_wheel("9.9.9", requires=("websockets>=17.4",)), signed_by=key_file.read_text())
+    installed = {"websockets": "17.3"}
+    monkeypatch.setattr(update_module.importlib.metadata, "version", installed.__getitem__)
+    update = updater(github, tmp_path / "data", keys=(public,), allow_unsigned=False)
+    run(update.check())
+    view = update.view()
+    assert view["available"] is True and view["error"] is None
+    assert view["in_place"] is False
+    assert view["unfit"] == "This version needs 'websockets>=17.4'; installed is 17.3."
+    assert view["command"] == update_module.upgrade_command() and view["command"].endswith(" -m pip install --upgrade qkvm")
+    # The installation, asked for all the same (a script), says the same and names the same command.
+    with pytest.raises(UpdateError, match=re.escape(f"installed is 17.3. Install the new version with pip instead: {view['command']}")):
+        run(update.install())
+    # Once the library is upgraded, the next look offers it, and it is installed.
+    installed["websockets"] = "17.4"
+    run(update.check())
+    view = update.view()
+    assert view["in_place"] is True and view["unfit"] is None and view["error"] is None
+    assert run(update.install()) == "9.9.9"
+
+
+def test_an_update_is_judged_on_the_package_it_is_and_once_for_each_release(github: FakeGitHub, tmp_path: Path) -> None:
+    # What the judgment reads is the package that would be installed: checked as the installation checks it. A package
+    # that cannot be checked is offered to nobody (and said why); one that was judged is not fetched again at every look.
+    key_file = tmp_path / "signing.key"
+    public = release.keygen(key_file)
+    github.publish("9.9.9", make_wheel("9.9.9"))  # not signed
+    update = updater(github, tmp_path / "data", keys=(public,), allow_unsigned=False)
+    run(update.check())
+    view = update.view()
+    assert view["available"] is True and view["in_place"] is None
+    assert view["error"] == "Version 9.9.9 could not be checked against this copy: The release is not signed"
+
+    github.publish("9.9.9", make_wheel("9.9.9"), signed_by=key_file.read_text())
+    asked: list[str] = []
+    fetch = Updater._fetch
+
+    async def counted(self: Updater, client: Any, url: str, limit: int) -> tuple[int, bytes]:
+        asked.append(url.rsplit("/", 1)[-1])
+        return await fetch(self, client, url, limit)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(Updater, "_fetch", counted)
+        run(update.check())
+        assert update.view()["in_place"] is True and update.view()["error"] is None
+        assert sorted(asked) == ["SHA256SUMS", "SHA256SUMS.sig", "latest", "qkvm-9.9.9-py3-none-any.whl"]
+        asked.clear()
+        run(update.check())
+        assert asked == ["latest"] and update.view()["in_place"] is True
+
+    # A copy without a release key installs nothing by itself, and a container is replaced as a whole: neither fetches
+    # a package to judge it.
+    for options, container in (({"keys": (), "allow_unsigned": False}, "0"), ({"keys": (public,), "allow_unsigned": False}, "1")):
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setenv("QKVM_CONTAINER", container)
+            patch.setattr(Updater, "_fetch", counted)
+            asked.clear()
+            other = updater(github, tmp_path / "other", **options)
+            run(other.check())
+            assert asked == ["latest"] and other.view()["available"] is True and other.view()["in_place"] is None
+
+
+def test_an_update_that_needs_another_python_says_which_and_offers_no_pip_command(github: FakeGitHub, tmp_path: Path) -> None:
+    # (0.2.2's review.) pip, run by the Python this copy runs under, keeps the version there is where a release needs another
+    # Python: the page offered that command all the same. What is said is which Python it needs, and no command.
+    metadata = b"Metadata-Version: 2.1\nName: qkvm\nVersion: 9.9.9\nRequires-Python: >=3.99\n"
+    github.publish("9.9.9", make_wheel("9.9.9", extra={"qkvm-9.9.9.dist-info/METADATA": metadata}))
+    update = updater(github, tmp_path / "data")
+    run(update.check())
+    view = update.view()
+    needs = f"This version needs Python >=3.99; this copy runs {platform.python_version()}."
+    assert view["in_place"] is False and view["unfit"] == needs
+    assert view["command"] is None
+    with pytest.raises(UpdateError) as refused:  # (the installation, asked for all the same, says the same)
+        run(update.install())
+    assert str(refused.value) == needs
+
+
+@pytest.mark.parametrize("how", ["an address the HTTP library takes for none", "a package that ends before its end"])
+def test_whatever_stands_in_the_way_of_judging_an_update_the_check_ends_and_nothing_is_offered(
+    github: FakeGitHub, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, how: str
+) -> None:
+    # (0.2.2's review.) The judging "never raises", and an address the HTTP library takes for none (httpx.InvalidURL, none of
+    # its HTTPError) or a package whose packed file ends early (EOFError) got out of it all the same: the check ended in that
+    # exception, and its state stayed "checking". The release is not judged, and the page says why.
+    github.publish("9.9.9", make_wheel("9.9.9"))
+    if how == "an address the HTTP library takes for none":
+        found = Updater._release
+
+        def with_a_stray_character(self: Updater, data: dict[str, Any]) -> Any:
+            release = found(self, data)
+            return release and dataclasses.replace(release, sums_url=f"{release.sums_url}{chr(127)}")
+
+        monkeypatch.setattr(Updater, "_release", with_a_stray_character)
+    else:
+
+        def ends_early(wheel: bytes, version: str) -> str:
+            raise EOFError("Compressed file ended before the end-of-stream marker was reached")
+
+        monkeypatch.setattr(update_module, "metadata_of", ends_early)
+    update = updater(github, tmp_path / "data")
+    run(update.check())
+    view = update.view()
+    assert view["state"] == "idle" and view["available"] is True and view["in_place"] is None
+    assert view["error"] == "Version 9.9.9 could not be checked against this copy: its package could not be fetched or read"
+
+
+def test_a_release_whose_package_comes_too_slowly_is_not_judged_and_holds_nothing_up(github: FakeGitHub, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # (0.2.2's review.) The judgment downloads the package, up to 30 MB, with 20 s for each read and no deadline for the
+    # whole: on a slow line the check went on as long as the package dripped in, and meanwhile a check and an installation
+    # were refused as "under way". It has a deadline: run out, the release is not judged (nothing is offered, and the page
+    # says why), and it is asked again at the next check.
+    monkeypatch.setattr(update_module, "JUDGE_WITHIN", 1.0)
+    github.publish("9.9.9", make_wheel("9.9.9", extra={"qkvm/padding.bin": os.urandom(200_000)}))
+    github.drip = 0.5  # a few kilobytes every half second: half a minute for the package
+    update = updater(github, tmp_path / "data")
+    began = time.monotonic()
+    run(asyncio.wait_for(update.check(), 10))
+    took = time.monotonic() - began
+    view = update.view()
+    print(f"\nthe check took {took:.1f} s: state {view['state']}, in place {view['in_place']}, error {view['error']!r}")
+    assert took < 5
+    assert view["state"] == "idle" and view["available"] is True and view["in_place"] is None
+    assert view["error"] == "Version 9.9.9 could not be checked against this copy: its package did not come within 1 s (it is asked for again at the next check)"
+    github.drip = 0.0
+    run(update.check())
+    assert update.view()["in_place"] is True and update.view()["error"] is None
+
+
+def test_the_round_that_locks_up_once_nobody_is_signed_in_never_waits_for_a_release_download(github: FakeGitHub, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # (0.2.2's review.) The housekeeping round asked for the release check and waited for it, the package's download among
+    # it; and that round is what locks the saved passwords once the last sign-in has run out. On a slow line they stayed
+    # open as long as the package dripped in. The check is set going, and the round goes on.
+    monkeypatch.setattr(vault, "SCRYPT_N", 2**12)
+    monkeypatch.setattr("qkvm.server.HOUSEKEEPING_EVERY", 0.05)
+    monkeypatch.setattr("qkvm.security.IDLE_TTL", 2.0)  # (a sign-in runs out after two seconds left alone)
+    github.publish("9.9.9", make_wheel("9.9.9", extra={"qkvm/padding.bin": os.urandom(200_000)}))
+    github.drip = 0.5
+    package = "qkvm-9.9.9-py3-none-any.whl"
+    core = Core(tmp_path, locked_start=True)  # (locked whenever nobody is signed in)
+    core.unlock_at_start()
+    core.updater = updater(github, tmp_path, current=__version__)
+    with TestClient(create_app(core), headers={"X-QKVM": "1"}, client=("127.0.0.1", 50000)) as client:
+        assert client.post("/api/v1/setup", json={"password": PASSWORD}).status_code == 200
+        deadline = time.monotonic() + 10
+        while package not in github.asked:
+            assert time.monotonic() < deadline, "the release check never asked for the package"
+            time.sleep(0.05)
+        assert core.vault.unlocked
+        deadline = time.monotonic() + 2 + 3  # (the sign-in runs out, and a round or few later the saved passwords are locked)
+        while core.vault.unlocked:
+            assert time.monotonic() < deadline, "the saved passwords stayed open while a release's package came in"
+            time.sleep(0.05)
+        assert core.updater.state == "checking"  # (it is still coming in)
+
+
+@pytest.mark.parametrize(
+    ("executable", "windows", "command"),
+    [
+        ("/opt/qkvm/bin/python", False, "/opt/qkvm/bin/python -m pip install --upgrade qkvm"),
+        ("/home/ann lee/qkvm/bin/python3", False, "'/home/ann lee/qkvm/bin/python3' -m pip install --upgrade qkvm"),
+        (r"C:\qkvm\venv\Scripts\python.exe", True, r"C:\qkvm\venv\Scripts\python.exe -m pip install --upgrade qkvm"),
+        # Started without a window: pip is run by the Python beside it, which prints what it does.
+        (r"C:\qkvm\venv\Scripts\pythonw.exe", True, r"C:\qkvm\venv\Scripts\python.exe -m pip install --upgrade qkvm"),
+        # (PowerShell, the shell Windows opens: a quoted path is run with '&', and nothing in single quotes is expanded.)
+        (r"C:\Program Files\Python314\python.exe", True, r"& 'C:\Program Files\Python314\python.exe' -m pip install --upgrade qkvm"),
+        (r"D:\O'Neil\py\python.exe", True, r"& 'D:\O''Neil\py\python.exe' -m pip install --upgrade qkvm"),
+        ("", False, "python -m pip install --upgrade qkvm"),
+    ],
+)
+def test_the_command_that_installs_an_update_with_pip_is_this_copys_own(executable: str, windows: bool, command: str) -> None:
+    assert update_module.upgrade_command(executable, windows=windows) == command
 
 
 def test_deeply_nested_signed_dependency_marker_fails_without_leaving_update_busy(
@@ -409,9 +594,50 @@ def test_a_container_is_updated_by_replacing_its_image(github: FakeGitHub, tmp_p
         assert client.post("/api/v1/setup", json={"password": PASSWORD}).status_code == 200
         status = client.post("/api/v1/update/check").json()
         assert status["available"] is True and status["container"] is True  # it still says what is new
+        assert status["image_commands"] == ["docker compose pull && docker compose up -d", "docker pull qkvm/qkvm"]  # and how to take it
+        assert status["in_place"] is None  # (an image is replaced as a whole: nothing is judged)
         refused = client.post("/api/v1/update/install", json={"password": PASSWORD})
         assert refused.status_code == 409 and refused.json()["code"] == "container"
     assert not (tmp_path / "updates").exists()
+
+
+def test_the_updates_view_says_whether_this_copy_can_take_the_update_in_place(github: FakeGitHub, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(vault, "SCRYPT_N", 2**12)
+    monkeypatch.setattr(update_module.importlib.metadata, "version", {"websockets": "17.3"}.__getitem__)
+    github.publish("9.9.9", make_wheel("9.9.9", requires=("websockets>=17.4",)))
+    core = Core(tmp_path)
+    core.updater = updater(github, tmp_path, current=__version__)
+    with TestClient(create_app(core), headers={"X-QKVM": "1"}, client=("127.0.0.1", 50000)) as client:
+        assert client.post("/api/v1/setup", json={"password": PASSWORD}).status_code == 200
+        checked = client.post("/api/v1/update/check").json()
+        assert checked["available"] is True and checked["in_place"] is False
+        assert checked["unfit"] == "This version needs 'websockets>=17.4'; installed is 17.3."
+        assert checked["command"] == update_module.upgrade_command()
+        assert client.get("/api/v1/update").json()["in_place"] is False  # and so it stays, until the next look
+    assert not (tmp_path / "updates").exists()
+
+
+def test_an_install_refused_on_requirements_is_said_once_and_so_that_the_page_knows(github: FakeGitHub, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # (0.2.2's review.) A library changed between the look and the installation, and the installation was refused on the
+    # requirements. The view said the reason twice: as the error (with the command), and as what stands in the way (with the
+    # command). Said once now, as what stands in the way; and the refusal says what it is, so that the page shows that view.
+    monkeypatch.setattr(vault, "SCRYPT_N", 2**12)
+    installed = {"websockets": "17.4"}
+    monkeypatch.setattr(update_module.importlib.metadata, "version", installed.__getitem__)
+    github.publish("9.9.9", make_wheel("9.9.9", requires=("websockets>=17.4",)))
+    core = Core(tmp_path)
+    core.updater = updater(github, tmp_path, current=__version__)
+    with TestClient(create_app(core), headers={"X-QKVM": "1"}, client=("127.0.0.1", 50000)) as client:
+        assert client.post("/api/v1/setup", json={"password": PASSWORD}).status_code == 200
+        assert client.post("/api/v1/update/check").json()["in_place"] is True
+        installed["websockets"] = "17.3"
+        refused = client.post("/api/v1/update/install", json={"password": PASSWORD})
+        assert refused.status_code == 502 and refused.json()["code"] == "unfit", refused.text
+        assert refused.json()["message"].startswith("This version needs 'websockets>=17.4'; installed is 17.3. Install the new version with pip instead: ")
+        view = client.get("/api/v1/update").json()
+        assert view["in_place"] is False and view["unfit"] == "This version needs 'websockets>=17.4'; installed is 17.3."
+        assert view["error"] is None
+    assert not (tmp_path / "updates" / "current.json").exists() and not (tmp_path / "updates" / "9.9.9").exists()
 
 
 def test_page_carries_the_server_version(tmp_path: Path) -> None:

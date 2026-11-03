@@ -620,6 +620,46 @@ def test_a_click_lands_where_it_was_made_on_a_letterboxed_picture(tmp_path: Path
         stand_in.__exit__()
 
 
+def test_the_row_of_keys_takes_its_own_place_and_the_whole_picture_is_seen_below_it(tmp_path: Path, browser: Browser, fakes: list[FakeKvm]) -> None:  # noqa: F811
+    # The office wall, 2026-11-02: Control brought the row of keys (Keyboard, Ctrl+Alt+Del, Win, ... Relative mouse) over
+    # the picture, and the top of the machine's screen lay under it. A picture of 16:9 in a view of 16:9 fills the box from
+    # its top edge to its bottom one: under a row laid over the box, its top was hidden, and a click there pressed the row.
+    film = h264_film(320, 180)
+    stand_in, _ = a_live_wall(tmp_path, fakes, pictures=film, codec="h264", width=320, height=180, pace=10)
+    try:
+        with looking(browser, stand_in, viewport={"width": 1280, "height": 720}) as page:
+            sign_in(page, stand_in)
+            enlarged(page, "Machine 1")
+            page.wait_for_function("() => Number(document.querySelector('#focus-live').dataset.drawn) >= 2")
+            whole = picture_box(page)
+            line = take_control(page, stand_in)
+            row = page.locator("#focus-keys").bounding_box()
+            foot = page.locator("#focus-statusbar").bounding_box()
+            assert row and foot and row["height"] > 20
+            box = picture_box(page)  # (once drawn again to the size it has now)
+            top, bottom = box["top"] + box["y"], box["top"] + box["y"] + box["h"]
+            assert top >= row["y"] + row["height"] - 0.5, (box, row)  # the picture's top edge is below the row
+            assert bottom <= foot["y"] + 0.5, (box, foot)
+            # It is the whole picture, fitted to the room that is left: as tall as that room, and as wide as its shape says.
+            assert abs(box["h"] - (whole["h"] - row["height"])) <= 1.5 and abs(box["w"] / box["h"] - 16 / 9) < 0.02, (whole, box)
+            # Nothing lies over any part of it.
+            for fx, fy in ((0.005, 0.005), (0.5, 0.005), (0.995, 0.005), (0.005, 0.995), (0.995, 0.995), (0.5, 0.5)):
+                x, y = box["left"] + box["x"] + box["w"] * fx, box["top"] + box["y"] + box["h"] * fy
+                assert page.evaluate("([x, y]) => document.elementFromPoint(x, y)?.id", [x, y]) == "focus-canvas", (fx, fy)
+            # And a click near its top edge (where the row lay) lands there on the machine.
+            page.mouse.click(box["left"] + box["x"] + box["w"] * 0.5, box["top"] + box["y"] + box["h"] * 0.02)
+            until(page, lambda: len(line.said("mb")) >= 2, f"the click did not arrive: {line.words}")
+            at = next(number for number, word in enumerate(line.words) if word.get("t") == "mb")
+            place = (line.words[at - 1]["x"], line.words[at - 1]["y"])
+            assert abs(place[0] - FARTHEST * 0.5) <= 120 and abs(place[1] - FARTHEST * 0.02) <= 120, line.places()
+            # Given back, the row goes and the picture has its room again.
+            page.keyboard.press("ControlRight")
+            expect(page.locator("#focus-keys")).to_be_hidden()
+            assert picture_box(page) == whole
+    finally:
+        stand_in.__exit__()
+
+
 def test_what_is_down_is_let_go_when_the_page_loses_the_keyboard(tmp_path: Path, browser: Browser, fakes: list[FakeKvm]) -> None:  # noqa: F811
     film = h264_film()
     stand_in, _ = a_live_wall(tmp_path, fakes, pictures=film, codec="h264", width=320, height=240, pace=10)

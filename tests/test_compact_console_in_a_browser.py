@@ -81,7 +81,11 @@ def test_compact_controls_and_video_fit(tmp_path: Path, browser: Browser, width:
                 reveal_control(page, "focus-" + ident)
             box = page.locator("#focus-keys").bounding_box()
             assert box and box["x"] >= 0 and box["x"] + box["width"] <= width
-            assert page.locator("#focus-screen").bounding_box() == before
+            # The row takes its own place under the bar, and the picture the room that is left (until 0.2.2 it lay over
+            # the picture's top: the office wall, 2026-11-02).
+            screen = page.locator("#focus-screen").bounding_box()
+            assert screen and abs(screen["y"] - (box["y"] + box["height"])) <= 1 and abs(screen["height"] - (before["height"] - box["height"])) <= 1
+            assert (screen["x"], screen["width"]) == (before["x"], before["width"])
             assert page.locator("#focus-bar").bounding_box() == header_before
             expect(page.locator("#focus-control")).to_have_text("Control")
             expect(page.locator("#focus-tools-toggle")).to_have_count(0)

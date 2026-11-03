@@ -82,6 +82,10 @@ const ICONS = {
   enter: [['path', { d: 'M9 10l-5 5 5 5M20 4v7a4 4 0 0 1-4 4H4' }]],
   star: [['path', { d: 'M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z' }]],
   download: [['path', { d: 'M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3' }]],
+  copy: [['rect', { x: 9, y: 9, width: 13, height: 13, rx: 2 }], ['path', { d: 'M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1' }]],
+  repeat: [['path', { d: 'M17 1l4 4-4 4M3 11V9a4 4 0 0 1 4-4h14M7 23l-4-4 4-4M21 13v2a4 4 0 0 1-4 4H3' }]],
+  camera: [['path', { d: 'M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z' }], ['circle', { cx: 12, cy: 13, r: 4 }]],
+  pointer: [['path', { d: 'M3 3l7.07 16.97 2.51-7.39 7.39-2.51L3 3zM13 13l6 6' }]],
   upload: [['path', { d: 'M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12' }]],
   archive: [['path', { d: 'M21 8v13H3V8M1 3h22v5H1zM10 12h4' }]],
   chevronLeft: [['path', { d: 'M15 18l-6-6 6-6' }]],
@@ -1875,8 +1879,12 @@ function actionsDialog(target) {
           certProblem && h('button', {
             type: 'button', class: 'danger admin-only', onclick: () => certificateDialog(device, () => { close(); reloadWall(); }),
           }, icon('shield'), h('span', {}, 'Review certificate')),
-          // A PC with Intel AMT whose KVM is on (switched on from its tile, or elsewhere): an admin's way back, as plainly.
-          device.kind === 'amt' && status?.server?.amt?.kvm === 'enabled' && h('button', {
+          // A PC with Intel AMT: its KVM switched on where it is off, and off where it is on, in this one place (the Health
+          // view's button switches it on as well). An admin's, asked first either way.
+          device.kind === 'amt' && amtKvmOff(status?.server?.amt) && h('button', {
+            type: 'button', class: 'admin-only', onclick: async () => { if (await switchKvmOn(device.id)) close(); },
+          }, icon('power'), h('span', {}, 'Switch on its KVM')),
+          device.kind === 'amt' && status?.server?.amt?.kvm === 'enabled' && !amtKvmOff(status.server.amt) && h('button', {
             type: 'button', class: 'admin-only', onclick: () => switchKvmOff(device, close),
           }, icon('power'), h('span', {}, 'Switch off its KVM'))));
       if (canDo(single, 'wol')) api('GET', `api/v1/devices/${device.id}/wol`).then(({ targets }) => {
@@ -1982,7 +1990,7 @@ function recoveryKeyView(key) {
     type: 'text', readOnly: true, value: key, class: 'mono', spellcheck: false, 'aria-label': 'Recovery key',
     onfocus: event => event.target.select(),
   });
-  const copy = h('button', { type: 'button' }, 'Copy');
+  const copy = h('button', { type: 'button' }, icon('copy'), 'Copy');
   copy.addEventListener('click', async () => {
     try {
       await navigator.clipboard.writeText(key);
@@ -2207,7 +2215,7 @@ function twoFactorSetup(onDone) {
 // The codes that each stand in once for the phone. Shown when they are made, and never again.
 function oneTimeCodes(codes, done) {
   const text = codes.join('\n');
-  const copy = h('button', { type: 'button' }, 'Copy');
+  const copy = h('button', { type: 'button' }, icon('copy'), 'Copy');
   copy.addEventListener('click', async () => {
     try {
       await navigator.clipboard.writeText(text);
@@ -2231,7 +2239,7 @@ function oneTimeCodes(codes, done) {
     h('p', {}, h('strong', {}, 'Keep these where the phone is not. '),
       'Each one signs you in once, in place of a code from the app: for a phone that is lost, broken or at home. They are not shown again.'),
     h('pre', { class: 'codes mono', tabIndex: 0 }, text),
-    h('div', { class: 'actions' }, copy, save, h('button', { type: 'button', class: 'primary', onclick: done }, 'I have kept them')));
+    h('div', { class: 'actions' }, copy, save, h('button', { type: 'button', class: 'primary', onclick: done }, icon('check'), 'I have kept them')));
 }
 
 function newOneTimeCodes(onDone) {
@@ -2285,7 +2293,7 @@ function shownOnce(value, label) {
   const box = h('input', {
     type: 'text', readOnly: true, value, class: 'mono', spellcheck: false, 'aria-label': label, onfocus: event => event.target.select(),
   });
-  const copy = h('button', { type: 'button' }, 'Copy');
+  const copy = h('button', { type: 'button' }, icon('copy'), 'Copy');
   copy.addEventListener('click', async () => {
     try {
       await navigator.clipboard.writeText(value);
@@ -3368,6 +3376,11 @@ function installUpdateDialog(status, onDone) {
             // "took too long" while the new version is installed and started under it all the same.
             result = await api('POST', 'api/v1/update/install', { password: input.value }, ACTION_PATIENCE);
           } catch (ex) {
+            if (ex.code === 'unfit') {  // (what stands in the way, and how to install it instead, the view says: once)
+              close();
+              onDone();
+              return;
+            }
             error.textContent = ex.message;
             error.hidden = false;
             return;
@@ -3393,6 +3406,26 @@ function installUpdateDialog(status, onDone) {
       h('div', { class: 'actions' }, h('button', { type: 'button', onclick: close }, 'Cancel'), install)));
     input.focus();
   });
+}
+
+// A command to be typed on the computer qKVM runs on, as it is, with a button that copies it.
+function commandLine(command) {
+  const box = h('input', {
+    type: 'text', readOnly: true, value: command, class: 'mono', spellcheck: false, 'aria-label': 'Command',
+    onfocus: event => event.target.select(),
+  });
+  const copy = h('button', { type: 'button' }, icon('copy'), 'Copy');
+  copy.addEventListener('click', async () => {
+    try {
+      await navigator.clipboard.writeText(command);
+      toast('Copied', 'ok');
+    } catch {  // no clipboard access on a plain http address
+      box.focus();
+      box.select();
+      toast('Press Ctrl+C to copy it', 'info');
+    }
+  });
+  return h('div', { class: 'once command' }, box, copy);
 }
 
 async function updatesTab(refresh, does) {
@@ -3440,7 +3473,9 @@ async function updatesTab(refresh, does) {
     state = `You have the newest version. Checked ${ago(status.checked_ago)}.`;
   }
   does.append(checkNow);
-  if (status.available && !status.container && status.installable) {
+  // Offered only where the wall found, when it found the update, that this copy can take it in place: never a password
+  // asked for first and then "needs a newer library" (0.2.0 did that).
+  if (status.available && !status.container && status.installable && status.in_place === true) {
     does.append(h('button', { type: 'button', class: 'primary', onclick: () => installUpdateDialog(status, refresh) },
       icon('download'), `Install ${latest.version}`));
   }
@@ -3448,12 +3483,18 @@ async function updatesTab(refresh, does) {
   return [
     notice,
     status.error && h('div', { class: 'note bad' }, status.error),
-    status.available && status.container && h('div', { class: 'note' },
-      'This copy runs in a container. To update it, get the new image and start the container from it:',
-      h('code', {}, 'docker compose pull && docker compose up -d')),
+    status.available && status.container && status.image_commands?.length === 2 && h('div', { class: 'note' },
+      'This copy runs in a container. To update it, get the new image and start the container from it. With compose:',
+      commandLine(status.image_commands[0]),
+      'Without compose, pull the image, then remove the container and run it again as before:',
+      commandLine(status.image_commands[1])),
     status.available && !status.container && !status.installable && h('div', { class: 'note' },
       'This copy has no release key built in, so it cannot tell who published an update and does not install one by itself. ',
       'Install the new version by hand, or start qKVM with ', h('code', {}, '--allow-unsigned-updates'), '.'),
+    status.available && !status.container && status.installable && status.in_place === false && h('div', { class: 'note' },
+      `Version ${latest.version} cannot be installed from here. ${status.unfit}`,
+      // (No command where it needs another Python: pip, run by this one, keeps the version there is.)
+      status.command && [' Install it with pip on the computer qKVM runs on, then restart qKVM:', commandLine(status.command)]),
     block(null,
       setting('This copy', state || 'The version that is running.', h('span', { class: 'value' }, `qKVM ${status.current}`)),
       status.available && setting(`Version ${latest.version}`,
@@ -4245,29 +4286,41 @@ function fillPanel(panel, status, full = false, id = null) {
 // on from here. It is a setting of the PC's, kept by its engine, and it is said so before anything is changed.
 function kvmSwitch(status, id) {
   const amt = status.server?.amt;
-  if (!amt || !id || !can('admin') || !(amt.kvm === 'disabled' || (amt.kvm === 'enabled' && amt.listener === false))) return null;
+  if (!id || !can('admin') || !amtKvmOff(amt)) return null;
   const button = h('button', {
     type: 'button',
-    onclick: async () => {
-      const yes = await confirmBox({
-        title: 'Switch on its KVM',
-        message: 'This changes a setting of the PC: its management engine will let whoever has its password see its screen and use its keyboard and mouse, from the network. Its redirection listener is switched on with it, which the engine\'s serial console and remote storage use as well. The KVM stays on until it is switched off again: under Actions here (the listener is then left on), or in the PC\'s MEBx. Intel AMT draws a red and yellow border on the PC\'s own screen while somebody looks.',
-        action: 'Switch on',
-        danger: false,
-      });
-      if (!yes) return;
-      button.disabled = true;
-      try {
-        await api('POST', `api/v1/devices/${encodeURIComponent(id)}/kvm`, { on: true });
-        toast('Its KVM is on. Its screen comes with the next look.', 'ok');
-        lookAgainSoon();
-      } catch (ex) {
-        toast(ex.message, 'error');
-        button.disabled = false;
-      }
-    },
+    onclick: () => switchKvmOn(id, busy => { button.disabled = busy; }),
   }, 'Switch on its KVM');
   return h('div', { class: 'panel-actions' }, button);
+}
+
+// Whether a PC's KVM is switched off on its engine, as its tile says it (its redirection listener off counts: no screen
+// comes either), and so to be switched on.
+function amtKvmOff(amt) {
+  return Boolean(amt) && (amt.kvm === 'disabled' || (amt.kvm === 'enabled' && amt.listener === false));
+}
+
+// Switching it on, from the Health view or under Actions: asked first, and said how it went. True where it was done.
+// `busy`: told true while it is being done, and false again where it failed.
+async function switchKvmOn(id, busy) {
+  const yes = await confirmBox({
+    title: 'Switch on its KVM',
+    message: 'This changes a setting of the PC: its management engine will let whoever has its password see its screen and use its keyboard and mouse, from the network. Its redirection listener is switched on with it, which the engine\'s serial console and remote storage use as well. The KVM stays on until it is switched off again: under Actions here (the listener is then left on), or in the PC\'s MEBx. Intel AMT draws a red and yellow border on the PC\'s own screen while somebody looks.',
+    action: 'Switch on',
+    danger: false,
+  });
+  if (!yes) return false;
+  busy?.(true);
+  try {
+    await api('POST', `api/v1/devices/${encodeURIComponent(id)}/kvm`, { on: true });
+    toast('Its KVM is on. Its screen comes with the next look.', 'ok');
+    lookAgainSoon();
+    return true;
+  } catch (ex) {
+    toast(ex.message, 'error');
+    busy?.(false);
+    return false;
+  }
 }
 
 // "Start into BIOS setup" for a PC with Intel AMT or a server over Redfish: the machine is told to boot into its
@@ -6032,6 +6085,7 @@ function renderControl() {
   const possible = Boolean(live && live.open && !live.ended && can('operator') && tile && canDo(tile, 'control'));
   button.hidden = !possible;
   keys.hidden = !control?.on;
+  $('#focus').classList.toggle('keys-shown', !keys.hidden);  // (the row's own place under the bar: app.css)
   button.setAttribute('aria-expanded', String(!keys.hidden));
   $('#focus-control-state').textContent = control?.on ? 'Controlling' : 'Viewing';
   $('#focus-release-hint').style.visibility = control?.on ? 'visible' : 'hidden';
@@ -7133,8 +7187,17 @@ function decorate() {
   $('#focus-actions').setAttribute('aria-label', 'Actions');
   $('#focus-actions').title = 'Actions';
   $('#focus-keyboard-toggle').prepend(icon('keyboard'));
+  // (Every button in the row of keys has its icon, as Keyboard has: those of the same keys under Actions where there are.)
+  $('#focus-cad').prepend(icon('command'));
+  $('#focus-win').prepend(icon('grid'));
+  $('#focus-alt-tab').prepend(icon('repeat'));
+  $('#focus-alt-f4').prepend(icon('x'));
+  $('#focus-prtsc').prepend(icon('camera'));
+  $('#focus-type').prepend(icon('type'));
+  $('#focus-relative').prepend(icon('pointer'));
   $('#focus-health').prepend(icon('activity'));
   $('#focus-open').prepend(icon('external'));
+  $('#focus-fullscreen').prepend(icon('maximize', 'i-enter'), icon('minimize', 'i-exit'));
   $('#focus-open').addEventListener('click', event => openSignedIn(event, focus && tiles.get(focus.id)));
   $('#focus-close').append(icon('x'));
 }

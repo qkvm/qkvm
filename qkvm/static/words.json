@@ -104,6 +104,7 @@
     "not_delivered": [502],
     "not_set_up": [502],
     "plain_only": [502],
+    "unfit": [502],
     "unreachable": [502],
     "update_failed": [502],
     "activity_unavailable": [503],

@@ -2,21 +2,25 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import io
 import re
 import socket
 import zipfile
+from collections.abc import AsyncIterator
 from typing import Any
 
 import uvicorn
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from fastapi import FastAPI
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from tests import ServerThread
+
+DRIP = 4096  # bytes of the package at a time, where it comes slowly (FakeGitHub.drip)
 
 
 def a_key() -> tuple[str, str]:
@@ -75,6 +79,8 @@ class FakeGitHub:
         self.tag: str | None = None  # None: the repository has no releases
         self.notes = ""
         self.files: dict[str, bytes] = {}
+        self.drip = 0.0  # seconds between the package's chunks of DRIP bytes, where it comes slowly (a slow line)
+        self.asked: list[str] = []  # the files asked for, in order
         self._sock = socket.socket()
         self._sock.bind(("127.0.0.1", 0))
         self.url = f"http://127.0.0.1:{self._sock.getsockname()[1]}"
@@ -114,9 +120,19 @@ class FakeGitHub:
 
         @app.get("/download/{name}")
         async def download(name: str) -> Response:
+            self.asked.append(name)
             if name not in self.files:
                 return Response(status_code=404)
-            return Response(self.files[name], media_type="application/octet-stream")
+            data = self.files[name]
+            if self.drip and name.endswith(".whl"):
+
+                async def dripping() -> AsyncIterator[bytes]:
+                    for at in range(0, len(data), DRIP):
+                        yield data[at : at + DRIP]
+                        await asyncio.sleep(self.drip)
+
+                return StreamingResponse(dripping(), media_type="application/octet-stream")
+            return Response(data, media_type="application/octet-stream")
 
         return app
 
