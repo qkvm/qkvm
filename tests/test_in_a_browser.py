@@ -532,7 +532,7 @@ def test_a_kvm_is_added_from_the_wall(tmp_path: Path, browser: Browser, fakes: l
 
 
 TABS = {
-    "devices": "KVMs", "actions": "Actions", "alerts": "Alerts", "files": "Export and import", "users": "Accounts", "tokens": "Tokens",
+    "devices": "KVMs", "actions": "Actions", "alerts": "Alerts", "media": "Server images", "files": "Export and import", "users": "Accounts", "tokens": "Tokens",
     "security": "Security", "network": "Network", "metrics": "Metrics", "activity": "Activity", "updates": "Updates", "about": "About",
 }
 
@@ -679,6 +679,67 @@ def test_an_install_refused_on_requirements_closes_its_box_and_the_view_says_why
         expect(note.locator("input")).to_have_value(command)
         expect(pane.get_by_role("button", name=re.compile("Install"))).to_have_count(0)
         assert page.locator("body").inner_text().count("installed is 17.3") == 1
+
+
+def test_an_update_that_brings_libraries_says_what_it_downloads_how_far_it_is_and_is_followed_through_a_cut_request(tmp_path: Path, browser: Browser) -> None:
+    # (0.3.0, updates in place.) The view says what the new version brings and downloads, and what this copy runs of its own;
+    # while it installs, the box says how far it is; and a proxy that cuts the long request leaves the page following the
+    # view to the end of the installation.
+    with a_wall(tmp_path) as (live, admin), looking(browser, live) as page:
+        newer = {
+            **admin.get("/api/v1/update").json(), "repo": "owner/wall", "checked_ago": 5, "available": True, "installable": True,
+            "signed": True, "latest": {"version": "9.9.9", "notes": "", "url": "", "published": ""}, "in_place": True, "unfit": None,
+            "libraries": {"fetch": ["av 17.2.0", "websockets 17.5"], "size": 48_200_000, "brought": 3}, "own_libraries": ["h11 0.16.0"],
+        }  # fmt: skip
+        shown = {"status": newer}
+        held: list[Any] = []
+        page.route("**/api/v1/update", lambda route: route.fulfill(json=shown["status"]) if route.request.method == "GET" else route.continue_())
+        page.route("**/api/v1/update/install", lambda route: held.append(route))
+        sign_in(page, live)
+        pane = settings(page, "updates")
+        brings = "It brings 3 libraries of its own and downloads 48.2 MB: av 17.2.0, websockets 17.5."
+        expect(pane.locator(".setting", has_text="Version 9.9.9")).to_contain_text(brings)
+        expect(pane.locator(".setting", has_text="Its libraries")).to_contain_text("It runs 1 library of its own, brought with it when it was installed in place.")
+        pane.get_by_role("button", name="Install 9.9.9").click()
+        box = top(page)
+        expect(box).to_contain_text(brings)
+        box.locator("input[type=password]").fill(PASSWORD)
+        box.get_by_role("button", name="Install", exact=True).click()
+        shown["status"] = {**newer, "state": "installing", "progress": "Downloading av 17.2.0 (1.0 MB of 48.2 MB)"}
+        expect(box.locator("p.progress")).to_have_text("Downloading av 17.2.0 (1.0 MB of 48.2 MB)...")
+        assert len(held) == 1
+        shown["status"] = {**newer, "state": "ready", "available": False, "installed": "9.9.9", "supervised": False, "progress": None}
+        held[0].abort()  # (a proxy that gave up on the request: the installation went on, and ended)
+        told(page, "Version 9.9.9 is installed. Restart qKVM to start using it.")
+        expect(page.locator("dialog[open]")).to_have_count(1)  # (Settings alone)
+
+
+def test_an_install_whose_request_was_cut_is_taken_for_installed_once_qkvm_runs_the_new_version(tmp_path: Path, browser: Browser) -> None:
+    # (The final review of 0.3.0, core L5.) The request cut, the installation went on, and qKVM restarted on the new version
+    # (its sign-ins kept) before the page looked: the new process says it runs it (`current`) and has nothing installed.
+    # That was "failed". (Where the sign-in was not kept, the page is signed out, and fetches itself anew for the version.)
+    with a_wall(tmp_path) as (live, admin), looking(browser, live) as page:
+        newer = {
+            **admin.get("/api/v1/update").json(), "repo": "owner/wall", "checked_ago": 5, "available": True, "installable": True,
+            "signed": True, "latest": {"version": "9.9.9", "notes": "", "url": "", "published": ""}, "in_place": True, "unfit": None,
+        }  # fmt: skip
+        shown = {"status": newer}
+        held: list[Any] = []
+        page.route("**/api/v1/update", lambda route: route.fulfill(json=shown["status"]) if route.request.method == "GET" else route.continue_())
+        page.route("**/api/v1/update/install", lambda route: held.append(route))
+        sign_in(page, live)
+        pane = settings(page, "updates")
+        pane.get_by_role("button", name="Install 9.9.9").click()
+        box = top(page)
+        box.locator("input[type=password]").fill(PASSWORD)
+        box.get_by_role("button", name="Install", exact=True).click()
+        shown["status"] = {**newer, "state": "installing", "progress": "Downloading the new version"}
+        expect(box.locator("p.progress")).to_have_text("Downloading the new version...")
+        assert len(held) == 1
+        shown["status"] = {**newer, "current": "9.9.9", "available": False, "installed": None, "state": "idle", "progress": None}
+        held[0].abort()  # (a proxy that gave up on the request; qKVM installed it and restarted on it meanwhile)
+        expect(page.get_by_role("heading", name="Updating to 9.9.9")).to_be_visible()  # (followed: the page reloads as it)
+        expect(box.locator(".error:not([hidden])")).to_have_count(0)
 
 
 MADE_OF = """(pane) => {
@@ -921,7 +982,7 @@ def test_an_account_that_only_looks_is_offered_nothing_else_and_refused_what_it_
             hers.keyboard.press("Escape")
             expect(hers.locator("#focus")).to_be_hidden()
             hers.locator("#open-settings").click()
-            expect(top(hers).locator("[role=tab]")).to_have_text(["Security", "About"])
+            expect(top(hers).locator("[role=tab]")).to_have_text(["Alerts", "Security", "About"])  # (Alerts: her own browsers, by Web Push)
             hers.keyboard.press("Escape")
 
             # What the page does not offer, its script asks for all the same: refused by the wall, each of them.

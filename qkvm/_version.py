@@ -1,3 +1,3 @@
 """The version of this copy of the program. Releases are tagged v<this> on GitHub."""
 
-__version__ = "0.2.2"
+__version__ = "0.3.0"

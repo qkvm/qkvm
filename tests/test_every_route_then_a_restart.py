@@ -34,6 +34,7 @@ from tests.fake_amt import FakeAmt
 from tests.fake_jetkvm import FakeJetKvm, JetState
 from tests.fake_kvm import FakeKvm, FakeState
 from tests.fake_proxmox import SECRET, TOKEN_ID, FakeProxmox, Guest, PveState
+from tests.fake_push import Browser
 from tests.fake_redfish import FakeBmc
 from tests.fake_vnc import FakeVnc, VncState
 from tests.test_totp import code_for, switch_on
@@ -310,6 +311,17 @@ def test_every_changing_route_leaves_a_file_that_a_start_reads(tmp_path: Path, m
             for minutes in (1, 7 * 24 * 60, 0, 5.0, "15", 0):
                 ok(admin.post("/api/v1/alerts/pause", json={"minutes": minutes}))
                 reads(f"alerts paused for {minutes!r} minutes")
+            # --- browsers told the alerts by Web Push ------------------------------------------------------------------
+            key = ok(admin.post("/api/v1/push/key")).json()["key"]
+            reads("the wall's key for push made")
+            phone = Browser()
+            first = ok(admin.post("/api/v1/push", json=phone.subscription("  Chrome \t on Android ", key=key))).json()["id"]
+            reads("a browser told the alerts")
+            ok(admin.post("/api/v1/push", json=phone.subscription("", key=key)))  # the same browser again, with no name
+            ok(admin.post("/api/v1/push", json=Browser("/send/other").subscription("x" * 100)))
+            reads("browsers told the alerts again")
+            ok(admin.delete(f"/api/v1/push/{first}"))
+            reads("a browser told the alerts no more")
 
             # --- metrics, updates, where it listens ---------------------------------------------------------------
             ok(admin.post("/api/v1/metrics/token"))
@@ -464,9 +476,11 @@ def test_a_field_that_holds_what_the_program_gives_it_is_what_it_is_declared_as(
         account(admin, "olga", "operator", devices=[], groups=["a"])
         ok(admin.post("/api/v1/tokens", json={"name": "t", "days": 2}), 201)
         ok(admin.post("/api/v1/actions", json={"name": "Lock", "kind": "keys", "keys": "MetaLeft,KeyL"}), 201)
+        ok(admin.post("/api/v1/push/key"))
+        ok(admin.post("/api/v1/push", json=Browser().subscription()), 201)
         store = admin.core.store  # type: ignore[attr-defined]
         wrong = []
-        for record in (store.server, store.alerts, *store.users, *store.devices, *store.actions, *store.tokens):
+        for record in (store.server, store.alerts, *store.users, *store.devices, *store.actions, *store.tokens, *store.pushes):
             for each in fields(record):
                 if each.name in st._OPENED_LATER:
                     continue

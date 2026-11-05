@@ -27,7 +27,15 @@ It follows the device firmware (jetkvm/kvm, release 0.5.9, commit 36c008f) in th
 * with its HTTPS mode on it serves HTTPS beside plain HTTP, and sends nobody from the one to the other
   (two stand-ins that share one JetState are one such device: see FakeJetKvm's `tls_dir`);
 * fresh from its box, before anybody chose how it is signed in to, it lets nobody in;
-* it says which keyboard layout its computer uses (`getKeyboardLayout`, `JetState.layout`).
+* it says which keyboard layout its computer uses (`getKeyboardLayout`, `JetState.layout`);
+* its own image storage and its virtual drive, as jsonrpc.go and usb_mass_storage.go have them (dev d646be8, release
+  0.5.9): getVirtualMediaState, getStorageSpace, listStorageFiles, deleteStorageFile (a base name: a path is cut to its
+  last part), startStorageFileUpload (refused where the file is there; `<name>.incomplete` opened to add to, its size
+  said back as `alreadyUploadedBytes`; a start for a file under way already ends that one; dropped where nothing claims
+  it in a minute) and POST /storage/upload?uploadId= under the same sign-in (claimed once; renamed into place where every
+  byte came; answered "Upload completed" also where the body ended early), mountWithStorage ("another virtual media is
+  already mounted"; a mode other than the drive's binds its USB device anew: `rebinds`) and unmountImage. What qKVM
+  never asks is noted (`media_never`): mountWithHTTP, checkMountUrl, rpcMountBuiltInImage, setMassStorageMode.
 
 Uses the aiortc package, like the driver it tests.
 """
@@ -38,6 +46,8 @@ from contextlib import asynccontextmanager
 
 import asyncio
 import base64
+import datetime
+import hashlib
 import json
 import struct
 import time
@@ -53,6 +63,7 @@ from aiortc import RTCConfiguration, RTCPeerConnection, RTCSessionDescription
 from aiortc.mediastreams import MediaStreamTrack
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
+from starlette.requests import ClientDisconnect
 
 from tests import ServerThread, local_socket
 from tests.fake_kvm import make_device_certificate
@@ -147,6 +158,30 @@ class JetState:
     keep_alives: int = 0  # keep-alives that counted
     keep_alives_refused: int = 0  # ...and that did not (late, or after one that was)
     auto_released: list[int] = field(default_factory=list)  # keys it let go of by itself, no keep-alive having come
+    # Its own image storage and virtual drive (see the top of this file). False: an older one, without any of it.
+    storage: bool = True
+    files: dict[str, dict[str, Any]] = field(default_factory=dict)  # name -> size, createdAt, sha256 (of what was uploaded)
+    storage_size: int = 7_000_000_000
+    mounted: dict[str, Any] | None = None  # what getVirtualMediaState says: source, mode, filename, size
+    cdrom_mode: bool = True  # its drive's kind as it stands (cdrom=1 out of its box)
+    rebinds: int = 0  # mounts that changed its drive's kind, binding its USB device anew (keyboard and mouse dropped)
+    uploads_open: dict[str, dict[str, Any]] = field(default_factory=dict)  # upload id -> filename, size, already, claimed
+    claim_within: float = 60.0  # seconds a started upload waits to be claimed
+    upload_pause: float = 0.0  # seconds it waits after each piece of an upload (a slow card)
+    uploads: list[dict[str, Any]] = field(default_factory=list)  # every POST /storage/upload: id, received, complete
+    media_calls: list[str] = field(default_factory=list)  # every call of its storage and drive, as "method params"
+    media_never: list[str] = field(default_factory=list)  # what qKVM is never to ask, by method
+
+
+MEDIA_METHODS = (
+    "getVirtualMediaState", "getStorageSpace", "listStorageFiles", "deleteStorageFile", "startStorageFileUpload", "mountWithStorage",
+    "mountWithHTTP", "checkMountUrl", "rpcMountBuiltInImage", "setMassStorageMode",
+)  # fmt: skip
+
+
+def now_stamp() -> str:
+    """A time as the device says one (Go's time.Time in JSON)."""
+    return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="microseconds")
 
 
 REPORTS = ("keyboardReport", "absMouseReport", "relMouseReport", "wheelReport", "keypressReport")  # what is kept together
@@ -375,7 +410,9 @@ def make_fake_jetkvm(state: JetState) -> FastAPI:
                 state.asked_after_hand_over.append(method)
         result: Any = None
         error: dict[str, Any] | None = None
-        if method == "getVideoState":
+        if method == "unmountImage" and state.storage:
+            result, error = media_unmount()
+        elif method == "getVideoState":
             result = {
                 "ready": state.signal, "streaming": 1, "width": state.width, "height": state.height, "fps": 60,
                 **({} if state.signal else {"error": "no_signal"}),
@@ -414,6 +451,8 @@ def make_fake_jetkvm(state: JetState) -> FastAPI:
             state.actions.append(f"wol {params['macAddress']}")
         elif method == "reboot":
             state.actions.append("reboot")
+        elif method in MEDIA_METHODS and state.storage:
+            result, error = media_call(method, params)
         else:
             error = {"code": -32601, "message": "Method not found"}
         reply = {"jsonrpc": "2.0", "id": call.get("id")}
@@ -428,6 +467,109 @@ def make_fake_jetkvm(state: JetState) -> FastAPI:
                 channel.send(answer)
         if call.get("id") in after:
             asyncio.get_running_loop().call_later(after.pop(call.get("id")), hand_over)
+
+    # --- its own image storage and virtual drive ---------------------------------------------------------------------
+
+    def base_name(filename: Any) -> str | None:
+        """sanitizeFilename: a path cut to its last part; None for what is refused."""
+        if not isinstance(filename, str) or not filename or filename.startswith("/") or ".." in filename:
+            return None
+        base = filename.replace("\\", "/").rsplit("/", 1)[-1]
+        return base if base not in ("", ".") else None
+
+    def free() -> int:
+        return state.storage_size - sum(int(about["size"]) for about in state.files.values())
+
+    def media_call(method: str, params: dict[str, Any]) -> tuple[Any, dict[str, Any] | None]:
+        state.media_calls.append(f"{method} {json.dumps(params, sort_keys=True)}" if params else method)
+
+        def refused(message: str) -> tuple[Any, dict[str, Any]]:
+            return None, {"code": -32603, "message": "Internal error", "data": message}
+
+        if method in ("mountWithHTTP", "checkMountUrl", "rpcMountBuiltInImage", "setMassStorageMode"):
+            state.media_never.append(method)
+            return refused("not in this stand-in")
+        if method == "getVirtualMediaState":
+            return state.mounted, None
+        if method == "getStorageSpace":
+            return {"bytesUsed": state.storage_size - free(), "bytesFree": free()}, None
+        if method == "listStorageFiles":
+            return {"files": [{"filename": name, "size": about["size"], "createdAt": about["createdAt"]} for name, about in state.files.items()]}, None
+        name = base_name(params.get("filename"))
+        if name is None:
+            return refused("invalid filename")
+        if method == "deleteStorageFile":
+            if name not in state.files:
+                return refused(f"file does not exist: {params.get('filename')}")
+            del state.files[name]
+            return None, None
+        if method == "startStorageFileUpload":
+            if name in state.files:
+                return refused(f"file already exists: {name}")
+            for old, upload in list(state.uploads_open.items()):
+                if upload["filename"] == name:
+                    del state.uploads_open[old]  # (superseded: that one writes nothing more)
+            partial = state.files.setdefault(name + ".incomplete", {"size": 0, "createdAt": now_stamp(), "sha256": ""})
+            upload_id = f"upload_{uuid.uuid4()}"
+            state.uploads_open[upload_id] = {"filename": name, "size": int(params.get("size") or 0), "already": partial["size"], "claimed": False, "at": time.monotonic()}
+            return {"alreadyUploadedBytes": partial["size"], "dataChannel": upload_id}, None
+        if method == "mountWithStorage":
+            if state.mounted is not None:
+                return refused("another virtual media is already mounted")
+            if name not in state.files:
+                return refused(f"failed to get file info: stat /userdata/jetkvm/images/{name}: no such file or directory")
+            mode = params.get("mode")
+            if mode not in ("CDROM", "Disk"):
+                return refused(f"invalid mode: {mode}")
+            if mode == "CDROM" and state.files[name]["size"] < 300 * 2048:
+                # (Linux's USB gadget takes a CD-ROM image of 300 sectors at least: errno 525 is its ETOOSMALL. The words a
+                # real JetKVM answered a 368 KB image with in a trial before the release of 0.3.0.)
+                return refused("failed to set mass storage image: write /sys/kernel/config/usb_gadget/jetkvm/functions/mass_storage.usb0/lun.0/file: errno 525")
+            if (mode == "CDROM") != state.cdrom_mode:
+                state.cdrom_mode = mode == "CDROM"
+                state.rebinds += 1
+            state.mounted = {"source": "Storage", "mode": mode, "filename": name, "size": state.files[name]["size"]}
+            return None, None
+        return refused("unknown")
+
+    def media_unmount() -> tuple[Any, dict[str, Any] | None]:
+        state.media_calls.append("unmountImage")
+        state.mounted = None
+        return None, None
+
+    @app.post("/storage/upload")
+    async def storage_upload(request: Request, uploadId: str = "") -> JSONResponse:
+        if not allowed(request.cookies):
+            return JSONResponse({"error": "Unauthorized"}, status_code=401)
+        upload = state.uploads_open.get(uploadId)
+        record: dict[str, Any] = {"id": uploadId, "received": 0, "complete": False}
+        state.uploads.append(record)
+        if upload is None or upload["claimed"] or time.monotonic() - upload["at"] > state.claim_within:
+            return JSONResponse({"error": "Upload not found"}, status_code=404)
+        upload["claimed"] = True
+        name = upload["filename"]
+        partial = state.files.setdefault(name + ".incomplete", {"size": 0, "createdAt": now_stamp(), "sha256": ""})
+        hashed = hashlib.sha256()
+        written = upload["already"]
+        try:
+            async for piece in request.stream():
+                if state.uploads_open.get(uploadId) is not upload:
+                    break  # (a new start for the same file ended this one)
+                hashed.update(piece)
+                written += len(piece)
+                partial["size"] = written
+                record["received"] = written - upload["already"]
+                if state.upload_pause:
+                    await asyncio.sleep(state.upload_pause)
+        except ClientDisconnect:
+            state.uploads_open.pop(uploadId, None)
+            return JSONResponse({"error": "Failed to read upload data"}, status_code=500)
+        state.uploads_open.pop(uploadId, None)
+        if written == upload["size"] and name + ".incomplete" in state.files:
+            del state.files[name + ".incomplete"]
+            state.files[name] = {"size": written, "createdAt": now_stamp(), "sha256": hashed.hexdigest()}
+            record["complete"] = True
+        return JSONResponse({"message": "Upload completed"})  # (whether every byte came or not)
 
     # --- the hidrpc channel ------------------------------------------------------------------------------------------
 

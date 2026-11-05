@@ -11,7 +11,9 @@ not running.
 from __future__ import annotations
 
 import asyncio
+import copy
 import datetime
+import hashlib
 import json
 import os
 import secrets
@@ -32,6 +34,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
+from starlette.requests import ClientDisconnect
 
 from tests import ServerThread, local_socket
 
@@ -190,6 +193,42 @@ class FakeState:
     server_host: object = "pikvm"  # its name in /api/info (meta.server.host: the machine's own, as the page shows it)
     jiggler: bool = False  # whether keep-awake is on (a stock one says so in /api/hid)
     jiggler_enabled: bool = True  # False: keep-awake is switched off in its settings, and switching it on answers yes and does nothing
+    # Its mass storage drive (kvmd's MSD) and its own image storage (0.3.0), as GL.iNet's kvmd tree (4.16) and stock kvmd's
+    # source have them: GET /api/msd, set_params (only while the drive is disconnected; a CD-ROM drive read-only, `rw=1` no
+    # CD-ROM drive on GL.iNet's), set_connected, write (its length from Content-Length, 507 where it is more than is free, an
+    # image of that name refused, what a write cut off leaves removed with `remove_incomplete`), remove (not while mounted),
+    # and an `msd` event on /api/ws (the whole state as a line opens, then what changed). Off unless a test says so: a kvmd
+    # whose drive is switched off in its settings, as the A1 tests take a KVM without virtual media to be.
+    msd: bool = False
+    msd_online: bool = True
+    msd_busy: bool = False
+    msd_images: dict[str, dict[str, Any]] = field(default_factory=dict)  # name -> complete, removable, size, mod_ts, sha256 (of what was written)
+    msd_size: int = 8_000_000_000
+    msd_free: int = 6_000_000_000
+    msd_drive: dict[str, Any] = field(default_factory=lambda: {"image": None, "connected": False, "cdrom": True, "rw": False})
+    msd_sharing: bool = False  # GL.iNet's File Sharing on: its whole storage open to the machine, read-write
+    msd_events: bool = True  # its line for events says `msd` (False: one that does not)
+    msd_writing: str | None = None  # the image being written now
+    msd_write_pause: float = 0.0  # seconds it waits after each piece written (a slow storage)
+    # Bytes a second it writes at the most (0: no limit): as slow by the bytes, however large the pieces that come (a
+    # runner whose pieces were large wrote 8 MB in under a second at a pause per piece)
+    msd_write_rate: float = 0.0
+    msd_cut_after: int | None = None  # set: it ends a write itself once this many bytes came (its storage gave out)
+    # Seconds after a write ends before its image is listed: kvmd's own lists it once its watch on the storage has seen
+    # it, some two seconds later on kvmd's test environment (a trial before the release of 0.3.0). 0: at once.
+    msd_lists_after: float = 0.0
+    msd_written_at: dict[str, float] = field(default_factory=dict)  # name -> when its write ended (time.monotonic)
+    msd_removed_at: dict[str, tuple[float, dict[str, Any]]] = field(default_factory=dict)  # name -> when removed, and as it was
+    # True: for msd_lists_after seconds after its write a written image is listed as it was mid-write (incomplete, at a
+    # size short of the whole), not left out: as a listing its watch last reloaded mid-write says it (the delta review).
+    msd_lists_stale: bool = False
+    msd_size_said: Any = None  # set: every image's size is said so (a KVM that says no number)
+    msd_keeps_incomplete: bool = False  # what a write cut off leaves stays, whatever `remove_incomplete` says (left to qKVM to remove)
+    msd_says_written: int = 0  # set: its answer to a write says this many bytes were written, whatever came
+    msd_always_rw: bool = False  # a hostile one: whatever is asked, a USB flash drive is made writable
+    msd_calls: list[str] = field(default_factory=list)  # every change of its drive or storage asked, as "set_params <query>"
+    msd_writes: list[dict[str, Any]] = field(default_factory=list)  # each write: name, said (its length), received, complete, removed
+    msd_never: list[str] = field(default_factory=list)  # what qKVM is never to ask (write_remote, read, set_enabled, partition_*)
 
 
 GLINET_ONLY = (
@@ -587,6 +626,193 @@ def make_fake_kvm(state: FakeState) -> FastAPI:
         state.actions.append(f"wol {mac}")
         return ok()
 
+    # --- its mass storage drive and own image storage (kvmd's MSD), as GL.iNet's kvmd 4.16 tree and stock kvmd have it --
+
+    def msd_state() -> dict[str, Any]:
+        """GET /api/msd's answer: what kvmd's otg plugin says (its images without their paths), and GL.iNet's extras."""
+        if not state.msd:
+            # (A kvmd whose drive is switched off in its settings: its `disabled` plugin.)
+            return {"enabled": False, "online": False, "busy": False, "storage": None, "drive": None, **({} if state.stock else {"drive_partition": None, "available_devices": {}})}
+        late = {name for name, at in state.msd_written_at.items() if time.monotonic() - at < state.msd_lists_after}
+        # (Removed a moment ago, and listed still, as it was: its watch on the storage has not seen it go yet.)
+        still = {name: about for name, (at, about) in state.msd_removed_at.items() if time.monotonic() - at < state.msd_lists_after and name not in state.msd_images}
+        images = {name: {key: about[key] for key in ("complete", "removable", "size", "mod_ts")} for name, about in {**still, **state.msd_images}.items() if name not in late}
+        if state.msd_lists_stale:
+            images.update({name: {**{key: state.msd_images[name][key] for key in ("removable", "mod_ts")}, "complete": False, "size": max(0, state.msd_images[name]["size"] - 65536)} for name in late if name in state.msd_images})
+        if state.msd_size_said is not None:
+            images = {name: {**about, "size": state.msd_size_said} for name, about in images.items()}
+        drive = state.msd_drive
+        image = drive["image"]
+        said = {
+            "enabled": True, "online": state.msd_online, "busy": state.msd_busy or state.msd_writing is not None,
+            "storage": {
+                "images": images, "parts": {"": {"size": state.msd_size, "free": state.msd_free, "writable": True}},
+                "downloading": None, "uploading": None if state.msd_writing is None else {"name": state.msd_writing, "size": 0, "written": 0},
+            },
+            "drive": {
+                "image": None if image is None else {"name": image, **images.get(image, {"complete": True, "removable": True, "size": 0, "mod_ts": 0.0}), "in_storage": True},
+                "connected": drive["connected"], "cdrom": drive["cdrom"], "rw": drive["rw"],
+            },
+        }  # fmt: skip
+        if not state.stock:
+            said["drive_partition"] = {"image": None, "connected": state.msd_sharing, "cdrom": False, "rw": True}
+            said["available_devices"] = {}
+        return said
+
+    def msd_error(name: str, message: str, status: int = 400) -> JSONResponse:
+        return error(name, status, message)
+
+    def msd_changes() -> JSONResponse | None:
+        """What kvmd's plugin refuses every change with, before it looks at what is asked."""
+        if not state.msd:
+            return msd_error("MsdDisabledError", "MSD is disabled")
+        if not state.msd_online:
+            return msd_error("MsdOfflineError", "MSD is not found")
+        if state.msd_busy or state.msd_writing is not None:
+            return msd_error("MsdIsBusyError", "Performing another MSD operation, please try again later", 409)
+        return None
+
+    @app.get("/api/msd")
+    async def msd() -> Any:
+        return ok(msd_state())
+
+    @app.post("/api/msd/set_params")
+    async def msd_set_params(request: Request) -> Any:
+        state.msd_calls.append(f"set_params {request.url.query}")
+        if refused := msd_changes():
+            return refused
+        drive = state.msd_drive
+        if drive["connected"]:
+            return msd_error("MsdConnectedError", "MSD is connected to Server, but shouldn't for this operation")
+        image = request.query_params.get("image")
+        if image is not None:
+            if image not in state.msd_images:
+                return msd_error("MsdUnknownImageError", "The image is not found in the storage")
+            drive["image"] = image
+        cdrom, rw = request.query_params.get("cdrom"), request.query_params.get("rw")
+        if cdrom is not None:
+            drive["cdrom"] = cdrom in ("1", "true")
+            if drive["cdrom"]:
+                drive["rw"] = False
+        if rw is not None and not (drive["cdrom"] and state.stock):  # (stock: `rw` ignored with a CD-ROM drive)
+            drive["rw"] = rw in ("1", "true") or state.msd_always_rw
+            if drive["rw"]:
+                drive["cdrom"] = False  # (GL.iNet's: a writable drive is no CD-ROM drive)
+        return ok()
+
+    @app.post("/api/msd/set_connected")
+    async def msd_set_connected(connected: str) -> Any:
+        state.msd_calls.append(f"set_connected {connected}")
+        if refused := msd_changes():
+            return refused
+        drive = state.msd_drive
+        if connected in ("1", "true"):
+            if drive["connected"]:
+                return msd_error("MsdConnectedError", "MSD is connected to Server, but shouldn't for this operation")
+            if drive["image"] is None:
+                return msd_error("MsdImageNotSelected", "The image is not selected")
+            if drive["image"] not in state.msd_images:
+                return msd_error("MsdUnknownImageError", "The image is not found in the storage")
+            if drive["cdrom"] and state.msd_images[drive["image"]]["size"] < 300 * 2048:
+                return msd_error("MsdError", "Can't connect the drive: [Errno 525] (Linux's USB gadget refuses a CD-ROM image under 300 sectors)")
+            drive["connected"] = True
+        else:
+            if not drive["connected"]:
+                return msd_error("MsdDisconnectedError", "MSD is disconnected from Server, but should be for this operation")
+            drive["connected"] = False
+        return ok()
+
+    @app.post("/api/msd/remove")
+    async def msd_remove(image: str) -> Any:
+        state.msd_calls.append(f"remove {image}")
+        if refused := msd_changes():
+            return refused
+        if image not in state.msd_images:
+            return msd_error("MsdUnknownImageError", "The image is not found in the storage")
+        if state.msd_drive["image"] == image and state.msd_drive["connected"]:
+            return msd_error("MsdImageInUseError", "Cannot remove image that is currently mounted")
+        if state.msd_drive["image"] == image:
+            state.msd_drive["image"] = None
+        gone = state.msd_images.pop(image)
+        state.msd_removed_at[image] = (time.monotonic(), gone)
+        state.msd_free += gone["size"]
+        return ok()
+
+    @app.post("/api/msd/write")
+    async def msd_write(request: Request) -> Any:
+        """As kvmd's __write_handler: the length from Content-Length (none: refused), GL.iNet's 507 where it is more than is
+        free, an image of that name refused, the bytes written as they come (here counted and hashed, and kept nowhere), and
+        what a write cut off leaves removed where `remove_incomplete` says so."""
+        name = request.query_params.get("image", "")
+        remove_incomplete = request.query_params.get("remove_incomplete") in ("1", "true")
+        state.msd_calls.append(f"write {name} remove_incomplete={int(remove_incomplete)}")
+        length = request.headers.get("content-length")
+        if refused := msd_changes():
+            return refused
+        if length is None or not length.isdigit():
+            return msd_error("ValidatorError", "Invalid MSD image size")
+        size = int(length)
+        if size > state.msd_free:
+            return msd_error("MsdNoSpaceError", "storage space is insufficient", 507)
+        if not name or "/" in name or name in state.msd_images:
+            return msd_error("MsdImageExistsError", "This image is already exists")
+        state.msd_images[name] = {"complete": False, "removable": True, "size": 0, "mod_ts": time.time(), "sha256": ""}
+        state.msd_writing = name
+        written = 0
+        hashed = hashlib.sha256()
+        record = {"name": name, "said": size, "received": 0, "complete": False, "removed": False}
+        state.msd_writes.append(record)
+        raw = request.scope.get(RAW_RECEIVE)  # (the web server's own, past the middleware: see RawWrites)
+
+        async def stream() -> AsyncIterator[bytes]:
+            if raw is None:
+                async for piece in request.stream():
+                    yield piece
+                return
+            more = True
+            while more:
+                message = await raw()
+                if message["type"] != "http.request":
+                    raise ClientDisconnect()
+                more = bool(message.get("more_body", False))
+                yield message.get("body", b"")
+
+        try:
+            async for piece in stream():
+                hashed.update(piece)
+                written += len(piece)
+                record["received"] = written
+                state.msd_images[name]["size"] = written
+                if state.msd_write_pause:
+                    await asyncio.sleep(state.msd_write_pause)
+                if state.msd_write_rate:
+                    await asyncio.sleep(len(piece) / state.msd_write_rate)
+                if state.msd_cut_after is not None and written >= state.msd_cut_after:
+                    raise ConnectionResetError("the KVM ended the write")  # (as a KVM whose storage gave out)
+        except (ClientDisconnect, ConnectionResetError, OSError):
+            pass
+        finally:
+            state.msd_writing = None
+            complete = written == size
+            state.msd_images[name].update({"complete": complete, "size": written, "sha256": hashed.hexdigest(), "mod_ts": time.time()})
+            state.msd_written_at[name] = time.monotonic()
+            record["complete"] = complete
+            state.msd_free -= written
+            if not complete and remove_incomplete and not state.msd_keeps_incomplete:
+                state.msd_images.pop(name, None)
+                state.msd_free += written
+                record["removed"] = True
+        if not complete:
+            return msd_error("MsdError", "The image was not written in full", 500)
+        return ok({"image": {"name": name, "size": size, "written": written if not state.msd_says_written else state.msd_says_written}})
+
+    @app.api_route("/api/msd/{never:path}", methods=["GET", "POST"])
+    async def msd_never(never: str, request: Request) -> Any:
+        """What qKVM never asks: an image fetched from an address (write_remote), one read back (read), the drive switched on
+        or off (set_enabled), GL.iNet's partition routes (partition_format formats on a GET). Noted, and answered as kvmd would."""
+        state.msd_never.append(f"{request.method} {never}")
+        return ok()
+
     @app.websocket("/api/ws")
     async def ws(websocket: WebSocket) -> None:
         state.ws_queries.append(websocket.url.query)
@@ -611,6 +837,7 @@ def make_fake_kvm(state: FakeState) -> FastAPI:
             opened = time.monotonic()
             fingerbot_said: bool | None = None
             fingerbot_at = 0.0
+            msd_last: dict[str, Any] | None = None
             try:
                 while True:
                     if state.event_junk:
@@ -634,6 +861,19 @@ def make_fake_kvm(state: FakeState) -> FastAPI:
                             fingerbot_said, fingerbot_at = state.fingerbot, time.monotonic()
                             await websocket.send_text(json.dumps({"event_type": "fingerbot", "event": {"exist": fingerbot_said}}))
                             state.fingerbot_events_sent += 1
+                    if state.msd and state.msd_events and state.pongs:
+                        # (Its drive, where it is switched on, after the board and the Fingerbot: the whole state first, then what
+                        # changed of it, as GL.iNet's poll_state yields it.)
+                        now_msd = msd_state()
+                        if msd_last is None or msd_last.get("online") != now_msd.get("online"):
+                            await websocket.send_text(json.dumps({"event_type": "msd", "event": now_msd}))
+                        elif now_msd != msd_last:
+                            diff: dict[str, Any] = {key: now_msd[key] for key in ("busy", "drive", "drive_partition") if key in now_msd and now_msd[key] != msd_last.get(key)}
+                            for part in ("images", "parts", "downloading", "uploading"):
+                                if (msd_last.get("storage") or {}).get(part) != (now_msd.get("storage") or {}).get(part):
+                                    diff.setdefault("storage", {})[part] = (now_msd.get("storage") or {}).get(part)
+                            await websocket.send_text(json.dumps({"event_type": "msd", "event": diff}))
+                        msd_last = copy.deepcopy(now_msd)
                     await asyncio.sleep(state.line_every)
             except Exception:  # (the line is gone)
                 return
@@ -769,6 +1009,23 @@ def pictures_of(film: bytes) -> list[tuple[bool, bytes]]:
     return found
 
 
+RAW_RECEIVE = "fake.raw_receive"
+
+
+class RawWrites:
+    """An image written to the stand-in is read from the web server itself, past its middleware (Starlette's keeps something
+    of every piece of a body until the request ends: kvmd, which is aiohttp, keeps nothing, and a test of how much memory
+    an upload takes measures the stand-in beside the wall)."""
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope["type"] == "http" and scope.get("path") == "/api/msd/write":
+            scope[RAW_RECEIVE] = receive
+        await self.app(scope, receive, send)
+
+
 class FakeKvm:
     """Runs make_fake_kvm() on a localhost port in a background thread.
 
@@ -784,7 +1041,7 @@ class FakeKvm:
             cert, key = make_device_certificate(tls_dir)
             tls = {"ssl_certfile": str(cert), "ssl_keyfile": str(key)}
         self.url = f"{'https' if tls else 'http'}://127.0.0.1:{self.port}"
-        config = uvicorn.Config(make_fake_kvm(self.state), log_level="error", access_log=False, **tls)
+        config = uvicorn.Config(RawWrites(make_fake_kvm(self.state)), log_level="error", access_log=False, **tls)
         self._server = uvicorn.Server(config)
         self._serving = ServerThread("fake KVM", lambda: self._server.run(sockets=[self._sock]), lambda: self._server.started)
         self._thread = self._serving.thread

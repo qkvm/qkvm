@@ -16,7 +16,7 @@ import pytest
 from tests.workflow_text import APP, SECURITY, WORKFLOWS, jobs, steps
 
 RELEASE = WORKFLOWS / "release.yml"
-THREE_NAMES = 'test "$listed" = "qkvm-${TAG#v}-image.json qkvm-${TAG#v}-py3-none-any.whl qkvm-${TAG#v}.tar.gz "'
+THREE_NAMES = 'test "$listed" = "qkvm-${TAG#v}-image.json qkvm-${TAG#v}-libraries.json qkvm-${TAG#v}-py3-none-any.whl qkvm-${TAG#v}.tar.gz "'
 
 
 def tag_pattern() -> str:

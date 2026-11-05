@@ -11,6 +11,14 @@ at its own pace, whatever is asked). Tried on OpenBMC's romulus image in QEMU (2
 signed in to with the session's token (and refused without one, or with a session that was given back), and that
 build of bmcweb has no console (no graphical console announced, and the path answers "not found" to a signed-in
 upgrade), so no picture ever came from a real OpenBMC. The pictures are the stand-in's (tests/fake_redfish.py).
+
+Keys and the pointer go the way they go to a VNC server (vncdevice.ScreenInput): RFB's key and pointer events, over the
+console the screen comes on. bmcweb hands on what comes over the WebSocket as it comes, both ways, to whoever may open
+the console at all (its route asks ConfigureComponents or ConfigureManager: an account that may not is refused the
+console, picture and keys together); obmc-ikvm turns the events into the reports of the USB keyboard and the absolute
+mouse it gives the server, and drops what comes in a client's first frames (about a second): input waits that long
+after the console opens (INPUT_AFTER). Where a build has no USB keyboard for obmc-ikvm to write to, the keys go nowhere,
+and nothing on the console says so. None of this has been seen on a real controller.
 """
 
 from __future__ import annotations
@@ -37,6 +45,13 @@ class OpenBmcScreen(DoorScreen):
     # lasted half a minute is.
     SETTLED_BY_A_FRAME = False
     LOOK_PACE = 1.0  # (it sends frames at its own pace whatever is asked: asking often adds nothing)
+    # obmc-ikvm takes no keys and no pointer from a client for its first frames (`skipFrame`, as many as its frame rate,
+    # thirty by default): they wait this long after the handshake.
+    INPUT_AFTER = 1.5
+    # obmc-ikvm makes each keysym into the key of its USB keyboard the keysym is on ('A' and 'a' the A key, '!' the 1 key:
+    # ikvm_input.cpp, keyToScancode) and sets Shift only from a Shift key's own events (keyToMod): typed text goes with
+    # the US layout's Shift around what needs it, and what that layout cannot type is refused (vncdevice.text_events).
+    US_SHIFT = True
 
     def __init__(self, spec: DeviceSpec, server: RedfishDevice) -> None:
         super().__init__(spec)

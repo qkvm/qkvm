@@ -27,8 +27,9 @@ WORDS = json.loads((qKVM / "static" / "words.json").read_text(encoding="utf-8"))
 SCRIPT = (qKVM / "static" / "app.js").read_text(encoding="utf-8")
 PROGRAM = {path.name: path.read_text(encoding="utf-8") for path in qKVM.glob("*.py")}
 STATES = ("connecting", "online", "no_signal", "offline", "auth", "error", "busy")
-# What the page says of its own where no server answered: not the wall's words, and so not in the file.
-PAGES_OWN_CODES = {"network", "error"}
+# What the page says of its own where no server answered, or none in a way it can read (api(): a body that is no JSON):
+# not the wall's words, and so not in the file. Each is one the page makes itself (test_the_page_uses_no_word_...).
+PAGES_OWN_CODES = {"network", "error", "invalid_response"}
 # The live line's own codes, which its `control` and `bye` messages carry (live.py; the README's chapter "Live view and
 # control" names them) and the file does not hold: the page may name one only where the line can say it.
 LINE_CODES = (
@@ -132,6 +133,8 @@ def test_the_page_uses_no_word_the_file_does_not_have() -> None:
     reached = SCRIPT[SCRIPT.index("const CANNOT_BE_REACHED = [") :].split("\n", 1)[0]
     codes |= set(re.findall(r"'(\w+)'", reached))
     known = set(WORDS["codes"]) | set(WORDS["refusals"]) | PAGES_OWN_CODES | LINE_CODES
+    made = set(re.findall(r"new ApiError\([^;]*?, '(\w+)', ", SCRIPT)) | set(re.findall(r"\|\| '(\w+)', res\.status", SCRIPT))
+    assert PAGES_OWN_CODES <= made, PAGES_OWN_CODES - made  # (the page's own: made by the page, none of them only named)
     assert codes - known == set(), codes - known
     assert {"taken", "idle", "not_allowed", "gone"} <= LINE_CODES, LINE_CODES  # (the look at live.py finds what it is meant to)
 

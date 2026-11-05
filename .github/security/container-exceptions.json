@@ -23,6 +23,25 @@
         "https://sqlite.org/src/info/a7f8c92f62",
         "https://nvd.nist.gov/vuln/detail/CVE-2026-119373"
       ]
+    },
+    {
+      "id": "CVE-2026-76844",
+      "severity": "HIGH",
+      "architectures": [
+        "amd64",
+        "arm64"
+      ],
+      "packages": {
+        "zlib1g": "1:1.3.dfsg+really1.3.1-1+b1"
+      },
+      "reviewed": "2026-11-05",
+      "expires": "2026-12-03",
+      "reason": "A heap overflow in zlib's gzip file writing (gz_write keeps its input pointer after a failed write(), and a later gz* write goes past its buffer). Only zlib's gzFile functions (gzwrite, gzprintf, gzputs and the like) reach it. qKVM calls none: CPython's zlib module compresses and decompresses in memory with deflate and inflate, its gzip module is written in Python on top of those, and no other library in the application-only image writes gzip files. Debian has a fixed package in unstable alone on the review date (trixie and bookworm are listed vulnerable). Accepted for the 0.3.0 image by the owner on 2026-11-05; a published fix or a changed version or severity fails the gate.",
+      "references": [
+        "https://security-tracker.debian.org/tracker/CVE-2026-76844",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-76844",
+        "https://osv.dev/vulnerability/AZL-105345"
+      ]
     }
   ]
 }

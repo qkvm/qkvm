@@ -4,6 +4,12 @@ inputs:
   arch:
     description: Linux architecture (amd64 or arm64)
     required: true
+  libraries:
+    description: >-
+      The release's lock of the image's libraries as pip installs them (requirements/cp313-linux-<arch>.txt of the job
+      libraries, held to its hash); none on a commit's run, where they are resolved at that hour
+    required: false
+    default: ""
 # What the archive and its evidence are, by hash, taken right after the scan and the native step, before the suite's
 # test tools are installed on this runner (until then it has installed only skopeo, from Ubuntu's own archive, and run
 # BuildKit and Trivy, named by digest and held to a hash). The release's image jobs hand them on as job outputs.
@@ -29,11 +35,17 @@ runs:
       run: |
         sudo apt-get update --quiet
         sudo apt-get install --yes --no-install-recommends skopeo
-    - name: Prepare the archive destination
+    # (What the image's libraries are: the release's lock, given, in place of the list kept in the repository, which names
+    # none: on a commit's run, and in an image built from the source, they are taken from PyPI at that hour.)
+    - name: Prepare the archive destination and the image's libraries
       shell: bash
       env:
         ARCH: ${{ inputs.arch }}
-      run: mkdir -p "image-$ARCH"
+        LIBRARIES: ${{ inputs.libraries }}
+      run: |
+        set -euo pipefail
+        mkdir -p "image-$ARCH"
+        if [ -n "$LIBRARIES" ]; then cp -- "$LIBRARIES" .github/security/image-libraries.txt; fi
     - name: Build once, without registry credentials
       uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
       with:

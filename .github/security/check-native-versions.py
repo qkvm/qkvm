@@ -76,11 +76,15 @@ def minimums_of(document):
     return minimums
 
 
-def evaluate(record, document, arch):
-    """Each component's version, and what blocks the image."""
+def evaluate(record, document, arch, wheels_only=False):
+    """Each component's version, and what blocks the image. `wheels_only`: of what the wheels bring alone (the libraries an
+    update installed in place runs, on a release's runner): the CPython is the computer's own, and is not asked."""
     if arch not in ARCHITECTURES:
         raise InvalidInput(f"unsupported architecture: {arch}")
     minimums = minimums_of(document)
+    if wheels_only:
+        minimums.pop("cpython")
+        record = {**record, "raw": {name: text for name, text in record.get("raw", {}).items() if name != "cpython"}} if isinstance(record, dict) and isinstance(record.get("raw"), dict) else record
     if not isinstance(record, dict) or record.get("schema") != 1 or not isinstance(record.get("raw"), dict):
         raise InvalidInput("the record is not what native-versions.py prints")
     if record.get("arch") != arch:
@@ -120,10 +124,11 @@ def main(argv=None):
     parser.add_argument("record", help="what native-versions.py printed inside the image")
     parser.add_argument("--minimums", required=True)
     parser.add_argument("--arch", required=True, choices=sorted(ARCHITECTURES))
+    parser.add_argument("--wheels-only", action="store_true", help="the wheels' own components only (not the CPython): an update installed in place")
     arguments = parser.parse_args(argv)
     try:
         record = load_json(arguments.record)
-        versions, blocked = evaluate(record, load_json(arguments.minimums), arguments.arch)
+        versions, blocked = evaluate(record, load_json(arguments.minimums), arguments.arch, arguments.wheels_only)
     except (OSError, UnicodeError, json.JSONDecodeError, InvalidInput) as error:
         print(f"INVALID INPUT: {error}", file=sys.stderr)
         return 2

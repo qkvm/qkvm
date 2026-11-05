@@ -3,14 +3,14 @@
 `gh release create ... release/*` attaches everything in the folder. The folder was held only by what the signed list
 names (and the signature by its hash): a sixth file in it, however it got there, would have gone onto the draft, and
 only the read-back after the draft existed would have refused it. Now the step before the draft is made requires the
-folder to hold exactly SHA256SUMS, SHA256SUMS.sig and the three files of this version the list names, each a plain file.
+folder to hold exactly SHA256SUMS, SHA256SUMS.sig and the four files of this version the list names (the lock of its libraries since 0.3.0), each a plain file.
 """
 from __future__ import annotations
 
 from tests.workflow_text import WORKFLOWS, jobs, steps
 
 RELEASE = WORKFLOWS / "release.yml"
-FIVE = 'test "$held" = "SHA256SUMS SHA256SUMS.sig qkvm-${TAG#v}-image.json qkvm-${TAG#v}-py3-none-any.whl qkvm-${TAG#v}.tar.gz "'
+FIVE = 'test "$held" = "SHA256SUMS SHA256SUMS.sig qkvm-${TAG#v}-image.json qkvm-${TAG#v}-libraries.json qkvm-${TAG#v}-py3-none-any.whl qkvm-${TAG#v}.tar.gz "'
 
 
 def test_the_folder_attached_is_exactly_the_checked_files_before_the_draft_is_made() -> None:

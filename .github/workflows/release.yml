@@ -11,9 +11,13 @@
 #   refuses a tag whose commit is not on main, or whose Tests run was not green in every job
 #   builds with tools pinned by hash and checksums the packages at once, then runs the test suite against the built
 #   wheel, installed by itself, checks the source archive and audits, all on a copy held to that checksum
+#   locks the libraries         the exact wheels of every library the version runs, for each Python and system an update
+#                               is installed in place on, held to PyPI's hashes; tries that set on Linux x86-64 and ARM64
+#                               and on Windows, with the oldest and the newest Python; and builds the image from it
 #   audits the installed wheel and both final container archives against fresh vulnerability data, and records
 #   and gates the native libraries inside the image that the scan cannot see
-#   signs SHA256SUMS            of qkvm-1.2.3-py3-none-any.whl, qkvm-1.2.3.tar.gz and qkvm-1.2.3-image.json
+#   signs SHA256SUMS            of qkvm-1.2.3-py3-none-any.whl, qkvm-1.2.3.tar.gz, qkvm-1.2.3-libraries.json (the
+#                               lock, which every copy's updater holds each library it fetches to) and qkvm-1.2.3-image.json
 #                               (what each architecture's scan saw, and the run that keeps those archives), with
 #                               the RELEASE_SIGNING_KEY secret: a version that has a release key built in is not
 #                               published without it, anywhere. The runner's openssl signs, in a job that does only
@@ -78,11 +82,12 @@
 #
 # Nothing that builds or tries the release can write to the repository or reach a secret. The tools that make the
 # packages are pinned by hash. What still comes unpinned is of two kinds. The image's own build (the Dockerfile's
-# `apt-get upgrade` and `pip install .`, in the image jobs, in BuildKit's containers) takes three things as they are at
-# that hour: Debian's updates, the wheel's dependencies from PyPI, and its own build backend (hatchling and what it
-# needs, which `pip install .` fetches for an isolated build of qKVM from the tagged source: the image's qKVM is built
-# there, by that hatchling, and is not the hash-pinned and checked wheel of the packages). They decide what the image
-# holds, and so what is signed (the signed record vouches that what is published is the image that was then scanned,
+# `apt-get upgrade` and `pip install .`, in the image jobs, in BuildKit's containers) takes two things as they are at
+# that hour: Debian's updates, and its own build backend (hatchling and what it needs, which `pip install .` fetches for
+# an isolated build of qKVM from the tagged source: the image's qKVM is built there, by that hatchling, and is not the
+# hash-pinned and checked wheel of the packages). The wheel's dependencies it installs from the release's lock, by hash,
+# before (image-libraries.txt, the lock of its Python and architecture, held to the job libraries' hash). They decide
+# what the image holds, and so what is signed (the signed record vouches that what is published is the image that was then scanned,
 # gated and tested, not for the versions it holds). The tools that try the packages (twine, pytest, pip-audit, the
 # wheel's dependencies, in the job packages) can change an artifact at most, never have it signed. Every file a job of
 # the tag run takes from another's artifact and uses is held to a hash its maker hands on as a job output: the packages
@@ -237,13 +242,18 @@ jobs:
           if-no-files-found: error
           overwrite: true
 
-  # The packages as built, tried: on a copy held first to the checksum the build job handed on. What runs here (twine,
-  # pytest, pip-audit, the wheel's dependencies, all from PyPI) can at most change an artifact, never have that
-  # signed: sign holds the packages to the build's hash and the image evidence to the image jobs', and refuses.
-  packages:
+  # The exact wheels of every library the version runs, for every Python and system an update is installed in place on
+  # (qkvm/_libraries.py TARGETS: 3.11 to 3.14 on Linux x86-64 and ARM64 with glibc, and on Windows x86-64): pip, pinned by
+  # hash, resolves the built wheel's closure for each, and every wheel that fits is downloaded and held to the hash PyPI
+  # gives (make-libraries.py), then read back by the program's own reader. The lock goes into the signed SHA256SUMS; the
+  # jobs that try what walls will run, and the image jobs, install from it. No secret here; what it made is hashed (its
+  # list's hash handed on as a job output) before anything runs on this runner that is not pinned.
+  libraries:
     if: github.event_name == 'push'
     needs: build
     runs-on: ubuntu-24.04
+    outputs:
+      sums: ${{ steps.lock.outputs.sums }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -263,7 +273,61 @@ jobs:
           [[ "$SUMS" =~ ^[0-9a-f]{64}$ ]]
           test "$(sha256sum release/SHA256SUMS | cut -d ' ' -f 1)" = "$SUMS"
           (cd release && sha256sum --check --strict SHA256SUMS)
+      - id: lock
+        name: The lock, made with pip and packaging pinned by hash, and read back as every copy reads it
+        run: |
+          set -euo pipefail
+          python -m venv "$RUNNER_TEMP/locker"
+          "$RUNNER_TEMP/locker/bin/python" -m pip install --require-hashes --no-deps --only-binary :all: -r .github/security/lock-requirements.txt
+          "$RUNNER_TEMP/locker/bin/python" -I .github/security/make-libraries.py --version "${TAG#v}" \
+            --wheel "release/qkvm-${TAG#v}-py3-none-any.whl" --work "$RUNNER_TEMP/libraries" --out libraries
+          "$RUNNER_TEMP/locker/bin/python" -m qkvm.release libraries "libraries/qkvm-${TAG#v}-libraries.json"
+          (cd libraries && sha256sum --check --strict LIBRARIES.sums)
+          # (Into a variable first: a failing substitution in an argument of echo passes set -e unseen.)
+          sums=$(sha256sum libraries/LIBRARIES.sums | cut -d ' ' -f 1)
+          [[ "$sums" =~ ^[0-9a-f]{64}$ ]]
+          echo "sums=$sums" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: libraries
+          path: libraries/
+          if-no-files-found: error
+          overwrite: true
+
+  # The packages as built, tried: on a copy held first to the checksum the build job handed on. What runs here (twine,
+  # pytest, pip-audit, the wheel's dependencies, all from PyPI) can at most change an artifact, never have that
+  # signed: sign holds the packages to the build's hash and the image evidence to the image jobs', and refuses.
+  packages:
+    if: github.event_name == 'push'
+    needs: [build, libraries]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release
+          path: release/
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: libraries
+          path: libraries/
+      - name: The packages are the ones the build checksummed
+        env:
+          SUMS: ${{ needs.build.outputs.sums }}
+          LIBRARIES: ${{ needs.libraries.outputs.sums }}
+        run: |
+          set -euo pipefail
+          [[ "$SUMS" =~ ^[0-9a-f]{64}$ && "$LIBRARIES" =~ ^[0-9a-f]{64}$ ]]
+          test "$(sha256sum release/SHA256SUMS | cut -d ' ' -f 1)" = "$SUMS"
+          (cd release && sha256sum --check --strict SHA256SUMS)
           test "$(ls release | wc -l)" -eq 3
+          test "$(sha256sum libraries/LIBRARIES.sums | cut -d ' ' -f 1)" = "$LIBRARIES"
+          (cd libraries && sha256sum --check --strict LIBRARIES.sums)
           mkdir dist
           cp release/*.whl release/*.tar.gz dist/
       # Before anything is installed beside it, and with Python's own library only (-I -S): the source archive holds,
@@ -277,10 +341,13 @@ jobs:
           python -m pip install twine
           python -m twine check --strict dist/*
 
+      # With the lock's libraries for this Python, by hash, and nothing resolved at this hour: what walls get.
       - name: The package installs, and is the version the tag says
         run: |
           python -m venv /tmp/installed
-          /tmp/installed/bin/pip install dist/*.whl
+          /tmp/installed/bin/pip install --require-hashes --no-deps --only-binary :all: -r "libraries/requirements/$(python -c 'from qkvm.__main__ import target; print(target())').txt"
+          /tmp/installed/bin/pip install --no-deps dist/*.whl
+          /tmp/installed/bin/pip check
           cd /tmp && test "$(/tmp/installed/bin/qkvm --version)" = "qkvm ${TAG#v}"
 
       # What is published has passed its own tests, as built: not "it passed on another day", and not the source
@@ -302,6 +369,8 @@ jobs:
 
       - name: Fresh dependency audit of the built wheel
         run: bash .github/security/audit-wheel.sh dist/*.whl dependency-audit
+      - name: Fresh dependency audit of every library the lock names
+        run: bash .github/security/audit-lock.sh libraries dependency-audit
       - name: Retain dependency audit evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -312,6 +381,75 @@ jobs:
           retention-days: 90
           overwrite: true
 
+  # What an update installed in place runs, tried before it is signed: on each system the lock is for, with the oldest and
+  # the newest Python, the lock's libraries installed by hash beside the built wheel (nothing resolved), and the suite run
+  # against them from outside the tree; on Linux the native libraries the wheels bring held to their minimums, as in the
+  # image. (A matrix: these jobs hand nothing on.)
+  libraries_tested:
+    if: github.event_name == 'push'
+    needs: [build, libraries]
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm, windows-2025]
+        python: ["3.11", "3.12", "3.13", "3.14"]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release
+          path: release/
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: libraries
+          path: libraries/
+      - name: The packages and the lock are the ones their jobs made
+        env:
+          SUMS: ${{ needs.build.outputs.sums }}
+          LIBRARIES: ${{ needs.libraries.outputs.sums }}
+        run: |
+          set -euo pipefail
+          [[ "$SUMS" =~ ^[0-9a-f]{64}$ && "$LIBRARIES" =~ ^[0-9a-f]{64}$ ]]
+          test "$(sha256sum release/SHA256SUMS | cut -d ' ' -f 1)" = "$SUMS"
+          (cd release && sha256sum --check --strict SHA256SUMS)
+          test "$(sha256sum libraries/LIBRARIES.sums | cut -d ' ' -f 1)" = "$LIBRARIES"
+          (cd libraries && sha256sum --check --strict LIBRARIES.sums)
+      - name: The lock's libraries for this Python and system, by hash, and the wheel beside them
+        run: |
+          set -euo pipefail
+          target=$(python -c "from qkvm.__main__ import target; print(target())")
+          python -m venv "$RUNNER_TEMP/installed"
+          bin="$RUNNER_TEMP/installed/bin"; [ -d "$bin" ] || bin="$RUNNER_TEMP/installed/Scripts"
+          "$bin/python" -m pip install --require-hashes --no-deps --only-binary :all: -r "libraries/requirements/$target.txt"
+          "$bin/python" -m pip install --no-deps "release/qkvm-${TAG#v}-py3-none-any.whl"
+          "$bin/python" -m pip check
+          cd "$RUNNER_TEMP" && test "$("$bin/python" -P -m qkvm --version)" = "qkvm ${TAG#v}"
+      - name: Tests, against what an update installed in place runs
+        run: |
+          set -euo pipefail
+          bin="$RUNNER_TEMP/installed/bin"; [ -d "$bin" ] || bin="$RUNNER_TEMP/installed/Scripts"
+          "$bin/python" -m pip install pytest
+          cd "$RUNNER_TEMP"
+          "$bin/python" -P -c 'import os, sys, sysconfig, qkvm, pytest; site = sysconfig.get_paths()["purelib"]; assert os.path.commonpath([os.path.abspath(qkvm.__file__), site]) == site, qkvm.__file__; raise SystemExit(pytest.main(["--import-mode=importlib", "-q", "-p", "no:cacheprovider", sys.argv[1]]))' "$GITHUB_WORKSPACE/tests"
+      - name: The native libraries the wheels bring are past their minimums, as in the image
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/installed/bin/python" -P -s .github/security/native-versions.py > "$RUNNER_TEMP/native-versions.json"
+          arch=$(case "$(uname -m)" in x86_64) echo amd64 ;; aarch64) echo arm64 ;; esac)
+          python .github/security/check-native-versions.py "$RUNNER_TEMP/native-versions.json" \
+            --minimums .github/security/native-minimums.json --arch "$arch" --wheels-only
+
   # Both architectures are built, exercised and scanned without write permissions or secrets.
   # The resulting OCI archives (including SBOM/provenance) are the only images allowed to publish. They are kept until
   # the draft can have been published: the image job of the publication takes them from this run.
@@ -320,7 +458,7 @@ jobs:
   # syscall emulation.
   images_amd64:
     if: github.event_name == 'push'
-    needs: build
+    needs: [build, libraries]
     runs-on: ubuntu-24.04
     outputs:
       archive: ${{ steps.image.outputs.archive }}
@@ -331,12 +469,27 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # (The image's libraries are the lock's for its Python, held to the hash the job libraries handed on, before anything
+      # else runs here.)
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: libraries
+          path: libraries/
+      - name: The lock is the one the job libraries made
+        env:
+          LIBRARIES: ${{ needs.libraries.outputs.sums }}
+        run: |
+          set -euo pipefail
+          [[ "$LIBRARIES" =~ ^[0-9a-f]{64}$ ]]
+          test "$(sha256sum libraries/LIBRARIES.sums | cut -d ' ' -f 1)" = "$LIBRARIES"
+          (cd libraries && sha256sum --check --strict LIBRARIES.sums)
       # (The action takes the hashes of the archive and its evidence right after the scan and the native step,
       # before it installs anything on this runner; sign holds the evidence to them.)
       - id: image
         uses: ./.github/security
         with:
           arch: amd64
+          libraries: libraries/requirements/cp313-linux-x86_64.txt
       # (The ID this upload gets is handed on: the draft is made only while no archive of this name newer than this one
       # is listed. It replaces one of its name, as every upload of this run does: a run again uploads anew.)
       - id: upload
@@ -351,7 +504,7 @@ jobs:
 
   images_arm64:
     if: github.event_name == 'push'
-    needs: build
+    needs: [build, libraries]
     runs-on: ubuntu-24.04-arm
     outputs:
       archive: ${{ steps.image.outputs.archive }}
@@ -362,12 +515,27 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # (The image's libraries are the lock's for its Python, held to the hash the job libraries handed on, before anything
+      # else runs here.)
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: libraries
+          path: libraries/
+      - name: The lock is the one the job libraries made
+        env:
+          LIBRARIES: ${{ needs.libraries.outputs.sums }}
+        run: |
+          set -euo pipefail
+          [[ "$LIBRARIES" =~ ^[0-9a-f]{64}$ ]]
+          test "$(sha256sum libraries/LIBRARIES.sums | cut -d ' ' -f 1)" = "$LIBRARIES"
+          (cd libraries && sha256sum --check --strict LIBRARIES.sums)
       # (The action takes the hashes of the archive and its evidence right after the scan and the native step,
       # before it installs anything on this runner; sign holds the evidence to them.)
       - id: image
         uses: ./.github/security
         with:
           arch: arm64
+          libraries: libraries/requirements/cp313-linux-aarch64.txt
       # (The ID this upload gets is handed on: the draft is made only while no archive of this name newer than this one
       # is listed. It replaces one of its name, as every upload of this run does: a run again uploads anew.)
       - id: upload
@@ -385,7 +553,7 @@ jobs:
   # openssl, and qkvm/release.py and image-digests.py as they are at the tag. What it signed goes on as an artifact.
   sign:
     if: github.event_name == 'push'
-    needs: [build, packages, images_amd64, images_arm64]
+    needs: [build, packages, libraries, libraries_tested, images_amd64, images_arm64]
     runs-on: ubuntu-24.04
     environment: release  # the signing key, and nothing else (see the top of this file)
     permissions:
@@ -401,6 +569,10 @@ jobs:
         with:
           name: release
           path: release/
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: libraries
+          path: libraries/
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: container-security-amd64
@@ -440,6 +612,19 @@ jobs:
             test "$(sha256sum "evidence/container-security-$arch/native-versions.json" | cut -d ' ' -f 1)" = "${!native}"
             test "$(jq --raw-output .archive.sha256 "evidence/container-security-$arch/scanned-image.json")" = "${!archive}"
           done
+
+      # The lock that the job libraries made, tried by the jobs after it, held to its hash; in the checksums that are signed,
+      # which every copy's updater holds it to before it fetches one library by it.
+      - name: The lock, in the checksums that are signed
+        env:
+          LIBRARIES: ${{ needs.libraries.outputs.sums }}
+        run: |
+          set -euo pipefail
+          [[ "$LIBRARIES" =~ ^[0-9a-f]{64}$ ]]
+          test "$(sha256sum libraries/LIBRARIES.sums | cut -d ' ' -f 1)" = "$LIBRARIES"
+          (cd libraries && sha256sum --check --strict LIBRARIES.sums)
+          cp "libraries/qkvm-${TAG#v}-libraries.json" release/
+          (cd release && sha256sum -- "qkvm-${TAG#v}-libraries.json" >> SHA256SUMS)
 
       # What each architecture's scan saw, what each image said of the native code the scanner cannot see, the commit,
       # and the run that keeps the archives: signed with the packages, so that the publication pushes those archives
@@ -561,17 +746,17 @@ jobs:
             exit 1
           fi
 
-      # The signed list names the three files of this version and nothing else, before a draft of it exists; and the
-      # folder whose every file the draft is made with holds those three, the list and its signature, and nothing
-      # else (each a plain file): a sixth would go onto the draft unchecked.
-      - name: The signed list is this version's three files, and the folder holds those, the list and its signature only
+      # The signed list names the four files of this version and nothing else, before a draft of it exists; and the
+      # folder whose every file the draft is made with holds those four, the list and its signature, and nothing
+      # else (each a plain file): a seventh would go onto the draft unchecked.
+      - name: The signed list is this version's four files, and the folder holds those, the list and its signature only
         run: |
           set -euo pipefail
           listed=$(awk '{print $2}' release/SHA256SUMS | LC_ALL=C sort | tr '\n' ' ')
-          test "$listed" = "qkvm-${TAG#v}-image.json qkvm-${TAG#v}-py3-none-any.whl qkvm-${TAG#v}.tar.gz "
+          test "$listed" = "qkvm-${TAG#v}-image.json qkvm-${TAG#v}-libraries.json qkvm-${TAG#v}-py3-none-any.whl qkvm-${TAG#v}.tar.gz "
           test -z "$(find release -mindepth 1 ! -type f)"
           held=$(ls -A release | LC_ALL=C sort | tr '\n' ' ')
-          test "$held" = "SHA256SUMS SHA256SUMS.sig qkvm-${TAG#v}-image.json qkvm-${TAG#v}-py3-none-any.whl qkvm-${TAG#v}.tar.gz "
+          test "$held" = "SHA256SUMS SHA256SUMS.sig qkvm-${TAG#v}-image.json qkvm-${TAG#v}-libraries.json qkvm-${TAG#v}-py3-none-any.whl qkvm-${TAG#v}.tar.gz "
 
       - name: Make the draft release, then check every file it holds against the signature
         env:
@@ -605,9 +790,9 @@ jobs:
           done
           # Signed with a key built in, every file it holds listed with its checksum, every file listed held.
           /usr/bin/python3 -m qkvm.release verify --all --signed --openssl "$drafted/SHA256SUMS" "${files[@]}"
-          # And the list names the three files of this version and nothing else, as the publication will require.
+          # And the list names the four files of this version and nothing else, as the publication will require.
           listed=$(awk '{print $2}' "$drafted/SHA256SUMS" | LC_ALL=C sort | tr '\n' ' ')
-          test "$listed" = "qkvm-${TAG#v}-image.json qkvm-${TAG#v}-py3-none-any.whl qkvm-${TAG#v}.tar.gz "
+          test "$listed" = "qkvm-${TAG#v}-image.json qkvm-${TAG#v}-libraries.json qkvm-${TAG#v}-py3-none-any.whl qkvm-${TAG#v}.tar.gz "
           # The very files the cryptography library checked in the job before (and openssl here).
           cmp "$drafted/SHA256SUMS" release/SHA256SUMS
           cmp "$drafted/SHA256SUMS.sig" release/SHA256SUMS.sig
@@ -657,10 +842,10 @@ jobs:
           /usr/bin/python3 -c "import cryptography" 2>/dev/null || { sudo apt-get update --quiet && sudo apt-get install --yes --quiet python3-cryptography; }
           # Signed with a key built in, every file it holds listed with its checksum, every file listed held.
           /usr/bin/python3 -m qkvm.release verify --all --signed "$RUNNER_TEMP/published/SHA256SUMS" "${files[@]}"
-          # And the list names the three files of this version and nothing else: the wheel the updater takes by this
-          # name, the source archive, the image record.
+          # And the list names the four files of this version and nothing else: the wheel the updater takes by this
+          # name, the lock of its libraries, the source archive, the image record.
           listed=$(awk '{print $2}' "$RUNNER_TEMP/published/SHA256SUMS" | LC_ALL=C sort | tr '\n' ' ')
-          test "$listed" = "qkvm-${TAG#v}-image.json qkvm-${TAG#v}-py3-none-any.whl qkvm-${TAG#v}.tar.gz "
+          test "$listed" = "qkvm-${TAG#v}-image.json qkvm-${TAG#v}-libraries.json qkvm-${TAG#v}-py3-none-any.whl qkvm-${TAG#v}.tar.gz "
           mkdir "$RUNNER_TEMP/records"
           run=$(python3 .github/security/image-digests.py from-release --version "${TAG#v}" --commit "$GITHUB_SHA" "$RUNNER_TEMP/published/qkvm-${TAG#v}-image.json" "$RUNNER_TEMP/records")
           echo "run=$run" >> "$GITHUB_OUTPUT"

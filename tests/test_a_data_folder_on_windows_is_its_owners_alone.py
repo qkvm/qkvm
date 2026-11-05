@@ -253,7 +253,8 @@ def test_a_data_folder_of_another_account_is_said_with_how_to_take_it_over(tmp_p
     # names the owner is given beside it (the round 2 review's note 7), with the account qKVM runs as here filled in. Neither
     # goes into what is in the folder (no /T, no /R: the round 3 review, L6, as a junction inside would be followed).
     me = _folders._name(_folders._windows(), _folders._me(_folders._windows()))
-    assert "belongs to another user" in said and f'takeown /F "{data}" ' in said and f'icacls "{data}" /setowner "{me}" ' in said, said
+    taken = f'icacls "{data}" /setowner "{me}"; icacls "{data}" /grant "{me}:F" '  # (and its own entry: see setowner_line)
+    assert "belongs to another user" in said and f'takeown /F "{data}" ' in said and taken in said, said
     assert "service's account" in said and "/T" not in said and "/R" not in said, said
 
 
@@ -709,13 +710,14 @@ def test_a_data_folder_of_another_account_and_open_to_others_is_given_every_line
     assert run_cli(["--data-dir", str(data), "--disable-2fa", "nobody"]) == 2
     said = " ".join(capsys.readouterr().err.split())
     me = _folders._name(_folders._windows(), _folders._me(_folders._windows()))
-    owner, entry = f'icacls "{data}" /setowner "{me}"', f'icacls "{data}" /remove:g *{AUTHENTICATED_USERS}'
+    owner, own, entry = f'icacls "{data}" /setowner "{me}"', f'icacls "{data}" /grant "{me}:F"', f'icacls "{data}" /remove:g *{AUTHENTICATED_USERS}'
     assert f"qkvm: {data} belongs to another user, and can be written to by other users of this computer." in said, said
-    assert owner in said and entry in said and said.index(owner) < said.index(entry), said
+    assert f"{owner}; {own}" in said and entry in said and said.index(owner) < said.index(entry), said
     monkeypatch.undo()
-    for line in (owner, entry):
+    for line in (owner, own, entry):
         assert subprocess.run(line, shell=True, capture_output=True).returncode == 0, line
     assert _folders.folder_judged(data) is None
+    list(data.iterdir())  # (and the account's to use, not PermissionError: an owner is given nothing by owning)
 
 
 def test_an_acl_that_cannot_be_looked_at_is_said_so_and_not_as_what_others_may_do(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:

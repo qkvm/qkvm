@@ -20,9 +20,10 @@ from tests.workflow_text import SECURITY, WORKFLOWS, jobs, steps
 RELEASE = WORKFLOWS / "release.yml"
 # Who makes each artifact of the tag's run (the image jobs' container-security-<arch> through the shared action; each
 # downloaded by its exact name: test_every_artifact_is_downloaded_by_its_exact_name).
-MAKERS = {"release": {"build"}, "container-security-amd64": {"images_amd64"}, "container-security-arm64": {"images_arm64"}, "signed": {"sign"}}
+MAKERS = {"release": {"build"}, "libraries": {"libraries"}, "container-security-amd64": {"images_amd64"}, "container-security-arm64": {"images_arm64"}, "signed": {"sign"}}
 OUTPUTS = {
     "build": {"sums"},
+    "libraries": {"sums"},
     "images_amd64": {"archive", "scan", "native"},
     "images_arm64": {"archive", "scan", "native"},
     "sign": {"sums", "sig"},
@@ -57,7 +58,7 @@ def test_each_maker_hands_on_the_hashes_of_what_it_made() -> None:
 def test_every_artifact_read_in_the_tags_run_is_held_to_its_makers_hash_before_it_is_used() -> None:
     every = jobs(RELEASE)
     readers = {name for name, job in every.items() if downloads(job)}
-    assert readers == {"packages", "sign", "signature", "draft"}, readers
+    assert readers == {"libraries", "packages", "libraries_tested", "images_amd64", "images_arm64", "sign", "signature", "draft"}, readers
     for name in readers:
         order = steps(every[name])
         last_download = max(index for index, step in enumerate(order) if "actions/download-artifact@" in step)

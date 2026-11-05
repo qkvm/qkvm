@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import ipaddress
 import json
 import logging
 import os
@@ -14,6 +15,7 @@ from collections import deque
 from collections.abc import Awaitable, Callable, Iterable
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 
 from . import activity, unlock
@@ -23,10 +25,13 @@ from .forward import Syslog
 from .history import FILE as HISTORY_FILE
 from .history import History
 from .kvm import Device, DeviceSpec, KvmDevice, KvmError, Snapshot, saved_mark
-from .netbind import lan_ip, tailscale_ip
+from .netbind import TAILSCALE_NET, lan_ip, tailscale_ip
+from .screens import ScreenWatch
 from .security import Limiter, Sessions, proxy_networks
-from .store import FINGERBOT_STRENGTHS, KINDS, AuditLog, DeviceRecord, Store, UserRecord, activity_file_bytes
+from .served import Served, address_of, same_address
+from .store import AMT_VIEWS, FINGERBOT_STRENGTHS, KINDS, AuditLog, DeviceRecord, Store, UserRecord, activity_file_bytes
 from .tlscert import certificate_fingerprint, ensure_certificate
+from ._libraries import FILES
 from .update import GITHUB_API, Updater
 from .vault import NoMemory, Vault
 
@@ -121,8 +126,13 @@ class Core:
         # MOST_CONTROL_A_MINUTE), which pace them: kept with the program too, not started afresh with the listeners.
         self.control_said: dict[str, deque[float]] = {}
         self.console_said = {event: activity.Allowance(lambda: activity.CONSOLE_SAID_AN_HOUR) for event in ("console_opened", "console_failed")}
+        # When each account last had a test alert sent to a browser of its own by Web Push (server.push_test): a request
+        # to whatever address that browser gave, so not one after the other. Kept with the program, as the pacing is.
+        self.push_tested: dict[str, float] = {}
         # What each machine was last seen as, for alerts: kept over a restart, and over the listeners being reopened.
         self.watcher = Watcher(data_dir / "watch.json")
+        # Its screens watched (screens.py): which of those alerts stand, kept over a restart; the pictures that set them off.
+        self.screens = ScreenWatch(data_dir)
         # What the wall saw of each machine, kept for a while (see history.py): opened by its own thread once the wall serves.
         self.history = History(data_dir / HISTORY_FILE, limits=lambda: (self.store.server.history_days, self.store.server.history_mb))
         # Where qKVM was started with --setup-code: printed where it runs, and asked of whoever sets the first
@@ -141,12 +151,17 @@ class Core:
         self.exit_status: int | None = None  # set to leave the program altogether with this status
         self.supervised = False  # started by `python -m qkvm`, which can start us again
         self.container = os.environ.get("QKVM_CONTAINER") == "1"  # set in the Docker image
+        # The images mounted on the wall's servers, which their controllers read from it (served.py): kept while it runs.
+        self.served = Served(lambda: self.store.server.media_folder, self.media_address, self._tile_identity)
         self.updater = Updater(
             data_dir,
             update_repo or os.environ.get("QKVM_UPDATE_REPO") or None,
             # For a GitHub Enterprise server, or a stand-in when testing.
             api=os.environ.get("QKVM_UPDATE_API") or GITHUB_API,
             allow_unsigned=allow_unsigned_updates,
+            # (And where the libraries a release lists are fetched from: PyPI's file host, or a stand-in when testing. Only
+            # what the release's signed list names is taken, wherever it is asked for.)
+            files=os.environ.get("QKVM_UPDATE_FILES") or FILES,
         )
 
     def _still_let_in(self, user_id: str, mark: str) -> bool:
@@ -170,6 +185,30 @@ class Core:
     def https(self) -> bool:
         """Whether browsers are served over HTTPS: switched on in the settings, or said at start."""
         return self.https_forced or self.store.server.https
+
+    def _tile_identity(self, device_id: str) -> tuple[str | None, str, str]:
+        """A tile's controller as it is known now, from its saved record: what a mount of an image is bound to."""
+        record = self.store.device(device_id)
+        return (record.cert_pem, record.machine, record.ident) if record is not None else (None, "", "")
+
+    def media_address(self) -> str | None:
+        """The wall's address as the servers' controllers reach it, to read a mounted image from (served.py): the one named in
+        the settings, or else the first place it listens on the network (not this computer alone, not Tailscale's, which a
+        controller does not reach; on IPv6's "::", all of the computer's addresses, its address on the network, as `urls`
+        has it for 0.0.0.0); None where there is none."""
+        if self.store.server.media_address:
+            return address_of(self.store.server.media_address)
+        for url in self.listening:
+            parts = urlsplit(url)
+            if parts.hostname == "::":
+                if (lan := lan_ip()) is None:
+                    continue
+                url = parts._replace(netloc=lan if parts.port is None else f"{lan}:{parts.port}").geturl()
+            found = address_of(url)
+            host = same_address(urlsplit(url).hostname or "")
+            if found is not None and host is not None and not ipaddress.ip_address(host).is_loopback and ipaddress.ip_address(host) not in TAILSCALE_NET:
+                return found
+        return None
 
     def prepare_tls(self, addresses: list[str]) -> tuple[Path, Path]:
         """Make sure the wall's own certificate covers `addresses`; returns (certificate, key) files.
@@ -320,6 +359,9 @@ class Core:
         # in, alerts would be shown as set up and go nowhere.
         self.store.actions = [action for action in self.store.actions if action.kind != "text"]
         self.store.alerts.webhook = None
+        # ...and the browsers told the alerts by Web Push, whose accounts are gone, with the wall's key they subscribed to.
+        self.store.pushes = []
+        self.store.alerts.push_key = None
         # Whoever had the token that reads the measurements was given it by an account that is gone.
         self.store.server.metrics_token = ""
         self.store.save()  # (the second copy of the settings is renewed with it)
@@ -438,7 +480,7 @@ class DeviceManager:
         self.moved: Callable[[str, str, str], Awaitable[None]] | None = None
         # Told when a driver takes a number its machine gives for itself (device id, the address it has, the number kept
         # until now, the one to keep): kept by whoever changes what is saved, one change at a time (see `_known`).
-        self.known: Callable[[str, str, str, str], Awaitable[None]] | None = None
+        self.known: Callable[[str, str, str, str, Callable[[], bool] | None], Awaitable[None]] | None = None
         # Told what the wall sees of a device at every look (device id, its status): the history keeps it. Must not wait.
         self.observed: Callable[[str, dict[str, Any]], None] | None = None
         # Told before a client is closed, with it still open: what a live line has down on the device is let go of
@@ -462,17 +504,21 @@ class DeviceManager:
             cert_pem=record.cert_pem,
             kind=record.kind,
             machine=record.machine,
+            ident=record.ident,
             fingerbot_strength=record.fingerbot_strength if record.fingerbot_strength in FINGERBOT_STRENGTHS else FINGERBOT_STRENGTHS[0],
+            amt_view=record.amt_view if record.amt_view in AMT_VIEWS else AMT_VIEWS[0],
         )
 
-    async def _known(self, device_id: str, url: str, was: str, mark: str) -> None:
+    async def _known(self, device_id: str, url: str, was: str, mark: str, current: Callable[[], bool] | None = None) -> None:
         """A driver took a number its machine gives for itself (DeviceSpec.machine): the first one, where none was kept; or a
         server's controller's beside its computer's. Kept with the tile only where what is kept is still `was`, at the address
         it was seen at; by the server (`known`), as every change of what is saved is made: in its turn among the changes, with
         a new record in the old one's place, so that an edit under way notices. Not waited for: the driver is in the middle
         of a look or a command, which whoever holds that turn may be waiting for."""
+        if current is not None and not current():
+            return  # (a driver replaced meanwhile has nothing to say of the record that took its place)
         if self.known is not None:
-            saving = asyncio.ensure_future(self.known(device_id, url, was, mark))
+            saving = asyncio.ensure_future(self.known(device_id, url, was, mark, current))
         else:
             # (No server: the record changed where it is, and saved in its turn, as a first certificate is.)
             record = self.core.store.device(device_id)
@@ -483,7 +529,9 @@ class DeviceManager:
         self._saving.add(saving)
         saving.add_done_callback(self._saving.discard)
 
-    async def _pinned(self, device_id: str, url: str, cert_pem: str) -> None:
+    async def _pinned(self, device_id: str, url: str, cert_pem: str, current: Callable[[], bool] | None = None) -> None:
+        if current is not None and not current():
+            return  # (a driver replaced meanwhile has nothing to say of the record that took its place)
         record = self.core.store.device(device_id)
         # Only for the address it was seen at, and only where a certificate is still what is asked for:
         # a client that was replaced while it looked has nothing to say about the KVM's new settings.
@@ -519,10 +567,15 @@ class DeviceManager:
 
     def _install(self, device: Device) -> None:
         device_id, url = device.spec.id, device.spec.base_url
-        device.on_pin = lambda pem: self._pinned(device_id, url, pem)
+
+        def current() -> bool:
+            return self.devices.get(device_id) is device
+
+        device.on_pin = lambda pem: self._pinned(device_id, url, pem, current)
         device.on_move = lambda to: self._moved(device_id, url, to)
         device.on_status = lambda status: self._observed(device_id, status)
-        device.on_known = lambda was, mark: self._known(device_id, url, was, mark)
+        device.on_known = lambda was, mark: self._known(device_id, url, was, mark, current)
+        device.served = self.core.served
         self.devices[device_id] = device
 
     def _observed(self, device_id: str, status: dict[str, Any]) -> None:

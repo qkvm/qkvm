@@ -17,6 +17,7 @@ import pytest
 
 from qkvm import alerts, kvm
 from qkvm.kvm import power_said
+from tests.conftest import at_least
 from tests.fake_kvm import FakeKvm, FakeState
 from tests.test_alerts import Inbox, baseline
 from tests.test_history import hist
@@ -179,7 +180,7 @@ def test_a_button_the_board_holds_after_answering_is_one_thing_at_a_time(tmp_pat
             pressing.join(20)
             took, answer = first[0]
             assert (answer.status_code, answer.json()) == (200, {"ok": True, "note": None}), answer.text
-            assert took >= 1.2, f"the reset was said done after {took:.2f} s, while the board held the button 1.2 s"
+            assert took >= at_least(1.2), f"the reset was said done after {took:.2f} s, while the board held the button 1.2 s"
             assert fake.state.actions == ["atx reset"] and fake.state.held_over == 0
             assert press(client, device, "atx_power")[1].status_code == 200  # let go, the next one goes through
     finally:

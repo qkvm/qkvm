@@ -57,7 +57,7 @@ def test_the_tests_and_audits_run_on_a_copy_held_to_the_builds_checksum() -> Non
     held = next(index for index, step in enumerate(checked) if HELD[0] in step)
     assert "SUMS: ${{ needs.build.outputs.sums }}" in checked[held] and HELD[1] in checked[held]
     later = "\n".join(checked[held + 1 :])
-    for work in ("twine check --strict", "/tmp/installed/bin/pip install dist/*.whl", "pytest.main(", "check-sdist.py", "audit-wheel.sh"):
+    for work in ("twine check --strict", "/tmp/installed/bin/pip install --no-deps dist/*.whl", "pytest.main(", "check-sdist.py", "audit-wheel.sh", "audit-lock.sh"):
         assert work in later, work
     assert all("pip install" not in step for step in checked[:held]), "nothing installed before the copy is held"
 

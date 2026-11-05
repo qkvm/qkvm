@@ -32,7 +32,12 @@
         then it refuses, as there is no key to check a signature with. With --openssl, the
         signature is checked by the openssl command.
 
-Attach the wheel, the source archive, SHA256SUMS and SHA256SUMS.sig to a GitHub release tagged v1.2.3 (the release
+    python -m qkvm.release libraries qkvm-1.2.3-libraries.json
+        Reads a release's lock of its libraries as every copy reads it (qkvm/_libraries.py), and refuses one that no
+        copy would take, or that has no build for one of the targets an update is installed in place on. What the
+        release workflow runs on the lock it made (.github/security/make-libraries.py). Needs packaging.
+
+Attach the wheel, the libraries' lock, the source archive, SHA256SUMS and SHA256SUMS.sig to a GitHub release tagged v1.2.3 (the release
 workflow makes it a draft with these files and the record of the scanned images, and a person publishes it).
 
 This file needs the cryptography library, or with --openssl the openssl command instead, and nothing else of what the
@@ -340,7 +345,28 @@ def verify(
     return f"{len(files)} file(s) are the ones the release lists. No key is built into this version: checked against the checksums only."
 
 
+def libraries(path: Path) -> str:
+    """A release's lock, read as every copy reads it; SystemExit where no copy would take it, or it leaves a target out."""
+    from . import _libraries
+
+    named = re.fullmatch(r"qkvm-(\d+\.\d+\.\d+)-libraries\.json", path.name)
+    if named is None:
+        raise SystemExit(f"{path.name} is not named as a release's lock is (qkvm-X.Y.Z-libraries.json)")
+    try:
+        read = _libraries.read(path.read_bytes(), named.group(1))
+    except _libraries.LockError as ex:
+        raise SystemExit(f"{path.name} is not a lock any copy takes: {ex}") from None
+    missing = [target for target in _libraries.TARGETS if target not in read.targets]
+    if missing:
+        raise SystemExit(f"{path.name} has no build for {', '.join(missing)}")
+    wheels = {wheel.file for libraries in read.targets.values() for library in libraries for wheel in library.wheels}
+    return f"{path.name}: {len(read.targets)} targets, {len(wheels)} wheels, every one at PyPI's file host with its SHA-256."
+
+
 def main(argv: list[str]) -> int:
+    if len(argv) == 2 and argv[0] == "libraries":
+        print(libraries(Path(argv[1])))
+        return 0
     if argv[:1] == ["verify"]:
         rest = argv[1:]
         options: list[str] = []

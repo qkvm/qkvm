@@ -23,6 +23,7 @@ import pytest
 from qkvm import kvm
 from qkvm.kvm import power_said
 from tests.fake_kvm import FakeKvm, FakeState
+from tests.conftest import at_least
 from tests.test_a_comets_power_board import press
 from tests.test_history import hist
 from tests.test_wall import add, wait_until, wall
@@ -306,7 +307,7 @@ def test_a_no_board_on_the_line_while_a_press_is_waited_for_is_no_word_on_the_co
             pressing.join(30)
             took, reply = answers[0]
             assert (reply.status_code, reply.json()) == (200, {"ok": True, "note": "held, but the computer is still on"}), reply.text
-            assert took >= quick["power_long"] + kvm.SEEN_WITHIN
+            assert took >= at_least(quick["power_long"] + kvm.SEEN_WITHIN), took
     finally:
         fake.stop()
 

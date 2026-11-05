@@ -107,7 +107,8 @@ with a setup code from the first request. Existing accounts are preserved.
 The image is there for amd64 and arm64 (the same
 one is at `ghcr.io/qkvm/qkvm`) and runs as an unprivileged user; settings live in the
 `qkvm-data` volume. (If you mount a folder of your own at `/data` instead, it has to be
-writable by that user, uid 10001.) The
+writable by that user, uid 10001. Where a start refuses files of another account there, the
+lines it gives name the paths inside the container and the user by that number.) The
 [`docker-compose.yml`](https://github.com/qkvm/qkvm/blob/main/docker-compose.yml) in the
 source runs it the same way and locked down further, on a read-only file system and without
 capabilities: put that file in a folder and run `docker compose up -d` there. To update,
@@ -254,6 +255,8 @@ The first visit walks you through four steps:
     Fingerbot says nothing of the computer's power: the tile shows what follows on the screen. On a
     KVM with several inputs it presses the machine it sits on, whichever is on screen.
   - *Reboot KVM*: restarts the KVM itself.
+  - *Media...* (an admin's, where the machine has virtual media): an image in its drive, see
+    [Virtual media](#virtual-media).
 - **Bulk actions:** press **Select** (or `S`) to enter select mode, tick the KVMs you want
   (*Select all* takes the ones currently shown, so filter or search first), then
   **Run action...**. You confirm against the list of machines; what can lose somebody's work
@@ -285,7 +288,9 @@ The first visit walks you through four steps:
   "not pressed": an answer that says neither (the KVM's web server answers 502, 503 or 504 while
   kvmd restarts behind it, kvmd itself 500), none within eight seconds, or one that broke off, is
   "it may have been done", and the board is then left alone for eight seconds and the button's
-  hold, whoever asks (a Fingerbot on the same machine too). A Fingerbot's press is
+  hold, whoever asks (a Fingerbot on the same machine too), also through an edit of the tile to
+  another address where the KVM's own certificate is pinned and shown there; a tile edited to
+  another KVM, or over plain HTTP, starts afresh, and so does a restart of qKVM. A Fingerbot's press is
   on its way until the press's own time is over after the Comet's answer, and one press of the
   Fingerbot's and one of the board's on the same machine are two things, one after the other (also
   while a Fingerbot's press that got no clear answer may still be under way).
@@ -312,7 +317,8 @@ The first visit walks you through four steps:
 
 Text is typed with a US keyboard layout. On a computer set to another layout, letters and
 digits arrive as written but some symbols do not. (A VNC server is sent the characters
-themselves, and its own layout decides: see [VNC servers](#vnc-servers). A JetKVM says which
+themselves, and its own layout decides: see [VNC servers](#vnc-servers); a server whose console
+is OpenBMC's is sent a US keyboard's keys, Shift with them where needed. A JetKVM says which
 layout its computer uses, and text is typed in that one: see [JetKVM](#jetkvm).) The keys of the
 live view are places on the keyboard, whatever the layout.
 
@@ -350,6 +356,18 @@ keys for mouse or touch input. Shift, Ctrl, Alt and Win apply to the next key on
 on the remote machine between clicks. **Type text** briefly releases this page's live control after confirmation, waits for acknowledgement, types through the normal action channel, then requests control again. A missing acknowledgement or another session holding control blocks the text. Closing the keyboard, losing page focus or releasing control
 clears those modifiers. The labels use US key positions; the remote machine's keyboard layout
 determines the resulting text. **Details** in the status strip opens device information, stream statistics, history graphs and permitted recent activity together.
+
+**The size of the picture**, in the status strip: **Fit** (the default: the whole picture in the
+view) or 50, 75, 100, 125, 140 or 200 %, so many pixels of your screen to each of the machine's
+(100 % is one to one, sharp whatever your system's scaling or the browser's zoom; at a fixed size
+the page asks for the machine's whole picture). Smaller than the view, the picture sits in its
+middle; larger, it scrolls: by its scroll bars and the wheel, or by dragging it while you only
+watch. While you hold the keyboard and mouse, every key, click, drag and turn of the wheel is the
+machine's as before, and the scroll bars move the picture; a click lands on the machine's pixel
+it was made on at every size, in fullscreen and with the row of keys shown (with **Relative
+mouse**, give the pointer back with Esc to reach the scroll bars). The size has no key of its
+own, so that none is taken from the machine. Your browser keeps the size for each machine, a wall
+screen's too; another browser starts at Fit.
 
 **Who may.** Whoever may see the machine may watch it: a viewer, a wall screen opened with its
 display link, a token for scripts. Taking its keyboard and mouse takes an operator or an admin,
@@ -419,10 +437,10 @@ loop cannot push out of the log what was done before (see [Activity log](#activi
 | A KVM with the `kvmd` interface without that line, and a viewer that shows JPEG alone | JPEG pictures asked one after the other, as fast as the fastest viewer asks and never more than the KVM gives (30 a second at most), only those that changed | yes; the pointer by steps where the KVM's mouse is set to relative (see below) |
 | JetKVM | JPEG made of the frames qKVM decodes anyway; its H.264 is not passed on (see Limits) | yes |
 | A server whose controller is AMI MegaRAC (see [Servers](#servers)) | JPEG of its screen, each time the screen changes | yes, as the console's own USB keyboard and mouse reports; the pointer goes as an absolute place where the server's mouse is absolute (what these boards are by default), the back and forward buttons have no bit there |
-| A server whose controller runs OpenBMC (see [Servers](#servers)) | JPEG of its screen, each time the screen changes | no: qKVM only looks at an OpenBMC console |
+| A server whose controller runs OpenBMC (see [Servers](#servers)) | JPEG of its screen, each time the screen changes | yes, as RFB's key and pointer events over the console the screen comes on, which OpenBMC turns into the server's USB keyboard and mouse; they wait about a second after the console opens, which OpenBMC takes nothing in; the back and forward buttons have none there; not tried on a real controller |
 | A PC with Intel AMT whose KVM qKVM may use (see [Intel AMT](#intel-amt)) | JPEG of its screen, each time the screen changes, at the pace the viewer asks for | yes, as the KVM's own key and pointer events; the back and forward buttons have none there |
 | A virtual machine on Proxmox VE, while it runs (see [Proxmox and virtual machines](#proxmox-and-virtual-machines)) | JPEG of its screen, each time the screen changes, at the pace the viewer asks for; the tile's console and the line's are one | yes, as RFB's key and pointer events through its console; the back and forward buttons have none there |
-| A VNC server | none in this version (`live` is not in its `can`): the tile's pictures | no |
+| A VNC server (see [VNC servers](#vnc-servers)) | JPEG of its screen, each time the screen changes, at the pace the viewer asks for; the tile's connection and the line's are one | yes, as RFB's key and pointer events; the back and forward buttons have none there; a server set to view only takes them and does nothing with them, which qKVM cannot see |
 
 **The pointer.** A KVM with the `kvmd` interface moves its computer's pointer the way its mouse
 is set on the KVM (its own settings): to a place (absolute, stock kvmd's default) or by steps
@@ -431,8 +449,8 @@ pointer to a place the page sent. The line says which (`pointer` in its `state` 
 the page follows it: where the mouse moves by steps only, the bar says so and a click on the
 picture hands the pointer to the machine (the browser's pointer lock; Esc gives it back), as
 the KVM's own page does it, and that click is no click on the machine; where it takes places
-only, *Relative mouse* is not offered. A JetKVM, a PC with Intel AMT and a virtual machine take
-both. With the pointer handed over, the computer moves it by its own settings (Windows speeds a
+only, *Relative mouse* is not offered. A JetKVM, a PC with Intel AMT, a virtual machine, a VNC
+server and an OpenBMC console take both. With the pointer handed over, the computer moves it by its own settings (Windows speeds a
 fast move up), so it goes where the computer puts it, which the picture shows.
 
 The messages of the line, for whoever writes a program that speaks it. Text messages are JSON
@@ -472,6 +490,131 @@ forward), then the picture. A viewer that falls behind is not waited for: it is 
 forward to the next key frame, and sees that as a jump in the counter. Keys and the mouse are
 taken only from the connection that holds them, and only after the server has said so.
 
+## Virtual media
+
+An image in a machine's drive, and the machine started from it: an installer, a rescue system, a
+firmware tool. *Actions > Media...* is an admin's, in person: whoever mounts an image on a
+machine and starts it from that is root on it (see [Accounts](#accounts)). The box lists the
+images, says what is in the drive and who put it there from qKVM, and mounts, unmounts, uploads
+and deletes. Each of those asks first, naming the machine and the image; the request carries
+both, and nothing is done where the machine is called otherwise by then, or the image is no
+longer listed. Each is in the activity log with the account, the machine and the image, and with
+the image's SHA-256 where qKVM carried it there. The tile says what is in the drive
+(`CD: debian-13.iso`, `Flash: ...`), to everybody who sees it.
+
+| Machine | Its images | Mounted as | Started from it |
+|---|---|---|---|
+| A KVM with the kvmd interface (a GL.iNet Comet, a PiKVM), with its drive switched on in its own settings | on the KVM's own storage; uploaded through qKVM | a CD-ROM drive (read-only) or a USB flash drive (read-only, or writable where that is chosen) | the KVM is no firmware: pick its drive in the machine's boot menu. *Restart it now*, where it has a power board, presses its reset button (its power button where the machine is off) |
+| A JetKVM | on its own storage; uploaded through qKVM | a CD-ROM drive or a disk, both read-only (its drive has no other way) | as a KVM above, with its ATX extension switched on |
+| A virtual machine on Proxmox | on Proxmox's storages | its CD-ROM drive, read-only | once, or until it is unmounted: see [Proxmox and virtual machines](#proxmox-and-virtual-machines) |
+| A server (its controller's Redfish; AMI's MegaRAC first) | ISO images in a folder an admin names on the computer qKVM runs on (*Settings > Server images*); the controller reads the one mounted from qKVM | its virtual CD-ROM drive, read-only | once, or until it is unmounted (the controller's "Cd" boot override), restarted or switched on now; where the controller allows no such override, *Restart it now* restarts it, for its firmware to find the drive |
+
+- **Uploads** carry an image from the browser to a KVM's own storage through qKVM, up to 16 GB:
+  a piece at a time as it comes, hashed (SHA-256) on its way, and kept nowhere on the wall (no
+  file, and no more of it in memory than a piece or two, however large the image). The box says
+  how far it has come. Closing the box stops it; one that is stopped, cut off, or that sends
+  nothing for a minute leaves nothing on the KVM: kvmd removes what was written
+  (`remove_incomplete`), and qKVM removes what it may have left. Nor does an upload go on for an
+  account that may no longer send it (asked every five seconds). An image of that name already
+  on the KVM is not written over, nor one larger than the space free there. An image's name is
+  of letters, digits, spaces and `. _ + - ( ) [ ] ~ ,`, and neither begins nor ends with a space
+  or a dot.
+- **Read-only unless it is chosen.** A CD-ROM drive is always read-only. A USB flash drive is
+  read-only unless *USB flash drive, writable* is chosen; then the machine can change and delete
+  what is on the image, and the question says so. A KVM that mounts it otherwise than it was
+  asked (writable where read-only was asked) has it taken out again at once, and the box says so.
+- **What a KVM's CD-ROM drive reads.** The drive of a kvmd KVM and of a JetKVM is Linux's USB
+  gadget. As a CD-ROM drive it takes an image of 614,400 bytes at least (300 sectors of 2,048
+  bytes: a smaller one is refused before the KVM is asked), and gives the machine only the first
+  2.36 GB of a larger image, which the kernel says in its log alone: the question says so where
+  the image is larger, and a Windows image is. As a USB flash drive (a JetKVM: as a disk) it is
+  read whole; whether a machine starts from an image there is the image's to say (a hybrid one,
+  as most Linux images are, does).
+- **One image at a time.** A KVM's drive holds one image: unmount it before the next. One upload
+  at a time to a KVM, while its keys and its power buttons are free.
+- **Nothing is fetched from an address.** qKVM never has a KVM fetch an image from an address
+  (kvmd's `write_remote`, and its images by address), which would make it a way into the network
+  it stands in; nor reads an image back off it, nor switches its drive on or off (some machines
+  cannot have a drive and a keyboard on one USB port: that is the owner's to switch, at the KVM),
+  nor uses GL.iNet's File Sharing or its partition routes, some of which change things on a
+  plain GET. While File Sharing is on, or the drive is offline or busy, nothing is changed, and
+  the box says why.
+- **Delete images after use.** They stay on the KVM's own storage, readable to anyone with its
+  own password (kvmd can hand one back), and an unattended-install file in one holds passwords.
+- **A JetKVM** is asked over the connection the wall holds to it, which is only ever to the JetKVM
+  the tile was added for (see [JetKVM](#jetkvm)); an upload's bytes go on a connection of their
+  own, after the JetKVM that answers at the address was asked again which it is, under the
+  session they go with (another one there is sent none of the image, and what was opened for
+  it is taken off again). A change of its drive between CD-ROM and disk binds its whole USB
+  device anew, and its keyboard and mouse drop for a moment: the box says so first, and a mount
+  or an unmount waits while somebody else has its keyboard and mouse over a live line (409
+  `busy`, with `by`). A part of an upload cut off earlier is listed as such, to delete: an
+  upload of that name is not added to it. It is never asked to mount an image from an address
+  (`mountWithHTTP`, `checkMountUrl`); one mounted so at its own page is said as "an image from
+  an address", without the address, which may hold a password.
+- **A server reads its image from qKVM.** Its controller is handed an address made for that one
+  mount, `<the wall's address as servers reach it>/media/<token>/<name>` (the token 256 random
+  bits, in the path: some controllers refuse an address with `?` or `&`), and reads the image
+  from it a piece at a time for as long as it is mounted, as the server reads its drive: keep
+  qKVM running until it is unmounted. That address answers the controller's own address alone
+  (the one its tile has, or what its name stands for at the mount; a NAT between the two, or a
+  reverse proxy that is not named with `--trusted-proxy`, and it answers nothing), GET and HEAD
+  with a range, and only the file that was mounted: one changed, moved or replaced in the folder
+  since is served no more. Over HTTPS it comes with a user and a password made for that mount as
+  well, which every read has to bring. It ends when the image is unmounted from qKVM; when a
+  look finds the drive empty, or another image in it (two minutes after the mount at the
+  earliest); when the tile is removed or its address changed; and when qKVM stops. After a
+  restart of qKVM the drive still holds an address that answers nothing: the box says so, and
+  the image is unmounted and mounted again. The address is the controller's alone: it is in no
+  log, and on no page; where a controller says it back (in a refusal, or as the name of what is
+  in its drive), the address, its token, and the mount's user and password are said as
+  "(hidden)". Every other request under `/media/` is answered with nothing.
+- **The folder and the address** are an admin's, in *Settings > Server images*: the ISO images
+  directly in the folder (files of their own, not links, by names as for an upload), nothing
+  written there; and the wall's address as the servers' controllers reach it (`http://` or
+  `https://`, a host, a port), which, left empty, is where qKVM listens on the network (none
+  where it listens on this computer alone, the default: *Settings > Network*). A name there has
+  to be in `allowed_hosts`, as for any request; started with `--allow-from`, the controllers'
+  addresses have to be among those named. In a container, the folder is one mounted into it.
+- **AMI's controllers** (MegaRAC) show their virtual CD-ROM drive only once their remote media
+  is switched on: a mount switches it on (`AMIVirtualMedia.EnableRMedia`, a setting of the
+  controller's, which stays on, and the answer says so); one that keeps it off is said so.
+  Which kinds of transfer a drive takes is read from what the controller says (the drive's own
+  list, or the description of its InsertMedia); where it says none, an AMI drive is taken to
+  take HTTPS alone, and over plain HTTP it is refused before anything is sent. Its answer is a
+  task, followed for two minutes. Another controller is given the image over HTTP or HTTPS, as
+  the wall is reached.
+- **On the AMI boards tried**, the image went over plain HTTP alone, and from port 80, whatever
+  port its address named (every HTTPS address was refused as of the wrong form). For them, name
+  an `http://` address without a port in *Settings > Server images*, and forward port 80 of it
+  to the port qKVM listens on, in a way that keeps the controller's own address (the image is
+  served to that address alone), for instance on Linux:
+  `iptables -t nat -A PREROUTING -p tcp --dport 80 -j REDIRECT --to-ports 8787`. A mount that
+  fails on such a board with an address on another port says so.
+- **A mount is bound to the controller it was made on**: the certificate qKVM checked, and the
+  numbers the server and its controller give for themselves. A tile changed to another address,
+  kind, certificate check or controller, a certificate trusted anew, or a tile removed ends it at
+  once, and a mount under way then hands out nothing. Where nothing was known of the controller
+  when it was mounted (no certificate checked, no numbers), it cannot be told from another one at
+  its address: the first time it is known, the mount ends, and the image is mounted again.
+- **Starting a server from it** goes the way of *Start into BIOS setup* (see [Servers](#servers)),
+  with the "Cd" boot override, for its next start ("Once") or for every start until it is
+  unmounted ("Continuous"): another tool's override is not replaced, and where the override may
+  be set every answer says whether it is. The one set from qKVM is cleared again at the unmount,
+  where it still shows (after a restart of qKVM it is said, and left as it is). Another image in
+  its drive (put there at the controller's own page) is said by its name, never its address, and
+  a mount waits for it to be unmounted.
+- **A controller rarely checks a certificate** (Redfish's own default is not to), and the wall's
+  is as a rule its own: on a network you do not trust, an image read over it could be changed on
+  its way. Mount over the management network, and where it matters check the image at the
+  server (an installer's own check of its media).
+- **What is mounted** is heard on a kvmd KVM's line for events while somebody watches its picture
+  (kvmd's `msd` event: a change made at the KVM's own page shows at once), and asked every 30
+  seconds otherwise. Who mounted it from qKVM, and the hashes of what it carried there, are kept
+  while qKVM runs: after a restart the tile still says what is in the drive, without who put it
+  there; and a hash is said of an image only while its size and its time on the KVM are still
+  those it was carried with.
+
 ## Accounts
 
 The first account is an admin called `admin`. Admins add more under *Settings > Accounts*,
@@ -504,6 +647,10 @@ each with its own name, password and role:
 - An admin may take a machine's keyboard and mouse over from whoever holds them in its live
   view, after a question that names them; an operator never takes them from anybody (see
   [Live view and control](#live-view-and-control)).
+- **Virtual media** (an image in a machine's drive, and the machine started from it) is a right
+  of its own, and an admin's, in person: whoever mounts an installer or a rescue system on a
+  machine and starts it from that is root on it. Operators run power buttons and type; they
+  do not mount images. A token never does, of any role.
 - The page hides what an account may not use, but the rule is enforced on the server:
   every request is checked against the role, and anything not explicitly opened to
   viewers or operators takes an admin.
@@ -609,6 +756,10 @@ is over. A change counts once it has lasted about half a minute.
   tap on the notification does). Leave it empty for alerts without one.
 - **One machine can be left out:** *Settings > KVMs > Edit > Send alerts about this one*. For
   a test bench that is switched on and off all day, or a machine that sleeps.
+- **A machine's screen can be watched** (below): *Settings > KVMs > Edit*, *No signal for* and
+  *Screen unchanged for*, in minutes.
+- **On a phone:** *Settings > Alerts > This browser* has them told to the browser it is pressed
+  in, by Web Push ([below](#on-a-phone)): for any account, of the machines it may see.
 - **Pause for maintenance:** *Pause alerts*, for an hour or for four, sends nothing while machines
   are worked on, restarts included. When the pause is over, what is not as it was before it is
   told then, so nothing that went wrong meanwhile stays unseen; what went wrong and was put
@@ -631,6 +782,93 @@ is over. A change counts once it has lasted about half a minute.
   device nor tell anybody. `GET /healthz` says `"locked": true` for as long as that lasts
   (both under [Keeping it running](#keeping-it-running)).
 
+### Watching a screen
+
+A machine whose tile shows a screen has two watches on its *Edit*, each in minutes (empty is
+off, a day the most). Each is told through the alerts, with the picture that set it off kept
+on the wall, and again when it is over ("back to normal").
+
+- **No signal for N minutes:** the KVM's own signal flag has said "no signal" for that long,
+  as the alert round sees it (every fifteen seconds, settled over two looks). The computer
+  sends no picture: it is off, asleep, its screen switched off, or its cable out. A machine
+  with this watch has no "no video signal" alert at the half minute; it is told after its
+  minutes, and "a picture again" only where that was told. A KVM that stops answering ends
+  the run; what was told stands until a picture comes.
+- **Screen unchanged for N minutes:** every picture the wall had of the machine in that time
+  looked the same. These are the pictures the wall gets anyway, while the tile is on a screen
+  somewhere (a wall screen, a browser): no session is opened for it and nothing is asked of
+  the device, so with nobody looking nothing is compared and nothing is said. Each picture is
+  shrunk to 64 by 36 squares, each the average brightness of its part of the screen, and
+  counts as another where two squares differ by more than 10 of 255 from the first picture of
+  the run: the noise of a capture and of JPEG does not count, a pointer that moves, a clock
+  that ticks or a line of text does. Eleven minutes without a new picture, or the KVM's own
+  "no signal" picture, starts the run again.
+- **What they do not mean.** "Unchanged" is not "hung": a screen nobody uses looks the same
+  too (a login screen, a console at its prompt), and a hung computer whose cursor blinks or
+  whose clock ticks has a screen that changes. "No signal" is not "off": a screen that sleeps
+  sends nothing either. Neither tells a crash screen from another, and no text is read.
+- **What they cost:** nothing for a machine without them. With "unchanged", at most one
+  picture every fifteen seconds is compared, where a new one came: decoded in the video worker
+  (the process of its own, without the saved passwords, that every picture a device sends is
+  decoded in; one while any machine has the watch) and shrunk in a thread, about 10 ms of one
+  core for a tile's picture and 25 ms for one of 1920 by 1080. A PNG is not compared.
+- **The picture kept** is the last one of each machine (the next alert's takes its place), in
+  `alert-pictures` in the data folder, the owner's alone, for 30 days, and it goes with the
+  machine when that leaves the wall. For "no signal" it is the last picture with a signal the
+  wall had, and none where nobody looked at the machine. The alert's line in the activity log
+  has *Picture*, for an admin (in *Settings > Activity*, and under *Done to it* beside the
+  machine's history). It is never sent with an alert.
+- As every alert: nothing goes off while alerts are paused (what is so when the pause ends is
+  told then), nor for a machine whose alerts are off. A watch is told whatever kinds are
+  ticked in *Settings > Alerts*, since it was asked for on the machine itself; its "back to
+  normal" only where *It is over* is ticked. A webhook's JSON has `event`
+  `unchanged` for a screen that looked the same, `no_signal` for no signal and `recovered`
+  for either being over. Which watches stand is written down (`screens.json`), so that the
+  "back to normal" comes after a restart too. The minutes go into an export with the machine.
+
+### On a phone
+
+*Settings > Alerts > This browser* has the alerts told to the browser it is pressed in, by Web
+Push: on a phone, a notification, and a tap on it opens the wall at the tile it is about. Any
+account may do so for its own browsers, and is told about the machines it may see; the list
+under it shows the account's browsers, and to an admin everybody's, each with when an alert
+last reached it, or why not, and *Remove*. A browser told another account's alerts is turned on
+for this one once that account or an admin has removed it (an admin may take it over).
+
+- **What it needs.** The wall reached over HTTPS, with a certificate the phone trusts: a name
+  of the wall's own with a certificate from a public authority, or from one the phone was given.
+  The certificate qKVM makes itself, which a browser warns about, does not do. On an iPhone or
+  iPad (iOS 16.4 or later) the wall has to be added to the Home Screen (*Share*, *Add to Home
+  Screen*), opened from there, and turned on there. And alerts on (*Watch the KVMs and send
+  alerts*): the browsers are told what the webhook is, with or without a webhook.
+- **Through whom.** A browser is reached through its maker's push service: Apple's for Safari,
+  Google's for Chrome and most browsers on Android, Mozilla's for Firefox, Microsoft's for
+  Edge. The wall posts each alert there, and the service carries it to the phone without being
+  able to read it: it is encrypted for that browser alone (RFC 8291) and signed with the wall's
+  own key (RFC 8292), which the wall makes the first time a browser is turned on and keeps
+  sealed with the saved passwords. The service sees that an alert went to the browser, when,
+  and how long it is (padded). As whose the alerts are, the wall gives `https://qkvm.com`,
+  which names nothing of it: never its address.
+- **What an alert carries:** the machine's name and what happened, as the webhook says it, and
+  which tile it is about. Never a password, a token, a machine's address or a picture.
+- **When.** As every alert: not while they are paused, not for a machine whose alerts are off,
+  of the kinds ticked. A suspended account's browsers are told nothing; an account that is
+  removed takes its browsers with it. A phone that is off gets, when it is on again, what came
+  within a day.
+- **Sending** holds up neither the watching, nor the webhook, nor another browser: each
+  browser's alerts go in the order they happened, eight sends at a time from the whole wall,
+  each given 15 seconds, tried again after 5, 30 and 120 seconds where its push service was
+  away, and 20 waiting for one browser at the most (the oldest give way). A browser its push
+  service says is no longer subscribed is taken off the list.
+- **Where it may send:** only to the address the browser's push service gave it, which has to
+  be https on port 443 to a name on the internet; and every address that name leads to has to
+  be one of the internet's (not loopback, a private range, link-local, site-local, nor an IPv4
+  address of those inside an IPv6 one, nor the local-use NAT64 prefix `64:ff9b:1::/48`), and the connection goes to the
+  address that was looked at. A name
+  that leads into the wall's own network is not sent to, and its browser says so.
+- *Send a test* tries this browser (one test every five seconds for an account). A wall whose
+  clock is far out is refused by the push services (its signature runs out by that clock).
+
 ## Export and import
 
 *Settings > Export and import* writes the wall to a file, and takes a file in: to keep what
@@ -645,7 +883,9 @@ servers, the saved actions, the alert settings, the wall's settings.
   included, and opens with that passphrase only (scrypt and AES-256-GCM, as the saved
   passwords themselves are kept). The passphrase needs ten characters or more; keep it
   somewhere else than the file. Nothing of the wall can be read off the file without it,
-  not a name and not an address either (its size says roughly how much is in it).
+  not a name and not an address either (its size says roughly how much is in it). The
+  password of a tile of a kind this version does not know (from a later version's settings)
+  is left out, and counted among those not in the file.
 - **Without one** it is a plain file (`qkvm-<date>.json`): the same, with every password
   and the alert address left out, and the saved actions that type a text left out with
   their text. It can be read, compared and kept anywhere.
@@ -775,9 +1015,9 @@ with the statuses it comes with; the ones the requests below answer:
 | 400, 408 | `disconnected` (the body was not sent in full), `timeout` (it took too long to arrive) | the request |
 | 401 | `unauthorized` (sign in first; in the middle of things: the session ended, sign in again and do not loop), `bad_password`, `bad_code`, `code_required`, `bad_key`, `bad_recovery` | the session |
 | 403 | `forbidden` (the header), `not_allowed` (the role, or a token), `totp_required` (set the second step up first), `suspended`, `stopped` (whoever asked lost the right while it was under way) | |
-| 404 | `not_found` (also: a machine this account was not given), `no_picture`, `no_console`, `no_live` (no live picture of this machine) | |
-| 409 | `busy` (something else is being done to that machine), `changed`, `no_text`, `in_use`, `console_held`, `enabled`, `not_enabled`, `not_started`, `not_initialized`, `no_second_step`, `no_password` (the account has no password here: it is signed in by the identity proxy), `same_host` (a device's page on a host name qKVM is looked at under), `unknown_kind` (a tile of a kind of machine this version does not know, kept from a later version: nothing is sent to it; it can be removed) | the state of things |
-| 411, 413 | `length_required` (a body sent without its length), `too_large` (a body over 64 KiB, or a file over what a file may be) | the request |
+| 404 | `not_found` (also: a machine this account was not given), `no_picture`, `no_console`, `no_live` (no live picture of this machine), `no_virtual_media` (no `media` in its `can`) | |
+| 409 | `busy` (something else is being done to that machine), `changed`, `duplicate` (an image of that name is there already), `no_text`, `in_use`, `console_held`, `enabled`, `not_enabled`, `not_started`, `not_initialized`, `no_second_step`, `no_password` (the account has no password here: it is signed in by the identity proxy), `same_host` (a device's page on a host name qKVM is looked at under), `unknown_kind` (a tile of a kind of machine this version does not know, kept from a later version: nothing is sent to it; it can be removed) | the state of things |
+| 411, 413 | `length_required` (a body sent without its length), `too_large` (a body over 64 KiB, a file over what a file may be, an image over 16 GB) | the request |
 | 422 | `invalid`, `name_required`; for a file: `not_a_file`, `damaged`, `newer`, `passphrase_needed`, `wrong_passphrase`, `too_large` | the request |
 | 429 | `rate_limited`, with `Retry-After` in seconds, which is meant; `busy` (too many passwords being checked at once: try again shortly) | |
 | 500, 501 | `internal` (the details are in the wall's log); `missing_driver` (a JetKVM, where the Python that runs qKVM lacks the aiortc package qKVM is installed with) | the wall's |
@@ -785,6 +1025,7 @@ with the statuses it comes with; the ones the requests below answer:
 | 503 | `no_stream` (not yet: ask again), `no_sign_in` (the device answers, and does not sign qKVM in), `locked` (qKVM cannot open the saved passwords just now), `busy` (no memory to check a password with) | |
 | 504 | `timeout`: no answer from the device | |
 | 507 | `not_saved`: the change could not be written down (a full disk), and was taken back | the wall's disk |
+| 507 | `no_space`: an image larger than the space free on the device's own storage | the device's |
 
 After an action, `unreachable` and `no_stream` mean that nothing was sent; `timeout` and `dropped` mean
 that the request went out and its answer did not come, or came broken: **it may have been done**, so do
@@ -822,7 +1063,14 @@ wherever something is written down; `locked`; and the device's own wherever a de
 | `GET /api/v1/actions` | operator | | `actions`: each `id`, `name`, `kind` ("keys" or "text"), `keys`, `enter`, `danger`, `changed` (how often it was edited). Never the text a saved action types |
 | `GET /api/v1/devices/{id}/wol` | operator | | `targets`: each `mac`, `name` (what the device calls it, which a KVM fills with the address where it has no name; empty where it has nothing). A machine without `wol` in `can` answers an empty list. 404 `not_found`; the device's |
 | `POST /api/v1/devices/{id}/actions` | operator | `action`*, and what that one needs (the table below); `batch` (any id of letters, digits and "-", up to forty: ties several requests together as one act in the activity log) | `ok`, `note` (null; or "already on", "already off" for a server that was so; or "pressed, but the computer is still off", "held, but the computer is still on", "pressed; its board has not said since", "pressed; not seen: its connection ended" (the tile was edited or removed, or the wall locked itself; and "held; ..." of the same) for a KVM's power button whose change its board did not show: it was pressed). 404 `not_found` (also: the saved action is gone); 409 `busy` (with `by`, the name of whoever has the machine's keyboard and mouse over a live line, where that is why: an account's, or a token's with "(token)"; to an admin in person the message adds that they can take them over in the live view: an action never takes over by itself); 409 `conflict` (it waited for the last holder of the keyboard to be let go of, and meanwhile the tile was changed or taken off the wall: nothing was sent); 409 `changed` (the saved action was edited since it was listed); 409 `no_text`; 403 `not_allowed` (a token and a saved text); 403 `stopped`; 422 `invalid` (also: an action this machine cannot do); 502 `action_failed` (the device refused); 504 `timeout` and 502 `dropped` (it may have been done); the device's. Every action is written to the activity log with the account |
+| `PUT /api/v1/devices/{id}/view` | operator, a person | `view`*: "health", "stills" or "live" | which of its three views a PC with Intel AMT is in (see [Intel AMT](#intel-amt)): `ok`, `amt_view` (as it is now). In effect at once; each change is written to the activity log (`amt_view_changed`, with `view` and `was`), and one that changes nothing is not. 403 `not_allowed` (a token: it changes no setting of a tile); 404 `not_found`; 422 `invalid` (no PC with Intel AMT); 507 `not_saved` |
 | `POST /api/v1/devices/{id}/console` | operator, a person | `{}` | `url`: a way into a server's own console, signed in, good for one use, for the browser of whoever asked; it is in no log, and is not to be kept. 403 `not_allowed` (a token); 404 `not_found`; 404 `no_console` (no such way in from this device); 409 `same_host` (the browser reaches the device by a host name qKVM is looked at under, the one this request came by or one in `allowed_hosts`: it would hand the device its sign-in to qKVM, and nothing is asked of the device); the device's |
+| `GET /api/v1/devices/{id}/media` | admin, a person | | what can be mounted on the machine, asked of it now: `images` (each `id`, the only thing a mount names, `name`, `where` (for a virtual machine on Proxmox, the storage; null on a KVM's own and a server's), `size` in bytes or null, `partial` (an upload of it was cut off: only to delete; a JetKVM's keeps its name with `.incomplete`), `sha256` (where qKVM carried it there and it is still that image, else null)), `unseen` (a sentence for each place whose images could not be listed, in the device's words: a storage the token may not read), `left_out` (how many entries were no image qKVM passes on to the device), `notes` (sentences of what stands against a change now: a KVM's File Sharing on, its drive offline or busy), `space` (a KVM's own storage: `free` and `size` in bytes; null elsewhere), `mounted` (what is in its drive now, as the status's `media` below, or null), `uploading` (an upload to it under way, as `GET .../media/upload` says it, or null) and `offers`, by what the last look at the machine found: `drives` (what an image goes in as: "cd", read-only; "flash", a kvmd KVM's USB flash drive; "disk", a JetKVM's, read-only), `writable` (of `drives`: those an image may be mounted writable in, where that is chosen), `boot` (how it can be told to start from it: "once", "until_unmounted"; none on a KVM), `restart` (it can be restarted from here: a KVM with a power board too), `upload` (images are carried through qKVM to it), `delete` (images can be deleted from it), `drops_input` (a mount or an unmount drops its keyboard and mouse for a moment), `where` ("proxmox": the images are on the storages of its node; "device": on the KVM's own storage; "qkvm": a server's, in the folder qKVM serves them from); and for a server `served_from` (the wall's address as its controller reaches it, or null where there is none). 403 `not_allowed` (a token); 404 `not_found`; 404 `no_virtual_media`; 502 `another_machine`; the device's |
+| `POST /api/v1/devices/{id}/media` | admin, a person | `image`* (an `id` as listed), `machine`* (the machine's name, as the confirmation named it), `drive` (of the offer's `drives`; "cd", the default), `writable` (true: the machine may change what is on it; only for a drive of the offer's `writable`; false, the default), `boot` ("none", the default: its boot order is left as it is; "once": it is restarted now to start from the image, and its boot order is as before for every start after; "until_unmounted": it starts from the image from its next start until it is unmounted), `restart` (true: restart it now, with "until_unmounted"; "once" always restarts; on a machine that cannot be told to start from it, a KVM, with `boot` "none": its reset button, its power button where it is off, for its boot menu to find the drive). A restart of a virtual machine stops it at once and starts it again | the image is put in its drive, read-only: `ok`, `note` (null, or a sentence: a CD-ROM drive added where there was none, which a running guest has from its next start; how it starts), `mounted`. 409 `changed` (the machine is called otherwise now, the image is no longer listed, or its settings were changed on the device meanwhile: nothing was done); 409 `busy` (as for an action; with a restart also while somebody has its keyboard and mouse over a live line, with `by`); 409 `changed` also where another image is in a KVM's drive (unmount it first), or the image is not there whole; 409 `busy` where another image is in a server's drive; 409 `action_failed` (no CD-ROM drive and no place for one, a boot order the wall does not read; a KVM's File Sharing on, its drive offline; a KVM that did not mount it as asked, which has it taken out again; no address servers reach the wall at, a server's controller that takes HTTPS alone while the wall is reached over plain HTTP, another tool's boot override); 502 `action_failed` (a server's controller did not mount it: in its words); 422 `invalid` (a drive it has not got, writable where that is not offered, a way of starting it cannot do, a restart with `boot` "none" where it can be told to start from it, a restart where it has no power board); 504 `timeout` and 502 `dropped` (it may have been done); 502 `another_machine`; the device's. A refusal after the image was put in says so: `"mounted": true`. Every mount, and every start or restart from it, is in the activity log with the account, the machine, the image, the drive, and its SHA-256 where qKVM carried it there |
+| `POST /api/v1/devices/{id}/media/unmount` | admin, a person | `image`* (`image` of `mounted`, as the confirmation named it), `machine`* | the drive is emptied, and the boot order put back where it was set to start from the image from here: `ok`, `note` ("nothing was mounted"; or what is left of the boot order), `mounted` (null). 409 `changed` (another image is in the drive now, or the machine is called otherwise: nothing was taken out); 409 `busy`; 502 `another_machine`; the device's. In the activity log as a mount is |
+| `POST /api/v1/devices/{id}/media/upload?name=...&machine=...` | admin, a person | the image itself as the body, its length said (`Content-Length`, 16 GB at the most); `name`* (what it is called on the device), `machine`* (as the confirmation named it) | the image carried into the device's own storage (an offer with `upload`), streamed as it comes and hashed on its way, kept nowhere on the wall: `ok`, `image` (as `GET .../media` lists it: `id`, `name`, `where`, `size`, `partial`, `sha256`), `sha256`. 409 `changed` (the machine is called otherwise); 409 `duplicate` (an image of that name is there); 409 `busy` (another upload to it under way, its drive busy); 411 `length_required`; 413 `too_large` (over 16 GB, refused before a byte is read); 422 `invalid` (a name of characters qKVM does not hand on, an empty body, a machine without uploads); 507 `no_space`; 400 `disconnected` (cut off, gone quiet for a minute) and 403 `stopped` (the account may no longer); the device's. What a refused or cut-off upload wrote is removed from the device, where it allows that; the answer says where it could not be. In the activity log with the account, the machine, the image, its size and its SHA-256 (one that failed: how much of it came) |
+| `GET /api/v1/devices/{id}/media/upload` | admin, a person | | the upload under way to the machine: `uploading` (`name`, `size`, `sent` (bytes carried to the device so far), `by`, `at`), or null. Nothing is asked of the device for it |
+| `POST /api/v1/devices/{id}/media/delete` | admin, a person | `image`* (an `id` as listed), `machine`* | the image deleted from the device's own storage (an offer with `delete`): `ok`, `note` (null; "it was not on the KVM any more"). 409 `busy` (it is mounted, or being uploaded); 409 `changed`; 422 `invalid`; the device's. In the activity log as a mount is |
 | `PUT /api/v1/wall/order` | admin | `ids`* (device ids, first to last; the rest keep their order after them) | `ok`, `ids` (the whole order, as it is now, for every browser). 507 `not_saved` |
 | `POST /api/v1/devices/remove` | admin | `ids`* (1 to 5000 device ids, within the 64 KiB a body may have; one given twice is one machine) | takes every one of them off the wall, or none: `ok`, `removed` (their ids, in the wall's order). Each one's saved password and history go with it, and each gets a line of its own in the activity log (`device_removed`), as one removed on its own does. An action on its way to one of them is answered as one cut off by an edit of the tile (it may have been done), and a live line to one is told `gone`, the keys it held let go of first. 404 `not_found` with `unknown` (the ids that are not on the wall: nothing was removed); 507 `not_saved` (nothing was removed, and nothing on them was cut off) |
 | `GET /api/v1/tokens` | admin | | `tokens`: each `id`, `name`, `kind` ("api" or "display"), `role`, `devices` (ids, or null for all), `groups`, `created`, `expires` (null: never), `used` (null: not yet). Never the token itself |
@@ -845,7 +1093,8 @@ In `devices` of `GET /api/v1/wall`:
 | `open_url` | where a browser reaches the machine's own page |
 | `same_as` | other tiles that are the same machine under another address: each `id`, `name`, `host` |
 | `can` | what this tile can be asked, as words (below) |
-| to an admin only | `url`, `custom_open_url`, `username`, `tls` (`pinned`, `system`, `insecure`), `fingerprint`, `has_password`, `alerts`, `fingerbot_strength` (how hard a Fingerbot paired with the KVM presses: `firm` or `light`). The password is never sent to anybody |
+| `amt_view` | a PC with Intel AMT's only: which of its three views its tile is in, `health`, `stills` or `live` (`PUT .../view` changes it) |
+| to an admin only | `url`, `custom_open_url`, `username`, `tls` (`pinned`, `system`, `insecure`), `fingerprint`, `has_password`, `alerts`, `fingerbot_strength` (how hard a Fingerbot paired with the KVM presses: `firm` or `light`), `no_signal_minutes` and `unchanged_minutes` (its screen watched: [Watching a screen](#watching-a-screen); 0 is off). The password is never sent to anybody |
 
 **`can`** says what this machine can be asked: from its driver, and from what the wall last
 found at the device (a power board, several inputs, a light). It is in the wall's answer
@@ -857,7 +1106,7 @@ keyboard, and a KVM without a power board has no power button either. Each word 
 | Word | Opens |
 |---|---|
 | `screen` | a picture: `GET .../snapshot` (a server: as long as its controller is not known to give none, which asking finds out; a PC with Intel AMT: where its KVM may be used; a virtual machine on Proxmox: while it runs; the status's `screen` says the same) |
-| `keys` | `keys`, `ctrl_alt_del`, and a saved action that presses keys (a server: once its console is known to be AMI's, and while nobody at the controller's own console has it) |
+| `keys` | `keys`, `ctrl_alt_del`, and a saved action that presses keys (a server: once its console is known to be AMI's, and while nobody at the controller's own console has it; or OpenBMC's, while its screen can be had) |
 | `text` | `text`, and a saved action that types |
 | `jiggler` | `jiggler_on`, `jiggler_off` |
 | `power` | the power button: `atx_power`, `atx_power_long` (a KVM with a power board; a server; a virtual machine on Proxmox, where holding it stops the machine at once) |
@@ -871,8 +1120,9 @@ keyboard, and a KVM without a power board has no power button either. Each word 
 | `resume` | `resume`: a JetKVM that stepped aside for whoever opened its own page is taken up again |
 | `locator` | `locate_on`, `locate_off`: a server's light to find it by |
 | `console` | `POST .../console`: a signed-in way into a server's own console |
-| `live` | the live picture: `POST .../live` for a pass, then the WebSocket at the same path (a KVM; a server whose console the wall reads, once that is known; a PC with Intel AMT whose KVM may be used; a virtual machine on Proxmox while it runs) |
-| `control` | keyboard and mouse over that line: `control` with `on` true, and with `take` true to take them over (an admin in person) (a KVM; a PC with Intel AMT; a virtual machine on Proxmox; a server whose console is AMI's, as `keys`; not an OpenBMC console, which answers `no_input`) |
+| `live` | the live picture: `POST .../live` for a pass, then the WebSocket at the same path (a KVM; a server whose console the wall reads, once that is known; a PC with Intel AMT whose KVM may be used; a virtual machine on Proxmox while it runs; a VNC server) |
+| `control` | keyboard and mouse over that line: `control` with `on` true, and with `take` true to take them over (an admin in person) (a KVM; a PC with Intel AMT; a virtual machine on Proxmox; a VNC server; a server whose console is AMI's, as `keys`, or OpenBMC's) |
+| `media` | virtual media: `GET .../media`, `POST .../media`, `POST .../media/unmount`, and where it is offered `.../media/upload` and `.../media/delete`, an admin's in person (a virtual machine on Proxmox; a KVM with the kvmd interface whose drive is switched on; a JetKVM) |
 
 A word not in this list was added since: a client leaves out what it does not know. And
 `can` is what the wall would send, not a promise that the machine takes it: a controller
@@ -922,8 +1172,9 @@ was switched off in the PC's MEBx, "absent" on vPro Essentials, which has none, 
 `consent` (true where a KVM session needs the code the PC shows on its own screen, false, or
 null), `listener` (true where the engine's redirection listener is on, which its KVM is reached
 through; false, or null), `session_timeout` (the minutes after which the engine ends a KVM
-session, 0 for never, or null), `make`, `model`, `serial` and `bios` as the engine says them, and
-`plain` (true where the wall reaches the engine over plain HTTP).
+session, 0 for never, or null), `make`, `model`, `serial` and `bios` as the engine says them,
+`plain` (true where the wall reaches the engine over plain HTTP), and `view` (its tile's view, as
+`amt_view` above: in `health`, `screen` is false and `no_screen` says so, whatever the KVM is like).
 
 A virtual machine on Proxmox VE (`kind` `proxmox`) is said as a server is: `state` `online` while it
 runs and `no_signal` while it is stopped, `atx.power` the same, no temperatures, fans or light,
@@ -934,6 +1185,18 @@ it runs and its console can be had (and `screen`, `keys`, `text`, `live` and `co
 one more record, `proxmox`: `node` (the node it is on, followed where it was moved), `vmid`,
 `status` ("running" or "stopped", Proxmox's own word), `qmpstatus` (what QEMU says of it: "running",
 "paused" and others) and `uptime` (seconds).
+
+A machine with `media` in its `can` says `media`, what is in its virtual drive, to everybody who
+sees it: null where nothing is (or nothing is known yet), else `drive` ("cd", "flash", "disk"), `image` (an
+`id` as `GET .../media` lists it, or what the machine says is in it), `name`, `where`, `read_only`,
+`first` (it starts from it first at its next start; null on a KVM, which cannot tell), `by` and `at`
+(the account that mounted it from qKVM, and when, in seconds since 1970; null where that is not
+known: put there on the device itself, or before qKVM was restarted), `sha256` (where qKVM carried
+it there, and it is still that image; else null). A virtual machine on Proxmox says it as its
+settings were last read: once a minute, and at every request of its virtual media; a KVM with the
+kvmd interface as its line for events said it, or as it was asked within the last 30 seconds; a
+JetKVM at every look; a server as its controller said it within the last 30 seconds, and at every
+request of its virtual media (its `first` true where its boot override is "Cd", else null).
 
 ### An account
 
@@ -989,11 +1252,15 @@ machine: while an action is on its way, a second one for the same machine is ref
 
 These are under `/api/v1/` as well, take an admin (but for the first-run setup, which takes
 nobody), and change with the page: `setup`; `devices` (adding, changing and removing one),
-`devices/{id}/certificate`, `devices/{id}/trust`, `devices/{id}/kvm` (switching a PC's Intel AMT
+`devices/{id}/certificate`, `devices/{id}/trust`, `devices/{id}/alert-picture/{stamp}` (the picture
+a screen alert kept, by the `picture` of its line in the activity log), `devices/{id}/kvm` (switching a PC's Intel AMT
 KVM on or off on its engine, `{"on": true}`; 409 `busy` with `by` as for an action), `discover`; `proxmox` (`proxmox/guests`, `{"url",
 "username", "password"}`: the virtual machines an API token may see on a Proxmox, to pick from when
 adding them, and `named`, the one an address names by its ID); `actions` (saving one);
-`users`; `security`; `recovery`; `settings`; `alerts`; `audit` (the activity log, and `audit/export`
+`users`; `security`; `recovery`; `settings` (and `settings/media`, `{"folder", "address"}`: the folder of
+images for servers and the wall's address as their controllers reach it); `alerts`; `push` (the browsers told the alerts by Web
+Push, which takes any account, for its own: `push`, `push/key`, `push/{id}`, `push/{id}/test`, as
+[On a phone](#on-a-phone) says); `audit` (the activity log, and `audit/export`
 to download it: `q`, `kind`, `before`, `since`, `until`, `user`, `device`, `limit`, as the chapter
 [Activity log](#activity-log) says); `metrics` (the token for
 `/metrics`); `update`. A program written against them is written against this version. Their
@@ -1225,7 +1492,8 @@ Who signed in, changed what, and did what to which machine: *Settings > Activity
   settings, accounts, tokens, machines and saved actions; every action on a machine, and one
   that failed; a live view opened and ended, with how long it was open; keyboard and mouse
   taken, taken over and given back; a server's console opened, or asked for and not had;
-  alerts; a file of the wall exported or taken in, and a download of this log with what it was
+  alerts (one of a [watched screen](#watching-a-screen) with `watch`, `minutes`, `back` where it
+  is over, and `picture` and `picture_at` where a picture was kept); a file of the wall exported or taken in, and a download of this log with what it was
   of. Never a password, a key pressed, or a text that was typed. An account's live views write
   120 entries an hour at the most, and the next one says how many were left out: two entries a
   view, a script opening lines in a loop would otherwise push out of the log what was done
@@ -1296,6 +1564,8 @@ How a JetKVM is reached is its owner's choice, made at the device's own page (*S
   it is checked before the password goes.
 - **Loopback-only mode** (*Settings*, *Advanced* on the device) shuts everything but the
   device itself out, qKVM included.
+- **Virtual media**, for an admin: an image of its own storage in its drive, as a CD-ROM drive or
+  a disk, and images uploaded there through qKVM (see [Virtual media](#virtual-media)).
 
 Three things are different from a Comet, and they come from the device:
 
@@ -1335,7 +1605,10 @@ seconds, where a JetKVM that stops sending pictures of a screen it shows is give
 comes by then, it is taken for one that stopped, as after those five: called offline for the
 moment it takes to connect again, and a live view that held its keyboard and mouse takes them
 again (a real one once sent no picture on the connection it held while its computer was woken,
-and a new connection had it at once).
+and a new connection had it at once). Where qKVM falls behind decoding its video (a busy
+computer), it goes on from the next key frame, which it asks the JetKVM for; a JetKVM that sends
+none when asked has its connection made anew after five seconds without a picture, and each time
+in a row after twice as long as the time before, forty seconds at the most.
 
 
 Keys, typed text, keep-awake, Wake-on-LAN, the ATX power extension and reboot are in the action
@@ -1482,10 +1755,21 @@ the KVM-over-IP kind), the screen comes from that console instead: a WebSocket o
 qKVM opens it with the Redfish session it holds already, so there is no second sign-in; it takes one
 of the controller's four console seats while somebody looks, and gives it back a minute after nobody
 does, and before the session it was opened with. The console asks for no password of its own; one
-that does is sent nothing, since the only password here is the controller's. No key goes that
-way. This was built from the source of OpenBMC's web server and tried against a stand-in; on
-OpenBMC's own image in QEMU only the console's sign-in could be tried, since that image has no
-console (see [Limits](#limits)).
+that does is sent nothing, since the only password here is the controller's. Keys, typed text and
+keyboard and mouse over the live line go over that same console, as a VNC server's do (key events
+by keysym, the pointer at a place in the screen's pixels), and OpenBMC's VNC server (obmc-ikvm)
+turns them into the server's USB keyboard and absolute mouse. It makes each key event the key of
+a US keyboard it is on and takes Shift only from the Shift key itself, so typed text goes with
+Shift pressed around a capital or a sign, and a character the US layout has no key for is refused
+(422 `invalid`) before anything is typed. It takes nothing from a viewer for
+its first frames, about a second, so keys wait that long after the console opens. OpenBMC's web
+server lets whoever may open the console type into it (an account with the right to configure
+components or the manager): an account that may not is refused the console, picture and keys
+together, and the tile says so. A controller whose VNC server has no USB keyboard to write to (a
+build without one) takes the keys and they go nowhere, which nothing on the console tells qKVM.
+This was built from the source of OpenBMC's web server and its VNC server and tried against a
+stand-in; on OpenBMC's own image in QEMU only the console's sign-in could be tried, since that
+image has no console (see [Limits](#limits)).
 
 On a controller of another make (iDRAC, iLO and the rest speak consoles of their own; an iDRAC's
 own VNC server, where it is switched on, can be a tile of its own: see [VNC servers](#vnc-servers)), and
@@ -1527,7 +1811,8 @@ what else a server's tile gives:
   server switched on meanwhile (at its button, by another tool) is restarted, and one that began
   to change its state is left alone and the override cleared again. After a 204, which is what
   the board this was tried on answers, the change is not read back, and the power is read once
-  before the power command, for five seconds at the most, and decides as above. That board
+  before the power command, for five seconds at the most (a connection to ask on, waited for or
+  made, included), and decides as above. That board
   answers no read for about a minute after the change: where that read gets no answer, the power
   read before the change decides, and a server read off then and switched on by somebody during
   the change is sent *On*, which a server that is on takes as nothing to do, so the button says
@@ -1546,6 +1831,10 @@ what else a server's tile gives:
   has how it ended.
 - **Locator light on** lights the server up, front and back, for whoever is standing in
   front of the rack looking for it. The tile says so for as long as the light is on.
+- **Virtual media**, for an admin: an ISO image of the folder named in *Settings > Server images*
+  in the server's virtual CD-ROM drive, which its controller reads from qKVM while it is
+  mounted, and the server started from it once or until it is unmounted (see
+  [Virtual media](#virtual-media)).
 - **Open console** leads to the controller's own page, where its remote console is. Where
   the controller hands out a pass for that (AMI's does, on the boards whose maker left it
   in), the link leads straight into the console, signed in. See below for what that means.
@@ -1742,8 +2031,22 @@ has its state and its power buttons on the tile, and the tile says that its scre
 engine's ports forwarded as they are. What a real engine was seen to do, and what qKVM does
 about it:
 
+- **Three views, a setting of the tile.** Each PC's tile is in one of three, which an admin or
+  an operator changes under *Actions* (the tile and its large view say which it is in, and the
+  activity log notes each change, `amt_view_changed`):
+  - *Health only*: qKVM never opens a KVM session to the PC, so Intel's border never comes up on
+    its monitor. The tile shows how the PC is (on or off, what it is) and its power buttons; a
+    still, the live view, keys and *Type text* are refused with words that say how to change
+    the view. A session open when the view is changed to it is let go of at once.
+  - *Stills* (a new tile, and one saved before the views): as described in the next point.
+  - *Live KVM*: a session is held while the tile is shown on the wall as well (at the wall's
+    pace), so the tile is current and Intel's border stays on the PC's monitor; it is let go of
+    a minute after the tile is no longer shown.
+
+  The view is kept with the tile, in an export, and through an edit. It concerns the KVM only:
+  the power buttons, *Start into BIOS setup* and switching the KVM on or off are the same in all three.
 - **A still now and then for a tile that is only shown; a held session only for the large or
-  live view.** A tile that is only shown on the wall gets a still picture every five minutes,
+  live view** (the view *Stills*). A tile that is only shown on the wall gets a still picture every five minutes,
   each one a short session: qKVM opens the KVM, takes one frame, and closes it, so Intel's
   border is on the PC's own monitor only for the few seconds that takes. Between stills the tile
   shows the cached picture and says how old it is. Only while the machine is enlarged, or its
@@ -1868,6 +2171,20 @@ What works, and how:
   character (Latin-1 characters as themselves, others as Unicode keysyms); what the machine makes
   of a character its layout has not got is the server's business. Ctrl+Alt+Del is a chord like any
   other.
+- **Live, with keyboard and mouse.** Enlarged, its screen comes over the [live line](#live-view-and-control)
+  on the tile's own connection (one connection to the server, whatever the number of viewers),
+  asked for what changed 25 times a second while somebody watches, and what a server's pictures
+  cost to draw is shared out as below. *Control* takes its keyboard and mouse, one person at a
+  time, as for every machine: a key goes as RFB's key event with the keysym of that key (Shift
+  and the rest go as keys of their own, and the server's layout decides what they make), the
+  pointer as a place in the screen's pixels with the buttons held, a notch of the wheel as a press
+  and a release of its button; the back and forward buttons have none in RFB. Whatever was down
+  is let go of whenever the line loses them (given back, taken over by an admin, the line closed
+  or dropped, fifteen minutes without input, the wall stopping). A server whose password stands
+  rejected has no live line; its tile says why. A server set to view only (a view-only password,
+  x11vnc's `-viewonly`) takes the events and does nothing with them, which qKVM cannot see: the
+  picture shows it. Over plain `vnc://` the keys go in the clear, as the password's answer does
+  (below).
 - **The password** goes the way VNC authentication has it: the server's challenge encrypted with
   DES under a key made of the password's first eight characters (the rest is not looked at, by any
   server). That is weak, as RFC 6143 itself says: anybody who can read the line can take the
@@ -1948,7 +2265,11 @@ the Proxmox host.
 1. A user for the wall, `wall@pve` say (realm *Proxmox VE authentication server*; it needs no
    password of its own).
 2. A role with `VM.Audit` (to see the guests and whether they run), `VM.Console` (their screens and
-   keys) and `VM.PowerMgmt` (the power buttons; leave it out for a wall that only looks).
+   keys) and `VM.PowerMgmt` (the power buttons; leave it out for a wall that only looks). For
+   virtual media (at the end of this chapter) as well: `VM.Config.CDROM` (an image in a guest's
+   CD-ROM drive, and a drive added where it has none) and `VM.Config.Disk` (its boot order) on the
+   pool, and `Datastore.Audit` on each storage that holds the ISO images (`/storage/<name>`);
+   leave them out for a wall that mounts nothing.
 3. A pool with the guests the wall is to show, and the role given on the pool (*Permissions > Add*,
    path `/pool/<name>`).
 4. An API token for the user (*API Tokens > Add*). With *Privilege Separation* on, as it comes, the
@@ -1979,6 +2300,9 @@ What a guest's tile gives:
   at once, in Proxmox's words. A guest with nothing in it that hears a request to shut down goes on
   running; the tile shows it, and *Hold power button* stops it.
 - **Open console** leads to the guest's console on Proxmox's own page (signed in there, as yourself).
+- **Virtual media**, for an admin: an ISO image on Proxmox in its CD-ROM drive, and the guest
+  started from it (see the end of this chapter). The tile says what is in the drive
+  (`CD: debian-13.iso`).
 
 **The screen, and what it costs Proxmox.** Proxmox has no picture of a guest to hand out. The screen
 is in the console Proxmox's own page opens: qKVM asks for a ticket (`vncproxy`), opens the WebSocket
@@ -2040,7 +2364,8 @@ A few things are worth knowing:
   `Pool.Audit` cannot list pools, and need not: the guests it may see are listed all the same.
 - **A wrong token is left alone**, as every password is (a minute, five, a quarter of an hour, then
   hourly), and for every guest of that Proxmox together. Proxmox holds back each answer to a wrong one
-  for three seconds.
+  for three seconds. A right one is signed in once for them all: at a start, every guest goes on at
+  that one answer.
 - **A guest moved to another node** of its cluster is followed, without anything to do, once the
   virtual machine with its number there is found to be the guest itself (below).
 - **Its certificate** is remembered on first contact, as for every device: the node's own. Every
@@ -2066,6 +2391,48 @@ A few things are worth knowing:
   page: the wall shares the guest's VNC server, and pushes nobody out of it.
 - **Containers** (LXC) are not shown: their console is a terminal of Proxmox's own. The list says
   how many it left out.
+
+**Virtual media.** *Actions > Media...* (an admin's, in person: it is root on that guest) lists
+the ISO images on the storages of the guest's node that the token may see, says what is in its
+CD-ROM drive and who put it there from qKVM, and mounts or unmounts one. Every mount and unmount asks first, naming the
+guest and the image; the request carries both, and nothing is done where the guest is called
+otherwise by then, or the image is no longer listed. Each is in the activity log with the account,
+the guest and the image, and so is every start from one.
+
+- **Nothing moves.** The image stays on its Proxmox storage; the guest's settings name it
+  (`ide2: local:iso/debian-13.iso,media=cdrom`), always read-only. qKVM never asks Proxmox to
+  fetch an image from an address (`download-url`, which also lets one probe the host's network)
+  and uploads nothing: put images on a storage on Proxmox itself. Only an image the listing
+  shows at that moment is handed to Proxmox, by the name Proxmox gave it; one whose name has
+  characters Proxmox leaves out of an uploaded image's is not listed.
+- **The drive.** The guest's CD-ROM drive is used (the one with something in it, else the first).
+  A guest without one gets one, on the first free of `ide2`, `ide0`, `ide1`, `ide3`, `sata0` to
+  `sata5`; a running guest has it from its next start by Proxmox, and the box says so.
+- **Starting from it.** *Leave its boot order as it is*: the image is only put in (drivers for an
+  installed system, say). *Start from it until it is unmounted*: the CD-ROM drive goes first in
+  its boot order, from its next start by Proxmox, or now with *Restart it now*; unmounting it
+  puts the order back as it was. *Start from it once, now*: the CD-ROM drive goes first, the
+  guest is restarted, and once it runs the order is put back as it was, for every start by
+  Proxmox after this one. Proxmox has no start "once" of its own, and a running guest keeps the
+  order its process began with: **a restart from inside the guest starts from the image again
+  while the image is in the drive**; unmount it when the guest is done with it. A restart from
+  here stops the guest at once (as *Hold power button*: unsaved work is lost) and starts it
+  again, as two power buttons, with their waits; a reset would not do, as Proxmox takes a new
+  boot order only at a start. A boot order written the old way (`boot: cdn`, or none at all) is
+  not changed: set one on Proxmox (*Options > Boot Order*) first.
+- **The guest it was added for, and no other.** Every request of its media reads the guest's
+  settings first and asks the SMBIOS UUID in them, as a power button does; every change is made
+  on those settings by their digest, so that Proxmox refuses it where they were changed meanwhile
+  (another virtual machine made under the number among them), and the box says so: nothing was
+  changed.
+- **What the token lacks** is said in Proxmox's words: without `Datastore.Audit` on a storage
+  its images are not listed (a storage the token may not see is not even named); without
+  `VM.Config.CDROM` nothing is mounted; without `VM.Config.Disk` the image is mounted and the
+  boot order left as it is, and the box says so; without `VM.PowerMgmt` it is not restarted.
+- **What qKVM remembers** of it (who mounted what, the boot order it replaced) is kept while it
+  runs. After a restart of qKVM the tile still says what is in the drive, without who put it
+  there, and an unmount leaves a boot order it set as it is, and says so: with nothing in the
+  CD-ROM drive, the guest's firmware passes over it to the next.
 
 **libvirt, QEMU and Unraid guests** are plain VNC servers: add them as [VNC servers](#vnc-servers).
 Their port and password are in the guest's definition: for libvirt, `virsh vncdisplay <guest>` says
@@ -2152,7 +2519,10 @@ HTTP request of their own, with a session; that door is not built.
   name, not by port. Where a device's own page is reached on another port of the name qKVM
   is looked at under (a router that forwards two ports of one name, tunnels to `localhost`),
   the browser would hand that page your sign-in to qKVM, and a device is not trusted with
-  that. The wall offers no *Open console* link to such a device and says why.
+  that. The wall offers no *Open console* link to such a device and says why. A console link
+  is saved with its host written one way; one that a browser and qKVM would read as two hosts
+  (numbers written another way, `127.1`) is refused. One that 0.2.0 saved so is kept as it is
+  through an edit of the rest of the tile, until it is written again.
 - **HTTPS** for qKVM itself is one checkbox (a certificate is made on this computer; its
   fingerprint is shown so you can check the browser's warning). Turn it on whenever qKVM
   listens on the local network. Tailscale already encrypts its traffic.
@@ -2175,6 +2545,18 @@ HTTP request of their own, with a session; that door is not built.
   put a page of its own in your browser. One part of that is not qKVM's own to promise: a
   JetKVM's video and its control channel come through a WebRTC library (aiortc), and what a
   taken-over JetKVM could make that library hold or compute has not been measured.
+- **Virtual media is root on a machine**, and is kept so: an admin's right, in person, never a
+  token's; a confirmation that names the machine and the image, which the request carries and
+  is held to; every mount, unmount and start from an image in the activity log; images
+  read-only; and a device is only ever handed what qKVM itself listed or made, never an
+  address somebody typed (a device that fetches an address is a way into the network it stands
+  in). On Proxmox nothing is fetched at all: the image is one on its storages. An image carried
+  to a KVM's own storage goes through the wall as it comes, never written to its disk, with a
+  rule of its own for its length (16 GB) and a minute for each piece; it is hashed on its way,
+  and what one cut off left is removed from the KVM. A server's controller, which fetches its
+  image by an address, is handed one qKVM made for that mount alone, which answers that
+  controller's address alone (and the mount's user and password over HTTPS), for as long as the
+  image is mounted, and only the file in the admin's folder that was mounted.
 - **The activity log** (*Settings > Activity*) keeps 50 MB, which is some nine months of a
   busy wall, in files of JSON lines in the data folder that are its record, never rewritten:
   one entry a line, with the time, what happened, the address it came from, the account, and
@@ -2329,10 +2711,13 @@ button in the top bar when there is something new; installing is always your cli
 for your password again.
 
 - **What a check sends:** one request to GitHub's public API for the newest release. Nothing
-  about your KVMs. Turn the daily check off in the same place if you'd rather not.
+  about your KVMs. Turn the daily check off in the same place if you'd rather not. Its answer
+  is waited for a minute at the most, and the package checked against this copy two more.
 - **How an install works:** the release is downloaded, its signature and checksum are
-  checked, and it is unpacked into `updates/<version>/` in the data folder, next to the running version.
-  qKVM then restarts itself on it.
+  checked, and it is unpacked into `updates/<version>/` in the data folder, next to the running version,
+  with the libraries it brings (below). A throwaway process of the same Python then loads it, and only
+  then is it named the version to start. qKVM then restarts itself on it. One install at a time; a
+  page closed meanwhile leaves it running, and one cut off by a stop says so in the activity log.
 - **Only signed releases are installed.** The public half of the publisher's release key is
   built into the program, and a release that does not carry a valid signature is refused. A
   copy built without a release key tells you about new versions and leaves installing them
@@ -2341,12 +2726,29 @@ for your password again.
 - **If the new version won't start,** qKVM goes back to the previous one by itself.
   `qkvm --roll-back` does the same by hand. (The move from 0.1.x to 0.2.0 is made with pip or a
   new image instead: see below.)
-- **It only replaces the program's own files.** The installed Python and libraries must meet
-  the new release's requirements. qKVM checks them when it finds the release: if a package is
-  missing or its version is incompatible, it offers no install and shows the pip command for
-  your installation instead (`/opt/qkvm/bin/python -m pip install --upgrade qkvm`, say). That works at
-  any other time as well; qKVM runs whichever of the two is newer. An installed update checks
-  these requirements again before opening the data folder.
+- **It brings the libraries it needs** (since 0.3.0's updater). Each release lists, in a file its
+  signature covers (`qkvm-<version>-libraries.json`), the exact wheels of every library it was tested
+  with, for Python 3.11 to 3.14 on Linux x86-64 and ARM64 (glibc) and on Windows x86-64. A version
+  installed in place runs exactly that set: a library your Python already has at that version is
+  used from there, one the running version brought is copied from its folder, and every other one
+  is downloaded from PyPI's file host (files.pythonhosted.org) by the address the signed list
+  gives, held to its checksum, and unpacked into `updates/<version>/lib`. No pip, no package
+  index and no build is run, and your Python's own libraries are never changed. *Settings >
+  Updates* says what an update brings and how much it downloads before you install it.
+- **Where an update cannot be installed in place,** qKVM offers no install and shows the pip
+  command for your installation instead (`/opt/qkvm/bin/python -m pip install --upgrade qkvm`,
+  say): a computer the release has no build for (macOS, Alpine, 32-bit systems, a free-threaded
+  Python, a Python outside 3.11 to 3.14), a release that lists no libraries (one made before 0.3.0,
+  or a fork's) and needs newer ones than this computer has, or a version that does not load in
+  that trial. pip works at any other time as well; qKVM runs whichever of the two is newer. An
+  installed update checks its requirements again before opening the data folder, and a version
+  whose libraries were brought for another Python (one upgraded under it) goes back to the
+  version before it by itself.
+- **Disk space:** a version with its libraries takes up to about 150 MB in the data folder (Linux;
+  about 100 MB on Windows), and two versions are kept, the running one and the one to go back to.
+  An install needs twice what it unpacks, plus 100 MB, free, and says so before it downloads
+  anything. **Backups may leave `updates/` out:** it holds only program files and libraries that
+  can be downloaded again, no settings (without it qKVM starts the version pip installed).
 - **A container is updated by replacing its image**, not from inside: the app tells you when
   there is a new one.
 
@@ -2508,7 +2910,14 @@ app says there is nothing newer.
    findings remain visible in the retained report, and the native libraries inside the image
    that the scan cannot see are held to the minimums kept in the repository. The policy and
    temporary exceptions are described in [.github/security/README.md](.github/security/README.md).
-   Then it signs `SHA256SUMS` (of the wheel, the source archive and `qkvm-<version>-image.json`,
+   It also locks the libraries (`.github/security/make-libraries.py`, with pip and packaging pinned
+   by hash): for every Python and system an update is installed in place on, the exact wheels of
+   every library the version runs (by the markers of that Python and system, not of the one the
+   lock is made on), each held to the checksum PyPI gives, in
+   `qkvm-<version>-libraries.json`. The package job and the image are installed from that lock, and
+   the suite runs against it on Linux x86-64 and ARM64 and on Windows, with Python 3.11 to 3.14,
+   before anything is signed; every library it names is audited.
+   Then it signs `SHA256SUMS` (of the wheel, the source archive, the lock and `qkvm-<version>-image.json`,
    the record of what each architecture's scan saw) with openssl in a job that does only that,
    checks the signature with the cryptography library (what every installed copy checks with)
    in a job with no secret, and only then makes a **draft** release of the tag
@@ -2640,8 +3049,12 @@ gives its own, `icacls "D:\qkvm-data" /remove:g *S-1-5-...`. A link on the way (
 the folder, say) is set by a line of its own with `/L`, the link and not where it leads, and
 the folder it leads to by its own. A folder another account owns is that account's to change:
 in an elevated console, `icacls "D:\qkvm-data" /setowner "PC\you"` gives it to the account
-qKVM runs as and `takeown /F "D:\qkvm-data"` to the console's own, neither into what is in it;
-or run qKVM as that account. A drive formatted FAT or exFAT keeps no permissions at all: keep
+qKVM runs as, and `icacls "D:\qkvm-data" /grant "PC\you:F"` lets that account use it (owning a
+folder or a file lets nobody read it by itself; where it is open to its owner by an entry for
+OWNER RIGHTS, as Python makes a private folder and 0.2.0 made its data folder, Windows turns
+that entry off when the owner is set);
+`takeown /F "D:\qkvm-data"` gives it to the console's own; none goes into what is in it. Or run
+qKVM as that account. A drive formatted FAT or exFAT keeps no permissions at all: keep
 the data folder on NTFS.
 
 Stopping it this way is the same as Ctrl+C: connections are closed, the log says so.
@@ -2697,12 +3110,12 @@ or from published source, and tried on a stand-in laid out like it.
 |---|---|
 | GL.iNet Comet (GL-RM1, GL-RM10), GLKVM firmware | Used daily on real devices: picture, status, actions. ATX board, heard on the KVM's line for events, and keyboard and mouse in the live view: tried on a real device (see below). A Fingerbot paired with it: tried on a real Comet with a Fingerbot on a desk, pressing nothing (see below) |
 | GL.iNet Comet X (four ports) | Real device: picture, status, port switching |
-| JetKVM | Real device: picture, status, sharing with its own page, restart, keys, typed text, saved actions, keep-awake, the live view with keyboard and mouse, over its `hidrpc` channel and over JSON-RPC; a key and a mouse button held as its own page takes the viewer and as a connection ends; the ATX extension's short press and its lights (see below); its long press and reset, Wake-on-LAN, a password, HTTPS, a firmware without `hidrpc` and typed text in a layout other than US only against a stand-in |
+| JetKVM | Real device: picture, status, sharing with its own page, restart, keys, typed text, saved actions, keep-awake, the live view with keyboard and mouse, over its `hidrpc` channel and over JSON-RPC; a key and a mouse button held as its own page takes the viewer and as a connection ends; the ATX extension's short press and its lights (see below); virtual media (see below); its long press and reset, Wake-on-LAN, a password, HTTPS, a firmware without `hidrpc` and typed text in a layout other than US only against a stand-in |
 | Stock PiKVM, and other KVMs with PiKVM's `kvmd` interface | kvmd's own test environment, kvmd 4.226 with ustreamer 6.67 (a video loopback and the GPIO mockup in place of a Pi's capture and pins): sign-in, the tile, its picture, the status, keys, typed text, keep-awake, the power and reset buttons and the power light, the network search, the live line with its pictures and with kvmd-media's H.264, keyboard and mouse over it, the history: see below. No real PiKVM yet |
 | Servers through Redfish, AMI MegaRAC controllers | Real boards of two makers: see below |
 | Servers through Redfish, Dell iDRAC9 | Dell's own capture of an iDRAC9 (firmware 7.20.10.05, from `dell/iDRAC-Redfish-Scripting`), served by DMTF's Redfish-Mockup-Server 1.3.0: sign-in and out, status, temperatures and fans, the locator light, the power actions it offers; no real iDRAC yet |
 | Servers through Redfish, HPE iLO 5 | HPE's own `ilo-redfish-emulator` v1.1.0 (an iLO 5 on a DL360 Gen10 Plus): the same, and the power actions carried out; no real iLO yet |
-| Servers through Redfish, OpenBMC | Built from bmcweb's source (its names, the newer shape of the sensors, where its console is and the console `/kvm/0` itself, its firmware inventory) and tried on a stand-in laid out like it, the console's pictures included, and against OpenBMC's own romulus image in QEMU (a build of its master branch of October 2026) on a Linux machine: signing in, the controller and its firmware's version, the server's power, where its console is, and the console's sign-in with the session (refused without one); that image has no console, so no picture came from a real OpenBMC; the run in QEMU is written for every push and passed on GitHub |
+| Servers through Redfish, OpenBMC | Built from bmcweb's source (its names, the newer shape of the sensors, where its console is and the console `/kvm/0` itself, its firmware inventory) and tried on a stand-in laid out like it, the console's pictures included, and against OpenBMC's own romulus image in QEMU (a build of its master branch of October 2026) on a Linux machine: signing in, the controller and its firmware's version, the server's power, where its console is, and the console's sign-in with the session (refused without one); that image has no console, so no picture came from a real OpenBMC, and no key went to one; the run in QEMU is written for every push and passed on GitHub |
 | Virtual machines on Proxmox VE | A real Proxmox VE 9.2 (a throwaway one, with Alpine Linux guests): the guests a token may see listed and added, a running guest's screen on the tile, enlarged and live, letters typed at its login prompt and taken back, a stopped guest switched on, asked to shut down (not heard: nothing in it answers ACPI) and stopped, twenty guests' consoles held at once, a guest deleted and another made under its number refused; a stand-in for what was not met there (a guest moved to another node, a token that lacks a right, Proxmox misbehaving). Containers are not shown |
 | Virtual machines on libvirt, QEMU, Unraid | As VNC servers (above): a libvirt guest's console (libvirt 11.3, QEMU 10.0, no password) was looked at so, its name and its screen; Unraid's VM form was read in its documentation, not tried |
 | An iDRAC's own VNC server | As a VNC server, `vncs://` where its encryption is on: built from Dell's documentation, not tried |
@@ -2857,7 +3270,8 @@ or from published source, and tried on a stand-in laid out like it.
   controller is OpenBMC, its screen is read from its console (`rfb_console`, `/kvm/0`): built
   from the source of OpenBMC's web server and of its VNC server, and tried against a stand-in
   that serves the protocol of VNC behind a `/kvm/0` of its own (pictures, four seats, a session
-  it forgot, a console without its VNC server behind it). OpenBMC's own romulus image, run in
+  it forgot, a console without its VNC server behind it, keys and the pointer taken only after
+  its first second). OpenBMC's own romulus image, run in
   QEMU, has no console in its latest build (its manager announces none, and `/kvm/0` is "not
   found" to a signed-in request), and QEMU's model of the board has no video engine to take a
   picture with anyway: there, what was tried is that the console's address is refused without a
@@ -2948,7 +3362,10 @@ or from published source, and tried on a stand-in laid out like it.
   nothing else through what it documents). A server's console takes keyboard and mouse
   where it is AMI's: typed keys were tried on a real board (an older Gigabyte); the pointer
   went out and was taken there, but its effect was not seen (the screen was a text console),
-  and a board set to a relative mouse was not tried. An OpenBMC console takes none from qKVM.
+  and a board set to a relative mouse was not tried. A VNC server's keyboard and mouse over the
+  line were tried against the stand-in only (the test against TigerVNC and QEMU types through
+  the wall's actions); an OpenBMC console's against the stand-in only, since no real controller
+  with a console was at hand.
 - A GL.iNet Fingerbot paired with a Comet was tried on a real Comet with a Fingerbot on a desk:
   it lay loose, so its presses pressed nothing, and what a press does to a computer was not
   seen. Presses were sent from the wall, from the page and through the driver (half a second,
@@ -2967,6 +3384,36 @@ or from published source, and tried on a stand-in laid out like it.
   are not known; nor whether its "Failed to click" can come of a press the Fingerbot made after
   all (it was seen only for a press sent 0.3 s into another), or whether it says by itself that
   a Fingerbot was paired since (the stand-in in the tests does).
+- *Virtual media of a KVM* was tried on a real JetKVM, through a wall of qKVM on the same
+  network: an image uploaded through the Media box (in a fraction of a second; its SHA-256 the
+  same as the file's), mounted as a CD-ROM drive and then as a disk, both read-only (the disk in
+  1.3 s, its USB device bound anew), each said on the tile and in the box, unmounted, and deleted,
+  every step in the activity log with the image's hash. An image of 368 KB mounted as a CD-ROM
+  drive was refused by its kernel (errno 525): such a one is now refused in words before the KVM
+  is asked. What the machine behind it made of the drive was not looked at. A kvmd KVM's (a GL.iNet
+  Comet, a PiKVM) was tried against kvmd's own test environment (its drive's code, without a USB
+  port behind it): an upload, a CD-ROM drive and a USB flash drive, both read-only, unmounted,
+  deleted. kvmd lists an image some two seconds after its write is answered, and a deleted one as
+  long: qKVM waits for its listing (up to ten seconds), which it did not before that trial.
+- *Alerts in a browser* (Web Push) were tried with Chrome on Windows 11, through Google's push
+  service: turned on in *Settings > Alerts*, and a test alert shown by the page's worker. Safari,
+  Firefox, Edge and the browsers of phones were not tried; on an iPhone the wall's certificate has
+  to be one it trusts.
+- *Virtual media of a server* was built from the standard's VirtualMedia (v1.7) and the remote
+  media actions AMI documents for its MegaRAC, against a stand-in that reads the image back from
+  the wall over a real connection as a controller does, and tried on three real AMI boards of
+  two makers (mounted and unmounted; nothing was started from an image). A newer Gigabyte board
+  took the image over plain HTTP, read it from port 80, showed it in its drive and gave it back
+  at the unmount; it refused every HTTPS address as of the wrong form (see
+  [Virtual media](#virtual-media) for the address on port 80). An ASRock Rack board took the
+  switch of its remote media and kept it off: its own settings keep it off until an image share
+  of their own is set there, and qKVM cannot mount an image on it (it says so). An older
+  Gigabyte board asked for the image once, for its size, and ended the mount with an error of its
+  own (416) without reading it. Whether a server then starts from such an image was not tried.
+- *Two walls on one computer* (one address, two ports) share a browser's sign-in, which a browser
+  keeps by the address and not the port: signing in to one ends the sign-in to the other, and a
+  wall over plain HTTP cannot sign in beside one over HTTPS. Use a private window or another
+  browser profile for the second.
 - *Start into BIOS setup* was tried on that same real Gigabyte board (AMI MegaRAC): from its
   Proxmox login prompt it was restarted and came up in its AMI BIOS setup, which was then left
   without saving, through the console's keys, and the server booted back to its login prompt. A

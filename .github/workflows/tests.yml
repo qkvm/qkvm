@@ -17,7 +17,7 @@ permissions:
 jobs:
   tests:
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 90
+    timeout-minutes: 150  # (the suite took 89 minutes on Windows, 3.13, on 2026-11-05)
     strategy:
       fail-fast: false
       matrix:
@@ -64,6 +64,8 @@ jobs:
         run: python .github/security/test-native-versions.py
       - name: Moving image tag regression tests
         run: python .github/security/test-newest-release.py
+      - name: Libraries lock regression tests
+        run: python .github/security/test-make-libraries.py
 
   # The page itself, run in a real browser against stand-in KVMs: what a person presses, and what they
   # then see; and, in a second file, against the program as it is started (an update, a restart onto HTTPS). Playwright and its browser are for this job only and nothing a wall is installed with; in

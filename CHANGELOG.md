@@ -1,5 +1,123 @@
 # Changes
 
+## 0.3.0
+
+Recover a machine from the wall: mount an image on it and start it from there, on Proxmox guests, KVMs with the kvmd
+interface, JetKVM and servers over Redfish. Be told when a screen goes dark or stops changing, also on a phone. See and
+steer more of them: VNC servers live, keys to OpenBMC consoles, three views for a PC with Intel AMT, zoom. And updates
+that bring their own libraries. Upgrade with `pip install --upgrade qkvm` or `docker pull qkvm/qkvm:0.3.0`; from 0.2.1
+and 0.2.2 the app's own update installs it in place (0.3.0 needs the same libraries as 0.2.2).
+
+### New
+
+- **Virtual media.** A tile's *Actions, Media...* lists the images the machine can be given, mounts one, says what is
+  mounted and unmounts it:
+  - **Proxmox guests:** an ISO image from the guest's own Proxmox storage in its CD-ROM drive (one is added where it has
+    none), read-only; started from it once, or until it is unmounted, its boot order put back afterwards.
+  - **KVMs with the kvmd interface (GL.iNet Comet, PiKVM) and JetKVM:** the images on the KVM's own storage, as a CD-ROM
+    drive or a USB flash drive (read-only unless chosen writable). An image uploaded from the browser is carried
+    through qKVM to the KVM as it comes, up to 16 GB, hashed on its way and kept nowhere; one cut off is taken off the
+    KVM again. Images are deleted there too. Before a byte goes, the KVM is asked again whether it is the one the tile
+    was added for; what the KVM would refuse at once (a name there already, more than is free) the box says itself.
+  - **Servers over Redfish** (AMI MegaRAC first): an image from a folder the admin names in *Settings, Server images*,
+    which qKVM serves to that server's controller alone, over HTTPS with a user and password made for that mount (or
+    over plain HTTP, where the controller takes no other), at an address made for it, for as long as it is mounted and
+    bound to that controller; started from it once or until it is unmounted.
+  - Mounting, uploading and deleting are for admins (a token never may), asked first with the machine and the image
+    named, one at a time per machine, and each written in the activity log, with the image's SHA-256 where qKVM carried
+    it.
+- **Screen watching.** Two watches on a machine's *Edit*, in minutes: **no signal** (the KVM's own signal flag) and,
+  where chosen, **screen unchanged** (from the pictures the wall gets anyway: no session is opened for it). Each is
+  told through the alerts and again when it is over, with the picture that set it off kept on the wall for an admin
+  for 30 days, never sent.
+- **Alerts in a browser and on a phone (Web Push).** *Settings, Alerts, This browser*: the alerts of the machines the
+  account may see, as notifications, with the wall closed too; a tap opens the wall at the tile. Encrypted for that
+  browser alone and signed with the wall's own key, through its maker's push service (Apple's, Google's, Mozilla's or
+  Microsoft's), which cannot read them. It needs the wall over HTTPS with a certificate the phone trusts; on an iPhone
+  or iPad, the wall added to the Home Screen.
+- **VNC servers live, with keyboard and mouse**, in the enlarged view as the other kinds, over one connection.
+- **Keys to an OpenBMC console**: keys, combinations and typed text (in the US layout) in its live view.
+- **Three views for a PC with Intel AMT**, chosen per tile by an admin or an operator: *health only* (no KVM session
+  is ever opened), *stills* (the default: a picture now and then, so Intel's border is on the PC's monitor only for
+  moments; enlarged, it goes live) and *live KVM* (a session held while the tile is shown: the border stays).
+- **Zoom in the enlarged view**: Fit, 50 % to 200 %, where 100 % is the machine's own pixels, remembered per viewer
+  and machine; scrolled or dragged when larger than the window, and the pointer lands where it points at every size.
+- **Updates that bring their own libraries.** From 0.3.0 on, a release lists the exact libraries it was tested with,
+  in a file signed with it. The app's own update puts them in a folder of the new version's own (copied where the same
+  version is installed already, else downloaded from PyPI and checked by its hash), tries the new version in a
+  process of its own before it switches to it, and stays on the old one at any refusal. On Linux (x86-64 and ARM64,
+  glibc) and Windows (x64), with Python 3.11 to 3.14; elsewhere it says the pip command. The first update it serves is
+  the one after 0.3.0. A backup may leave the data folder's `updates` out.
+
+### Fixed
+
+- Proxmox guests on one token no longer sign in one after the other at a start.
+- The hold after a power press follows the machine's address (and its pinned certificate), not the tile.
+- A JetKVM that does not answer requests for a key frame is asked less and less often (5 to 40 seconds), not every 5.
+- A server's power action answered with no content waits no longer than its own bound for the next state.
+- A tile with a 0.2.0 console link in an unusual number form can be edited again.
+- An export leaves out the passwords of tiles of a kind it does not know.
+- The printed lines to take over files: in a container they name the container's paths; on Windows the owner and the
+  access are given in two lines (an account without administrator rights was left without access to the file).
+- A JetKVM whose video connection fails is said to be online where it answers, not offline.
+- A check for updates gives up after a minute; an install that fails for any reason says so and ends.
+
+### Security
+
+- Who may mount, upload and delete images: admins alone, never a token. An image served to a server goes to its
+  controller's own address only, with that mount's user and password, at an address that ends with the mount; the
+  controller's own words are shown without that address and its token, and no log has either.
+- Web Push: the wall's key and the browsers' subscriptions are sealed with the saved passwords and are not exported;
+  a push service is sent to only at a name on the internet whose every address is one of the internet's, looked up at
+  each send, and connected to at the address looked at. A browser is kept for one account, and only that account or
+  an admin replaces it.
+- Alert pictures are the data folder owner's files alone, shown to admins only, for 30 days, and refused at start
+  where something else stands in their place, as `screens.json` is.
+- Updates: only what is in the signed list of libraries is loaded, by hash; the list is tried on every system and
+  Python it names before it is signed, and the container image is built from it. Whether a release has such a list is
+  its signed checksums' to say: one left out of the release's assets is not done without.
+- Before the release, an outside security review and a second review of our own read the new code; nothing they found
+  was high, and what they found of medium and low is changed: the reads of a served image are counted before they
+  wait, and end when its tile is removed or moved; what a cut-off upload left is taken off only on the device it was
+  going to; an image a KVM wrote whole is never deleted for a listing that lags; the local-use NAT64 prefix is no
+  address of the internet's for a push service; an alert waiting for a browser asks again, before each attempt,
+  whether its account may still be told it.
+
+### Upgrading
+
+- **By pip:** `pip install --upgrade qkvm`, then start qKVM again.
+- **By Docker:** pull `qkvm/qkvm:0.3.0` and start the container again with the same volumes.
+- **From the app (Settings, Updates):** 0.2.1 and 0.2.2 install it in place. On 0.2.0, use pip or Docker, as for
+  0.2.1.
+- **Going back to 0.2.2** (`pip install qkvm==0.2.2`, or the app's roll-back) keeps what only 0.3.0 has in the
+  settings, unused, and 0.3.0 finds it again: tried on one data folder, 0.3.0 to 0.2.2 and back.
+
+### Known
+
+- Virtual media was tried on a real JetKVM and against kvmd's own test environment (upload, each kind of drive,
+  delete). A server's was tried on three real AMI boards: a newer Gigabyte board mounts an image over plain HTTP from
+  port 80 alone (name the address on port 80 and forward it to qKVM: see the README); an ASRock Rack board keeps its
+  remote media off without an image share of its own, and an older Gigabyte board ends the mount with its own error.
+  Starting a server from an image was not tried on a real board.
+- A mount on a controller qKVM knew nothing of (no certificate checked, no numbers) ends the first time the
+  controller is known, and is mounted again.
+- Two walls on one computer share a browser's sign-in: use a private window for the second.
+- A KVM's CD-ROM drive (Linux's USB gadget) gives the machine only the first 2.36 GB of an image, as a Windows image
+  is larger: the mount's question says so; as a USB flash drive or a disk it is read whole.
+- Intel AMT has no virtual media yet (planned for 0.4, experimental).
+- Web Push was tried with Chrome on Windows; an iPhone needs the wall's certificate trusted, and was not tried. The
+  push services are told `https://qkvm.com` as whose the alerts are (the software's site, never the wall's address);
+  it cannot be changed yet.
+- Where the free space on a KVM changes between the Media box's look and an upload, the browser may say there was no
+  answer instead of the reason; the box then shows the KVM as it is.
+- The desktop app's joint test of the live connection waits for the desktop.
+- The container image's SQLite exception ends on 2026-12-03, or when Debian fixes it, whichever comes first.
+- Two walls on one computer, at two ports, share a browser's session cookie (a browser keeps cookies by name and host,
+  whatever the port): signing in to one may sign out of the other, and a page over plain HTTP cannot replace the
+  cookie one over HTTPS set. A private window, or another name for the computer, keeps them apart.
+- The signed list of libraries names every build of a library's version that fits a system (for older and newer
+  Linux, say); the release's tests run each system's Python on the build its own runner picks.
+
 ## 0.2.2
 
 Fixes found on a real wall after 0.2.1. Nothing new is added. Upgrade with `pip install --upgrade qkvm` or

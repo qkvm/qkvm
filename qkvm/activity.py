@@ -71,7 +71,11 @@ MOST_WORDS, LONGEST_WORD = 20, 100  # words looked for at once, and characters o
 # the index again (KINDS_MARK), so that it can never say the old kinds.
 KINDS: dict[str, frozenset[str]] = {
     "signin": frozenset({"login", "login_failed", "login_code_asked", "logout", "setup", "password_recovered", "recovery_failed", "display_opened"}),
-    "action": frozenset({"action", "action_failed", "console_opened", "console_failed", "live_control", "live_opened", "live_closed", "activity_left_out"}),
+    "action": frozenset({
+        "action", "action_failed", "console_opened", "console_failed", "live_control", "live_opened", "live_closed", "activity_left_out",
+        "media_mounted", "media_mount_failed", "media_booted", "media_boot_failed", "media_restarted", "media_restart_failed",
+        "media_unmounted", "media_unmount_failed", "media_uploaded", "media_upload_failed", "media_deleted", "media_delete_failed",
+    }),
     "alert": frozenset({"alert", "alerts_paused", "alerts_resumed"}),
 }
 KIND_NAMES = ("signin", "action", "change", "alert")

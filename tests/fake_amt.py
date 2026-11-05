@@ -28,7 +28,7 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from qkvm import amt
-from tests import local_socket
+from tests import ServerThread, local_socket
 from tests.fake_kvm import make_device_certificate
 from tests.fake_vnc import FakeVnc, PixelFormat, VncState
 
@@ -804,7 +804,8 @@ class FakeAmt:
             tls = {"ssl_certfile": str(cert), "ssl_keyfile": str(key)}
         self.url = f"{'https' if tls else 'http'}://127.0.0.1:{self.port}"
         self._server = uvicorn.Server(uvicorn.Config(make_fake_amt(self.state), log_level="error", access_log=False, **tls))
-        self._thread = threading.Thread(target=self._server.run, kwargs={"sockets": [self._sock]}, daemon=True)
+        self._serving = ServerThread("fake Intel AMT machine", lambda: self._server.run(sockets=[self._sock]), lambda: self._server.started)
+        self._thread = self._serving.thread
         self.redirection = FakeRedirection(self.state, redirection, redirection_tls_dir or tls_dir)
 
     @staticmethod
@@ -825,12 +826,7 @@ class FakeAmt:
     def start(self) -> FakeAmt:
         if self.beside:
             amt.REDIRECTION_BESIDE[self.port] = self.port + 2
-        self._thread.start()
-        deadline = time.monotonic() + 10
-        while not self._server.started:
-            if time.monotonic() > deadline:
-                raise RuntimeError("fake Intel AMT machine did not start")
-            time.sleep(0.02)
+        self._serving.start()  # (as every stand-in: a minute on a loaded computer, and why, where its server's thread ended)
         self.redirection.start()
         return self
 
