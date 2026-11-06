@@ -140,8 +140,10 @@ def test_a_kvms_media_box_mounts_as_chosen_uploads_with_its_progress_in_place_an
 
 def test_closing_the_box_stops_its_upload_and_leaves_nothing_on_the_kvm(tmp_path: Path, browser: Browser, comet: FakeKvm) -> None:  # noqa: F811
     comet.state.msd_write_pause = 0.05  # (slow: it is closed in the middle)
-    comet.state.msd_write_rate = 1_000_000  # (8 s for it, however large the pieces: GitHub's runner wrote it in under one)
-    upload_path, _ = an_image(tmp_path, "stopped.iso", 8_000_000)
+    # (Larger than what the network's buffers between the browser, the wall and the KVM hold: on GitHub's Linux runner
+    # 8 MB was all in flight when the box closed, and the KVM got it whole. At 4 MB/s, what is buffered drains in time.)
+    comet.state.msd_write_rate = 4_000_000
+    upload_path, _ = an_image(tmp_path, "stopped.iso", 64_000_000)
     with a_wall(tmp_path / "wall", ("comet", comet)) as (live, admin), looking(browser, live) as page:
         sign_in(page, live)
         expect(tile(page, "comet")).to_have_attribute("data-state", "online", timeout=30_000)

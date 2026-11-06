@@ -135,7 +135,7 @@ jobs:
   tested_commit:
     if: github.event_name == 'push'
     runs-on: ubuntu-24.04
-    timeout-minutes: 100
+    timeout-minutes: 170  # (the tag's own Tests run takes about 90 minutes on Windows, and may queue)
     permissions:
       actions: read
       contents: read
@@ -166,7 +166,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          for attempt in $(seq 1 380); do
+          for attempt in $(seq 1 640); do
             runs=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow tests.yml \
               --commit "$GITHUB_SHA" --limit 100 --json databaseId,createdAt,headSha,status,conclusion,event)
             latest=$(jq --arg sha "$GITHUB_SHA" \
