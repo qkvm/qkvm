@@ -3,6 +3,7 @@ signed, signs it, and builds the image from it (the owner's decisions of 2026-11
 
 from __future__ import annotations
 
+import os
 import re
 
 from qkvm import _libraries
@@ -60,7 +61,8 @@ def test_the_image_is_built_from_the_lock_of_its_own_python() -> None:
     install = dockerfile.index("pip install --require-hashes --no-deps --only-binary :all: -r image-libraries.txt")
     assert install < dockerfile.index("pip install . \\") < dockerfile.index("pip check")
     kept = (SECURITY / "image-libraries.txt").read_text(encoding="utf-8")
-    assert all(line.startswith("#") for line in kept.splitlines()), "kept empty: a build from the source takes them from PyPI"
+    if os.environ.get("QKVM_CONTAINER") != "1":  # (inside the release's image it holds the lock for its Python: its point)
+        assert all(line.startswith("#") for line in kept.splitlines()), "kept empty: a build from the source takes them from PyPI"
     assert "!.github/security/image-libraries.txt" in (APP / ".dockerignore").read_text(encoding="utf-8")
 
 
