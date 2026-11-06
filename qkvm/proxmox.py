@@ -20,7 +20,9 @@ What was measured on Proxmox VE 9.2, and what follows from it here:
   asked for none at all (Proxmox would hand out a ticket all the same, and its task would say that it failed).
 - Proxmox sends the console in binary frames of at most 128 KiB.
 - The token's grants decide what a tile can do: VM.Audit to see the guest, VM.Console for its screen and keys,
-  VM.PowerMgmt for the power buttons. What it lacks is said on the tile as Proxmox says it.
+  VM.PowerMgmt for the power buttons; and for its virtual media (0.3.0, read from Proxmox's own source, see "virtual media"
+  below) Datastore.Audit on the storages of its images, VM.Config.CDROM and VM.Config.Disk. What it lacks is said on the
+  tile, or in the Media box, as Proxmox says it.
 - A virtual machine made is given the lowest number that is free: one made after a guest was deleted had its number
   (2026-10-19). So a guest is known by the SMBIOS UUID it gives for itself, asked again before anything is sent (see
   ProxmoxGuest._same_guest), and not by its number alone.
@@ -55,6 +57,7 @@ from .kvm import (
     Device,
     DeviceSpec,
     KvmError,
+    MediaOffer,
     Snapshot,
     _transport_error,
     can_do,
@@ -355,12 +358,101 @@ def own_number(config: Any) -> str | None:
     return "proxmox:" + hashlib.sha256(found.group(1).lower().encode()).hexdigest()[:32]
 
 
+# --- virtual media: an ISO image on one of Proxmox's storages, in the guest's CD-ROM drive (0.3.0) --------------------
+# Nothing moves: the image is on Proxmox already, and the guest's settings name it (`ide2: local:iso/x.iso,media=cdrom`).
+# Never Proxmox's `download-url`, which has Proxmox fetch an address (and with it probe its own network: Proxmox says so in
+# its permission text), and no upload. Read from Proxmox's own source (qemu-server's Qemu.pm, pve-storage's Storage.pm),
+# the token needs, beside what the tile needs: Datastore.Audit on the storages that hold the images (to list them, and to
+# put one in a drive), VM.Config.CDROM (a disc in the drive; also a CD-ROM drive added where the guest has none),
+# VM.Config.Disk (the boot order, which is one of the disk options), and VM.PowerMgmt to restart it (the power buttons').
+# Each change is made on the settings as they were read for it, by their digest: one made meanwhile on Proxmox (another
+# virtual machine made under the guest's number among them) has Proxmox refuse it. And those settings are first judged to
+# be the guest's this tile was added for (`_judge`). A running guest has a new disc at once; a new boot order, and a drive
+# added, only from its next start by Proxmox (a start: a reset is the same process begun again, with what it began with).
+# There is no start "once" in Proxmox: qKVM starts the guest anew with the CD-ROM drive first, and puts the order back
+# after; a restart from inside the guest keeps the order its process began with, the CD-ROM drive first while it is so.
+
+MEDIA = MediaOffer(drives=("cd",), boot=("once", "until_unmounted"), restart=True, upload=False, where="proxmox")
+STORAGE_ID = re.compile(r"[A-Za-z][A-Za-z0-9._-]{0,63}")  # what Proxmox names a storage by (pve-storage-id)
+# An ISO image on a storage as Proxmox names it (its volume id), and as qKVM hands it back to Proxmox: a name of the
+# characters Proxmox leaves in the name of an image uploaded to it and no others (a comma would add an option to the
+# drive's setting, a slash name another place).
+ISO_VOLUME = re.compile(r"(?P<storage>[A-Za-z][A-Za-z0-9._-]{0,63}):iso/(?P<name>[A-Za-z0-9_+-][A-Za-z0-9_.+-]{0,199}\.(?:iso|img))", re.IGNORECASE)
+CD_SLOTS = (*(f"ide{n}" for n in (2, 0, 1, 3)), *(f"sata{n}" for n in range(6)), *(f"scsi{n}" for n in range(31)))
+NEW_CD_SLOTS = CD_SLOTS[:10]  # where a CD-ROM drive is added: IDE, as Proxmox's own page adds one (ide2 first), then SATA
+BOOT_DEVICE = re.compile(r"[a-z]{2,8}[0-9]{1,3}")  # an entry of a boot order: scsi0, ide2, net0, hostpci0, usb1
+DIGEST = re.compile(r"[0-9a-f]{40}")  # the SHA-1 of a guest's settings file, as Proxmox says it with them
+CHANGED_MEANWHILE = re.compile(r"checksum mismatch|file change by other user|detected modified configuration", re.IGNORECASE)
+MOST_STORAGES = 64  # storages of a node whose images are listed
+MOST_IMAGES = 2000  # images listed to pick from
+# What was done here, by guest (its Proxmox, its number, the number it gives for itself): who mounted what, and when; and the
+# boot order a start "until unmounted" replaced, with the one it wrote (put back at the unmount, where the order is still the
+# one written). Kept beside the guests, which are made anew at every edit of a tile; gone at a restart of qKVM, after which an
+# unmount leaves a boot order it does not know the old one of as it is, and says so.
+_MOUNTED: dict[str, tuple[str, str, float]] = {}
+_BOOT_WAS: dict[str, tuple[str, str]] = {}
+MOST_REMEMBERED = 2048
+
+
+def _remember(table: dict[str, Any], key: str, value: Any) -> None:
+    table.pop(key, None)  # (the newest last)
+    table[key] = value
+    while len(table) > MOST_REMEMBERED:
+        del table[next(iter(table))]
+
+
+def drive_of(value: Any) -> tuple[str, dict[str, str]] | None:
+    """A drive's setting as Proxmox writes it ('local:iso/x.iso,media=cdrom,size=1G', 'none,media=cdrom'): what is in it,
+    and its options. None for what is no such setting."""
+    if not isinstance(value, str) or not 0 < len(value) <= 2048:
+        return None
+    disc: str | None = None
+    options: dict[str, str] = {}
+    for at, part in enumerate(value.split(",")):
+        key, named, said = part.partition("=")
+        if not named:
+            if at:
+                return None
+            disc = part
+        elif key == "file" and disc is None:
+            disc = said
+        else:
+            options[key] = said
+    return (disc, options) if disc else None
+
+
+def cd_of(config: Any) -> tuple[str | None, str | None]:
+    """The guest's CD-ROM drive (the first that holds something, else the first there is) and what is in it ("none":
+    nothing); (None, None) where its settings have no CD-ROM drive."""
+    first: str | None = None
+    for slot in CD_SLOTS:
+        found = drive_of(config.get(slot)) if isinstance(config, dict) else None
+        if found is None or found[1].get("media") != "cdrom":
+            continue
+        if found[0] != "none":
+            return slot, found[0]
+        first = first or slot
+    return first, "none" if first else None
+
+
+def boot_order(config: Any) -> list[str] | None:
+    """A guest's boot order ('order=scsi0;ide2;net0') as a list; None where it is written the old way ('cdn', and where
+    none is written, which Proxmox takes for that) or otherwise than this reads: qKVM changes no order it cannot read whole."""
+    said = config.get("boot") if isinstance(config, dict) else None
+    if not isinstance(said, str) or not said.startswith("order=") or len(said) > 1024:
+        return None
+    order = said[len("order=") :].split(";")
+    if not all(BOOT_DEVICE.fullmatch(one) for one in order) or len(set(order)) != len(order):
+        return None
+    return order
+
+
 # --- the guest ---------------------------------------------------------------------------------------------------------
 
 
 # Sign-ins under way, by the mark of the token at its Proxmox (ProxmoxGuest._offered): every guest of it on the wall shares
 # one verdict on the token, and one that comes while another's sign-in is out waits for that one's answer (see `_login`).
-_SIGNING_IN: dict[str, asyncio.Future[None]] = {}
+_SIGNING_IN: dict[str, asyncio.Future[str | None]] = {}
 
 # When each guest's console was last forgiven, by kind and address: for the guest seen stopped, and for its process seen to
 # begin again (see ProxmoxConsole). Kept here, beside the ladders they forgive (vncdevice._PACED), and not in the console,
@@ -490,9 +582,9 @@ class ProxmoxGuest(Device):
 
     kind = "proxmox"
     picture = False  # (said as a server is: on or off, and its screen where it can be had: `screen`)
-    # Its power buttons, and on/off by what is wanted. A look adds its screen, keys and text, and the live line with
-    # keyboard and mouse, while it runs.
-    can = ("power", "reset", "power_state")
+    # Its power buttons, and on/off by what is wanted, and its virtual media. A look adds its screen, keys and text, and the
+    # live line with keyboard and mouse, while it runs.
+    can = ("power", "reset", "power_state", "media")
 
     def __init__(self, spec: DeviceSpec, on_pin: Any = None) -> None:
         super().__init__(spec, on_pin)
@@ -518,6 +610,9 @@ class ProxmoxGuest(Device):
         # not told by the time: Windows' clock before Python 3.13 moves in steps of 15.6 ms, and a look that came within one
         # step of the last one's question took it for its own, and asked nothing.)
         self._judges = 0
+        # What its CD-ROM drive holds, as the last reading of its settings that was judged to be the guest's found it (once a
+        # minute at a look, and at every call of its virtual media): its slot, the disc, whether the order starts with it.
+        self._cd: tuple[str, str, bool] | None = None
 
     async def close(self) -> None:
         self._closed = True  # (no console is opened from here on)
@@ -568,13 +663,22 @@ class ProxmoxGuest(Device):
             # guests held the token back an hour where one no holds it a minute (the review's probe p1).
             client = await self._http()
             # Another guest of this Proxmox signing in with this token just now (at a wall's start, they all look at once): its
-            # answer is waited for, and then this one goes on as it went (let in: it signs in itself, as ever; told no: it is
-            # told no too, sent nothing). Held back meanwhile, each of them said "no_sign_in" at its first look: eleven of twelve
-            # tiles flashed a problem. (Waited for within `until`, as a sign-in of its own would be.)
+            # answer is waited for, and then this one goes on as it went (let in: so is this one, the same token at the same
+            # Proxmox, and nothing is sent for it; told no: it is told no too, sent nothing). Held back meanwhile, each of them
+            # said "no_sign_in" at its first look: eleven of twelve tiles flashed a problem. And signing in itself once let in,
+            # each waited for the next one's sign-in in turn: twelve guests, twelve sign-ins' time before the last was shown.
+            # (Waited for within `until`, as a sign-in of its own would be.)
             while (under_way := _SIGNING_IN.get(offered)) is not None and not under_way.done():
                 await asyncio.wait({under_way}, timeout=None if until is None else max(0.0, until - time.monotonic()))
                 if not under_way.done():
                     raise KvmError("no_sign_in", "Proxmox does not take the token just now, and the wait it was asked in has no time left for a sign-in")
+                if (theirs := under_way.result()) is not None and REJECTED.wait_left(offered) <= 0:
+                    # (Taken, and nothing noted against the token since: no no, and no sign-in of another's out. Every
+                    # question after it carries the token, and a 401 to one is a sign-in again, counted, as for any guest.)
+                    self._login_error = None
+                    self._version = theirs
+                    self._signed_in = True
+                    return
             request = client.build_request("GET", f"{self._origin}{API}/version", headers={**headers, "Accept": "application/json"}, timeout=sign_in_waits())
             within = None
             if until is not None:
@@ -587,34 +691,37 @@ class ProxmoxGuest(Device):
             self._not_yet(offered, NO_SAID)
             before = REJECTED.sent(offered)
             signing_in = _SIGNING_IN[offered] = asyncio.get_running_loop().create_future()
+            taken: str | None = None  # Proxmox's version, where it took the token: handed to whoever waited
             try:
-                reply = await self._send(client, request, MAX_REPLY, within)
-            except httpx.HTTPError as ex:
-                raise self._came_to_nothing(offered, _transport_error(ex, self.spec.tls), NO_SAID, before, went_out(ex)) from ex
-            except KvmError as ex:
-                raise self._came_to_nothing(offered, ex, NO_SAID, before) from None
+                try:
+                    reply = await self._send(client, request, MAX_REPLY, within)
+                except httpx.HTTPError as ex:
+                    raise self._came_to_nothing(offered, _transport_error(ex, self.spec.tls), NO_SAID, before, went_out(ex)) from ex
+                except KvmError as ex:
+                    raise self._came_to_nothing(offered, ex, NO_SAID, before) from None
+                self._answered()
+                if reply.status_code == 401:
+                    self._login_error = KvmError("auth_failed", "Proxmox does not take the saved API token - check the token's ID and secret")
+                    self._login_retry_at = time.monotonic() + REJECTED.said_no(offered)
+                    log.warning("%s: Proxmox rejected the API token", self.label)
+                    raise self._login_error
+                try:
+                    said = data_of(reply, "say its version")
+                except KvmError as ex:
+                    raise self._neither_yes_nor_no(offered, ex, NO_SAID) from None
+                version = said.get("version") if isinstance(said, dict) else None
+                if not isinstance(version, str):
+                    raise self._neither_yes_nor_no(offered, KvmError("bad_response", "What answers does not say it is Proxmox VE"), NO_SAID)
+                self._login_error = None
+                REJECTED.accepted(offered)
+                taken = plain(version, 20)
             finally:
                 # (Its answer is noted before anything waits on: whoever waited finds the verdict, whatever it was. Not
                 # waited for past this sign-in's own end, however it ended.)
-                signing_in.set_result(None)
+                signing_in.set_result(taken)
                 if _SIGNING_IN.get(offered) is signing_in:
                     del _SIGNING_IN[offered]
-            self._answered()
-            if reply.status_code == 401:
-                self._login_error = KvmError("auth_failed", "Proxmox does not take the saved API token - check the token's ID and secret")
-                self._login_retry_at = time.monotonic() + REJECTED.said_no(offered)
-                log.warning("%s: Proxmox rejected the API token", self.label)
-                raise self._login_error
-            try:
-                said = data_of(reply, "say its version")
-            except KvmError as ex:
-                raise self._neither_yes_nor_no(offered, ex, NO_SAID) from None
-            version = said.get("version") if isinstance(said, dict) else None
-            if not isinstance(version, str):
-                raise self._neither_yes_nor_no(offered, KvmError("bad_response", "What answers does not say it is Proxmox VE"), NO_SAID)
-            self._login_error = None
-            REJECTED.accepted(offered)
-            self._version = plain(version, 20)
+            self._version = taken
             self._signed_in = True
 
     async def _call(
@@ -726,6 +833,8 @@ class ProxmoxGuest(Device):
                 raise
             config = None
         await self._judge(own_number(config))
+        if isinstance(config, dict):
+            self._cd_from(config)  # (the guest's: what its CD-ROM drive holds, for the tile)
 
     async def _judge(self, seen: str | None) -> None:
         """Whether the virtual machine that has this guest's number is the guest this tile was added for, by the number it
@@ -912,6 +1021,8 @@ class ProxmoxGuest(Device):
             raise KvmError(ex.code, f"Which virtual machine has this guest's number could not be told: {ex.message}", ex.status) from None
         seen = own_number(config)
         await self._judge(seen)
+        if isinstance(config, dict):
+            self._cd_from(config)
         return {**said, "ident": seen}
 
     async def _screen_allowed(self) -> None:
@@ -1053,6 +1164,7 @@ class ProxmoxGuest(Device):
             "about": {"model": f"VM {self._vmid} on {self._node}", "version": f"Proxmox VE {self._version}" if self._version else None},
             "ports": None,
             "console": False,
+            "media": self.media_now(),  # what its CD-ROM drive holds (said to everybody who sees the tile)
             "server": {
                 "power": power,
                 "health": None,
@@ -1222,6 +1334,220 @@ class ProxmoxGuest(Device):
                 return
             self._status_at = 0.0
             self._refresh_soon()
+
+    # --- virtual media (see "virtual media" above the guest) ---------------------------------------------------------
+
+    def _mark(self) -> str:
+        """What is remembered of this guest's media by (_MOUNTED, _BOOT_WAS): its Proxmox, its number, its own number."""
+        return f"{self._origin}\0{self._vmid}\0{self.spec.machine}"
+
+    def _cd_from(self, config: dict[str, Any]) -> None:
+        """What the guest's CD-ROM drive holds, from settings read just now and judged to be the guest's."""
+        slot, disc = cd_of(config)
+        order = boot_order(config)
+        self._cd = None if slot is None or disc is None or disc == "none" else (slot, disc, order is not None and order[:1] == [slot])
+
+    def media_now(self) -> dict[str, Any] | None:
+        if self._cd is None or self._other is not None:
+            return None
+        _, disc, first = self._cd
+        found = ISO_VOLUME.fullmatch(disc)
+        mounted = _MOUNTED.get(self._mark())
+        by, at = (mounted[1], mounted[2]) if mounted is not None and mounted[0] == disc else (None, None)
+        # (What another hand put there is said as Proxmox says it, and is taken out by those words: `media_unmount`.)
+        name = found.group("name") if found else "the host's own CD drive" if disc == "cdrom" else plain(disc.rsplit("/", 1)[-1], 120)
+        return {"drive": "cd", "image": plain(disc, 300), "name": name, "where": found.group("storage") if found else None, "read_only": True, "first": first, "by": by, "at": at, "sha256": None}
+
+    async def _this_guest(self) -> dict[str, Any]:
+        """The guest's settings, read now, and judged to be those of the guest this tile was added for (KvmError
+        "another_machine" where they are not): what every call of its virtual media begins with, before anything is changed."""
+        config = await self._guest("GET", "config", "read this guest's settings", urgent=True)
+        if not isinstance(config, dict):
+            raise KvmError("bad_response", "Proxmox did not say the guest's settings")
+        await self._judge(own_number(config))
+        self._cd_from(config)
+        return config
+
+    async def _change(self, config: dict[str, Any], changes: dict[str, str], what: str, still: Callable[[], bool] | None) -> None:
+        """Change the guest's settings, on those read for it (`config`, by their digest): where they were changed on Proxmox
+        since (another virtual machine made under the guest's number among them), Proxmox refuses it, and so does this, as
+        `changed`: nothing was changed. `what`: what is done, for the words of a refusal."""
+        digest = config.get("digest")
+        if not isinstance(digest, str) or not DIGEST.fullmatch(digest):
+            raise KvmError("bad_response", "Proxmox did not say which version of the guest's settings it read")
+        assert self._node is not None and self._vmid is not None
+        # (Not sent twice: on the strength of the digest, a second one after a first that was carried out is refused.)
+        reply = await self._call("PUT", f"/nodes/{self._node}/qemu/{self._vmid}/config", urgent=True, again=False, still=still, data={**changes, "digest": digest})
+        if reply.status_code == 500 and CHANGED_MEANWHILE.search(_said(reply)):
+            raise KvmError("changed", "The guest's settings were changed on Proxmox meanwhile, and nothing was changed here. Look at it again.", 409)
+        try:
+            data_of(reply, what)
+        except AnswerLost as ex:
+            raise KvmError("timeout", f"Proxmox's answer did not come back ({ex.message}): it may have been done. Look at the guest before trying again.", 504) from None
+
+    async def media_images(self) -> dict[str, Any]:
+        await self._this_guest()  # (the guest's, and on the node it is on now: images are on that node's storages)
+        node = self._node
+        listed = data_of(await self._call("GET", f"/nodes/{node}/storage", urgent=True, params={"content": "iso", "enabled": "1"}), "list the storages of the guest's node")
+        storages: list[str] = []
+        unseen: list[str] = []
+        for entry in listed if isinstance(listed, list) else []:
+            name = entry.get("storage") if isinstance(entry, dict) else None
+            content = entry.get("content") if isinstance(entry, dict) else None
+            if not isinstance(name, str) or not STORAGE_ID.fullmatch(name) or name in storages or not isinstance(content, str) or "iso" not in content.split(","):
+                continue
+            if entry.get("active") in (0, False):
+                unseen.append(f"{name}: Proxmox says it is not active")
+                continue
+            storages.append(name)
+        images: list[dict[str, Any]] = []
+        left_out = 0
+        for name in storages[:MOST_STORAGES]:
+            try:
+                reply = await self._call("GET", f"/nodes/{node}/storage/{name}/content", urgent=True, vital=False, limit=MOST_LISTED, params={"content": "iso"})
+                found = data_of(reply, f"list the images on {name}")
+            except KvmError as ex:
+                if ex is RETIRED or self._closed:
+                    raise
+                unseen.append(f"{name}: {ex.message}")
+                continue
+            for entry in found if isinstance(found, list) else []:
+                volume = entry.get("volid") if isinstance(entry, dict) else None
+                iso = ISO_VOLUME.fullmatch(volume) if isinstance(volume, str) else None
+                # (Taken by kind: an image of this storage, named as qKVM hands names on, and nothing else.)
+                if iso is None or iso.group("storage") != name or entry.get("content", "iso") != "iso" or len(images) >= MOST_IMAGES:
+                    left_out += 1
+                    continue
+                images.append({"id": volume, "name": iso.group("name"), "where": name, "size": number(entry.get("size"), 0, 2**50), "partial": False, "sha256": None})
+        images.sort(key=lambda one: (one["name"].casefold(), one["where"]))
+        return {"images": images, "unseen": unseen, "left_out": left_out, "notes": [], "space": None}
+
+    def media_offer(self) -> MediaOffer:
+        return MEDIA  # (every guest: what it has is read at each call, and said there)
+
+    async def media_mount(self, image: str, *, drive: str = "cd", writable: bool = False, by: str, still: Callable[[], bool] | None = None) -> str | None:
+        if drive != "cd" or writable:
+            raise KvmError("invalid", "A guest of Proxmox takes an image in its CD-ROM drive, read-only", 422)
+        found = ISO_VOLUME.fullmatch(image)
+        if found is None:
+            raise KvmError("invalid", "That is not an image of Proxmox's that qKVM lists", 422)
+        # Only an image listed now, from the storages the token may see: nothing else is handed to Proxmox.
+        listed = await self.media_images()
+        if image not in {one["id"] for one in listed["images"]}:
+            raise KvmError("changed", f"{found.group('name')} is not on the storages of the guest's node that the token may see: look again.", 409)
+        config = await self._this_guest()
+        slot, disc = cd_of(config)
+        note = None
+        if slot is None:
+            slot = next((one for one in NEW_CD_SLOTS if one not in config), None)
+            if slot is None:
+                raise KvmError("action_failed", "The guest has no CD-ROM drive, and no free place for one (ide0 to ide3, sata0 to sata5): add one on Proxmox.", 409)
+            note = f"The guest had no CD-ROM drive: one was added ({slot}). A running guest has it from its next start by Proxmox."
+        elif disc == image:
+            return "It was in the guest's CD-ROM drive already."
+        await self._change(config, {slot: f"{image},media=cdrom"}, "put an image in the guest's CD-ROM drive", still)
+        _remember(_MOUNTED, self._mark(), (image, by, time.time()))
+        self._status_at = 0.0  # (the tile says it at the next look)
+        await self._this_guest()
+        return note
+
+    async def media_boot(self, how: str, *, restart: bool, still: Callable[[], bool] | None = None) -> str | None:
+        if how not in MEDIA.boot:
+            raise KvmError("invalid", "A guest of Proxmox starts from an image once, or until it is unmounted", 422)
+        config = await self._this_guest()
+        slot, disc = cd_of(config)
+        if slot is None or disc in (None, "none"):
+            raise KvmError("action_failed", "Nothing is in the guest's CD-ROM drive to start from", 409)
+        order = boot_order(config)
+        if order is None:
+            raise KvmError(
+                "action_failed",
+                "The guest's boot order is written the old way, or not at all, and qKVM changes no order it cannot read whole: set it on Proxmox (Options, Boot Order), then try again.",
+                409,
+            )  # fmt: skip
+        first = [slot, *(one for one in order if one != slot)]
+        if first != order:
+            await self._change(config, {"boot": "order=" + ";".join(first)}, "set the guest's boot order", still)
+            if how == "until_unmounted":
+                _remember(_BOOT_WAS, self._mark(), (";".join(order), ";".join(first)))
+        self._status_at = 0.0
+        if how == "until_unmounted":
+            if restart:
+                await self._restart(still)
+                await self._this_guest()
+                return None
+            await self._this_guest()
+            return "It starts from the image at its next start by Proxmox, until the image is unmounted."
+        # Once: started anew with the CD-ROM drive first, and the order put back after, for every start after this one.
+        try:
+            await self._restart(still)
+        except KvmError:
+            if first != order:
+                try:
+                    await self._order_back(order, first, still=None)  # (a restart that did not come about leaves no order behind)
+                except KvmError as ex:
+                    log.warning("%s: the boot order could not be put back after a start from an image that did not come about: %s", self.label, ex.message)
+            raise
+        if first == order:
+            return "It started from the image. Its boot order began with the CD-ROM drive already, and still does."
+        try:
+            left = await self._order_back(order, first, still=None)
+        except KvmError as ex:
+            raise KvmError("action_failed", f"It started from the image, and its boot order could not be put back ({ex.message}): it starts from the image at its next start too, until the order is set on Proxmox.") from None
+        return left or "It started from the image. Its next start by Proxmox is from its boot order as before; a restart from inside the guest starts from the image again while it is mounted."
+
+    async def _order_back(self, order: list[str], written: list[str], *, still: Callable[[], bool] | None) -> str | None:
+        """Put the boot order `order` back, where the guest's order is still `written` (what qKVM wrote in its place); a
+        sentence where it was changed on Proxmox since, and is left as it is."""
+        config = await self._this_guest()
+        now = boot_order(config)
+        if now == order:
+            return None
+        if now != written:
+            return "Its boot order was changed on Proxmox meanwhile, and is left as it is."
+        await self._change(config, {"boot": "order=" + ";".join(order)}, "put the guest's boot order back", still)
+        await self._this_guest()
+        return None
+
+    async def _restart(self, still: Callable[[], bool] | None) -> None:
+        """Have Proxmox start the guest anew: stopped at once where it runs (the plug pulled), and started. Only a start
+        takes a new boot order: a reset is the same process begun again. Each is a power button's, with its waits and its
+        question which virtual machine has the number (`act`)."""
+        found = await self._guest("GET", "status/current", "look at this guest", urgent=True)
+        if isinstance(found, dict) and found.get("status") == "running":
+            await self.act("atx_power_long", still=still)
+        try:
+            await self.act("power_on", still=still)
+        except AlreadySo:
+            raise KvmError("action_failed", "The guest was running again before qKVM started it: it did not start from the image. Look at it.") from None
+
+    async def media_unmount(self, image: str, *, still: Callable[[], bool] | None = None) -> str | None:
+        config = await self._this_guest()
+        slot, disc = cd_of(config)
+        if slot is None or disc in (None, "none"):
+            raise AlreadySo("nothing was mounted")
+        shown = self.media_now()
+        if shown is None or shown["image"] != image:
+            named = shown["name"] if shown is not None else plain(disc, 120)
+            raise KvmError("changed", f"Another image is in the guest's CD-ROM drive now ({named}): nothing was taken out. Look again.", 409)
+        await self._change(config, {slot: "none,media=cdrom"}, "take the image out of the guest's CD-ROM drive", still)
+        _MOUNTED.pop(self._mark(), None)
+        self._status_at = 0.0
+        was = _BOOT_WAS.pop(self._mark(), None)
+        config = await self._this_guest()
+        order = boot_order(config)
+        if was is not None and order is not None and ";".join(order) == was[1]:
+            try:
+                await self._change(config, {"boot": "order=" + was[0]}, "put the guest's boot order back", still)
+            except KvmError as ex:
+                if ex is RETIRED or self._closed:
+                    raise
+                return f"Its boot order could not be put back ({ex.message}): it still begins with the CD-ROM drive, which is empty and passed over."
+            await self._this_guest()
+            return None
+        if order and order[0] == slot:
+            return "Its boot order still begins with the CD-ROM drive (not set so from qKVM, or qKVM was restarted since): empty, it is passed over."
+        return None
 
 
 async def guests(

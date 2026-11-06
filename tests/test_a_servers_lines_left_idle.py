@@ -38,6 +38,8 @@ class Middlebox:
         self.port, self.reset = port, reset
         self.flows: list[list[bool]] = []
         self.resets = 0  # (requests that came on a forgotten connection: each answered with a reset)
+        self.tasks: set[asyncio.Task[Any]] = set()
+        self.transports: list[asyncio.BaseTransport] = []
 
     async def start(self) -> int:
         self.server = await asyncio.start_server(self.flow, "127.0.0.1", 0)
@@ -47,10 +49,25 @@ class Middlebox:
         for alive in self.flows:
             alive[0] = False
 
+    async def close(self) -> None:
+        """Its connections ended, the forgotten ones too, and every flow waited for. (The requalification of 0.3.0, Windows
+        3.13: flows a forgotten connection held were left pending to the end, held by nothing but one another; the
+        collector destroyed them during the loop's poll, and Python's Windows loop raised InvalidStateError out of it.)"""
+        self.server.close()
+        for transport in self.transports:
+            transport.abort()
+        await asyncio.gather(*self.tasks, return_exceptions=True)
+        await self.server.wait_closed()
+
     async def flow(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        task = asyncio.current_task()
+        assert task is not None
+        self.tasks.add(task)
         alive = [True]
         self.flows.append(alive)
+        self.transports.append(writer.transport)
         up_reader, up_writer = await asyncio.open_connection("127.0.0.1", self.port)
+        self.transports.append(up_writer.transport)
 
         async def pipe(src: asyncio.StreamReader, dst: asyncio.StreamWriter) -> None:
             try:
@@ -84,7 +101,7 @@ def behind_a_middlebox(reset: bool, test: Any) -> None:
             await test(device, box, state)
         finally:
             await device.close()
-            box.server.close()
+            await box.close()
 
     try:
         asyncio.run(inside())

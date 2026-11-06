@@ -16,9 +16,10 @@ What a line gets, by the family of the machine:
   that speaks it hands out decoded frames and nothing else through what it documents (`JetSource`).
 * A server whose console the wall reads (AMI MegaRAC): JPEG of its screen, each time the screen changes
   (`ConsoleSource`), and keys and the mouse as the USB HID reports that console carries (`RedfishHid`); an OpenBMC
-  console shows the screen and takes no keyboard or mouse yet.
-* A PC with Intel AMT whose KVM the wall may use: the same, of the screen its KVM gives (`ConsoleSource`), and keys
-  and the mouse as RFB's key and pointer events through that KVM (`RfbHid`).
+  console the same, of the screen it carries, and keys and the mouse as RFB's key and pointer events over it (`RfbHid`).
+* A PC with Intel AMT whose KVM the wall may use, a virtual machine on Proxmox, a VNC server: the same, of the screen
+  each gives over RFB (`ConsoleSource`), and keys and the mouse as RFB's key and pointer events (`RfbHid`), on the
+  connection the tile's own pictures come over.
 
 Keyboard and mouse go to a kvmd KVM as the JSON events its own page sends, and to a JetKVM as the reports its
 page sends over the channel this program already asks it over. The line names a key by its USB HID usage
@@ -598,7 +599,7 @@ class KvmdHid(Hid):
 
 class RfbHid(Hid):
     """Keys and the mouse to a machine whose screen is read over RFB (a PC with Intel AMT, through its KVM; a guest of
-    Proxmox, through its console): key events
+    Proxmox, through its console; a VNC server; a server, through OpenBMC's console): key events
     by keysym, and pointer events in the pixels of its screen, with the buttons held as RFB counts them (the left one
     bit 0, the middle bit 1, the right bit 2; the wheel a press and a release of bit 3 up, 4 down, 5 left, 6 right).
     RFB has no back and forward buttons: those are not sent. A key that has no keysym is not sent either."""
@@ -1758,12 +1759,19 @@ class Machine:
             hid = JetHid(self.device)
         elif self.device.kind in ("amt", "proxmox"):
             hid = RfbHid(self.device)
+        elif self.device.kind in ("vnc", "redfish") and (way := self._rfb_way()) is not None:
+            hid = RfbHid(way)  # (a VNC server; a server whose console is OpenBMC's: see vncdevice.ScreenInput)
         elif self.device.kind == "redfish" and getattr(self.device, "takes_keys", False):
-            hid = RedfishHid(self.device)  # (a server over AMI's console; OpenBMC's shows the screen but takes no keys yet)
+            hid = RedfishHid(self.device)  # (a server over AMI's console)
         else:
             return None
         hid.owe = self._owe
         return hid
+
+    def _rfb_way(self) -> Any:
+        """What RFB's key and pointer events go through to this machine, where its driver hands one (`rfb_input`); None else."""
+        giving = getattr(self.device, "rfb_input", None)
+        return giving() if callable(giving) else None
 
     def _owe(self, task: asyncio.Task[None]) -> None:
         self.lines.owed(task, self.device_id)
@@ -2015,6 +2023,12 @@ class Lines:
             return True
         return bool(getattr(device, "console_readable", False))
 
+    @staticmethod
+    def why_no_live(device: Device) -> str:
+        """What a machine that has no live picture is said to have, in words of its own where it has them (a PC set to health only)."""
+        said = getattr(device, "no_live_why", None)
+        return said if isinstance(said, str) and said else "This machine has no live picture"
+
     def held_by(self, device_id: str) -> str | None:
         """Who holds this machine's keyboard and mouse over a live line at this moment, by the name a refusal gives (`by`:
         an account's name, a token's or a wall screen's with "(token)"); None where nobody does."""
@@ -2087,7 +2101,7 @@ class Lines:
             await self._turn_away(ws, why or "not_found", SAID.get(why or "not_found", "This line may not go on"))
             return
         if not self.offers(device):
-            await self._turn_away(ws, "no_live", "This machine has no live picture")
+            await self._turn_away(ws, "no_live", self.why_no_live(device))
             return
         wants = frozenset(codec for codec in ("h264", "jpeg") if isinstance(hello.get("video"), list) and codec in hello["video"])
         max_w = _number(hello.get("max_w"), 1, MOST_WIDTH) or TIERS["640"][0]

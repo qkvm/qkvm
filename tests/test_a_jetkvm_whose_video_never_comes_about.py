@@ -197,6 +197,42 @@ def test_while_a_tile_offers_no_other_its_look_and_the_alerts_say_the_same_of_th
             jet.stop()
 
 
+def test_a_look_that_waited_for_the_connection_that_came_to_nothing_says_what_the_looks_after_it_say(monkeypatch: pytest.MonkeyPatch) -> None:
+    # (0.2.2, a loaded Windows runner: the history of the test below went error, offline, error within a fifth of a second.) A
+    # tile's look that came while the first video connection was being made waited for it. That connection came to nothing,
+    # and the look said how it ended ("timeout": "offline") of a JetKVM that answers, where every look after it says that it
+    # has a problem, in the tile's words; and the history kept that look's "offline" between the "error" of its own looks.
+    state = JetState(answers_offers=False)
+    jet = FakeJetKvm(state).start()
+
+    async def run() -> None:
+        device = jetkvm.JetKvmDevice(DeviceSpec("j9", "jet", jet.url, "", "secret", kind="jetkvm"))
+        try:
+            try:
+                await device.snapshot(640)  # (the tile's picture: it offers the connection)
+            except KvmError:
+                pass
+            until = time.monotonic() + 30  # (the decoder's process is made first: seconds on a busy computer)
+            while not state.video_offers:
+                assert time.monotonic() < until, "no video connection was offered"
+                await asyncio.sleep(0.01)
+            await asyncio.sleep(0.2)  # (the offer's answer is waited for from now on, a second here)
+            monkeypatch.setattr(jetkvm, "CONNECT_TIMEOUT", 5.0)  # (and the look waits longer than that)
+            look = await device._read_status()
+            assert NO_ANSWER in look["error"]["message"], look  # (it waited for that connection, and heard how it ended)
+            after = await device._read_status()
+            assert look["state"] == after["state"] == await device.probe() == "error", (look, after)
+            assert "open it large" in look["error"]["message"], look
+            assert len(state.video_offers) == 1
+        finally:
+            await device.close()
+
+    try:
+        asyncio.run(run())
+    finally:
+        jet.stop()
+
+
 def test_while_a_tile_offers_no_other_the_history_keeps_one_state_of_the_jetkvm(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     # (The same, on a wall: the history keeps what every look at the tile says and what its own look says, once a second here.)
     from qkvm import server

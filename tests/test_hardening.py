@@ -22,6 +22,7 @@ from qkvm.core import Core
 from qkvm.kvm import KvmError, bounded
 from qkvm.server import _CHANGES, create_app
 from qkvm.update import UpdateError, Updater
+from tests import ServerThread
 from tests.fake_github import FakeGitHub, make_wheel
 from tests.fake_kvm import FakeKvm
 from tests.test_users import OTHER, visitor
@@ -210,14 +211,11 @@ class LiveWall:
         self.url = f"http://127.0.0.1:{self.port}"
         config = uvicorn.Config(create_app(Core(data)), **{"log_level": "error", "access_log": False, **options})
         self._server = uvicorn.Server(config)
-        self._thread = threading.Thread(target=self._server.run, kwargs={"sockets": [self._sock]}, daemon=True)
+        self._serving = ServerThread("the wall", lambda: self._server.run(sockets=[self._sock]), lambda: self._server.started)
+        self._thread = self._serving.thread
 
     def __enter__(self) -> LiveWall:
-        self._thread.start()
-        deadline = time.monotonic() + 10
-        while not self._server.started:
-            assert time.monotonic() < deadline, "the wall did not start"
-            time.sleep(0.02)
+        self._serving.start()  # (as every stand-in: a minute on a loaded computer, and why, where its thread ended)
         return self
 
     def __exit__(self, *_: object) -> None:

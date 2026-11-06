@@ -86,6 +86,13 @@ LIVE_WAIT = 10.0  # seconds a live line, or keys from one, wait for the session 
 # Intel's border is on the PC's monitor only for the seconds that takes): the owner's standard (2026-10-18). A live session
 # is held only while the machine is enlarged or its live view is open (see AmtScreen).
 STILL_EVERY = STANDARD_HOLD
+# A PC's tile is set to one of three views (DeviceSpec.amt_view, the owner's decision of 2026-11-03): "stills" (the
+# above, and the default), "health" (no KVM session at all: Intel's border never comes up on the PC's monitor), "live" (a
+# session held while its tile is shown as well, at the wall's pace: the border stays). Health only says this wherever a
+# session would be opened for it: its stills, its live view, keys and text.
+HEALTH_ONLY = "This PC is set to health only: qKVM opens no KVM session to it. An admin or an operator can change its view under Actions."
+# What a session to the screen brings to the tile's `can`.
+SESSION_CAN = ("screen", "keys", "text", "live", "control")
 TIMEOUT_SLACK = 5.0  # seconds before the engine's SessionTimeout at which a session that ends is taken to have ended at its time
 BRIDGE = 20.0  # seconds after such an end during which the last picture stands in, while the next session opens
 INPUT_AFTER = 0.5  # seconds after the RFB handshake before the engine is sent keys or the pointer (see AmtScreen.taking_input)
@@ -976,11 +983,13 @@ class AmtScreen(VncDevice):
             while len(kept) > vncdevice.MOST_PACED:
                 del kept[next(iter(kept))]
 
-    async def snapshot(self, width: int, fresh: float | None = None, big: bool = False) -> Snapshot:
+    async def snapshot(self, width: int, fresh: float | None = None, big: bool = False, held: bool = False) -> Snapshot:
         """The PC's screen. Live (the machine enlarged, or its live view open): the session that is held, drawn at a
         viewer's pace, and the last picture for the seconds the next session takes after the engine ends one at its time.
-        Only shown on the wall: a still every STILL_EVERY, each a short session; the cached one between them, with its age."""
-        if self._is_live():
+        `held` (a tile set to live KVM, only shown): the same session, held while it is asked for (LET_GO_AFTER after the
+        last), at a looking pace and not a viewer's. Only shown on the wall otherwise: a still every STILL_EVERY, each a
+        short session; the cached one between them, with its age."""
+        if held or self._is_live():
             self._looking()
             try:
                 snap = await self._picture(width, fresh)
@@ -1067,6 +1076,34 @@ class AmtScreen(VncDevice):
 
     def _is_live(self) -> bool:
         return super()._is_live() or time.monotonic() - self._live_at < 2.0
+
+    def _start(self, urgent: bool = False) -> vncdevice._Session:
+        # Set to health only: no session is opened, whatever asks for one (the tile's own paths refuse before this, in words
+        # of their own: this is the one place every one of them passes).
+        session = self._session
+        if self.spec.amt_view == "health" and (session is None or session.done.is_set()):
+            raise KvmError("no_picture", HEALTH_ONLY, 404)
+        return super()._start(urgent)
+
+    def _let_go_if_unwanted(self) -> float:
+        # Set to health only: a session that was open when the view was changed is let go of at the pacer's next turn,
+        # whoever was looking; not while keys or a still are still going through it (they finish, and then it goes).
+        if self.spec.amt_view == "health" and not self._inputs and not self._making:
+            raise vncdevice.LetGo
+        return super()._let_go_if_unwanted()
+
+    def let_go_now(self, everybody: bool = False) -> None:
+        """The tile's view was changed to one that holds no session for a tile that is only shown: the session held for it
+        (live KVM), or for keys a while ago, is let go of at its pacer's next turn instead of LET_GO_AFTER later. One that a
+        live or enlarged view holds stays while that is open (`_is_live`), as one that keys or a still are using does; unless
+        `everybody` (health only), where what a live or enlarged view asked a moment ago holds nothing either."""
+        if everybody:
+            self._live_at = float("-inf")
+        self._wanted_at = self._made_at = float("-inf")
+        self._wanted.set()  # (a pacer waiting out its idle pace asks again at once)
+        client = self._connected_or_none()
+        if client is not None:
+            client.updated.set()  # (and one waiting for an update of a screen that stands still asks again whether anybody looks)
 
     async def _open(self) -> rfb.Stream:
         """The redirection port, over TLS where the tile's address is, with Intel's handshake done: what follows is RFB."""
@@ -1282,6 +1319,11 @@ class AmtDevice(Device):
         self._hiccup = False
         self._power_on: bool | None = None  # what the last look found: on, off, or between the two
         self._starting_at = float("-inf")  # when the PC was last seen to start (switched on, reset, cycled: see STARTING)
+        # What the last good look found of its screen before the tile's view is applied (see `_viewed`): whether a session
+        # could be had, why not where not, and whether it can start into its BIOS setup.
+        self._could_screen = False
+        self._own_no_screen: str | None = None
+        self._boot_setup = False
 
     async def close(self) -> None:
         if self._following is not None:
@@ -1838,22 +1880,63 @@ class AmtDevice(Device):
 
     def watched(self) -> None:
         """The action comes from this PC's large view or live view: a session is held for it (and opened before a power-on),
-        whatever the page's own feed of pictures has asked lately (it asks nothing of a PC that is off)."""
-        self._screen.live_seen()
+        whatever the page's own feed of pictures has asked lately (it asks nothing of a PC that is off). Not where it is set
+        to health only."""
+        if self.spec.amt_view != "health":
+            self._screen.live_seen()
 
     async def snapshot(self, width: int, fresh: float | None = None, big: bool = False) -> Snapshot:
         """The PC's screen, through its KVM: the first one asked for opens a session (see AmtScreen).
 
         `big` (the enlarged view): the large view is open, so a session is held for it (the live branch, not stills), and is
         noted even where the picture is not had. (The page asks no pictures of a PC that is off; an action from its large view
-        says so itself: `watched`.) A tile that is only shown (no `big`) opens a session only for its stills."""
+        says so itself: `watched`.) A tile that is only shown (no `big`) opens a session only for its stills, unless the tile
+        is set to live KVM, where its being shown holds one as the large view does. Set to health only: none at all."""
+        if self.spec.amt_view == "health":
+            raise KvmError("no_picture", HEALTH_ONLY, 404)
         if big:
             self._screen.live_seen()
         await self._screen_allowed()
-        return await self._screen.snapshot(width, fresh)
+        return await self._screen.snapshot(width, fresh, held=self.spec.amt_view == "live")
+
+    # --- the tile's view: health only, stills or live KVM ----------------------------------------------------
+
+    def set_view(self, view: str) -> None:
+        """The tile's view was changed (the server's route, which keeps it with the tile): what the tile says follows at once,
+        and a session it holds no more is let go of now (AmtScreen.let_go_now), not a minute later. Set to health only, every
+        session goes, a live or enlarged view's too: its live line ends with HEALTH_ONLY at its next picture."""
+        was = self.spec.amt_view
+        self.spec.amt_view = view  # (the screen's spec is this one: AmtScreen sees it at once)
+        self._status = self._viewed(self._status)
+        self._good = self._viewed(self._good)
+        if view != was and view != "live":
+            self._screen.let_go_now(everybody=view == "health")
+
+    def _viewed(self, found: dict[str, Any] | None) -> dict[str, Any] | None:
+        """A look's result as the tile's view has it: set to health only, no screen and none of what a session brings (keys,
+        text, the live line), and its `no_screen` says why; every view said in `server.amt.view`. A result without the PC's
+        record (it could not be reached, or another PC answers) is left as it is."""
+        server = found.get("server") if found is not None else None
+        if found is None or not isinstance(server, dict) or not isinstance(server.get("amt"), dict):
+            return found
+        view = self.spec.amt_view
+        shown = self._could_screen and view != "health"
+        return {
+            **found,
+            "screen": shown,
+            "can": can_do(*self.can, *(SESSION_CAN if shown else ()), *(("bios_setup",) if self._boot_setup else ())),
+            "server": {**server, "no_screen": HEALTH_ONLY if view == "health" else self._own_no_screen, "amt": {**server["amt"], "view": view}},
+        }
+
+    @property
+    def no_live_why(self) -> str | None:
+        """Why it has no live picture, in words of its own, where that is its view (the live line says it: live.py)."""
+        return HEALTH_ONLY if self.spec.amt_view == "health" else None
 
     async def _screen_allowed(self) -> None:
         """Nothing, where the PC's screen may be had now; else the KvmError that says why not (the last look decides)."""
+        if self.spec.amt_view == "health":
+            raise KvmError("no_picture", HEALTH_ONLY, 404)  # (its tile's view: no session for anybody, whatever the PC is like)
         if self._other is not None:
             raise self._other.with_traceback(None)  # (another PC answers at the address: see `_same_machine`)
         if self._status is None or not self._kvm:
@@ -1874,7 +1957,7 @@ class AmtDevice(Device):
     @property
     def console_readable(self) -> bool:
         """Whether its screen can be had, as far as the last look knows: what the live line asks before it begins."""
-        return bool(self._kvm) and self._screen_now() is None and self._power_on is not False
+        return self.spec.amt_view != "health" and bool(self._kvm) and self._screen_now() is None and self._power_on is not False
 
     async def live_screen(self) -> tuple[int, int, int, bytearray]:
         """The PC's screen as it stands, for the live line: frames so far, width, height, three bytes a pixel."""
@@ -2050,11 +2133,16 @@ class AmtDevice(Device):
                     "serial": about["serial"],
                     "bios": about["bios"],
                     "plain": plain_http,
+                    "view": self.spec.amt_view,  # the tile's view (store.DeviceRecord.amt_view), applied below
                 },
             },
         }
-        self._good, self._good_at, self._hiccup, self._good_commanded = found, time.monotonic(), False, commanded
-        return found
+        # As the PC is, and then as its tile's view has it (`_viewed`), which a change of the view applies again at once.
+        self._could_screen, self._own_no_screen, self._boot_setup = has_screen, no_screen, bool(about.get("boot_setup"))
+        viewed = self._viewed(found)
+        assert viewed is not None
+        self._good, self._good_at, self._hiccup, self._good_commanded = viewed, time.monotonic(), False, commanded
+        return viewed
 
     # --- the power buttons -----------------------------------------------------------
 
@@ -2111,7 +2199,7 @@ class AmtDevice(Device):
         watching. So where the large or live view is open, the press waits (up to LIVE_WAIT) for the session to open first,
         and where it is not, the press does not wait at all. Opened only where a session may be opened but for the PC's own
         power (not where consent or the KVM's setup would stop it, nor where another PC answers; W11b's open question 1)."""
-        if self._other is not None or not self._screen._is_live():
+        if self._other is not None or self.spec.amt_view == "health" or not self._screen._is_live():
             return
         if self._kvm and self.why_no_screen(self._kvm) is None:  # (everything but the PC's own power allows a session)
             self._screen.live_seen()

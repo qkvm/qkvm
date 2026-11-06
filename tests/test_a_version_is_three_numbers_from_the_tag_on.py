@@ -17,7 +17,7 @@ import pytest
 from tests.workflow_text import SECURITY, WORKFLOWS, jobs, steps
 
 RELEASE = WORKFLOWS / "release.yml"
-THREE_NAMES = 'test "$listed" = "qkvm-${TAG#v}-image.json qkvm-${TAG#v}-py3-none-any.whl qkvm-${TAG#v}.tar.gz "'
+THREE_NAMES = 'test "$listed" = "qkvm-${TAG#v}-image.json qkvm-${TAG#v}-libraries.json qkvm-${TAG#v}-py3-none-any.whl qkvm-${TAG#v}.tar.gz "'
 LISTED = """listed=$(awk '{print $2}' "$drafted/SHA256SUMS" | LC_ALL=C sort | tr '\\n' ' ')"""
 
 
@@ -38,7 +38,7 @@ def test_the_image_record_takes_three_numbers_only() -> None:
             digests.release_record(version, "a" * 40, 1, [], [])
 
 
-def test_the_drafts_read_back_checks_the_three_names() -> None:
+def test_the_drafts_read_back_checks_the_four_names() -> None:
     made = next(step for step in steps(jobs(RELEASE)["draft"]) if "gh release create" in step)
     assert LISTED in made and THREE_NAMES in made, made[-900:]
     assert made.index("-m qkvm.release verify") < made.index(THREE_NAMES) < made.index("made and checked")

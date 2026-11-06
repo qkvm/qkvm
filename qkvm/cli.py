@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+# First of all: an update installed in place puts the libraries it brought first on the path here, before anything outside
+# the standard library is loaded (or steps back to the version before it). Nothing to do for any other copy.
+from . import _libs  # noqa: F401
+
 import argparse
 import asyncio
 import json
@@ -30,7 +34,7 @@ from websockets.frames import Frame
 
 from . import activity, history, live, unlock, vault_migration
 from ._version import __version__
-from ._folders import GENERAL, READ, folder_judged, for_consoles, judged as one_judged, keeps_no_permissions, not_alone, not_ours, open_private, own_folder, private, private_folder, setowner_line
+from ._folders import GENERAL, READ, folder_judged, for_consoles, in_powershell, judged as one_judged, keeps_no_permissions, not_alone, not_ours, open_private, own_folder, private, private_folder, setowner_line
 from ._where import default_data_dir
 from .core import Core
 from .kvm import WarningsOnly
@@ -491,7 +495,7 @@ def listen_again_as(settings: ServerSettings, before: tuple[list[str], int, bool
 OWN_FILES = (
     unlock.OWN, "qkvm.json", "qkvm.bak", "qkvm.log", "qkvm.log.1", "qkvm.log.2", "qkvm.log.3", "audit.log",
     *(f"audit.log.{number}" for number in range(1, AuditLog.OLD_FILES + 1)), "audit.sqlite", "audit.sqlite-wal", "audit.sqlite-shm",
-    "history.sqlite", "history.sqlite-wal", "history.sqlite-shm", "sessions.json", "watch.json",
+    "history.sqlite", "history.sqlite-wal", "history.sqlite-shm", "sessions.json", "watch.json", "screens.json",
 )  # fmt: skip
 
 
@@ -507,12 +511,14 @@ _DAMAGED = re.compile(r"qkvm\.damaged-.*\.json")  # settings set aside as damage
 
 def _own_name(entry: Path) -> bool:
     """Whether what is at `entry` has a name qKVM gives what it keeps in its data folder: its files, what it makes of them on
-    the way (a file being written, the request to a running copy, the lock), `tls` and `updates`; and what else it reads
+    the way (a file being written, the request to a running copy, the lock), `tls`, `updates` and `alert-pictures` (the
+    screen watching's, screens.py); and what else it reads
     there (the round 5 review): SQLite's rollback journals (a hot one is played into its database when that is opened), the
     migration's recovery archive, the settings set aside as damaged. By any case where the file system ignores case: on
     Windows, and elsewhere where the name qKVM opens leads to this very entry (macOS's)."""
     own = (
-        *OWN_FILES, "tls", "updates", "qkvm.lock", ASK_FILE, "qkvm.tmp", "qkvm.bak.new", "sessions.json.new", "watch.json.new",
+        *OWN_FILES, "tls", "updates", "alert-pictures", "qkvm.lock", ASK_FILE, "qkvm.tmp", "qkvm.bak.new", "sessions.json.new",
+        "watch.json.new", "screens.json.new",
         "audit.sqlite-journal", "history.sqlite-journal", vault_migration.ARCHIVE,
     )  # fmt: skip
     name, lowered = entry.name, entry.name.lower()
@@ -579,18 +585,21 @@ def _removal(entry: Path) -> str:
     return f"rm {shlex.quote(str(entry))}"
 
 
-def _take_over(entry: Path) -> str:
-    """The line that makes what is at `entry` (not a link) the account qKVM runs as here, and nothing in it: icacls /setowner
-    on Windows, chown elsewhere (no /T, no -R)."""
+def _take_over(entry: Path) -> list[str]:
+    """The lines that make what is at `entry` (not a link) the account qKVM runs as here, and nothing in it: icacls /setowner
+    with the account's own entry on Windows (two lines: see setowner_line), chown elsewhere (no /T, no -R). In the image, the
+    account by its number: the host knows no "qkvm"."""
     if sys.platform == "win32":
         return setowner_line(entry)
+    if os.environ.get("QKVM_CONTAINER") == "1":
+        return [f"chown {os.getuid()} {shlex.quote(str(entry))}"]
     try:
         import pwd
 
         name = pwd.getpwuid(os.getuid()).pw_name
     except (ImportError, KeyError):
         name = str(os.getuid())
-    return f"chown {shlex.quote(name)} {shlex.quote(str(entry))}"
+    return [f"chown {shlex.quote(name)} {shlex.quote(str(entry))}"]
 
 
 # What each of qKVM's own names holds, by how the name begins: what deleting it loses (the refusal of another account's).
@@ -604,6 +613,8 @@ _HOLDS = (
     (("qkvm.log",), "the log"),
     (("sessions.json",), "the sign-ins"),
     (("watch.json",), "what each device was last known to be"),
+    (("screens.json",), "the screen alerts that stand"),
+    (("alert-pictures",), "the pictures of the alerts"),
     (("tls",), "the HTTPS certificate browsers know"),
     (("updates",), "the update installed and the version to go back to"),
 )
@@ -1498,8 +1509,22 @@ def main(argv: list[str] | None = None, starter_said: tuple[str, ...] = ()) -> i
             them = "it" if len(owned) == 1 else "them"
             lost = _lost([entry.name for entry in owned])
             keep = f"do not delete {them}, that loses {lost}. " if lost else ""
-            where = "in an elevated console" if sys.platform == "win32" else "as root"
-            say(f"      {'It' if len(owned) == 1 else 'They'} may be the wall's own (a folder restored with its owners kept, a service's): {keep}Take {them} over while qKVM is stopped, {where} ({_lines('; '.join(_take_over(entry) for entry in owned))}), which makes {them} the account qKVM runs as here (where it runs as a service, name the service's account instead); or run qKVM as the account that owns {them}.", error=True)
+            taking = [line for entry in owned for line in _take_over(entry)]
+            if sys.platform == "win32":
+                # (A line each, below: Command Prompt has no ";" between two commands, and a file takes two, one after the other.)
+                say(f"      {'It' if len(owned) == 1 else 'They'} may be the wall's own (a folder restored with its owners kept, a service's): {keep}Take {them} over while qKVM is stopped, in an elevated console, with the lines below, each by itself in Command Prompt: they make {them} the account qKVM runs as here (where it runs as a service, name the service's account instead). Or run qKVM as the account that owns {them}.", error=True)
+                for line in taking:
+                    say(f"        {line}", error=True)
+                if any(sign in line for line in taking for sign in "$`"):
+                    say("      In PowerShell, the same lines:", error=True)  # (where a path holds what it would expand: see for_consoles)
+                    for line in taking:
+                        say(f"        {in_powershell(line)}", error=True)
+            else:
+                say(f"      {'It' if len(owned) == 1 else 'They'} may be the wall's own (a folder restored with its owners kept, a service's): {keep}Take {them} over while qKVM is stopped, as root ({'; '.join(taking)}), which makes {them} the account qKVM runs as here (where it runs as a service, name the service's account instead); or run qKVM as the account that owns {them}.", error=True)
+        if os.environ.get("QKVM_CONTAINER") == "1" and (links or owned):
+            # (The lines name paths inside the container, which has stopped: on the host they are under the folder or the
+            # volume mounted at the data folder, and a container of the image with that mount can run them as they are.)
+            say(f"      These are paths inside the container: run the lines as root in a container of the image with the same mount (docker run --rm -u root --entrypoint sh, the mount, the image, then -c and the line), or on the host with the mounted folder's path in place of {_in_full(data_dir)}.", error=True)
         return 2
     if not free:
         say(f"qkvm: another copy is already running with {_in_full(data_dir)}{who(lock.holder())}", error=True)

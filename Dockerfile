@@ -13,12 +13,15 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 COPY pyproject.toml LICENSE README.md ./
+COPY .github/security/image-libraries.txt ./
 COPY qkvm ./qkvm
 # Installation tools stay in this stage. The final stage contains the application,
 # its native runtime libraries, trust/timezone data and their original package records.
 RUN apt-get update \
     && apt-get upgrade --yes \
+    && if grep -q '^[^#]' image-libraries.txt; then pip install --require-hashes --no-deps --only-binary :all: -r image-libraries.txt; fi \
     && pip install . \
+    && pip check \
     && python -m pip uninstall --yes pip \
     && useradd --uid 10001 --home-dir /data --no-create-home --shell /usr/sbin/nologin qkvm
 COPY .github/security/assemble-runtime.py /assemble-runtime.py

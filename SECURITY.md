@@ -15,10 +15,20 @@ and what happened. A way to reproduce it helps most.
 ## What counts
 
 - Getting past sign-in, a role, or the limit of an account to some KVMs.
-- Reading a stored password, the recovery key, a two-factor key or the alert address from
+- Reading a stored password, the recovery key, a two-factor key, the alert address, the wall's
+  key for Web Push or a browser's push subscription from
   the page or the log; or from the protected data folder without the separate server
   storage key, including when an account password or legacy data key is known.
 - Making qKVM send a KVM's password to something other than that KVM.
+- Mounting an image on a machine, or starting a machine from one, without the media right (an
+  admin, in person); or having a device handed an address somebody typed, or an image qKVM did
+  not list for it; or an upload to a KVM's own storage that is kept on the wall (on its disk, or
+  held whole in its memory), that goes past 16 GB, or that writes an image other than the one
+  its confirmation named.
+- Reading an image qKVM serves to a server's controller (`/media/...`) from any address but that
+  controller's, after it was unmounted, without the mount's user and password where it has one,
+  or reading any other file of the computer qKVM runs on through it; or learning that address
+  (it is the controller's alone: in no log, and on no page).
 - Running code on the computer qKVM runs on, including through the updater.
 - A page on another website making a signed-in browser do something in qKVM.
 
@@ -37,7 +47,26 @@ and what happened. A way to reproduce it helps most.
   with what to do.
 - The network between qKVM and a KVM may be hostile; that is why certificates are remembered.
   The network between a browser and qKVM should be trusted, or HTTPS switched on.
-- An admin is trusted with everything, including where alerts are sent.
+- A VNC server at a plain `vnc://` address is spoken to without encryption: the answer to its
+  password challenge, its pictures and every key typed into it, over the live line or by an
+  action, go in the clear. Keep such servers on a network you trust or behind a tunnel, or use
+  `vncs://` where the server speaks TLS.
+- An admin is trusted with everything, including where alerts are sent, and with virtual
+  media: an image mounted on a machine and started from is root on that machine, and is an
+  admin's alone (operators press power buttons and type; they do not mount images).
+- What a Proxmox token may do there is Proxmox's to say: a token given `VM.Config.CDROM`,
+  `VM.Config.Disk` and `Datastore.Audit` lets qKVM put any ISO image of the storages it may
+  see into the guests it may see, and start them from it.
+- Images on a KVM's own storage (a Comet's, a PiKVM's, a JetKVM's) are the KVM's: anyone with
+  its own password can read them there, and a machine given one writable can change it. qKVM
+  removes what an upload cut off leaves, and deletes an image when asked; the rest is the
+  admin's to delete after use.
+- The folder of images for servers is the admin's to name and to fill (*Settings > Server
+  images*): an admin is trusted with what is on the computer qKVM runs on, as with an update.
+  A server's controller reads the image mounted on it from qKVM, and as a rule checks no
+  certificate (Redfish's default): the network between the two should be trusted (a management
+  network), or the image checked at the server. A server's controller is not trusted beyond its
+  own image: it is answered for that one file, for as long as it is mounted, and nothing else.
 - A new qKVM belongs to whoever opens it first, until a password is chosen. Where others can
   reach its port before you do, start it with `--setup-code`. The container image and
   supplied Compose deployment enable `--https --setup-code` by default. An explicit
@@ -78,6 +107,8 @@ inside it. Other files listed below are not covered by that envelope.
 | `qkvm.damaged-*.json` | a damaged protected settings file retained for inspection | a valid protected envelope requires the storage key; legacy plaintext remnants must be migrated or removed after verified archival |
 | `sessions.json` | the browsers that asked to be kept signed in over a restart: a SHA-256 of each one's cookie, its account and date | yes; it cannot be replayed as a sign-in |
 | `watch.json` | what each machine was last seen as (on, off, not answering), for alerts after a restart | yes |
+| `screens.json` | which screen alerts stand ("no signal", "screen unchanged"), by device id, for their "back to normal" after a restart | yes |
+| `alert-pictures/<device id>-<stamp>.jpg` (or `.png`) | the picture of a machine's screen that set off its last screen alert, as the wall had it: whatever that screen showed. One per machine, deleted after 30 days and when the machine leaves the wall; handed out to admins only, never sent with an alert | yes |
 | `audit.log`, `audit.log.1` ... | the activity log: who did what, when, from which address. At a failed sign-in, the name that was typed only where it is an account's | yes |
 | `audit.sqlite`, `audit.sqlite-wal`, `audit.sqlite-shm` | the activity log's searchable index, including copies of its entries; rebuilt from the text logs if missing or damaged. The companion files hold pending writes and SQLite's shared-memory index | yes |
 | `history.sqlite`, `history.sqlite-wal`, `history.sqlite-shm` | machine states, sensor readings, power events and when a machine was first and last heard from, identified by device id; no stored passwords. The companion files hold pending writes and SQLite's shared-memory index | yes |
@@ -162,9 +193,16 @@ upgrade through pip or a container requires the offline procedure above.
 one can do what it was made for (look, or look and act, on the machines it is for) until it
 runs out or an admin takes it back. `qkvm.json` holds a SHA-256 of each, never the token.
 They work only while qKVM is unlocked, and they cannot change settings, accounts, devices or
-tokens. An operator token can type its own text on the machines it is for, press their keys
+tokens (a PC with Intel AMT's view included, which an operator in person may change). An
+operator token can type its own text on the machines it is for, press their keys
 and power buttons and take pictures of their screens; it cannot run a saved text (which it
 could then read off the screen), or ask for a way into a console.
+
+**A PC with Intel AMT set to health only** is sent no KVM session by qKVM, whatever asks for one
+(its tile, its large view, its live line, keys and text): the one place every session is opened
+refuses it, so Intel's border never comes up on the PC's own monitor. It is a setting of the
+tile, not of the PC: the engine's KVM stays as it was set up (switched on, say), and whoever has
+the PC's password can still open a session with another tool.
 
 **Sign-on through a proxy** (`--sso-header`, off unless asked for) makes the reverse proxy
 named with `--trusted-proxy` the place where people prove who they are. qKVM then believes
@@ -173,14 +211,25 @@ address, or can make that proxy send the header, is whoever they say. Whoever si
 elsewhere brings no password here, so it cannot be had together with `--locked-start`.
 
 **A file exported with a passphrase** (*Settings > Export and import*) holds every device
-password of the wall, the saved texts and the alert address, encrypted with a key of its own
+password of the wall (but that of a tile of a kind the version does not know, which is not
+opened for it), the saved texts and the alert address, encrypted with a key of its own
 that the passphrase locks (scrypt, AES-256-GCM). It is as safe as its passphrase, and once
 made it is out of qKVM's reach: who has the file can try passphrases for as long as they
 like. Only an admin can make one, with their password typed again, and the activity log
 says that it was made. A file exported without a passphrase holds no secret. What a file
 that is taken in can do to a wall is add devices and saved actions, and set the alert and
 wall settings an admin ticks; it cannot add an account or a token, or change where qKVM
-listens or how people sign in.
+listens or how people sign in. Neither the wall's key for Web Push nor the browsers turned on
+for alerts go into a file: they are this wall's, and a browser subscribed to this wall's key.
+
+**Alerts by Web Push** are sealed in the settings as the other secrets are: the wall's own
+P-256 key (made the first time a browser is turned on, for "alerts:push-key"), and each
+browser's push address and keys (for "push:" and its id). The page is given the public half of
+the key and never a browser's address. Any account may turn on its own browsers, and is told
+about the machines it may see; a token has none. The service worker (`static/push.js`, scope
+`static/push/`, which holds no page) has no fetch handler: it shows what arrives and opens the
+wall at a tap, and no request of the page passes through it. The Content-Security-Policy gains
+`worker-src 'self'` and `manifest-src 'self'` for it and the Home Screen description.
 
 **One-time codes** for two-factor sign-in are kept as a keyed hash under the data key, not as
 a plain one: forty random bits would be tried through in minutes by whoever has the file.
@@ -212,8 +261,21 @@ the change was meant.
   and the Tailscale peers, on the ports KVMs answer on.
 - `api.github.com`, once a day, to ask whether a newer release exists (it sends nothing about
   the installation; *Settings > Updates* switches it off). When an admin installs one:
-  `github.com`, and the file servers GitHub sends the download on to, over HTTPS only.
+  `github.com`, and the file servers GitHub sends the download on to, over HTTPS only; and, for the
+  libraries an update brings that this computer has not, `files.pythonhosted.org` (PyPI's file
+  host), at the addresses the release's signed list names, over HTTPS only. A daily check
+  downloads no library.
 - The address alerts are sent to, if one was given.
+- The push service of each browser turned on for alerts (*Settings > Alerts > This browser*):
+  Apple's, Google's, Mozilla's or Microsoft's, at the address that browser was given there. Only
+  over HTTPS on port 443 to a name, and only where every address the name leads to is a public
+  one; the connection goes to the address that was checked, so a name that leads into the wall's
+  own network (loopback, private, link-local, site-local, IPv4 inside IPv6) is never followed.
+  Each alert is encrypted for that browser alone (RFC 8291) and signed with the wall's own key (RFC 8292); the
+  service sees when, and a padded length (as whose the alerts are, the wall gives
+  `https://qkvm.com`, never its address), and cannot
+  read what it carries: a machine's name and what happened, never a password, a token, a machine's
+  address or a picture.
 - The syslog collector given with `--audit-syslog`, if one was: each entry of the activity
   log, in clear (UDP or TCP).
 
@@ -227,8 +289,9 @@ Nothing else: no telemetry, no licence check, nothing that reports use.
   if that key signed it, whatever it was started with: a release that carries no valid
   signature is refused. A signed release is installed when you click for it, except where
   *Updates* in the README says the app does not install one: a copy that runs from a container
-  image is updated by pulling the new image, and a release that needs a Python package (or a
-  Python) this copy has not is installed with pip instead. A copy built without a key (a
+  image is updated by pulling the new image, and a release this copy cannot take in place (a
+  Python it does not run under, a computer its release has no build for, or, for a release without
+  a list of its libraries, a Python package this copy has not) is installed with pip instead. A copy built without a key (a
   fork's, before it makes its own) cannot tell who published a release, and installs none by
   itself: it says when there is a newer version, and that one is installed the way the first
   was (`pip install --upgrade qkvm`, or the new image). Started with
@@ -236,6 +299,23 @@ Nothing else: no telemetry, no licence check, nothing that reports use.
   which catches a broken download and not a tampered release. The signature says who published a
   release, not that it is the newest: whoever could decide what the list of releases shows
   could hold a copy back on an older signed one, not give it anything unsigned.
+- **The libraries an update brings** (0.3.0 on) are held to the same signature: the release's
+  `SHA256SUMS` names the SHA-256 of its lock (`qkvm-<version>-libraries.json`), and the lock names
+  the SHA-256 and size of every wheel, for each Python and system. A wheel is fetched only from
+  `https://files.pythonhosted.org/packages/...` at the address the lock gives (PyPI is asked for
+  the bytes, not trusted for them), streamed into a private file, cut off past its size, and refused
+  unless it hashes to the lock's value. It is unpacked by the program, never by pip and never run:
+  no name that would be another file, nothing of a `.data` folder but the code, no `.pth` file, no
+  module named like one of Python's own (or `qkvm`, `sitecustomize`, `usercustomize`), metadata of
+  that very library and version, and no file written by two libraries; every file private to the
+  account. A throwaway process then loads the version before it is named. At every start the
+  version's own loader (standard library only) judges `updates/<version>/lib` as the starter judges
+  the update's code (no link, nothing another account may write, on Windows by owner and ACL),
+  checks that it was brought for this Python and that none of its libraries was loaded before (a
+  `.pth` file of your Python could), and only then puts it first on the path; otherwise it goes back
+  to the version before it. The set is the one the release tested: the lock is made in the release
+  workflow, installed by hash in its tests on Linux x86-64 and ARM64 and Windows, audited, and the
+  container image is built from it too.
 - The container image carries a record of what it was built from (provenance) and of what is
   in it (SBOM); `docker buildx imagetools inspect qkvm/qkvm` lists both.
 - Each version on PyPI from 0.1.0 on is uploaded by the release workflow of the public
@@ -270,7 +350,10 @@ frames remain in the worker. Replies use a fixed binary format with dimensions,
 operation and size checks before payload allocation; Python object deserialization
 is not used. A failed or timed-out worker stops video, and where decoding falls
 behind, what waits for the worker is let go of up to the next key frame; neither
-falls back to native decoding in the credential-holding application.
+falls back to native decoding in the credential-holding application. The screen watch
+(an alert where a screen looked the same for some minutes) decodes the pictures it
+compares in a worker of its own, as the rest; it shrinks the decoded pixels itself, in
+Python, and a picture that cannot be decoded is not compared.
 
 On Linux x86-64 and ARM64, the worker loads trusted runtime code before applying a
 seccomp syscall allowlist. It then cannot open files, create sockets, processes or

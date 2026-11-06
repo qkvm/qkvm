@@ -126,6 +126,15 @@ class NativeVersions(unittest.TestCase):
                 with self.assertRaises(GATE.InvalidInput):
                     self.evaluate(recorded(), minimums)
 
+    def test_what_an_update_installed_in_place_runs_is_gated_without_the_computers_own_cpython(self):
+        versions, blocked = GATE.evaluate(recorded(cpython="3.11.2"), deepcopy(MINIMUMS), "amd64", wheels_only=True)
+        self.assertEqual(blocked, [])
+        self.assertNotIn("cpython", versions)
+        _, blocked = GATE.evaluate(recorded(cpython="3.11.2", ffmpeg="7.1.2"), deepcopy(MINIMUMS), "amd64", wheels_only=True)
+        self.assertEqual(len(blocked), 1)
+        _, blocked = self.evaluate(recorded(cpython="3.11.2"))
+        self.assertEqual(len(blocked), 1)  # (the image's own CPython is gated as before)
+
     def test_the_record_must_be_of_this_architecture(self):
         with self.assertRaises(GATE.InvalidInput):
             self.evaluate(recorded("arm64"), arch="amd64")

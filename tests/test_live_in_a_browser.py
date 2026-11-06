@@ -31,7 +31,6 @@ import re
 import secrets
 import socket
 import struct
-import threading
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -55,6 +54,7 @@ from qkvm import cli
 from qkvm import live as live_module
 from qkvm.core import Core
 from qkvm.server import create_app
+from tests import ServerThread
 from tests.fake_kvm import FakeKvm, FakeState
 from tests.test_hardening import LiveWall
 from tests.test_in_a_browser import DEVICE_PASSWORD, PATIENCE, browser, fast, looking, settings, sign_in, tile, told, top, until  # noqa: F401  (the fixtures)
@@ -175,7 +175,9 @@ class LiveStandIn(LiveWall):
         app = create_app(Core(data))
         self._wire(app)
         self._server = uvicorn.Server(uvicorn.Config(app, **{**cli.SERVER_OPTIONS, "log_level": "error"}))  # (served as the program serves: cli.Line)
-        self._thread = threading.Thread(target=self._server.run, kwargs={"sockets": [self._sock]}, daemon=True)
+        # (Started and waited for as LiveWall starts its own, by the shared starter: LiveWall.__enter__ has used it since a34acefd.)
+        self._serving = ServerThread("the wall", lambda: self._server.run(sockets=[self._sock]), lambda: self._server.started)
+        self._thread = self._serving.thread
 
     def __enter__(self) -> LiveStandIn:
         super().__enter__()
@@ -348,7 +350,9 @@ class WallBeforeTheLine(LiveWall):
             return JSONResponse(said, status_code=200, headers=kept)
 
         self._server = uvicorn.Server(uvicorn.Config(app, **{**cli.SERVER_OPTIONS, "log_level": "error"}))  # (served as the program serves: cli.Line)
-        self._thread = threading.Thread(target=self._server.run, kwargs={"sockets": [self._sock]}, daemon=True)
+        # (Started and waited for as LiveWall starts its own, by the shared starter: LiveWall.__enter__ has used it since a34acefd.)
+        self._serving = ServerThread("the wall", lambda: self._server.run(sockets=[self._sock]), lambda: self._server.started)
+        self._thread = self._serving.thread
 
 
 @contextmanager
@@ -361,8 +365,9 @@ def a_wall_before_the_line(data: Path, fake: FakeKvm) -> Iterator[WallBeforeTheL
 
 
 @contextmanager
-def the_program(data: Path, fake: FakeKvm) -> Iterator[LiveWall]:
-    """The program itself on a port, with the web server's own options, its first account made and one machine on its wall: no stand-in of the line."""
+def the_program(data: Path, fake: Any) -> Iterator[LiveWall]:
+    """The program itself on a port, with the web server's own options, its first account made and one machine on its wall
+    (a stand-in KVM, or a stand-in VNC server: anything with an address): no stand-in of the line."""
     with LiveWall(data, **cli.SERVER_OPTIONS) as live, httpx.Client(base_url=live.url, headers=CSRF, timeout=30) as admin:
         assert admin.post("/api/v1/setup", json={"password": PASSWORD}).status_code == 200
         made = admin.post("/api/v1/devices", json={"url": fake.url, "password": DEVICE_PASSWORD, "name": "Machine 1"})
@@ -1122,6 +1127,42 @@ def test_the_page_shows_a_kvm_live_over_the_programs_line_and_its_keys_and_click
             expect(page.locator("#focus")).to_be_hidden()
     finally:
         comet.stop()
+
+
+def test_the_page_controls_a_vnc_server_over_the_programs_line_and_its_keys_and_clicks_arrive(tmp_path: Path, browser: Browser) -> None:  # noqa: F811
+    # 0.3.0: a VNC server live, with keyboard and mouse as RFB's events (0.2.0 had stills and keys by action only).
+    from tests.fake_vnc import FakeVnc, VncState
+
+    server = FakeVnc(VncState(width=320, height=240, password=DEVICE_PASSWORD)).start()
+    try:
+        with the_program(tmp_path, server) as live, looking(browser, live) as page:
+            sign_in(page, live)
+            enlarged(page, "Machine 1")
+            expect(page.locator("#focus-live")).to_contain_text("Live · JPEG 320×240")  # noqa: RUF001
+            page.wait_for_function("() => Number(document.querySelector('#focus-live').dataset.drawn) >= 1")
+            page.keyboard.type("rm")  # nothing typed before Control goes anywhere
+            page.wait_for_timeout(300)
+            assert server.state.keys == []
+            expect(page.locator("#focus-control")).to_have_text("Control")
+            page.keyboard.press("c")
+            expect(page.locator("#focus-control")).to_have_attribute("aria-pressed", "true")
+            page.keyboard.press("KeyA")
+            page.keyboard.press("Shift+KeyB")
+            until(page, lambda: len(server.state.keys) >= 6, f"the keys did not arrive: {server.state.keys}")
+            assert server.state.keys == [(0x61, True), (0x61, False), (0xFFE1, True), (0x62, True), (0x62, False), (0xFFE1, False)]  # (X11 keysyms)
+            box = picture_box(page)
+            page.mouse.click(box["left"] + box["x"] + box["w"] / 2, box["top"] + box["y"] + box["h"] / 2)
+            until(page, lambda: any(buttons == 1 for *_, buttons in server.state.pointers) and server.state.pointers[-1][2] == 0, f"the click did not arrive: {server.state.pointers}")
+            x, y, _ = next(event for event in server.state.pointers if event[2] == 1)
+            assert abs(x - 160) <= 3 and abs(y - 120) <= 3, server.state.pointers  # the middle of the picture, in the screen's pixels
+            page.keyboard.press("ControlRight")  # gives keyboard and mouse back
+            expect(page.locator("#focus-control")).to_have_text("Control")
+            assert server.state.still_down() == (set(), 0)
+            assert server.state.connections == 1  # (the tile's connection is the line's)
+            page.keyboard.press("Escape")
+            expect(page.locator("#focus")).to_be_hidden()
+    finally:
+        server.stop()
 
 
 def test_the_page_shows_a_kvms_h264_over_the_programs_line(tmp_path: Path, browser: Browser) -> None:  # noqa: F811

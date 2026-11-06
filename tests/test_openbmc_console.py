@@ -40,8 +40,12 @@ def fast(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def ikvm(**manners: Any) -> VncState:
-    """obmc-ikvm as the stand-in has it: no password, full frames at its own pace whatever is asked."""
-    return VncState(**{"password": None, "width": 320, "height": 240, "name": "obmc-ikvm", "pushes": True, "push_every": 0.2, **manners})
+    """obmc-ikvm as the stand-in has it: no password, full frames at its own pace whatever is asked, and no keys or pointer
+    taken from a client for its first frames (`skipFrame` in its source: as many as its frame rate, about a second)."""
+    return VncState(**{
+        "password": None, "width": 320, "height": 240, "name": "obmc-ikvm", "pushes": True, "push_every": 0.2,
+        "drops_keys_for": 1.0, "drops_pointer_for": 1.0, **manners,
+    })  # fmt: skip
 
 
 def an_openbmc(**state: Any) -> FakeBmc:
@@ -70,7 +74,9 @@ def test_a_server_under_openbmc_shows_its_screen_through_its_console(tmp_path: P
             device = add(client, bmc.url)
             status = status_of(client, device, state="online")
             assert status["screen"] is True and status["server"]["rfb_console"] == "/kvm/0"
-            assert "screen" in status["can"] and "live" in status["can"] and "control" not in status["can"]  # (no keyboard there yet)
+            # Keys, typed text and keyboard and mouse over the live line, through the console the screen comes on (0.3.0: in
+            # 0.2.0 it took none, and this said "control" was not there).
+            assert all(word in status["can"] for word in ("screen", "live", "keys", "text", "control")), status["can"]
 
             def arrived() -> bool:
                 return bool(client.get(snap(device)).status_code == 200)
@@ -225,7 +231,9 @@ def test_a_controller_with_every_seat_taken_is_said_so(tmp_path: Path) -> None:
         bmc.stop()
 
 
-def test_a_server_under_openbmc_live(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_a_server_under_openbmc_live_with_its_keys_and_pointer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # 0.3.0: keyboard and mouse over the console the screen comes on, as RFB's events (0.2.0 refused them, `no_input`, and
+    # this test said so). obmc-ikvm takes nothing for its first frames: the line's keys wait for that, and none is lost.
     from tests.test_live import Wall
 
     monkeypatch.setattr(OpenBmcScreen, "LIVE_PACE", 0.02)
@@ -240,9 +248,78 @@ def test_a_server_under_openbmc_live(tmp_path: Path, monkeypatch: pytest.MonkeyP
             came = line.picture(timeout=20)
             assert came.kind == 2 and came.key and came.data[:2] == b"\xff\xd8"
             line.say(t="control", on=True)
-            refused = line.word("control")
-            assert refused["on"] is False and refused["code"] == "no_input"  # (no keyboard on a server's console yet)
-            line.close()
+            assert line.word("control", timeout=15) == {"t": "control", "on": True}
+            line.say(t="k", u=0xE1, d=True)  # ShiftLeft
+            line.say(t="k", u=0x04, d=True)
+            line.say(t="k", u=0x04, d=False)
+            line.say(t="m", x=32767, y=16384)
+            line.say(t="mb", b=1, d=True)
+            line.say(t="mb", b=1, d=False)
+            screen = bmc.state.kvm_screen
+            wait_until(lambda: len(screen.keys) >= 3 and len(screen.pointers) >= 3, f"the server's console got {screen.keys} {screen.pointers}")
+            assert screen.keys == [(0xFFE1, True), (0x61, True), (0x61, False)]
+            assert screen.pointers == [(319, 119, 0), (319, 119, 1), (319, 119, 0)]  # (the screen's pixels: obmc-ikvm makes its absolute mouse of them)
+            # One seat for the picture and the keys, opened with the tile's session: no second sign-in.
+            assert bmc.state.kvm_upgrades == ["token"] and bmc.state.kvm_open == 1 and bmc.state.logins == 1
+            line.close()  # with Shift still down: let go of on the server
+            wait_until(lambda: screen.still_down() == (set(), 0), f"Shift was not let go of: {screen.keys}")
+    finally:
+        bmc.stop()
+
+
+def test_keys_and_text_from_the_actions_reach_an_openbmc_console_once_it_takes_them(tmp_path: Path) -> None:
+    # Nobody looks: the console is opened for the keys, which wait until obmc-ikvm takes them (sent at once, they were
+    # dropped), and go as RFB's key events, each let go of.
+    bmc = an_openbmc()
+    try:
+        with wall(tmp_path) as client:
+            device = add(client, bmc.url)
+            status_of(client, device, state="online")
+            assert bmc.state.kvm_open == 0
+            refused = client.post(f"/api/v1/devices/{device}/actions", json={"action": "keys", "keys": "NoSuchKey"})
+            assert (refused.status_code, refused.json()["code"]) == (422, "invalid")
+            assert bmc.state.kvm_upgrades == []  # (said before a console is opened for it)
+            typed = client.post(f"/api/v1/devices/{device}/actions", json={"action": "text", "text": "ab"})
+            assert typed.status_code == 200, typed.text
+            pressed = client.post(f"/api/v1/devices/{device}/actions", json={"action": "ctrl_alt_del"})
+            assert pressed.status_code == 200, pressed.text
+            screen = bmc.state.kvm_screen
+            wait_until(lambda: len(screen.keys) >= 10, f"the keys did not all arrive: {screen.keys}")
+            assert screen.keys == [
+                (0x61, True), (0x61, False), (0x62, True), (0x62, False),
+                (0xFFE3, True), (0xFFE9, True), (0xFFFF, True), (0xFFFF, False), (0xFFE9, False), (0xFFE3, False),
+            ]  # fmt: skip
+            assert bmc.state.logins == 1 and bmc.state.kvm_upgrades == ["token"]
+    finally:
+        bmc.stop()
+
+
+def test_typed_capitals_and_signs_reach_an_openbmc_console_with_the_shift_of_the_us_layout(tmp_path: Path) -> None:
+    # obmc-ikvm makes each keysym into the key of the USB keyboard it is on, and sets Shift only from a Shift key's own
+    # events: a capital or a sign sent alone arrives unshifted ("A!" became "a1"). Typed text goes with the US layout's
+    # Shift around what needs it, as it does to an AMI console and a JetKVM; a combination names its own Shift. What the
+    # US layout cannot type is said before anything is (obmc-ikvm would drop it unsaid), by its place, never itself.
+    e_acute = chr(0xE9)  # (a letter of French, which the US layout has no key for)
+    bmc = an_openbmc()
+    try:
+        with wall(tmp_path) as client:
+            device = add(client, bmc.url)
+            status_of(client, device, state="online")
+            text = 'Hello, World! ~/a_b "x" {1+1=2} <ok>? 50% & #3 @home ^up (|) `q` \'s\'\tend'
+            typed = client.post(f"/api/v1/devices/{device}/actions", json={"action": "text", "text": text, "enter": False})
+            assert typed.status_code == 200, typed.text
+            screen = bmc.state.kvm_screen
+            wait_until(lambda: screen.typed() == text, f"the computer behind the console got {screen.typed()!r}", timeout=15)
+            pressed = client.post(f"/api/v1/devices/{device}/actions", json={"action": "keys", "keys": "ShiftLeft,Digit1"})
+            assert pressed.status_code == 200, pressed.text
+            wait_until(lambda: screen.typed() == text + "!", f"the computer behind the console got {screen.typed()!r}")
+            assert screen.still_down() == (set(), 0)  # (every Shift let go of)
+            sent = len(screen.keys)
+            refused = client.post(f"/api/v1/devices/{device}/actions", json={"action": "text", "text": "caf" + e_acute})
+            assert (refused.status_code, refused.json()["code"]) == (422, "invalid"), refused.text
+            assert "Character 4" in refused.json()["message"] and e_acute not in refused.json()["message"]
+            time.sleep(0.3)
+            assert len(screen.keys) == sent  # (nothing of it was typed)
     finally:
         bmc.stop()
 

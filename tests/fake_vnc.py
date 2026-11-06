@@ -23,10 +23,23 @@ from pathlib import Path
 from typing import Any
 
 from qkvm.rfb import COPY_RECT, DESKTOP_SIZE, HEXTILE, RAW, TIGHT, ZRLE, vnc_response
-from tests import local_socket
+from tests import ServerThread, local_socket
 from tests.fake_kvm import make_device_certificate
 
 Region = tuple[int, int, int, int]  # x, y, width, height
+
+# The keys of a US keyboard that type, as (unshifted, shifted), and the key each keysym is on for obmc-ikvm: a letter of
+# either case is its letter's key, a sign the key it is on, Return and Tab their own (VncState.typed).
+_US_PAIRS = [
+    *((chr(97 + i), chr(65 + i)) for i in range(26)),
+    *zip("1234567890", "!@#$%^&*()", strict=True),
+    *zip("-=[]\\;',./`", '_+{}|:"<>?~', strict=True),
+    (" ", " "), ("\n", "\n"), ("\t", "\t"),
+]
+US_KEY_OF: dict[int, tuple[str, str]] = {
+    **{ord(char): pair for pair in _US_PAIRS for char in pair if char not in "\n\t"},
+    0xFF0D: ("\n", "\n"), 0xFF09: ("\t", "\t"),
+}  # fmt: skip
 
 
 @dataclass
@@ -375,6 +388,7 @@ class VncState:
     bell_first: bool = False
     size_first: bool = False
     drops_keys_for: float = 0.0  # seconds after its ServerInit during which key events are dropped
+    drops_pointer_for: float = 0.0  # ...and pointer events (obmc-ikvm drops both for a client's first frames)
     # Seconds after its ServerInit at which it ends every connection, as a server with a time limit of its own does
     # (TigerVNC's MaxConnectionTime); 0: never.
     ends_after: float = 0.0
@@ -396,6 +410,30 @@ class VncState:
     open: int = 0  # connections open right now
 
     bombs: dict[str, bytes] = field(default_factory=dict)  # made here, before a test measures the reader's memory
+
+    def still_down(self) -> tuple[set[int], int]:
+        """What the events it was sent leave down: the keysyms pressed and not let go of since, and the buttons the last
+        pointer event held (0 where there was none)."""
+        down: set[int] = set()
+        for keysym, pressed in self.keys:
+            if pressed:
+                down.add(keysym)
+            else:
+                down.discard(keysym)
+        return down, self.pointers[-1][2] if self.pointers else 0
+
+    def typed(self) -> str:
+        """What the key events it was sent type on the computer behind it, as obmc-ikvm makes them into its USB keyboard's
+        reports (ikvm_input.cpp, keyToScancode and keyToMod) for a computer set to the US layout: each keysym is the key it
+        is on, a capital or a sign the key it is on unshifted ('A' and 'a' are the A key, '!' is the 1 key), and Shift is
+        down only between a Shift key's own press and release. A keysym of no key of that keyboard types nothing."""
+        shift, out = False, []
+        for keysym, pressed in self.keys:
+            if keysym in (0xFFE1, 0xFFE2):
+                shift = pressed
+            elif pressed and (key := US_KEY_OF.get(keysym)) is not None:
+                out.append(key[1] if shift else key[0])
+        return "".join(out)
 
     def __post_init__(self) -> None:
         if not self.picture:
@@ -477,13 +515,12 @@ class FakeVnc:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._stop: asyncio.Event | None = None
         self._started = threading.Event()
-        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._serving = ServerThread("fake VNC server", self._run, self._started.is_set)
+        self._thread = self._serving.thread
         self._connections: set[asyncio.Task[None]] = set()
 
     def start(self) -> FakeVnc:
-        self._thread.start()
-        if not self._started.wait(10):
-            raise RuntimeError("fake VNC server did not start")
+        self._serving.start()  # (as every stand-in: a minute on a loaded computer, and why, where its thread ended)
         return self
 
     def stop(self) -> None:
@@ -643,6 +680,7 @@ class FakeVnc:
         pending: tuple[bool, Region] | None = None
         answered = False  # (the first request is answered as `bell_first` and `size_first` say)
         taking_keys_at = asyncio.get_running_loop().time() + state.drops_keys_for
+        taking_pointer_at = asyncio.get_running_loop().time() + state.drops_pointer_for
         pusher: asyncio.Task[None] | None = None
         rectangles_sent = 0
 
@@ -743,7 +781,8 @@ class FakeVnc:
                         state.keys.append((keysym, down != 0))
                 elif kind == 5:  # PointerEvent
                     buttons, x, y = struct.unpack(">BHH", await wire.read(5))
-                    state.pointers.append((x, y, buttons))
+                    if asyncio.get_running_loop().time() >= taking_pointer_at:
+                        state.pointers.append((x, y, buttons))
                 elif kind == 6:  # ClientCutText
                     (length,) = struct.unpack(">3xI", await wire.read(7))
                     state.cut_texts.append(await wire.read(length))

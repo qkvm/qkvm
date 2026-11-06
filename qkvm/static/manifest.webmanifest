@@ -1,0 +1,11 @@
+{
+  "name": "qKVM",
+  "short_name": "qKVM",
+  "description": "The screen wall of your KVMs and servers.",
+  "start_url": "../",
+  "scope": "../",
+  "display": "standalone",
+  "background_color": "#080b11",
+  "theme_color": "#080b11",
+  "icons": [{ "src": "favicon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }]
+}

@@ -17,7 +17,7 @@ import re
 from tests.workflow_text import SECURITY, WORKFLOWS, jobs, steps, uncommented, waits_for
 
 RELEASE = WORKFLOWS / "release.yml"
-DRAFT_STAGE = {"tested_commit", "build", "packages", "images_amd64", "images_arm64", "sign", "signature", "draft"}
+DRAFT_STAGE = {"tested_commit", "build", "libraries", "packages", "libraries_tested", "images_amd64", "images_arm64", "sign", "signature", "draft"}
 PUBLISH_STAGE = {"published", "image", "pypi"}
 
 
@@ -55,7 +55,7 @@ def test_no_file_is_changed_on_a_release_after_it_is_published() -> None:
 def test_the_draft_is_made_only_once_everything_passed_and_its_files_are_read_back_and_checked() -> None:
     every = jobs(RELEASE)
     # (Signed in `sign`, the key's job, checked by the cryptography library in `signature`, then made a draft here.)
-    assert waits_for(every, "draft") == {"tested_commit", "build", "packages", "images_amd64", "images_arm64", "sign", "signature"}
+    assert waits_for(every, "draft") == {"tested_commit", "build", "libraries", "packages", "libraries_tested", "images_amd64", "images_arm64", "sign", "signature"}
     assert re.search(r"^    environment: release\b", every["sign"], flags=re.M), "the signing key's environment, by its name"
     signing = steps(every["sign"])
     signed = {key: next(index for index, step in enumerate(signing) if key in step) for key in (

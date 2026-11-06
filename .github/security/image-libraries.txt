@@ -1,0 +1,4 @@
+# The image's libraries, as the release's lock names them for its Python (cp313) and architecture: the release's image
+# jobs put requirements/cp313-linux-<arch>.txt of the job `libraries` here (held to that job's hash) before the image is
+# built, and the Dockerfile installs exactly those, by hash, before qKVM itself. Kept empty in the repository: an image
+# built from the source, and the one every commit's Tests run builds, takes them from PyPI at that hour.

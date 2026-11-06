@@ -32,7 +32,7 @@ from qkvm import ami, amt, cli, kvm, live, redfish, update, vault
 from qkvm.core import Core
 from qkvm.kvm import DeviceSpec, KvmDevice
 from qkvm.server import create_app
-from tests import local_socket
+from tests import ServerThread, local_socket
 from tests.aspeed_frames import console_screen
 from tests.fake_amt import AmtState, FakeAmt
 from tests.fake_jetkvm import FakeJetKvm, JetState, no_long_handshake
@@ -217,15 +217,12 @@ class Wall:
         self.core.unlock_at_start()
         config = uvicorn.Config(create_app(self.core), **{**cli.SERVER_OPTIONS, "log_level": "error", **(serving or {})})
         self._server = uvicorn.Server(config)
-        self._thread = threading.Thread(target=self._server.run, kwargs={"sockets": [self._sock]}, daemon=True)
+        self._serving = ServerThread("the wall", lambda: self._server.run(sockets=[self._sock]), lambda: self._server.started)
+        self._thread = self._serving.thread
         self.clients: list[httpx.Client] = []
 
     def __enter__(self) -> Wall:
-        self._thread.start()
-        deadline = time.monotonic() + 10
-        while not self._server.started:
-            assert time.monotonic() < deadline, "the wall did not start"
-            time.sleep(0.02)
+        self._serving.start()  # (as every stand-in: a minute on a loaded computer, and why, where its thread ended)
         return self
 
     def __exit__(self, *_: object) -> None:

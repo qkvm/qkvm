@@ -4,8 +4,8 @@ file (review of web-020-pipe, F2).
 A file added to a draft after the draft job read it back becomes part of the immutable release unchecked, and the
 updater took the first `qkvm-*.whl` in the order GitHub lists the files: a second wheel attached by hand could be
 the one every copy is offered. Now the updater takes `qkvm-<version>-py3-none-any.whl` of the release's own tag and
-nothing else, and the publication's first job refuses a release whose signed list is not exactly the three files of
-its version (and, by verify --all, any file the list does not name).
+nothing else, and the publication's first job refuses a release whose signed list is not exactly the files of its
+version (three until 0.3.0, four since: the lock of its libraries), and, by verify --all, any file the list does not name.
 """
 from __future__ import annotations
 
@@ -40,5 +40,5 @@ def test_the_publication_refuses_a_release_that_is_not_exactly_the_files_of_its_
     first = steps(jobs(WORKFLOWS / "release.yml")["published"])
     step = next(item for item in first if "image-digests.py from-release" in item)
     listed = re.search(r"""listed=\$\(awk '\{print \$2\}' "\$RUNNER_TEMP/published/SHA256SUMS" \| LC_ALL=C sort \| tr '\\n' ' '\)""", step)
-    exact = re.search(r'test "\$listed" = "qkvm-\$\{TAG#v\}-image\.json qkvm-\$\{TAG#v\}-py3-none-any\.whl qkvm-\$\{TAG#v\}\.tar\.gz "', step)
+    exact = re.search(r'test "\$listed" = "qkvm-\$\{TAG#v\}-image\.json qkvm-\$\{TAG#v\}-libraries\.json qkvm-\$\{TAG#v\}-py3-none-any\.whl qkvm-\$\{TAG#v\}\.tar\.gz "', step)
     assert listed and exact and listed.start() < exact.start() < step.index("image-digests.py from-release"), step

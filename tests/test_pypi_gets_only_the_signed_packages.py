@@ -137,7 +137,9 @@ def test_the_build_tests_the_installed_wheel_and_the_source_archive_before_anyth
     build = steps(every["packages"])
     text = "\n".join(build)
     assert not re.search(r"^\s*python -m pytest\b", text, flags=re.M), "not the source tree"
-    installed = next(index for index, step in enumerate(build) if "/tmp/installed/bin/pip install dist/*.whl" in step)
+    # (With the lock's libraries for its Python, by hash, and nothing resolved at that hour: what walls get.)
+    installed = next(index for index, step in enumerate(build) if "/tmp/installed/bin/pip install --no-deps dist/*.whl" in step)
+    assert "/tmp/installed/bin/pip install --require-hashes --no-deps --only-binary :all: -r \"libraries/requirements/" in build[installed]
     suite = [index for index, step in enumerate(build) if "pytest.main(" in step]
     assert len(suite) == 1 and suite[0] > installed
     step = build[suite[0]]
@@ -163,7 +165,7 @@ def test_pypi_gets_nothing_before_every_file_is_held_to_the_signed_list() -> Non
     every = jobs(RELEASE)
     first = "\n".join(steps(every["published"]))
     assert re.search(r'/usr/bin/python3 -m qkvm\.release verify --all --signed "\$RUNNER_TEMP/published/SHA256SUMS" "\$\{files\[@\]\}"', first)
-    assert 'test "$listed" = "qkvm-${TAG#v}-image.json qkvm-${TAG#v}-py3-none-any.whl qkvm-${TAG#v}.tar.gz "' in first, "every package listed goes"
+    assert 'test "$listed" = "qkvm-${TAG#v}-image.json qkvm-${TAG#v}-libraries.json qkvm-${TAG#v}-py3-none-any.whl qkvm-${TAG#v}.tar.gz "' in first, "every package listed goes"
     assert "published" in waits_for(every, "pypi")
     pypi = every["pypi"]
     order = steps(pypi)

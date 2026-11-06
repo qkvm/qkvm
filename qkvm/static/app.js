@@ -50,6 +50,7 @@ const ICONS = {
   power: [['path', { d: 'M18.36 6.64a9 9 0 1 1-12.73 0M12 2v10' }]],
   shield: [['path', { d: 'M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z' }]],
   search: [['circle', { cx: 11, cy: 11, r: 8 }], ['path', { d: 'M21 21l-4.35-4.35' }]],
+  zoomIn: [['circle', { cx: 11, cy: 11, r: 8 }], ['path', { d: 'M21 21l-4.35-4.35M11 8v6M8 11h6' }]],
   plus: [['path', { d: 'M12 5v14M5 12h14' }]],
   x: [['path', { d: 'M18 6L6 18M6 6l12 12' }]],
   sliders: [['path', { d: 'M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6' }]],
@@ -91,6 +92,9 @@ const ICONS = {
   chevronLeft: [['path', { d: 'M15 18l-6-6 6-6' }]],
   chevronRight: [['path', { d: 'M9 18l6-6-6-6' }]],
   chevronDown: [['path', { d: 'M6 9l6 6 6-6' }]],
+  disc: [['circle', { cx: 12, cy: 12, r: 10 }], ['circle', { cx: 12, cy: 12, r: 3 }]],
+  eject: [['path', { d: 'M5 15h14L12 6z' }], ['path', { d: 'M5 19h14' }]],
+  trash: [['path', { d: 'M3 6h18' }], ['path', { d: 'M8 6V4h8v2' }], ['path', { d: 'M6 6l1 14h10l1-14' }]],
 };
 const SVG_NS = 'http://www.w3.org/2000/svg';
 
@@ -151,6 +155,7 @@ class ApiError extends Error {
 // An action is over when the KVM says so, and typing a long text takes it more than a minute.
 // Giving up on it sooner would invite a second click, and the text typed twice.
 const ACTION_PATIENCE = 150000;  // ms
+const INSTALL_PATIENCE = 1800000;  // ms: an update that downloads its libraries on a slow line (the page follows the view meanwhile)
 // Start into BIOS setup over a slow controller: two minutes to come to its restart (SETUP_WITHIN), and what is under way
 // then (a request, a clearing of the boot override) is finished before it answers, so that the answer can say what is left.
 const SETUP_PATIENCE = 240000;  // ms
@@ -1143,6 +1148,14 @@ function editDeviceDialog(device, onDone) {
       h('option', { value: 'firm' }, 'Press firmly'),
       h('option', { value: 'light' }, 'Press lightly'));
     strength.value = device.fingerbot_strength || 'firm';
+    // Its screen watched, told through the alerts (minutes; empty is off): where its tile shows a screen.
+    const watchable = device.picture !== false;
+    const minutesBox = value => h('input', {
+      type: 'number', min: 0, max: 1440, step: 1, inputmode: 'numeric', value: value || '', placeholder: 'Off', class: 'minutes',
+    });
+    const dark = minutesBox(device.no_signal_minutes);
+    const same = minutesBox(device.unchanged_minutes);
+    const minutesOf = box => (box.value.trim() === '' ? 0 : Number(box.value));
     const error = h('p', { class: 'error', hidden: true });
     const save = h('button', { type: 'submit', class: 'primary' }, 'Save');
     const saveAnyway = h('button', { type: 'button', hidden: true }, 'Save without checking');
@@ -1155,6 +1168,8 @@ function editDeviceDialog(device, onDone) {
           name: name.value, url: url.value, username: username.value, password: password.value,
           open_url: openUrl.value, tls: tls.value, group: groupName.value, alerts: tell.checked, force,
           fingerbot_strength: hasBot ? strength.value : undefined,
+          no_signal_minutes: watchable ? minutesOf(dark) : undefined,
+          unchanged_minutes: watchable ? minutesOf(same) : undefined,
         });
       } catch (ex) {
         error.textContent = ex.message;
@@ -1186,6 +1201,9 @@ function editDeviceDialog(device, onDone) {
       showsCertificate(device) && field('Certificate', tls,
         device.fingerprint ? `Remembered SHA-256: ${device.fingerprint}` : 'No certificate remembered yet.'),
       check(tell, 'Send alerts about this one', 'Off for a machine that is switched on and off all day, or sleeps: its changes are nobody\'s news.'),
+      watchable && h('div', { class: 'row' },
+        field('No signal for', dark, 'Minutes. Told once the computer has shown nothing that long, with its last picture.'),
+        field('Screen unchanged for', same, 'Minutes, while its tile is on a screen somewhere. Not the same as hung: an idle screen does not change either.')),
       hasBot && field('Fingerbot', strength,
         'How hard the Fingerbot paired with this KVM presses the power button. A light press may not move a stiff button.'),
       error,
@@ -1876,6 +1894,8 @@ function actionsDialog(target) {
           }, icon('external'), h('span', {}, 'Open console'), status?.console && can('operator') && h('kbd', {}, 'signed in')),
           h('button', { type: 'button', onclick: () => { close(); openFocus(device.id); } }, icon('maximize'), h('span', {}, 'Enlarge')),
           h('button', { type: 'button', class: 'admin-only', onclick: () => { close(); editDeviceDialog(device, reloadWall); } }, icon('edit'), h('span', {}, 'Edit...')),
+          // Virtual media: an admin's (the server's media right), for a machine whose driver offers it.
+          canDo(single, 'media') && h('button', { type: 'button', class: 'admin-only', onclick: () => { close(); mediaDialog(device.id); } }, icon('disc'), h('span', {}, 'Media...')),
           certProblem && h('button', {
             type: 'button', class: 'danger admin-only', onclick: () => certificateDialog(device, () => { close(); reloadWall(); }),
           }, icon('shield'), h('span', {}, 'Review certificate')),
@@ -1896,8 +1916,21 @@ function actionsDialog(target) {
       head.push(h('p', { class: 'muted' }, 'The action you choose runs on every selected KVM. You are asked to confirm first.'));
     }
 
+    // A PC with Intel AMT: which of its three views its tile is in, an operator's to change as an admin's.
+    const amtViews = single && amtView(single) && h('div', { class: 'operator-only' },
+      h('h3', {}, 'View'),
+      h('div', { class: 'action-grid' }, Object.keys(AMT_VIEWS).map(which => {
+        const now = amtView(single) === which;
+        return h('button', {
+          type: 'button', disabled: now, 'aria-pressed': String(now),
+          onclick: async () => { if (await setAmtView(single, which)) close(); },
+        }, icon(AMT_VIEW_ICONS[which]), h('span', {}, AMT_VIEWS[which]), now && h('kbd', {}, 'now'));
+      })),
+      h('p', { class: 'muted' }, 'Health only opens no KVM session: Intel\'s border never shows on the PC, and its screen, keys and text are not offered. Stills take a picture every five minutes (the border shows for a few seconds); the large view is live. Live KVM holds a session while the tile is shown: the border stays on the PC\'s monitor.'));
+
     body.append(h('div', {},
       head,
+      amtViews,
       ports && [
         h('h3', {}, 'Computer on screen'),
         h('div', { class: 'action-grid' }, ports.list.map((port, index) => h('button', {
@@ -2706,8 +2739,196 @@ async function metricsTab(refresh, does) {
   ];
 }
 
+// --- alerts on this browser, by Web Push (webpush.py) ---------------------------------------------------------------
+
+// The worker that shows them, in a scope that holds no page: no request of the wall's passes through it.
+const PUSH_WORKER = 'static/push.js';
+const PUSH_SCOPE = 'static/push/';
+const PUSH_WORKER_STATES = ['activated', 'redundant'];
+const PUSH_SERVICES = [['.push.apple.com', 'Apple'], ['.googleapis.com', 'Google'], ['.mozilla.com', 'Mozilla'], ['.notify.windows.com', 'Microsoft']];
+
+// Whose push service a browser is reached through, by its name: "Google" for fcm.googleapis.com.
+function pushService(host) {
+  const found = PUSH_SERVICES.find(([end]) => `.${host}`.endsWith(end));
+  return found ? found[1] : host;
+}
+
+// What this browser is, for the list of those told the alerts: "Chrome on Android".
+function browserName() {
+  const said = navigator.userAgent;
+  const kind = /Edg\//.test(said) ? 'Edge' : /Firefox\/|FxiOS/.test(said) ? 'Firefox' : /Chrome\/|CriOS/.test(said) ? 'Chrome' : /Safari\//.test(said) ? 'Safari' : 'A browser';
+  const on = /iPhone/.test(said) ? 'iPhone' : /iPad/.test(said) ? 'iPad' : /Android/.test(said) ? 'Android'
+    : /Windows/.test(said) ? 'Windows' : /Mac OS X/.test(said) ? 'a Mac' : /Linux/.test(said) ? 'Linux' : '';
+  return on ? `${kind} on ${on}` : kind;
+}
+
+function keyBytes(text) {
+  const plain = atob(text.replace(/-/g, '+').replace(/_/g, '/') + '='.repeat((4 - (text.length % 4)) % 4));
+  return Uint8Array.from(plain, ch => ch.charCodeAt(0));
+}
+
+function sameKey(buffer, bytes) {
+  if (!buffer) return false;
+  const have = new Uint8Array(buffer);
+  return have.length === bytes.length && have.every((byte, at) => byte === bytes[at]);
+}
+
+// Why this browser cannot be told the alerts, in words; '' where it can.
+function pushUnfit() {
+  if (!window.isSecureContext) {
+    return 'The wall is not reached over HTTPS here. A browser takes alerts only from a wall with a certificate it trusts.';
+  }
+  if (!('serviceWorker' in navigator) || !('PushManager' in window) || !('Notification' in window)) {
+    return /iPhone|iPad/.test(navigator.userAgent)
+      ? 'On an iPhone or iPad: add the wall to the Home Screen (Share, Add to Home Screen), open it from there, and turn alerts on there.'
+      : 'This browser cannot be told alerts by Web Push.';
+  }
+  return '';
+}
+
+// The worker's registration: the one there is, or (with `make`) a new one, once it has started.
+async function pushRegistration(make) {
+  const scope = new URL(PUSH_SCOPE, location.href).href;
+  let registration = await navigator.serviceWorker.getRegistration(scope);
+  if (registration?.scope !== scope) {
+    if (!make) return null;
+    registration = await navigator.serviceWorker.register(PUSH_WORKER, { scope: PUSH_SCOPE });
+  }
+  // (A worker's own words for where it is, which are no tile's: 'activated' once it runs, 'redundant' where it never will.)
+  const [running, never] = PUSH_WORKER_STATES;
+  const worker = registration.active || registration.waiting || registration.installing;
+  if (worker && worker.state !== running) {
+    await new Promise((resolve, reject) => {
+      const late = setTimeout(() => reject(new Error('The worker that shows the alerts did not start')), 15000);
+      const look = () => {
+        if (worker.state === running) { clearTimeout(late); resolve(); }
+        if (worker.state === never) { clearTimeout(late); reject(new Error('The worker that shows the alerts did not start')); }
+      };
+      worker.addEventListener('statechange', look);
+      look();
+    });
+  }
+  return registration;
+}
+
+// This browser's subscription to the wall's key, where it has one.
+async function pushSubscription(key) {
+  try {
+    const registration = await pushRegistration(false);
+    const subscription = registration && await registration.pushManager.getSubscription();
+    return subscription && key && sameKey(subscription.options?.applicationServerKey, keyBytes(key)) ? subscription : null;
+  } catch {
+    return null;
+  }
+}
+
+// "This browser", and the list of the browsers told the alerts: the account's own, and for an admin everybody's.
+async function pushBlocks(refresh) {
+  let pushed;
+  try {
+    pushed = await api('GET', 'api/v1/push');
+  } catch (ex) {
+    return [block('Phones and browsers', setting('This browser', ex.message))];
+  }
+  const unfit = pushUnfit();
+  const ours = prefs.get('push', '');
+  const thisOne = pushed.browsers.find(browser => browser.id === ours && browser.mine);
+  const subscription = unfit ? null : await pushSubscription(pushed.key);
+  const on = Boolean(thisOne && subscription);
+  const button = (label, name, work, kind = '') => {
+    const made = h('button', { type: 'button', class: kind }, icon(name), label);
+    made.addEventListener('click', () => busy(made, work));
+    return made;
+  };
+  const turnOn = button('Turn on', 'bell', async () => {
+    // Asked first, in the press itself: an iPhone asks for it only there.
+    const allowed = Notification.requestPermission();
+    try {
+      const [answer, registration] = await Promise.all([allowed, pushRegistration(true)]);
+      if (answer !== 'granted') {
+        toast('This browser was not allowed to show notifications for the wall. Allow them in its settings for this site, then press again.', 'error');
+        return;
+      }
+      const key = pushed.key || (await api('POST', 'api/v1/push/key')).key;
+      const bytes = keyBytes(key);
+      let had = await registration.pushManager.getSubscription();
+      if (had && !sameKey(had.options?.applicationServerKey, bytes)) {
+        await had.unsubscribe();  // (to a key the wall no longer has)
+        had = null;
+      }
+      const made = had || await registration.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: bytes });
+      const said = made.toJSON();
+      const kept = await api('POST', 'api/v1/push', { endpoint: said.endpoint, keys: said.keys, name: browserName(), key });
+      prefs.set('push', kept.id);
+    } catch (ex) {
+      toast(ex instanceof ApiError ? ex.message : `This browser could not be turned on: ${ex.message}`, 'error');
+      return;
+    }
+    toast('This browser is told the alerts now', 'ok');
+    refresh();
+  });
+  const test = button('Send a test', 'zap', async () => {
+    try {
+      await api('POST', `api/v1/push/${thisOne.id}/test`);
+    } catch (ex) {
+      toast(ex.message, 'error');
+      refresh();
+      return;
+    }
+    toast('Test alert sent: it shows here in a moment', 'ok');
+  });
+  const remove = async browser => {
+    try {
+      await api('DELETE', `api/v1/push/${browser.id}`);
+    } catch (ex) {
+      toast(ex.message, 'error');
+      return;
+    }
+    if (browser.id === ours) {
+      prefs.set('push', '');
+      await subscription?.unsubscribe().catch(() => {});
+    }
+    toast(`${browser.name} is told the alerts no more`, 'ok');
+    refresh();
+  };
+  const off = button('Turn off', 'x', () => remove(thisOne));
+  const offWall = pushed.alerts ? '' : ' Alerts are off on this wall just now: an admin switches them on.';
+  const here = unfit
+    ? setting('This browser', unfit)
+    : on
+      ? setting('This browser', `On, as ${thisOne.name}, through ${pushService(thisOne.service)}.${offWall}`, test, off)
+      : setting('This browser', `Off. Turned on, it shows the alerts of the machines you may see, with the wall closed too.${offWall}`, turnOn);
+  const everybody = pushed.browsers.some(browser => !browser.mine);
+  const day = at => new Date(at * 1000).toLocaleDateString();
+  return [
+    block('Phones and browsers', here),
+    block('Browsers told the alerts', pushed.browsers.length
+      ? h('table', { class: 'rows' },
+        h('thead', {}, h('tr', {}, h('th', {}, 'Browser'), everybody && h('th', {}, 'Account'), h('th', {}, 'Last alert'), h('th', {}))),
+        h('tbody', {}, pushed.browsers.map(browser => h('tr', {},
+          h('td', { class: 'wrap' }, browser.name, browser.id === ours && on && h('span', { class: 'muted' }, ' (this one)'),
+            h('div', { class: 'muted' }, `Through ${pushService(browser.service)}, since ${day(browser.created)}`)),
+          everybody && h('td', {}, browser.account),
+          h('td', { class: 'wrap' }, browser.last_error ? h('span', { class: 'error' }, browser.last_error)
+            : browser.last_sent ? ago(Date.now() / 1000 - browser.last_sent) : 'None yet'),
+          h('td', {}, h('button', { type: 'button', class: 'danger', onclick: () => remove(browser) }, 'Remove'))))))
+      : h('p', { class: 'nothing' }, 'No browser is told the alerts yet.')),
+  ];
+}
+
+const PUSH_LIMITS = 'Alerts on a phone: the wall has to be reached over HTTPS, with a certificate the phone trusts; on an iPhone or iPad '
+  + 'it has to be added to the Home Screen and opened from there. They pass, encrypted, through the push service of the browser\'s maker '
+  + '(Apple\'s, Google\'s, Mozilla\'s or Microsoft\'s), which cannot read them: a machine\'s name and what happened, nothing more.';
+
 async function alertsTab(refresh, does) {
-  const state = await api('GET', 'api/v1/alerts');
+  if (!can('admin')) {
+    return [
+      h('p', { class: 'intro' }, 'An alert tells you when a machine you may see goes offline, loses its picture or has a problem, and when that is over.'),
+      ...await pushBlocks(refresh),
+      h('p', { class: 'footnote' }, PUSH_LIMITS),
+    ];
+  }
+  const [state, phone] = await Promise.all([api('GET', 'api/v1/alerts'), pushBlocks(refresh)]);
   const enabled = h('input', { type: 'checkbox', checked: state.enabled });
   const url = h('input', {
     type: 'text', inputMode: 'url', spellcheck: false, autocomplete: 'off',
@@ -2787,6 +3008,7 @@ async function alertsTab(refresh, does) {
   return [
     state.last_error && h('div', { class: 'note bad' }, `The last alert could not be delivered: ${state.last_error}`),
     form,
+    ...phone,
     block('Maintenance', state.paused_until
       ? setting(`Paused until ${until}`, 'Nothing is sent meanwhile. What is not as it was by then is told then.',
         h('button', { type: 'button', onclick: pause(0) }, 'Send alerts again'))
@@ -2798,7 +3020,52 @@ async function alertsTab(refresh, does) {
       'Without an address, changes are still written to the activity log. While alerts are on, qKVM keeps watching after ',
       'everyone has signed out, which means the saved KVM passwords stay unlocked in its memory until it is restarted. ',
       'After a restart, watching begins when someone signs in. A JetKVM that is not on screen is only checked for answering, ',
-      'not for its picture.'),
+      'not for its picture. ', PUSH_LIMITS),
+  ];
+}
+
+// Virtual media of servers: the folder whose ISO images can be mounted on a server, and the address the servers'
+// controllers reach qKVM at to read them (each by an address made for its mount alone).
+async function mediaTab(refresh, does) {
+  const state = await api('GET', 'api/v1/settings/media');
+  const folder = h('input', {
+    type: 'text', spellcheck: false, autocomplete: 'off', value: state.folder,
+    placeholder: navigator.platform?.startsWith('Win') ? 'D:\\images' : '/srv/images',
+  });
+  const address = h('input', {
+    type: 'text', inputMode: 'url', spellcheck: false, autocomplete: 'off', value: state.address,
+    placeholder: state.serving_at && !state.address ? state.serving_at : `${state.https ? 'https' : 'http'}://192.168.1.10:8787`,
+  });
+  const form = h('form', {
+    id: 'media-form',
+    onsubmit: event => {
+      event.preventDefault();
+      busy(save, async () => {
+        try {
+          await api('PUT', 'api/v1/settings/media', { folder: folder.value, address: address.value });
+        } catch (ex) {
+          toast(ex.message, 'error');
+          return;
+        }
+        toast('Server image settings saved', 'ok');
+        refresh();
+      });
+    },
+  },
+    block('Images for servers',
+      field('Folder', folder, 'On the computer qKVM runs on, as a whole path. The ISO images directly in it can be mounted on a server; nothing is written there. Empty: none.'),
+      field('Address servers reach qKVM at', address, 'As the servers\' controllers reach this computer: http:// or https://, a host and a port. '
+        + 'Empty: where qKVM listens on the network.')),
+    block('As it is now',
+      setting('Read from', null, h('span', { class: 'value' }, state.serving_at || 'Nowhere: qKVM listens on this computer alone (Settings, Network).'))));
+  const save = saves(form);
+  does.append(save);
+  return [
+    form,
+    h('p', { class: 'footnote' }, 'A mounted image is read by the server\'s controller from qKVM for as long as it is mounted, '
+      + 'by an address made for that mount alone, from the controller\'s own address alone; over HTTPS with a user and a password '
+      + 'made for it as well. Most controllers do not check qKVM\'s certificate: on a network you do not trust, an image could be changed on its way. '
+      + 'Mounting is for admins, on the server\'s Actions, Media...'),
   ];
 }
 
@@ -2860,7 +3127,7 @@ const EVENTS = {
   device_removed: 'KVM removed', certificate_trusted: 'Certificate trusted', action: 'Action',
   action_failed: 'Action failed', console_opened: 'Console opened', settings_changed: 'Network settings changed',
   live_control: 'Keyboard and mouse', export_refused: 'Export refused: wrong password',
-  kvm_switched: 'Intel AMT KVM switched', kvm_switch_failed: 'Intel AMT KVM not switched',
+  kvm_switched: 'Intel AMT KVM switched', kvm_switch_failed: 'Intel AMT KVM not switched', amt_view_changed: 'Intel AMT PC view changed',
   saved_action_added: 'Action saved', saved_action_changed: 'Saved action changed', saved_action_removed: 'Saved action removed',
   update_installed: 'Update installed', update_failed: 'Update failed',
   user_added: 'Account added', user_changed: 'Account changed', user_removed: 'Account removed',
@@ -2875,6 +3142,7 @@ const EVENTS = {
   login_code_asked: 'Password right, second step asked for',
   log_gap: 'Entries are missing from this log: it could not be written',
   alerts_paused: 'Alerts paused', alerts_resumed: 'Alerts sent again',
+  push_subscribed: 'Browser told the alerts', push_removed: 'Browser told the alerts no more', push_key_made: 'Key for alerts by Web Push made',
   totp_codes_created: 'New one-time codes made', security_changed: 'Two-factor rule changed',
   token_created: 'Token made', token_removed: 'Token taken back', display_opened: 'Wall screen opened with its link',
   wall_arranged: 'Order of the tiles set',
@@ -2882,6 +3150,11 @@ const EVENTS = {
   live_opened: 'Live view opened', live_closed: 'Live view closed', console_failed: 'Console not opened',
   activity_left_out: 'Entries not written',
   activity_exported: 'Activity log downloaded', accounts_reset: 'Accounts and saved passwords erased',
+  media_mounted: 'Image mounted', media_mount_failed: 'Image not mounted', media_booted: 'Started from the image',
+  media_boot_failed: 'Not started from the image', media_unmounted: 'Image taken out', media_unmount_failed: 'Image not taken out',
+  media_restarted: 'Restarted for the image', media_restart_failed: 'Not restarted for the image',
+  media_uploaded: 'Image uploaded', media_upload_failed: 'Image not uploaded', media_deleted: 'Image deleted', media_delete_failed: 'Image not deleted',
+  media_settings_changed: 'Server image settings changed',
 };
 const ACTION_NAMES = {
   reboot: 'Reboot KVM', ctrl_alt_del: 'Ctrl+Alt+Del', atx_power: 'Power button', power_on: 'Power on', power_off: 'Shut down',
@@ -2893,7 +3166,7 @@ const ACTION_NAMES = {
 
 const TAB_ICONS = {
   devices: 'grid', actions: 'zap', users: 'users', network: 'globe', security: 'shield', updates: 'download', activity: 'list',
-  about: 'info', alerts: 'bell', metrics: 'activity', tokens: 'code', files: 'archive',
+  about: 'info', alerts: 'bell', metrics: 'activity', tokens: 'code', files: 'archive', media: 'disc',
 };
 
 // The sections of the settings, in the groups they are listed under: [key, name, what is in it, what draws it].
@@ -2903,6 +3176,7 @@ const SETTINGS = [
     ['devices', 'KVMs', 'The KVMs and servers on the wall: add, change, remove.', devicesTab],
     ['actions', 'Actions', 'Key combinations and text of your own, to run on any machine.', actionsTab],
     ['alerts', 'Alerts', 'Who is told when a machine changes, and how.', alertsTab],
+    ['media', 'Server images', 'ISO images to mount on a server, and how servers reach qKVM for them.', mediaTab],
     ['files', 'Export and import', 'The wall as a file: to keep, or to take to another qKVM.', filesTab],
   ]],
   ['People', [
@@ -2923,7 +3197,8 @@ function settingsDialog(first) {
   openDialog('Settings', body => {
     // Someone who is not an admin can still change their own password and sign out elsewhere; a screen on the
     // wall has not even that.
-    const mine = key => can('admin') || key === 'about' || (key === 'security' && !me?.token);
+    // And have the alerts told to their own browsers (Web Push), of the machines they may see.
+    const mine = key => can('admin') || key === 'about' || ((key === 'security' || key === 'alerts') && !me?.token);
     const groups = SETTINGS.map(([group, sections]) => [group, sections.filter(([key]) => mine(key))]).filter(([, sections]) => sections.length);
     const all = new Map(groups.flatMap(([, sections]) => sections.map(section => [section[0], section])));
     const pane = h('div', { class: 'section', role: 'tabpanel' });
@@ -3358,33 +3633,76 @@ async function followRestart(version) {
     h('div', { class: 'actions' }, h('button', { type: 'button', class: 'primary', onclick: () => location.reload() }, 'Reload')));
 }
 
+// "48.2 MB", "310 KB": a download's size, as the Updates view says it.
+function sizeInWords(bytes) {
+  return bytes >= 100000 ? `${(bytes / 1e6).toFixed(1)} MB` : `${Math.max(1, Math.round(bytes / 1000))} KB`;
+}
+
+// What installing a version brings beside the program: the libraries it downloads, or that it has them all already.
+function bringsInWords(libraries) {
+  if (!libraries?.brought) return null;
+  return libraries.fetch.length
+    ? `It brings ${libraries.brought} ${libraries.brought === 1 ? 'library' : 'libraries'} of its own and downloads ${sizeInWords(libraries.size)}: ${libraries.fetch.join(', ')}.`
+    : `It brings ${libraries.brought} ${libraries.brought === 1 ? 'library' : 'libraries'} of its own, all on this computer already: nothing more to download.`;
+}
+
 // Installing new code asks for the password again, like changing it does.
 function installUpdateDialog(status, onDone) {
   const version = status.latest.version;
   openDialog(`Install version ${version}`, (body, close) => {
     const { el, input } = passwordField('Your password', { autocomplete: 'current-password', required: true });
     const error = h('p', { class: 'error', hidden: true });
+    const progress = h('p', { class: 'muted progress', hidden: true });
     const install = h('button', { type: 'submit', class: 'primary' }, 'Install');
     body.append(h('form', {
       onsubmit: event => {
         event.preventDefault();
         error.hidden = true;
         busy(install, async () => {
+          // How far it is, from the view, while the request runs (a download of many MB on a slow line takes minutes).
+          let asking = true;
+          const follow = (async () => {
+            while (asking) {
+              await sleep(1500);
+              try {
+                const now = await api('GET', 'api/v1/update');
+                if (asking && now.progress) {
+                  progress.textContent = `${now.progress}...`;
+                  progress.hidden = false;
+                }
+              } catch { /* asked again in a moment */ }
+            }
+          })();
           let result;
           try {
             // The download is part of this request. Given up on after half a minute, the page would say
             // "took too long" while the new version is installed and started under it all the same.
-            result = await api('POST', 'api/v1/update/install', { password: input.value }, ACTION_PATIENCE);
+            result = await api('POST', 'api/v1/update/install', { password: input.value }, INSTALL_PATIENCE);
           } catch (ex) {
             if (ex.code === 'unfit') {  // (what stands in the way, and how to install it instead, the view says: once)
+              asking = false;
               close();
               onDone();
               return;
             }
-            error.textContent = ex.message;
-            error.hidden = false;
-            return;
+            // A proxy that cut the long request (or a line that dropped it) leaves the installation running: the view says
+            // how it ends.
+            const cut = ex.code === 'network' || ex.code === 'timeout' || ex.code === 'invalid_response' || (!ex.data && [502, 504].includes(ex.status));
+            const ended = cut ? await installEnded(version) : null;
+            asking = false;
+            await follow;
+            if (ended?.current === version) {
+              result = { restarting: true };  // (qKVM restarted on it before the page looked: followed, and the page reloads)
+            } else if (ended?.installed === version) {
+              result = { restarting: ended.supervised };
+            } else {
+              error.textContent = ended?.error || ex.message;
+              error.hidden = false;
+              progress.hidden = true;
+              return;
+            }
           }
+          asking = false;
           close();
           if (result.restarting) {
             followRestart(version);
@@ -3399,13 +3717,32 @@ function installUpdateDialog(status, onDone) {
       h('p', {}, status.supervised
         ? 'The new version is downloaded, checked, and installed next to the current one. qKVM then restarts by itself; everyone has to sign in again.'
         : 'The new version is downloaded, checked, and installed next to the current one. It takes effect the next time qKVM is started.'),
+      bringsInWords(status.libraries) && h('p', {}, bringsInWords(status.libraries)),
       h('p', { class: 'muted' }, 'If the new version cannot start, qKVM goes back to this one by itself.'),
       h('input', { type: 'text', autocomplete: 'username', value: me?.name || 'admin', hidden: true }),
       el,
+      progress,
       error,
       h('div', { class: 'actions' }, h('button', { type: 'button', onclick: close }, 'Cancel'), install)));
     input.focus();
   });
+}
+
+// How an installation whose request was cut ended, as the Updates view says it once it is no longer under way (or null
+// where the wall did not answer for that long). (An update's own word for where it is, which is no tile's.)
+const UPDATE_INSTALLING = 'installing';
+
+async function installEnded(version) {
+  for (let attempt = 0; attempt < 600; attempt++) {
+    try {
+      const now = await api('GET', 'api/v1/update');
+      if (now.state !== UPDATE_INSTALLING) return now;
+    } catch (ex) {
+      if (ex.status === 401 || ex.status === 403) return null;
+    }
+    await sleep(2000);
+  }
+  return null;
 }
 
 // A command to be typed on the computer qKVM runs on, as it is, with a button that copies it.
@@ -3497,8 +3834,11 @@ async function updatesTab(refresh, does) {
       status.command && [' Install it with pip on the computer qKVM runs on, then restart qKVM:', commandLine(status.command)]),
     block(null,
       setting('This copy', state || 'The version that is running.', h('span', { class: 'value' }, `qKVM ${status.current}`)),
+      status.own_libraries?.length > 0 && setting('Its libraries',
+        `It runs ${status.own_libraries.length} ${status.own_libraries.length === 1 ? 'library' : 'libraries'} of its own, brought with it when it was installed in place.`),
       status.available && setting(`Version ${latest.version}`,
-        latest.published ? `Released ${new Date(latest.published).toLocaleDateString()}.` : null,
+        [latest.published ? `Released ${new Date(latest.published).toLocaleDateString()}.` : null,
+          status.in_place === true && !status.container && bringsInWords(status.libraries)].filter(Boolean).join(' ') || null,
         /^https:\/\/github\.com\//.test(latest.url) && h('a', {
           class: 'btn', href: latest.url, target: '_blank', rel: 'noopener noreferrer',
         }, icon('external'), 'Release page'))),
@@ -3687,6 +4027,36 @@ function consoleDetail(entry) {
   return [entry.unsaid && `${entry.unsaid} earlier ${entry.unsaid === 1 ? 'entry' : 'entries'} of this account's consoles not written: more than are kept an hour`];
 }
 
+// An alert of a machine's screen watch (screens.py), as words: what went off, or that it is over.
+function watchText(entry) {
+  const minutes = `${entry.minutes} ${entry.minutes === 1 ? 'minute' : 'minutes'}`;
+  if (entry.watch === 'no_signal') return entry.back ? 'Back to normal: a picture again' : `No signal for ${minutes}`;
+  return entry.back ? 'Back to normal: the screen changes again' : `Screen unchanged for ${minutes}`;
+}
+
+// The alert's line, and where it kept the picture that set it off, a link that shows it.
+function alertWords(entry) {
+  return entry.watch ? watchText(entry) : `${LABELS[entry.was] || entry.was} to ${LABELS[entry.state] || entry.state}`;
+}
+
+function pictureLink(entry) {
+  if (!entry.picture || !entry.device_id) return null;
+  return h('button', { type: 'button', class: 'link', onclick: () => alertPictureDialog(entry) }, 'Picture');
+}
+
+function alertPictureDialog(entry) {
+  openDialog(`${entry.device}: ${watchText(entry)}`, body => {
+    const gone = h('p', { class: 'muted', hidden: true }, 'This picture is no longer kept: only the last alert\'s of each machine is, for 30 days.');
+    const picture = h('img', {
+      class: 'alert-picture', alt: `The screen of ${entry.device} when the alert went off`,
+      src: `api/v1/devices/${encodeURIComponent(entry.device_id)}/alert-picture/${encodeURIComponent(entry.picture)}`,
+    });
+    picture.addEventListener('error', () => { picture.remove(); gone.hidden = false; });
+    body.append(picture, gone);
+    if (entry.picture_at) body.append(h('p', { class: 'muted' }, `Seen by the wall ${new Date(entry.picture_at * 1000).toLocaleString()}.`));
+  }, { size: 'wide' });
+}
+
 async function activityTab(refresh, does) {
   // What can be narrowed to: the machines on the wall, the accounts and the tokens (a token acts under its name and "(token)").
   const [{ devices }, { users }, { tokens }] = await Promise.all([api('GET', 'api/v1/wall'), api('GET', 'api/v1/users'), api('GET', 'api/v1/tokens')]);
@@ -3694,12 +4064,19 @@ async function activityTab(refresh, does) {
   const detail = entry => [
     entry.device, entry.account, ROLE_NAMES[entry.role], entry.name || ACTION_NAMES[entry.action] || entry.action,
     entry.strength && (entry.strength === 'light' ? 'pressing lightly' : 'pressing firmly'),
-    entry.event === 'alert' && `${LABELS[entry.was] || entry.was} to ${LABELS[entry.state] || entry.state}`,
-    entry.held && 'not sent: alerts were paused', entry.event !== 'live_control' && entry.minutes && `${entry.minutes} minutes`,
+    entry.event === 'alert' && alertWords(entry),
+    entry.held && 'not sent: alerts were paused', entry.event !== 'live_control' && !entry.watch && entry.minutes && `${entry.minutes} minutes`,
+    entry.browser, entry.service && `through ${entry.service}`, entry.event === 'push_removed' && entry.why === 'gone' && 'its push service said it is no longer subscribed',
+    entry.event === 'push_key_made' && entry.replaced && 'in place of one that did not open',
     entry.recovery_code && `with a one-time code (${entry.codes_left} left)`,
     entry.event === 'login_failed' && entry.suspended && 'the account is suspended',
     entry.event === 'login_failed' && entry.no_second_step && 'the key of its second step does not open',
     entry.no_such_account && 'no account of the name that was typed',
+    entry.event?.startsWith('media_') && entry.image, entry.event?.startsWith('media_') && entry.drive && entry.drive !== 'cd' && MEDIA_DRIVES_SAID[entry.drive],
+    entry.event?.startsWith('media_') && entry.writable && 'writable', entry.event?.startsWith('media_') && MEDIA_BOOT_SAID[entry.boot],
+    entry.event?.startsWith('media_') && entry.restart && 'restarted',
+    entry.event?.startsWith('media_') && entry.size != null && (entry.sent != null ? `${bytesText(entry.sent)} of ${bytesText(entry.size)} came` : bytesText(entry.size)),
+    entry.event?.startsWith('media_') && entry.sha256 && `SHA-256 ${entry.sha256}`,
     entry.event === 'export_made' && (entry.encrypted ? 'encrypted, with the passwords' : 'plain, without passwords'),
     entry.event === 'export_made' && entry.not_opened && `${entry.not_opened} saved ${entry.not_opened === 1 ? 'secret' : 'secrets'} did not open and ${entry.not_opened === 1 ? 'is' : 'are'} not in it`,
     (entry.event === 'export_made' || entry.event === 'import_done') && Array.isArray(entry.parts) && entry.parts.map(part => FILE_PARTS[part] || part).join(', '),
@@ -3719,7 +4096,7 @@ async function activityTab(refresh, does) {
     h('td', { class: 'when' }, new Date(entry.time * 1000).toLocaleString()),
     h('td', {}, entry.user || ''),
     h('td', {}, eventLabel(entry)),
-    h('td', { class: 'wrap' }, detail(entry)),
+    h('td', { class: 'wrap' }, detail(entry), entry.picture && ' ', pictureLink(entry)),
     h('td', {}, entry.ip));
   const find = h('input', {
     type: 'search', placeholder: 'A name, a machine, an address...', 'aria-label': 'Find in the activity log', spellcheck: false, autocomplete: 'off',
@@ -3981,25 +4358,47 @@ function pixelsOf(box) {
   return boxPixels.get(box) || { w: Math.round(box.clientWidth * ratio), h: Math.round(box.clientHeight * ratio) };
 }
 
+// Where a picture of w by h pixels goes in a canvas, and how large the canvas is, in screen pixels: fitted into `box` (the
+// canvas as large as the box), or at `scale` of the picture's own pixels (the enlarged view at a size of its own: the
+// canvas as large as the picture is then, which the view centres or scrolls).
+function pictureAt(box, w, h, scale) {
+  if (scale) {
+    const width = Math.max(1, Math.round(w * scale)), height = Math.max(1, Math.round(h * scale));
+    return { width, height, x: 0, y: 0, w: width, h: height };
+  }
+  const { w: boxW, h: boxH } = pixelsOf(box);
+  return { width: boxW, height: boxH, ...fitted(boxW, boxH, w, h) };
+}
+
+// The canvas's size on the page: the box's (the style sheet's, for Fit), or its own pixels' at a scale.
+function sizeCanvas(canvas, at, scale) {
+  const ratio = window.devicePixelRatio || 1;
+  canvas.style.width = scale ? `${at.width / ratio}px` : '';
+  canvas.style.height = scale ? `${at.height / ratio}px` : '';
+}
+
 // Draws a frame into `canvas` so that every canvas pixel is one screen pixel: the frame is
 // resampled exactly once, with the browser's best filter, straight to the size it is shown at.
 // Letting the browser stretch an <img> instead resamples a second time, which is what blurs.
-async function paintSharp(canvas, box, blob, stillWanted) {
+// `scale`: the enlarged view's size of the picture (see `pictureAt`); 0, fitted into the box.
+async function paintSharp(canvas, box, blob, stillWanted, scale = 0) {
   const { w: boxW, h: boxH } = pixelsOf(box);
   if (boxW < 2 || boxH < 2) return;  // not on screen right now
   const frame = await createImageBitmap(blob);
   let sized = frame;
   try {
-    const { x, y, w, h } = fitted(boxW, boxH, frame.width, frame.height);
+    const at = pictureAt(box, frame.width, frame.height, scale);
+    const { x, y, w, h } = at;
     if (w < frame.width) sized = await createImageBitmap(frame, { resizeWidth: w, resizeHeight: h, resizeQuality: 'high' });
     if (stillWanted()) {
-      if (canvas.width !== boxW || canvas.height !== boxH) {
-        canvas.width = boxW;
-        canvas.height = boxH;
+      if (canvas.width !== at.width || canvas.height !== at.height) {
+        canvas.width = at.width;
+        canvas.height = at.height;
       }
+      sizeCanvas(canvas, at, scale);
       const context = canvas.getContext('2d');
       context.fillStyle = '#000';
-      context.fillRect(0, 0, boxW, boxH);
+      context.fillRect(0, 0, at.width, at.height);
       context.imageSmoothingQuality = 'high';
       context.drawImage(sized, x, y, w, h);
     }
@@ -4043,11 +4442,12 @@ class Feed {
       running: false, failing: false, waking: false, blob: null, paints: 0, sent: 0,
     });
   }
-  // Draws the newest frame again, for instance when the tile has changed size.
+  // Draws the newest frame again, for instance when the tile has changed size. (`scale`, where it is set: the size the
+  // enlarged view shows its picture at, see `pictureAt`.)
   async paint() {
     if (!this.blob) return;
     const turn = ++this.paints;
-    await paintSharp(this.canvas, this.box, this.blob, () => turn === this.paints);
+    await paintSharp(this.canvas, this.box, this.blob, () => turn === this.paints, this.scale?.() || 0);
   }
   start() {
     if (this.running) return;
@@ -4138,10 +4538,12 @@ function sharpWidth(box) {
 // moment ago. Several people on one wall then cost each KVM little more than one of them would.
 // `big`: this is the enlarged (large) view, so a PC with Intel AMT holds a session open for it (and opens one before a
 // power-on to show the start), where a tile that is only shown gets a still now and then.
-function snapshotUrl(id, box, shared = 0, big = false) {
+// `whole`: the picture as large as the machine has it (the enlarged view at a scale of the machine's own pixels).
+function snapshotUrl(id, box, shared = 0, big = false, whole = false) {
   const age = shared ? `&age=${(shared * 0.8 / 1000).toFixed(2)}` : '';
-  return `api/v1/devices/${encodeURIComponent(id)}/snapshot?w=${sharpWidth(box)}${age}${big ? '&big=1' : ''}`;
+  return `api/v1/devices/${encodeURIComponent(id)}/snapshot?w=${whole ? WHOLE_WIDTH : sharpWidth(box)}${age}${big ? '&big=1' : ''}`;
 }
+const WHOLE_WIDTH = 16384;  // the widest picture asked for (the server's own limit): the machine's own, whatever it is
 
 // A view is what one feed knows about a device: { hasFrame, frameAt, signal, error }.
 function newView() {
@@ -4164,10 +4566,50 @@ function applyResult(view, result) {
 }
 
 // What a tile says it shows between stills (a PC with Intel AMT whose tile is only shown): the age of the still.
-function stillNote(view) {
+function stillNote(view, word = 'still') {
   if (!view?.still) return '';
   const age = Math.max(0, Math.round(view.stillAge || 0));
-  return `still, ${age < 60 ? `${age} s` : `${Math.round(age / 60)} min`} ago`;
+  return `${word}, ${age < 60 ? `${age} s` : `${Math.round(age / 60)} min`} ago`;
+}
+
+// The three views of a PC with Intel AMT, a setting of its tile (the server's `amt_view`): none opens a KVM session, a still
+// now and then (a session while the large or live view is open), or a session held while the tile is shown.
+const AMT_VIEWS = { health: 'Health only', stills: 'Stills', live: 'Live KVM' };
+const AMT_VIEW_ICONS = { health: 'activity', stills: 'camera', live: 'tv' };
+
+function amtView(tile) {
+  if (tile?.device.kind !== 'amt') return null;
+  const said = tile.status?.server?.amt?.view;  // (the status's is the fresher: another browser may have changed it)
+  return AMT_VIEWS[said] ? said : AMT_VIEWS[tile.device.amt_view] ? tile.device.amt_view : 'stills';
+}
+
+// What a tile (or its large view, `large`) says of what it shows: for a PC with Intel AMT, which view it is in, with the
+// age of the still it shows where it shows one; for every other machine, that age where it has one.
+function viewNote(tile, view, screen, large = false) {
+  const which = amtView(tile);
+  if (!which) return screen ? stillNote(view) : '';
+  if (which === 'stills' && screen && view?.still) return stillNote(view, AMT_VIEWS.stills);  // "Stills, 2 min ago"
+  if (which === 'stills' && large && screen) return 'Stills on the wall, live here';
+  return [AMT_VIEWS[which], screen ? stillNote(view) : ''].filter(Boolean).join(' · ');
+}
+
+// The view changed from the Actions box (an operator's or an admin's): said, and shown at once, with the status that says
+// what the tile can do now.
+async function setAmtView(tile, which) {
+  try {
+    const answer = await api('PUT', `api/v1/devices/${encodeURIComponent(tile.device.id)}/view`, { view: which });
+    tile.device.amt_view = answer.amt_view;
+    toast(`${tile.device.name}: ${AMT_VIEWS[answer.amt_view]}`, 'ok');
+    try {
+      applyStatuses(await api('GET', 'api/v1/status'));
+    } catch { /* the regular look brings it */ }
+    render(tile);
+    renderFocus();
+    return true;
+  } catch (ex) {
+    toast(ex.message, 'error');
+    return false;
+  }
 }
 
 // A server is seen through its management controller. Where that has a console qKVM reads (the status says
@@ -4179,9 +4621,10 @@ function showsScreen(device, status) {
 // A server whose screen is on the tile right now (and not the panel that says how it is): there is a picture
 // of it, and the server is running. A fault does not cover the screen of a server that runs: the tile's edge
 // says the rest. Switched off, what its controller says of it is what there is to see, and not "no signal:
-// not plugged into the KVM", which is a KVM's story.
-function pictured(device, view, state) {
-  return Boolean(device.picture === false && view.hasFrame && !view.error && (state === 'online' || state === 'error'));
+// not plugged into the KVM", which is a KVM's story. Nor where its status says its screen is not to be had any more (a PC
+// set to health only, or whose KVM was switched off): the last picture the tile has is not the screen, and is not shown.
+function pictured(device, view, state, status) {
+  return Boolean(device.picture === false && view.hasFrame && !view.error && (state === 'online' || state === 'error') && status?.screen !== false);
 }
 
 function stateOf(status, view) {
@@ -4201,7 +4644,12 @@ function stateOf(status, view) {
   return ['online', null];
 }
 
+// What a tile's footer says of the machine: which it is, or how it is; and what is in its virtual drive, for everybody.
 function metaText(status) {
+  return [machineText(status), status?.media ? `${MEDIA_DRIVES[status.media.drive] || 'Media'}: ${status.media.name}` : ''].filter(Boolean).join(' · ');
+}
+
+function machineText(status) {
   if (!status || !status.video) return '';
   if (status.picture === false) {
     // A server's panel already says whether it is on and how warm: its footer says which machine it is.
@@ -4376,6 +4824,395 @@ async function switchKvmOff(device, close) {
   } catch (ex) {
     toast(ex.message, 'error');
   }
+}
+
+// --- virtual media: an image mounted on a machine, and the machine started from it (admins) ----------------------
+// One box that holds still: one size and place whatever it shows, and only its list of images scrolls. Its main button,
+// Mount, is at the right of its first line, with Upload and Delete before it; what is in the drive is under it, with
+// Unmount at its right; then what the image goes in as, how the machine is to start, the list, and one line for what is
+// said (an upload's progress too). A control that cannot be used is shown disabled, never taken away, so that nothing comes
+// to stand where another one stood. Each mount, unmount, upload and deletion asks first, naming the machine and the image,
+// and sends both: the server does nothing where either is not what was named.
+
+// A mount that restarts the machine waits for it to stop and to start again, each as long as a power button's.
+const MEDIA_LOOK_AGAIN = 5000;  // ms: a look at the box's machine that got no answer is asked again once, this much later
+const MEDIA_PATIENCE = 420000;  // ms: a server's mount may wait for its drive to show (90 s), its answer (60 s) and its task (120 s)
+const MEDIA_DRIVES = { cd: 'CD', flash: 'Flash', disk: 'Disk' };  // (on the tile: "CD: debian-13.iso")
+const MEDIA_DRIVES_SAID = { cd: 'CD-ROM drive', flash: 'USB flash drive', disk: 'disk' };
+// What an image goes in as: a drive, and whether the machine may change what is on it (only where it is chosen so).
+const MEDIA_AS = [
+  ['cd', 'CD-ROM drive, read-only'],
+  ['flash', 'USB flash drive, read-only'],
+  ['flash_rw', 'USB flash drive, writable'],
+  ['disk', 'Disk, read-only'],
+];
+const MEDIA_MOST_UPLOAD = 16e9;  // bytes, as the server has it (MOST_UPLOAD)
+const MEDIA_MOST_CD = (256 * 60 * 75 - 1) * 2048;  // bytes a KVM's CD-ROM drive gives its machine of an image (kvm.MOST_CD)
+const MEDIA_PROGRESS_EVERY = 1000;  // ms between two looks at how far an upload has come
+// How each way of starting from it is said: in the box, and in the activity log.
+const MEDIA_BOOT_SAID = { none: '', once: 'started from it once', until_unmounted: 'started from it until it is unmounted' };
+const MEDIA_BOOT_CHOICES = [
+  ['none', 'Leave its boot order as it is'],
+  ['once', 'Start from it once, now'],
+  ['until_unmounted', 'Start from it until it is unmounted'],
+];
+const MEDIA_WHERE = {
+  proxmox: 'On the storages of its Proxmox that the token may see',
+  device: 'On the KVM\'s own storage',
+  qkvm: 'In the folder qKVM serves them from',
+};
+const MEDIA_NONE = {
+  proxmox: 'No ISO images here. They are put on a storage of the Proxmox that the token may see (Datastore.Audit) on Proxmox itself.',
+  device: 'No images on the KVM\'s own storage yet. Upload one: it is carried through qKVM as it is read, and kept nowhere on the way.',
+  qkvm: 'No ISO images in the folder for server images. Put them there on the computer qKVM runs on (Settings, Server images).',
+};
+const MEDIA_FOOT = {
+  proxmox: 'An image goes into the guest\'s CD-ROM drive, read-only. Proxmox has no start "once": qKVM starts the guest anew with the CD-ROM drive first and puts its boot order back after, so a restart from inside the guest starts from the image again while it is in the drive. A restart stops the guest at once and starts it again.',
+};
+
+// What the box says at its foot of a machine's drive, by what it offers (and, for a server, where it reads the image from).
+function mediaFoot(offers, servedFrom) {
+  if (MEDIA_FOOT[offers.where]) return MEDIA_FOOT[offers.where];
+  if (offers.where === 'qkvm') {
+    return [
+      'An image goes into the server\'s virtual CD-ROM drive, read-only.',
+      `Its controller reads it from qKVM${servedFrom ? ` at ${servedFrom}` : ''} for as long as it is mounted, by an address made for that mount alone: keep qKVM running until it is unmounted.`,
+      'Most controllers do not check qKVM\'s certificate: on a network you do not trust, an image could be changed on its way.',
+    ].join(' ');
+  }
+  return [
+    offers.drives.includes('flash')
+      ? 'An image goes in as a CD-ROM drive (read-only) or a USB flash drive (read-only, unless you choose it writable: then the machine can change and delete what is on it).'
+      : 'An image goes in as a CD-ROM drive or a disk, both read-only.',
+    offers.drops_input && 'A switch between the two drops its keyboard and mouse for a moment.',
+    offers.boot.length ? '' : `A KVM cannot tell the machine to start from it: ${offers.restart ? 'restart it from here, or ' : ''}pick the KVM's drive in the machine's boot menu.`,
+    'One image at a time. Images stay on the KVM, readable to anyone with its own password: delete them after use.',
+  ].filter(Boolean).join(' ');
+}
+
+function bytesText(bytes) {
+  if (bytes == null) return '';
+  const units = ['bytes', 'kB', 'MB', 'GB', 'TB'];
+  let value = bytes;
+  let unit = 0;
+  while (value >= 1000 && unit < units.length - 1) {
+    value /= 1000;
+    unit += 1;
+  }
+  return `${unit ? value.toFixed(value < 10 ? 1 : 0) : value} ${units[unit]}`;
+}
+
+// What is in a machine's drive, in one line: the image, where it is, what it is in, how the machine starts, and who put it
+// there.
+function mountedText(mounted) {
+  if (!mounted) return 'Nothing is mounted.';
+  const at = mounted.at ? ` at ${new Date(mounted.at * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}` : '';
+  return [
+    mounted.where ? `${mounted.name} on ${mounted.where}` : mounted.name,
+    mounted.drive !== 'cd' && MEDIA_DRIVES_SAID[mounted.drive],
+    mounted.read_only ? 'read-only' : 'writable',
+    mounted.first === true && 'first in its boot order', mounted.first === false && 'not first in its boot order',
+    mounted.by && `mounted by ${mounted.by}${at}`,
+  ].filter(Boolean).join(' · ');
+}
+
+function mediaDialog(id) {
+  const tile = tiles.get(id);
+  if (!tile) return;
+  const { device } = tile;
+  openDialog(`Virtual media of ${device.name}`, body => {
+    const dialog = body.closest('dialog');
+    const mount = h('button', { type: 'button', class: 'primary', disabled: true }, icon('disc'), h('span', {}, 'Mount'));
+    const upload = h('button', { type: 'button', class: 'media-upload', title: 'Upload an image from this computer', disabled: true }, icon('upload'), h('span', {}, 'Upload...'));
+    const remove = h('button', { type: 'button', class: 'media-delete', title: 'Delete the image that is picked', disabled: true }, icon('trash'), h('span', {}, 'Delete'));
+    const unmount = h('button', { type: 'button', disabled: true }, icon('eject'), h('span', {}, 'Unmount'));
+    const file = h('input', { type: 'file', hidden: true, 'aria-label': 'Image to upload' });
+    const where = h('span', { class: 'muted' }, '');
+    const now = h('small', { class: 'media-now' }, 'Looking...');
+    const as = h('select', { 'aria-label': 'Mount as' }, MEDIA_AS.map(([value, label]) => h('option', { value }, label)));
+    const how = h('select', { 'aria-label': 'Start from it' }, MEDIA_BOOT_CHOICES.map(([value, label]) => h('option', { value }, label)));
+    const restart = h('input', { type: 'checkbox' });
+    const list = h('div', { class: 'lines media-list', role: 'radiogroup', 'aria-label': 'Images' }, h('p', { class: 'nothing' }, 'Looking for images...'));
+    const said = h('p', { class: 'media-said', role: 'status' });
+    const foot = h('p', { class: 'media-foot muted' });
+    let shown = null;  // the last answer: what can be mounted, and what is
+    let picked = null;  // the image picked, by its id
+    let turn = 0;  // a newer look outdates an answer still on its way
+    let carrying = null;  // the upload under way from this box: how to stop it
+    let again = null;  // the one look asked again after one that got no answer (the newest look's alone)
+    const tell = (text, bad = false) => {
+      said.textContent = text || '';
+      said.classList.toggle('error', Boolean(text) && bad);
+    };
+    const pickedImage = () => shown?.images.find(image => image.id === picked) || null;
+    // What can be pressed, by what is so. Nothing comes or goes: a control is enabled, or not.
+    const fit = () => {
+      const offers = shown?.offers;
+      for (const option of as.options) {
+        const [drive, writable] = option.value.split('_');
+        option.disabled = !(offers?.drives || []).includes(drive) || (writable === 'rw' && !(offers?.writable || []).includes(drive));
+      }
+      if (as.selectedOptions[0]?.disabled) as.value = [...as.options].find(option => !option.disabled)?.value || 'cd';
+      for (const option of how.options) option.disabled = option.value !== 'none' && !(offers?.boot || []).includes(option.value);
+      if (how.selectedOptions[0]?.disabled) how.value = 'none';
+      const boots = Boolean(offers?.boot?.length);
+      if (how.value === 'once') restart.checked = true;
+      if (how.value === 'none' && boots) restart.checked = false;
+      // (Where it can be told to start from it, a restart goes with "until unmounted"; where it cannot, a KVM, on its own.)
+      restart.disabled = !offers?.restart || (boots && how.value !== 'until_unmounted');
+      if (restart.disabled && !boots) restart.checked = false;
+      const image = pickedImage();
+      mount.disabled = !image || image.partial;
+      remove.disabled = !offers?.delete || !image || shown?.mounted?.image === image.id;
+      upload.disabled = !offers?.upload;
+      unmount.disabled = !shown?.mounted;
+    };
+    const load = async (retried = false) => {
+      const mine = ++turn;
+      clearTimeout(again);  // (a newer look owns the one asked again: the outside review's fourth round)
+      again = null;
+      let answer;
+      try {
+        answer = await api('GET', `api/v1/devices/${encodeURIComponent(device.id)}/media`);
+      } catch (ex) {
+        if (mine !== turn) return;
+        // No answer this time (a real server's controller missed one look a second after an unmount): what the last look
+        // showed stays, but for what is in its drive, which is not known now; it is asked again once, a little later.
+        if (shown) {
+          show({ ...shown, mounted: null });
+          now.textContent = now.title = 'Not known just now: its controller did not answer.';
+        } else {
+          now.textContent = now.title = '';
+          list.replaceChildren(h('p', { class: 'nothing' }, 'No images to show.'));
+        }
+        const missed = String(ex.message || 'No answer').replace(/[.\s]+$/, '');
+        tell(retried ? `${missed}.` : `${missed}. Asked again in a moment.`, true);
+        fit();
+        if (!retried) {  // (once: a look asked again that gets no answer either is not asked again)
+          again = setTimeout(() => {
+            again = null;
+            if (dialog.open && mine === turn) load(true);
+          }, MEDIA_LOOK_AGAIN);
+        }
+        return;
+      }
+      if (mine !== turn) return;
+      show(answer);
+      tell([
+        ...(answer.notes || []),
+        answer.unseen.length && `Not listed: ${answer.unseen.join('; ')}`,
+        answer.left_out && `${answer.left_out} ${answer.left_out === 1 ? 'entry was' : 'entries were'} left out: no image that qKVM passes on`,
+        answer.uploading && !carrying && `${answer.uploading.name} is being uploaded by ${answer.uploading.by}: ${bytesText(answer.uploading.sent)} of ${bytesText(answer.uploading.size)}`,
+      ].filter(Boolean).join('. '), answer.unseen.length > 0 || Boolean(answer.notes?.length));
+      fit();
+    };
+    // What a look showed: where the images are, what is in the drive, the images.
+    const show = answer => {
+      shown = answer;
+      const space = answer.space ? ` · ${bytesText(answer.space.free)} free of ${bytesText(answer.space.size)}` : '';
+      where.textContent = where.title = `${MEDIA_WHERE[answer.offers.where] || ''}${space}`;
+      foot.textContent = mediaFoot(answer.offers, answer.served_from);
+      now.textContent = now.title = mountedText(answer.mounted);
+      if (!answer.images.some(image => image.id === picked)) picked = null;
+      list.replaceChildren(...(answer.images.length ? answer.images.map(image => {
+        const radio = h('input', { type: 'radio', name: `media-${device.id}`, value: image.id, checked: image.id === picked });
+        radio.addEventListener('change', () => { picked = image.id; fit(); });
+        return check(radio, image.name, [
+          image.partial && 'an upload of it was cut off: only to delete', image.where, bytesText(image.size),
+          answer.mounted?.image === image.id && 'mounted now', image.sha256 && `uploaded from qKVM, SHA-256 ${image.sha256.slice(0, 16)}...`,
+        ].filter(Boolean).join(' · '));
+      }) : [h('p', { class: 'nothing' }, MEDIA_NONE[answer.offers.where] || 'No images here.')]));
+    };
+    // While something is out, the box holds still: nothing in it takes a click (its Close does).
+    const carry = async (what, note, send) => {
+      if (acting.has(device.id)) {
+        tell(`"${acting.get(device.id)}" is still under way on ${device.name}. Wait for its answer.`, true);
+        return;
+      }
+      acting.set(device.id, what);
+      body.inert = true;
+      tell(note);
+      // While it is out, its line spins and counts the seconds (a server's mount can take minutes): it is under way.
+      const began = Date.now();
+      said.classList.add('working');
+      const counting = setInterval(() => {
+        const seconds = Math.floor((Date.now() - began) / 1000);
+        if (seconds >= 1) said.dataset.waited = `${seconds} s`;
+      }, 500);
+      try {
+        const done = await send();
+        toast(`${device.name}: ${what} done${done.note ? `. ${done.note}` : ''}`, 'ok');
+        tell(done.said || done.note || `${what}: done.`);  // (said in the box too: a quick one is over before its spinner is seen)
+      } catch (ex) {
+        // The wall's own words where it answered (a controller that took a mount and does not show it, say: a real board
+        // did), as for Start into BIOS setup; "no answer" where nothing came back, or something went wrong inside it.
+        const answered = (ex.data?.message && ex.code !== 'internal') || !unanswered(ex);
+        tell(answered ? ex.message : `No answer to "${what}": it may have been done. Look at ${device.name} before trying again.`, true);
+      } finally {
+        clearInterval(counting);
+        said.classList.remove('working');
+        delete said.dataset.waited;
+        acting.delete(device.id);
+        body.inert = false;
+      }
+      lookAgainSoon();
+      const message = said.textContent;
+      const bad = said.classList.contains('error');
+      if (dialog.open) await load();
+      if (!said.textContent) tell(message, bad);  // (what the answer said stays, where the look has nothing to say)
+      else if (message && !bad && said.classList.contains('error')) tell(`${message} ${said.textContent}`, true);  // (and where it got no answer)
+    };
+    // An upload: the file as this browser reads it, carried through qKVM to the device as it comes. Its progress is the
+    // server's count of what went through, asked every second; closing the box stops it, and what came of it is taken off.
+    const send = async chosen => {
+      const controller = new AbortController();
+      carrying = controller;
+      const shownProgress = async () => {
+        try {
+          const { uploading } = await api('GET', `api/v1/devices/${encodeURIComponent(device.id)}/media/upload`);
+          if (carrying === controller && uploading?.name === chosen.name && uploading.size) {
+            tell(`Uploading ${chosen.name}: ${bytesText(uploading.sent)} of ${bytesText(uploading.size)} (${Math.floor((uploading.sent / uploading.size) * 100)} %)`);
+          }
+        } catch { /* asked again in a second */ }
+      };
+      const progress = setInterval(shownProgress, MEDIA_PROGRESS_EVERY);
+      try {
+        const query = `name=${encodeURIComponent(chosen.name)}&machine=${encodeURIComponent(device.name)}`;
+        let reply;
+        try {
+          reply = await fetch(`api/v1/devices/${encodeURIComponent(device.id)}/media/upload?${query}`, {
+            method: 'POST', cache: 'no-store', signal: controller.signal, body: chosen,
+            headers: { 'X-QKVM': '1', 'Content-Type': 'application/octet-stream' },
+          });
+        } catch (ex) {
+          if (controller.signal.aborted) throw new ApiError('The upload was stopped: the box was closed', 'disconnected', 0);
+          throw new ApiError('qKVM is not responding', 'network', 0);
+        }
+        let data = null;
+        try { data = await reply.json(); } catch { /* said below */ }
+        if (!reply.ok) throw new ApiError(data?.message || `Request failed (HTTP ${reply.status})`, data?.code || 'error', reply.status, data);
+        return { note: null, said: data?.sha256 ? `${chosen.name} is on the KVM, SHA-256 ${data.sha256}` : null };
+      } finally {
+        clearInterval(progress);
+        carrying = null;
+      }
+    };
+    // What the wall refuses before it reads a byte, said here by the last look, and nothing sent: refused there, its answer
+    // can be lost, the connection closed under a browser still sending. (The wall still refuses it where it comes.)
+    const refusedAtOnce = chosen => {
+      if (!chosen.size) return 'An empty file is no image.';
+      const there = shown?.images.find(image => image.name === chosen.name);
+      if (there?.partial) return `A part of an earlier upload of ${chosen.name} is on the KVM: delete it in the list first, or upload it under another name.`;
+      if (there) return `${chosen.name} is on the KVM's own storage already: delete it first, or upload it under another name.`;
+      const free = shown?.space?.free;
+      if (typeof free === 'number' && chosen.size > free) {
+        return `The KVM's own storage has ${bytesText(free)} free, and ${chosen.name} is ${bytesText(chosen.size)}: delete an image there first.`;
+      }
+      if (shown?.uploading) return `${shown.uploading.name} is being uploaded to ${device.name} at this moment, by ${shown.uploading.by}. Wait for it to finish.`;
+      return null;
+    };
+    dialog.addEventListener('close', () => carrying?.abort());
+    as.addEventListener('change', fit);
+    how.addEventListener('change', fit);
+    upload.addEventListener('click', () => { file.value = ''; file.click(); });
+    file.addEventListener('change', async () => {
+      const chosen = file.files?.[0];
+      if (!chosen) return;
+      if (chosen.size > MEDIA_MOST_UPLOAD) {
+        tell(`${chosen.name} is ${bytesText(chosen.size)}: an image carried through qKVM may be ${bytesText(MEDIA_MOST_UPLOAD)} at the most.`, true);
+        return;
+      }
+      const refused = refusedAtOnce(chosen);
+      if (refused) {
+        tell(refused, true);
+        return;
+      }
+      const yes = await confirmBox({
+        title: `Upload ${chosen.name}`,
+        message: `${chosen.name} (${bytesText(chosen.size)}) is carried through qKVM to the KVM's own storage of ${device.name} as this browser reads it, and kept nowhere on the way. Keep this box open until it is done: closing it stops the upload, and what came of it is taken off the KVM.`,
+        action: 'Upload',
+        danger: false,
+      });
+      if (!yes) return;
+      await carry(`Upload ${chosen.name}`, `Uploading ${chosen.name}...`, () => send(chosen));
+    });
+    remove.addEventListener('click', async () => {
+      const image = pickedImage();
+      if (!image) return;
+      const yes = await confirmBox({
+        title: `Delete ${image.name}`,
+        message: `${image.name} is deleted from the KVM's own storage of ${device.name}. It cannot be brought back from here.`,
+        action: 'Delete',
+      });
+      if (!yes) return;
+      await carry(`Delete ${image.name}`, 'Deleting...', () => api('POST', `api/v1/devices/${encodeURIComponent(device.id)}/media/delete`, { image: image.id, machine: device.name }, MEDIA_PATIENCE));
+    });
+    mount.addEventListener('click', async () => {
+      const image = pickedImage();
+      if (!image) return;
+      const offers = shown.offers;
+      const [drive, rw] = as.value.split('_');
+      const writable = rw === 'rw';
+      const boot = how.value;
+      const again = restart.checked;
+      const into = {
+        cd: 'in its CD-ROM drive, read-only',
+        flash: writable ? 'as a USB flash drive, writable: the machine can change and delete what is on it' : 'as a USB flash drive, read-only',
+        disk: 'as a disk, read-only',
+      }[drive];
+      const then = offers.boot.length ? {
+        none: 'and its boot order is left as it is.',
+        once: 'and is restarted now to start from it once: stopped at once (unsaved work on it is lost) and started, with its boot order as before after that.',
+        until_unmounted: again
+          ? 'and starts from it until it is unmounted: it is restarted now, stopped at once (unsaved work on it is lost) and started.'
+          : 'and starts from it at its next start, until it is unmounted.',
+      }[boot] : again
+        ? 'and is restarted now with its reset button (its power button where it is off): unsaved work on it is lost. Pick the KVM\'s drive in its boot menu.'
+        : 'and nothing else is done: pick the KVM\'s drive in its boot menu at its next start.';
+      const drops = offers.drops_input ? ' Its keyboard and mouse drop for a moment if this switches its drive between CD-ROM and disk.' : '';
+      // (A KVM's drive is Linux's USB gadget, whose CD-ROM drive reads no further than 256*60*75 sectors: kvm.MOST_CD.)
+      const other = offers.drives.includes('disk') ? 'a disk' : 'a USB flash drive';
+      const cut = drive === 'cd' && offers.where === 'device' && image.size > MEDIA_MOST_CD
+        ? ` Linux's USB gadget, which KVMs such as this one are built on, gives the machine only the first 2.36 GB of an image in a CD-ROM drive, so one this large may not be read whole. As ${other} it is (whether the machine starts from it there is the image's to say).`
+        : '';
+      const yes = await confirmBox({
+        title: `Mount ${image.name}`,
+        message: `${device.name} gets ${image.name}${image.where ? ` (on ${image.where})` : ''} ${into}, ${then}${drops}${cut}`,
+        action: again ? 'Mount and restart' : 'Mount',
+        danger: again || writable,
+      });
+      if (!yes) return;
+      await carry(`Mount ${image.name}`, again ? 'Mounting and restarting: as long as it takes to stop and to start...' : 'Mounting...',
+        () => api('POST', `api/v1/devices/${encodeURIComponent(device.id)}/media`, { image: image.id, machine: device.name, drive, writable, boot, restart: again }, MEDIA_PATIENCE));
+    });
+    unmount.addEventListener('click', async () => {
+      const mounted = shown?.mounted;
+      if (!mounted) return;
+      const drops = shown.offers.drops_input ? ' Its keyboard and mouse may drop for a moment.' : '';
+      const yes = await confirmBox({
+        title: `Unmount ${mounted.name}`,
+        message: `${mounted.name} is taken out of the drive of ${device.name}${mounted.first ? ', and its boot order put back where it was set from here' : ''}. A system running from it loses it.${drops}`,
+        action: 'Unmount',
+      });
+      if (!yes) return;
+      await carry(`Unmount ${mounted.name}`, 'Unmounting...',
+        () => api('POST', `api/v1/devices/${encodeURIComponent(device.id)}/media/unmount`, { image: mounted.image, machine: device.name }, MEDIA_PATIENCE));
+    });
+    body.append(
+      h('div', { class: 'media-head' },
+        h('div', { class: 'section-what' }, h('strong', {}, 'Images'), where),
+        h('div', { class: 'section-does' }, upload, remove, mount, file)),
+      h('div', { class: 'lines media-how' },
+        h('div', { class: 'setting' }, h('div', { class: 'what' }, h('strong', {}, 'In its drive'), now), h('div', { class: 'does' }, unmount)),
+        field('Mount as', as),
+        field('Start from it', how),
+        check(restart, 'Restart it now', 'At once: unsaved work on it is lost. One that is stopped is started.')),
+      list,
+      said,
+      foot);
+    fit();
+    load();
+  }, { size: 'media' });
 }
 
 // --- multi-port KVMs: one KVM, several computers, one of them on screen ----------------------------
@@ -4654,12 +5491,12 @@ function render(tile) {
     }
   }
   tile.el.dataset.state = state;
-  const screen = pictured(tile.device, tile.view, state);
+  const screen = pictured(tile.device, tile.view, state, tile.status);
   tile.el.classList.toggle('has-frame', Boolean(tile.view.hasFrame));
   tile.el.classList.toggle('has-panel', Boolean(tile.device.picture === false && !screen && state !== 'connecting' && fillPanel(tile.panel, tile.status)));
   tile.el.classList.toggle('pictured', screen);
   if (state !== 'online') fillVeil(tile.veil, state, veilContent(tile.device, tile.status, tile.view, state, message));
-  $('.meta', tile.el).textContent = [metaText(tile.status), screen ? stillNote(tile.view) : ''].filter(Boolean).join(' · ');
+  $('.meta', tile.el).textContent = [metaText(tile.status), viewNote(tile, tile.view, screen)].filter(Boolean).join(' · ');
   fillPorts(tile.ports, tile);
   if (state !== tile.state) {
     tile.state = state;
@@ -5200,6 +6037,7 @@ class LivePicture {
       canvas, box, line, decoder: null, codecString: '', pending: null, waiting: 0, behind: false, shown: null, shownCounter: 0,
       jpegNewest: null, painting: false, drawn: 0, dropped: 0, counter: 0, size: { w: 0, h: 0 }, rect: null,
       lastDrawnAt: 0, codec: '', failed: '', stopped: false, onDrawn: null,
+      scale: null, drawnAt: null,  // the enlarged view's size of the picture (a function, see `pictureAt`), and the one it was drawn at
     });
   }
 
@@ -5335,29 +6173,34 @@ class LivePicture {
     else if (!this.painting) this.paintJpeg(this.shown, this.shownCounter);
   }
 
+  // Fitted into the box, or at the enlarged view's scale of the picture's own pixels (`scale`, see `pictureAt`).
   draw(source, w, h, counter) {
     const { w: boxW, h: boxH } = pixelsOf(this.box);
     if (boxW < 2 || boxH < 2 || !w || !h) return false;
-    const rect = fitted(boxW, boxH, w, h);
+    const scale = this.scale?.() || 0;
+    const at = pictureAt(this.box, w, h, scale);
     const context = this.canvas.getContext('2d');
-    if (this.canvas.width !== boxW || this.canvas.height !== boxH || this.size.w !== w || this.size.h !== h) {
-      this.canvas.width = boxW;
-      this.canvas.height = boxH;
+    if (this.canvas.width !== at.width || this.canvas.height !== at.height || this.size.w !== w || this.size.h !== h || this.drawnAt !== scale) {
+      this.canvas.width = at.width;
+      this.canvas.height = at.height;
       context.fillStyle = '#000';
-      context.fillRect(0, 0, boxW, boxH);
+      context.fillRect(0, 0, at.width, at.height);
     }
+    sizeCanvas(this.canvas, at, scale);
     context.imageSmoothingQuality = 'high';
-    context.drawImage(source, rect.x, rect.y, rect.w, rect.h);
-    Object.assign(this, { rect: { ...rect, boxW, boxH }, size: { w, h }, counter, lastDrawnAt: performance.now(), failed: '' });
+    context.drawImage(source, at.x, at.y, at.w, at.h);
+    const rect = { x: at.x, y: at.y, w: at.w, h: at.h, boxW: at.width, boxH: at.height };
+    Object.assign(this, { rect, size: { w, h }, drawnAt: scale, counter, lastDrawnAt: performance.now(), failed: '' });
     this.drawn += 1;
     this.onDrawn?.();
     return true;
   }
 
-  // The place of a pointer event over the picture, as 0 to FARTHEST each way; null outside the picture.
+  // The place of a pointer event over the picture, as 0 to FARTHEST each way; null outside the picture. Measured against
+  // the canvas, which is the box (Fit) or the picture at its scale, wherever the view has it scrolled to.
   placeOf(event) {
     if (!this.rect) return null;
-    const bounds = this.box.getBoundingClientRect();
+    const bounds = this.canvas.getBoundingClientRect();
     if (!bounds.width || !bounds.height) return null;
     const px = (event.clientX - bounds.left) * (this.rect.boxW / bounds.width) - this.rect.x;
     const py = (event.clientY - bounds.top) * (this.rect.boxH / bounds.height) - this.rect.y;
@@ -5781,23 +6624,29 @@ function openFocus(id) {
     const canvas = $('#focus-canvas');
     const box = $('#focus-screen');
     const view = newView();
+    const chosen = scaleChosen(id);
     const feed = new Feed(
       canvas,
       box,
-      () => snapshotUrl(id, box, 0, true),  // the large view: a PC with Intel AMT holds a session for it, even while off
+      // The large view: a PC with Intel AMT holds a session for it, even while off. At a scale, the machine's whole picture.
+      () => snapshotUrl(id, box, 0, true, Boolean(focus?.scale)),
       () => (period ? Math.min(period, FOCUS_PERIOD) : 0),
       () => !document.hidden && showsScreen(tile.device, tile.status),
       result => { applyResult(view, result); renderFocus(); },
     );
-    // Show what the tile already has right away; fresher frames replace it as they arrive.
-    if (tile.view.hasFrame && tile.feed.blob) {
+    feed.scale = () => focus?.scale || 0;
+    // Show what the tile already has right away; fresher frames replace it as they arrive. (Not at a scale of the
+    // machine's pixels: the tile's picture is a smaller one, and the view would jump to the right size a moment later.)
+    if (tile.view.hasFrame && tile.feed.blob && !SCALES[chosen]) {
       feed.blob = tile.feed.blob;
       Object.assign(view, tile.view);
     } else {
       canvas.width = canvas.height = 1;  // clears the previous KVM's picture
+      canvas.style.width = canvas.style.height = '';  // ...and the size it was shown at
     }
     const opening = !focus;
-    focus = { id, feed, view };
+    focus = { id, feed, view, scale: SCALES[chosen] };
+    showScale(chosen, false);
     for (const menu of document.querySelectorAll('#focus .focus-popover')) menu.open = false;
     if (opening) {
       $('#focus-details').open = false;
@@ -5870,7 +6719,7 @@ function renderFocus() {
   $('#focus-bar').dataset.state = state;
   $('#focus .focus-title').dataset.state = state;
   $('#focus').dataset.state = state;
-  const screen = pictured(tile.device, focus.view, state);
+  const screen = pictured(tile.device, focus.view, state, status);
   $('#focus-screen').classList.toggle('has-frame', Boolean(focus.view.hasFrame));
   // (Boolean: a toggle given undefined flips the class at every render instead of setting it, and the panel blinked.)
   $('#focus').classList.toggle('has-panel', Boolean(tile.device.picture === false && (!screen || focus.health) && state !== 'connecting'
@@ -5881,7 +6730,8 @@ function renderFocus() {
   $('#focus-health').setAttribute('aria-pressed', String(Boolean(focus.health)));
   $('#focus-state').textContent = stateLabel(state, tile.status);
   if (state !== 'online') fillVeil($('#focus-veil'), state, veilContent(tile.device, tile.status, focus.view, state, message));
-  $('#focus-meta').textContent = [tile.device.host === tile.device.name ? '' : tile.device.host, metaText(tile.status), screen ? stillNote(focus.view) : ''].filter(Boolean).join(' · ');
+  $('#focus-meta').textContent = [tile.device.host === tile.device.name ? '' : tile.device.host, metaText(tile.status), viewNote(tile, focus.view, screen, true)].filter(Boolean).join(' · ');
+  $('#focus-scale-pick').hidden = !showsScreen(tile.device, tile.status);  // (the size of a picture: none in health only, nor on a server's panel)
   fillPorts($('#focus-ports'), tile);
   renderLive();
   renderControl();
@@ -5895,10 +6745,110 @@ function renderFocus() {
   if (became) startLive(focus.id);
 }
 
-// How much of the picture this view needs: its own width in screen pixels, and few pictures while nobody sees the tab.
+// How much of the picture this view needs: its own width in screen pixels (at a scale of the machine's own pixels, the
+// whole picture, as large as the machine has it), and few pictures while nobody sees the tab.
 function liveNeed() {
   const { w } = pixelsOf($('#focus-screen'));
-  return { maxW: Math.max(320, Math.min(16384, w || 1280)), maxFps: document.hidden ? HIDDEN_FPS : 60 };
+  return { maxW: focus?.scale ? WHOLE_WIDTH : Math.max(320, Math.min(WHOLE_WIDTH, w || 1280)), maxFps: document.hidden ? HIDDEN_FPS : 60 };
+}
+
+// --- the enlarged picture's size ------------------------------------------------------------------------------------
+// Fit (fitted into the view, the default), or a scale of the machine's own pixels: so many pixels of this screen to each of
+// the machine's (100 %: one to one, sharp, whatever the browser's zoom or the system's scaling). Chosen in the bar under
+// the picture, and kept by this browser for each machine, by its id (a wall screen's too). No key of its own: while
+// keyboard and mouse are held every key is the machine's, and one that worked only while they are not would surprise.
+const SCALES = { fit: 0, 50: 0.5, 75: 0.75, 100: 1, 125: 1.25, 140: 1.4, 200: 2 };
+
+function scaleChosen(id) {
+  const kept = prefs.get(`scale.${id}`, 'fit');
+  return Object.hasOwn(SCALES, kept) ? kept : 'fit';
+}
+
+// The view at the size chosen (`chosen`, a key of SCALES), drawn again at once where it changed (`redraw`).
+function showScale(chosen, redraw = true) {
+  if (!focus) return;
+  const scroller = $('#focus-scroll');
+  const before = focus.scale;
+  focus.scale = SCALES[chosen];
+  $('#focus-scale').value = chosen;
+  $('#focus-screen').classList.toggle('scaled', Boolean(focus.scale));
+  if (!redraw) {
+    scroller.scrollTo(0, 0);  // (another machine: from its top left corner)
+    return;
+  }
+  if (before === focus.scale) return;
+  // What is in the middle of the view stays there, as far as it can (kept once the canvas has its new size: `scaledToSize`).
+  focus.middle = scroller.scrollWidth > scroller.clientWidth || scroller.scrollHeight > scroller.clientHeight
+    ? [(scroller.scrollLeft + scroller.clientWidth / 2) / scroller.scrollWidth, (scroller.scrollTop + scroller.clientHeight / 2) / scroller.scrollHeight]
+    : [0.5, 0.5];
+  drawFocusAgain();
+  focus.live?.shape(liveNeed());
+}
+
+// The enlarged view's picture drawn again (its size changed, or the view's): the live one where it has one, else the still.
+function drawFocusAgain() {
+  if (!focus) return;
+  // (A live picture that came while the view had no size yet is drawn now, in place of the stills: a still screen sends
+  // no other.)
+  if (focus.liveShowing || focus.picture?.shown) focus.picture.again();
+  else focus.feed.paint().catch(() => {});
+}
+
+// The canvas has its size: whether the picture is larger than the view (it is dragged then, while nobody holds its keyboard
+// and mouse), and what was in the middle before a change of the size brought back there.
+function scaledToSize() {
+  const scroller = $('#focus-scroll');
+  const box = $('#focus-screen');
+  box.classList.toggle('pannable', Boolean(focus?.scale) && (scroller.scrollWidth > scroller.clientWidth + 1 || scroller.scrollHeight > scroller.clientHeight + 1));
+  const middle = focus?.middle;
+  if (!middle) return;
+  focus.middle = null;
+  scroller.scrollTo(middle[0] * scroller.scrollWidth - scroller.clientWidth / 2, middle[1] * scroller.scrollHeight - scroller.clientHeight / 2);
+}
+
+// A drag over a picture larger than the view moves it, while nobody here holds the machine's keyboard and mouse (while
+// they are held, the mouse is the machine's, and the scroll bars move the picture). The mouse's own: a finger scrolls the
+// view by itself.
+function setupPanning() {
+  const scroller = $('#focus-scroll');
+  const canvas = $('#focus-canvas');
+  const box = $('#focus-screen');
+  let drag = null;
+  const end = () => {
+    drag = null;
+    box.classList.remove('panning');
+  };
+  canvas.addEventListener('pointerdown', event => {
+    if (!focus?.scale || focus.control?.on || event.button !== 0 || event.pointerType !== 'mouse' || !box.classList.contains('pannable')) return;
+    event.preventDefault();
+    drag = { x: event.clientX, y: event.clientY, left: scroller.scrollLeft, top: scroller.scrollTop };
+    try { canvas.setPointerCapture(event.pointerId); } catch { /* a pointer that is gone already */ }
+    box.classList.add('panning');
+  });
+  canvas.addEventListener('pointermove', event => {
+    if (!drag) return;
+    if (focus?.control?.on) {
+      end();  // (keyboard and mouse taken meanwhile: the mouse is the machine's from here)
+      return;
+    }
+    scroller.scrollTo(drag.left - (event.clientX - drag.x), drag.top - (event.clientY - drag.y));
+  });
+  for (const name of ['pointerup', 'pointercancel', 'lostpointercapture']) canvas.addEventListener(name, end);
+  new ResizeObserver(scaledToSize).observe(canvas);
+  new ResizeObserver(scaledToSize).observe(scroller);
+  $('#focus-scale').addEventListener('change', event => {
+    if (!focus) return;
+    prefs.set(`scale.${focus.id}`, event.target.value);
+    showScale(event.target.value);
+    keysToTheMachine();
+  });
+  // (Esc on the open list: it closes, and the keys are the machine's again where they were.)
+  $('#focus-scale').addEventListener('keydown', event => { if (event.key === 'Escape') keysToTheMachine(); });
+}
+
+// While keyboard and mouse are held, the keys go to the machine again once the bar's control has done its part.
+function keysToTheMachine() {
+  if (focus?.control?.on) $('#focus-screen').focus({ preventScroll: true });
 }
 
 // The live line for the machine that is enlarged, where the wall's server has one.
@@ -5928,6 +6878,7 @@ function startLive(id) {
     closed: (code, message) => { if (mine()) liveEnded(code, message); },
   });
   picture = new LivePicture(canvas, box, line);
+  picture.scale = () => (mine() ? focus.scale : 0);
   picture.onDrawn = () => {
     if (!mine()) return;
     if (!focus.liveShowing) {
@@ -6055,6 +7006,9 @@ function renderLive() {
   } else if (focus.endedBy) {
     text = 'No live picture: stills';
     title = focus.endedBy.message;
+  } else if (tile && !canDo(tile, 'live') && amtView(tile) === 'health') {
+    text = 'No live picture: health only';  // (and no stills either: no KVM session is opened)
+    title = tile.status?.server?.no_screen || '';
   } else if (tile && !canDo(tile, 'live')) {
     text = 'No live picture: stills';
     title = 'The server has no live picture of this machine';
@@ -6456,10 +7410,11 @@ function doneSection(id, done) {
     const action = entry.name || ACTION_NAMES[entry.action] || entry.action;
     const what = entry.event === 'action' ? [action, entry.keys && keysLabel(entry.keys)].filter(Boolean).join(' ')
       : entry.event === 'action_failed' ? `${action} failed`
-        : entry.event === 'alert' ? `Alert: ${LABELS[entry.was] || entry.was} to ${LABELS[entry.state] || entry.state}`
+        : entry.event === 'alert' ? `Alert: ${alertWords(entry)}`
           : eventLabel(entry);
     list.append(h('li', { title: new Date(entry.time * 1000).toLocaleString() },
-      h('span', { class: 'done-when', dataset: { time: entry.time } }, ago(Math.max(0, Date.now() / 1000 - entry.time))), ' ', h('b', {}, entry.user || 'qKVM'), ` ${what}`));
+      h('span', { class: 'done-when', dataset: { time: entry.time } }, ago(Math.max(0, Date.now() / 1000 - entry.time))), ' ', h('b', {}, entry.user || 'qKVM'), ` ${what}`,
+      entry.picture && ' ', pictureLink(entry)));
   }
   const all = h('button', { type: 'button', class: 'link', onclick: () => { activityFor = id; settingsDialog('activity'); } }, 'All of it');
   return h('section', { class: 'history-done', 'aria-label': 'Done to this machine' }, h('p', { class: 'done-head' }, h('b', {}, 'Done to it'), all), list);
@@ -7200,6 +8155,8 @@ function decorate() {
   $('#focus-fullscreen').prepend(icon('maximize', 'i-enter'), icon('minimize', 'i-exit'));
   $('#focus-open').addEventListener('click', event => openSignedIn(event, focus && tiles.get(focus.id)));
   $('#focus-close').append(icon('x'));
+  $('#focus-scale-pick').prepend(icon('zoomIn'));
+  $('#focus-scale-pick').append(icon('chevronDown', 'chevron'));
 }
 
 // A small panel that drops from a button in the top bar: for what is set now and then, and need not stand in
@@ -7303,12 +8260,10 @@ async function boot() {
   watchPixels($('#focus-screen'));
   $('#focus-screen').addEventListener('pixelsize', () => {
     if (!focus) return;
-    // (A live picture that came while the view had no size yet is drawn now, in place of the stills: a still
-    // screen sends no other.)
-    if (focus.liveShowing || focus.picture?.shown) focus.picture.again();
-    else focus.feed.paint().catch(() => {});
+    drawFocusAgain();
     focus.live?.shape(liveNeed());
   });
+  setupPanning();
   // A tab nobody sees is sent few pictures; a page that is left ends its line, letting go of what it held first.
   document.addEventListener('visibilitychange', () => focus?.live?.shape(liveNeed()));
   window.addEventListener('pagehide', () => focus?.live?.close());

@@ -28,6 +28,7 @@ from typing import Any
 from urllib.parse import parse_qs
 from uuid import uuid4
 
+import httpx
 import uvicorn
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, Response, StreamingResponse
@@ -230,6 +231,55 @@ class BmcState:
     # Every request to an address of AMI's web page (/api/...), whatever the layout, as "POST /api/session". bmcweb (layout
     # "openbmc") has none of them, and answers every request that is not signed in with 401 before it looks for the path.
     web_asked: list[str] = field(default_factory=list)
+    # Virtual media (0.3.0, A4), as the standard's VirtualMedia (v1.7) has it. None: the controller has none (and says
+    # nothing of any). "standard": a CD-ROM drive (CD1) beside a USB one under its manager (or, `media_under` "system", under
+    # the computer, as newer controllers keep them), taking an image by HTTP or HTTPS and answering 204. "ami": as AMI's
+    # MegaRAC (Lenovo's System Manager documents it): its CD-ROM drive shows only once its remote media is switched on
+    # (Oem AMIVirtualMedia.EnableRMedia), it takes an image over NFS, CIFS or HTTPS alone, with a user and a password, and
+    # answers 202 with a task. Either reads the image from the address it is given, as a real one does, before it shows it
+    # in its drive: its head, then a piece of its start and of its end (`media_read`); not where that could not be had.
+    virtual_media: str | None = None
+    media_under: str = "manager"
+    rmedia: bool = False  # (ami) its remote media is switched on
+    rmedia_advertised: bool = True  # (ami) its manager names the action that switches it on (False: only the place AMI documents)
+    rmedia_shows_after: float = 0.0  # (ami) seconds after the switch before the drive shows
+    # (ami) its manager links its virtual media only once its remote media is on; and its drives are not listed until this
+    # time.monotonic() (as on test server .23 while its media service came up: "can no longer take incoming requests")
+    media_linked_once_on: bool = False
+    media_unlinked_401: bool = False  # (ami) its documented place answers 401 while it links none (a guess there)
+    # (ami) as a real AMI board showed it before the release of 0.3.0: its manager never links its virtual media, its CD1
+    # is the standard's kind and says no protocols, refuses HTTPS and takes HTTP; its place answers 401 while it is off
+    ami_standard_drive: bool = False
+    # (ami, with ami_standard_drive) as a second real AMI board (2026-11-04): its CD1, the standard's kind, has an Oem part of
+    # AMI's and lists no protocols; its InsertMedia names a description (ActionInfo) listing CIFS, NFS, OEM, HTTP and HTTPS;
+    # it refuses every HTTPS address as "of a different format" and takes HTTP
+    ami_described: bool = False
+    # (ami) as a real ASRock Rack board (AMI, 2026-11-04): its switch of remote media is answered 200, "initiated", and its
+    # remote media stays off (its settings keep it off without an image share of their own); its manager says RMediaStatus
+    rmedia_stays_off: bool = False
+    # The port the controller reads an image from, whatever port its address names (None: the one named). The real AMI
+    # board above read from port 80.
+    media_reads_port: int | None = None
+    # (ami) a mount's task ends in Exception with these words, its TaskStatus "OK", and its 202 names a task monitor in
+    # Location (202 while it runs, the failed action's own 403 after): as the real AMI board answered an HTTP mount
+    media_task_fails: str | None = None
+    monitors: dict[str, str] = field(default_factory=dict)  # a task monitor's id -> its task's
+    drives_hidden_until: float = 0.0
+    media_inserted: bool = False
+    media_image: str = ""  # the address it was given, as it shows it (`media_shows_url`)
+    media_name: str = ""
+    media_shows_url: bool = True  # False: it shows the image's name alone, not its address
+    media_said: list[dict[str, Any]] = field(default_factory=list)  # every InsertMedia as it came
+    media_read: list[tuple[int, str, bytes]] = field(default_factory=list)  # what it read of an image: (status, range, bytes)
+    media_fetch: bool = True  # False: it takes an image without reading it first
+    media_reads_from: str | None = None  # the address it reads an image from, where not the one it answers at (127.0.0.2, say)
+    media_insert_status: int | None = None  # a mount is answered with this (an error of its own, a refusal), and nothing done
+    media_echo: bool = False  # a mount is refused in words that say back what it was sent (its address, user and password)
+    media_eject_status: int | None = None  # ...and an unmount
+    media_ignored: bool = False  # a mount answered 204 and nothing in its drive after (a real AMI board, over HTTP)
+    media_ejects: int = 0
+    rmedia_switches: int = 0
+    booted: list[str] = field(default_factory=list)  # what the server started from at each start: "cd <name>", or "disk"
 
 
 def make_fake_bmc(state: BmcState) -> FastAPI:
@@ -363,6 +413,7 @@ def make_fake_bmc(state: BmcState) -> FastAPI:
             "Status": {"Health": "OK", "HealthRollup": state.health, "State": "Enabled"},
             "ProcessorSummary": {"Count": 2, "Model": PROCESSOR},
             "MemorySummary": {"TotalSystemMemoryGiB": 256},
+            **({"VirtualMedia": {"@odata.id": f"{v1}/Systems/{name}/VirtualMedia"}} if state.virtual_media and state.media_under == "system" else {}),
             "Boot": {
                 "BootSourceOverrideEnabled": state.boot_override[0],
                 "BootSourceOverrideTarget": state.boot_override[1],
@@ -476,6 +527,10 @@ def make_fake_bmc(state: BmcState) -> FastAPI:
             return Response(status_code=202)  # accepted, and that is all that comes of it
         becomes = "Off" if kind in ("ForceOff", "GracefulShutdown") else "On"
         boots = kind != "On" or state.power != "On"  # ("On" to a server that is on is nothing to do: no boot, as a real controller takes it)
+        if becomes == "On" and boots:
+            # (Started from its virtual CD-ROM drive where the override says so and an image is in it; else from its disk.)
+            from_cd = state.boot_override[1] == "Cd" and state.boot_override[0] in ("Once", "Continuous") and state.media_inserted
+            state.booted.append(f"cd {state.media_name}" if from_cd else "disk")
         if becomes == "On" and boots and state.boot_override[0] == "Once":
             state.boot_override = ("Disabled", "None")  # a one-time boot override clears when it is booted
         if state.busy_after_reset:
@@ -490,9 +545,221 @@ def make_fake_bmc(state: BmcState) -> FastAPI:
             await asyncio.sleep(state.reset_answer_takes)  # (done, and answered late)
         return Response(status_code=204)
 
+    # --- virtual media (0.3.0, A4) ---------------------------------------------------------------------------------
+
+    def media_base() -> str:
+        owner, name = ("Systems", names()[0]) if state.media_under == "system" else ("Managers", names()[2])
+        return f"{v1}/{owner}/{name}/VirtualMedia"
+
+    def drives() -> list[str]:
+        """Its virtual drives, by id: AMI's CD-ROM drive only once its remote media is on (its hard disk one beside it)."""
+        if state.virtual_media == "ami":
+            return ["CD1", "HD1"] if state.rmedia and time.monotonic() >= state.drives_hidden_until else []
+        return ["USB1", "CD1"] if state.virtual_media else []
+
+    def is_media(owner: str, name: str) -> bool:
+        return state.virtual_media is not None and f"{v1}/{owner}/{name}/VirtualMedia" == media_base()
+
+    @app.get(v1 + "/{owner}/{name}/VirtualMedia")
+    async def media_collection(owner: str, name: str) -> Response:
+        if not is_media(owner, name):
+            return not_there()
+        if ((state.media_unlinked_401 and state.media_linked_once_on) or state.ami_standard_drive) and not state.rmedia:
+            return JSONResponse({"error": {"code": "Base.1.5.AccessDenied", "message": "denied access"}}, status_code=401)
+        members = [{"@odata.id": f"{media_base()}/{drive}"} for drive in drives()]
+        return JSONResponse({"@odata.id": media_base(), "Members": members, "Members@odata.count": len(members)})
+
+    @app.get(v1 + "/{owner}/{name}/VirtualMedia/{drive}")
+    async def media_drive(owner: str, name: str, drive: str) -> Response:
+        if not is_media(owner, name) or drive not in drives():
+            return not_there()
+        where = f"{media_base()}/{drive}"
+        cd = drive == "CD1"
+        inserted = cd and state.media_inserted
+        protocols = ["NFS", "CIFS", "HTTPS"] if state.virtual_media == "ami" else ["HTTP", "HTTPS"]
+        ami = state.virtual_media == "ami" and not state.ami_standard_drive
+        said_protocols = {} if state.ami_standard_drive else {"TransferProtocolType@Redfish.AllowableValues": protocols}
+        return JSONResponse({
+            "@odata.id": where, "@odata.type": "#AMIVirtualMedia.v1_0_0.AMIVirtualMedia" if ami else "#VirtualMedia.v1_3_2.VirtualMedia" if state.ami_standard_drive else "#VirtualMedia.v1_6_0.VirtualMedia",
+            **({"Oem": {"Ami": {"RedirectionStatus": "Started" if inserted else "Stopped", "BoostMode": False}}} if ami or state.ami_described else {}),
+            "Id": drive, "Name": "Virtual CD" if cd else "Virtual removable disk",
+            "MediaTypes": ["CD", "DVD"] if cd else ["USBStick"],
+            "Inserted": inserted, "WriteProtected": True, "TransferMethod": "Stream",
+            "ConnectedVia": "URI" if inserted else "NotConnected",
+            "Image": (state.media_image if state.media_shows_url else None) if inserted else None,
+            "ImageName": state.media_name if inserted else None,
+            "Actions": {
+                "#VirtualMedia.InsertMedia": {
+                    "target": f"{where}/Actions/VirtualMedia.InsertMedia", **said_protocols,
+                    **({"@Redfish.ActionInfo": f"{where}/InsertMediaActionInfo"} if state.ami_described else {}),
+                },
+                "#VirtualMedia.EjectMedia": {"target": f"{where}/Actions/VirtualMedia.EjectMedia"},
+            },
+        })  # fmt: skip
+
+    @app.get(v1 + "/{owner}/{name}/VirtualMedia/{drive}/InsertMediaActionInfo")
+    async def insert_media_described(owner: str, name: str, drive: str) -> Response:
+        if not is_media(owner, name) or drive not in drives() or not state.ami_described:
+            return not_there()
+        return JSONResponse({
+            "@odata.id": f"{media_base()}/{drive}/InsertMediaActionInfo", "Id": "InsertMedia", "Name": "InsertMedia",
+            "Parameters": [
+                {"DataType": "String", "Name": "Image", "Required": True},
+                {"AllowableValues": ["CIFS", "NFS", "OEM", "HTTP", "HTTPS"], "DataType": "String", "Name": "TransferProtocolType", "Required": True},
+                {"DataType": "String", "Name": "UserName", "Required": False}, {"DataType": "String", "Name": "Password", "Required": False},
+            ],
+        })  # fmt: skip
+
+    async def read_back(url: str, user: Any, password: Any) -> str | None:
+        """Read the image at `url` as a controller does before it shows it (it checks no certificate): None where it could;
+        else what went wrong."""
+        if state.media_reads_port is not None:
+            parts = httpx.URL(url)
+            url = str(parts.copy_with(port=state.media_reads_port))
+        auth = httpx.BasicAuth(user, password) if isinstance(user, str) and isinstance(password, str) else None
+        transport = httpx.AsyncHTTPTransport(local_address=state.media_reads_from, verify=False) if state.media_reads_from else None
+        try:
+            async with httpx.AsyncClient(verify=False, timeout=10, auth=auth, transport=transport) as asker:
+                head = await asker.head(url)
+                if head.status_code != 200:
+                    return f"the image could not be read (HTTP {head.status_code})"
+                size = int(head.headers["content-length"])
+                for asked in ("bytes=0-2047", f"bytes={max(0, size - 2048)}-"):
+                    got = await asker.get(url, headers={"Range": asked})
+                    state.media_read.append((got.status_code, asked, got.content))
+                    if got.status_code != 206:
+                        return f"the image could not be read (HTTP {got.status_code})"
+        except httpx.HTTPError as ex:
+            return f"the image could not be read ({type(ex).__name__})"
+        return None
+
+    def taken(url: str) -> None:
+        state.media_inserted, state.media_image = True, url
+        state.media_name = url.rstrip("/").rsplit("/", 1)[-1]
+
+    @app.post(v1 + "/{owner}/{name}/VirtualMedia/{drive}/Actions/VirtualMedia.InsertMedia")
+    async def insert_media(owner: str, name: str, drive: str, request: Request) -> Response:
+        if not is_media(owner, name) or drive not in drives():
+            return not_there()
+        body = await request.json()
+        state.media_said.append(body)
+        if state.media_echo:
+            echo = f"The image could not be read at {body.get('Image')} as {body.get('UserName')} with {body.get('Password')}"
+            return JSONResponse({"error": {"@Message.ExtendedInfo": [{"Message": echo}]}}, status_code=400)
+        if state.media_insert_status is not None:
+            return JSONResponse({"error": {"message": "The media could not be inserted"}}, status_code=state.media_insert_status)
+        url, kind = body.get("Image"), body.get("TransferProtocolType")
+        bad = None
+        if drive != "CD1":
+            bad = "Only CD MediaType is supported in Redfish"
+        elif not isinstance(url, str) or not url:
+            bad = "Image is required"
+        elif state.ami_described and kind == "HTTPS":
+            bad = f"The value '{url}' for the parameter Image in the action is of a different format than the parameter can accept."
+        elif state.ami_standard_drive and kind != "HTTP":
+            bad = f"The value {kind} for the property TransferProtocolType is not in the list of acceptable values."
+        elif state.virtual_media == "ami" and not state.ami_standard_drive and kind not in ("NFS", "CIFS", "HTTPS"):
+            bad = f"TransferProtocolType {kind} is not supported"
+        elif state.virtual_media == "ami" and not state.ami_standard_drive and kind == "HTTPS" and not (body.get("UserName") and body.get("Password")):
+            bad = "UserName and Password are required for HTTPS"
+        elif state.virtual_media != "ami" and kind is not None and kind not in ("HTTP", "HTTPS"):
+            bad = f"TransferProtocolType {kind} is not supported"
+        elif state.media_inserted:
+            bad = "The media is already redirected"
+        if bad is not None:
+            return JSONResponse({"error": {"@Message.ExtendedInfo": [{"Message": bad}]}}, status_code=400)
+        assert isinstance(url, str)
+        if state.media_ignored:
+            return Response(status_code=204)
+        if state.virtual_media == "ami":
+            at = str(len(state.tasks) + 1)
+            state.tasks[at] = {"Id": at, "Name": "Mount", "TaskState": "Running", "TaskStatus": "OK", "Messages": []}
+
+            if state.media_task_fails is not None:
+                said = state.media_task_fails
+                state.tasks[at] = {"Id": at, "Name": "InsertMedia Action", "TaskState": "Running", "TaskStatus": "OK", "Messages": []}
+
+                async def refusing() -> None:
+                    await asyncio.sleep(0.3)
+                    state.tasks[at] = {
+                        "Id": at, "Name": "InsertMedia Action", "TaskState": "Exception", "TaskStatus": "OK",
+                        "Messages": [{"Message": said, "MessageId": "SyncAgent.1.0.InsertMediaError", "Severity": "Critical"}],
+                    }  # fmt: skip
+
+                asyncio.get_running_loop().create_task(refusing())
+                state.monitors[at] = at
+                return JSONResponse({"@odata.id": f"{v1}/TaskService/Tasks/{at}", "Id": at, "TaskState": "New"}, status_code=202,
+                                    headers={"Location": f"{v1}/TaskService/TaskMonitors/{at}"})
+
+            async def mounting() -> None:
+                wrong = await read_back(url, body.get("UserName"), body.get("Password")) if state.media_fetch else None
+                if wrong is None:
+                    taken(url)
+                state.tasks[at] = {
+                    "Id": at, "Name": "Mount", "TaskState": "Exception" if wrong else "Completed", "TaskStatus": "Critical" if wrong else "OK",
+                    "Messages": [{"Message": wrong}] if wrong else [],
+                }  # fmt: skip
+
+            asyncio.get_running_loop().create_task(mounting())
+            where = f"{v1}/TaskService/Tasks/{at}"
+            return JSONResponse({"@odata.id": where, "Id": at, "TaskState": "New"}, status_code=202, headers={"Location": where})
+        wrong = await read_back(url, body.get("UserName"), body.get("Password")) if state.media_fetch else None
+        if wrong is not None:
+            return JSONResponse({"error": {"@Message.ExtendedInfo": [{"Message": wrong}]}}, status_code=400)
+        taken(url)
+        return Response(status_code=204)
+
+    @app.post(v1 + "/{owner}/{name}/VirtualMedia/{drive}/Actions/VirtualMedia.EjectMedia")
+    async def eject_media(owner: str, name: str, drive: str) -> Response:
+        if not is_media(owner, name) or drive not in drives():
+            return not_there()
+        state.media_ejects += 1
+        if state.media_eject_status is not None:
+            return JSONResponse({"error": {"message": "The media could not be ejected"}}, status_code=state.media_eject_status)
+        state.media_inserted, state.media_image, state.media_name = False, "", ""
+        if state.virtual_media == "ami":
+            at = str(len(state.tasks) + 1)
+            state.tasks[at] = {"Id": at, "Name": "Eject", "TaskState": "Completed", "TaskStatus": "OK", "Messages": []}
+            where = f"{v1}/TaskService/Tasks/{at}"
+            return JSONResponse({"@odata.id": where, "Id": at, "TaskState": "New"}, status_code=202, headers={"Location": where})
+        return Response(status_code=204)
+
+    @app.post(v1 + "/Managers/{name}/Actions/Oem/AMIVirtualMedia.EnableRMedia")
+    async def enable_remote_media(name: str, request: Request) -> Response:
+        if name != names()[2] or state.virtual_media != "ami":
+            return not_there()
+        if (await request.json()).get("RMediaState") != "Enable":
+            return JSONResponse({"error": {"message": "RMediaState is Enable or Disable"}}, status_code=400)
+        if state.rmedia_stays_off:
+            state.rmedia_switches += 1
+            said = "EnableRMedia action has been initiated successfully.Please allow upto 4-5 secs and verify the value of RMediaStatus OEM property"
+            return JSONResponse({"error": {"@Message.ExtendedInfo": [{"Message": said, "Severity": "OK"}], "code": "Ami.1.0.DelayInActionCompletion", "message": said}})
+        if state.rmedia:  # (as test server .23 answered a second switch)
+            return JSONResponse({"error": {"code": "Base.1.5.GeneralError", "message": "The operation failed because RMediaState is already enabled and can no longer take incoming requests."}}, status_code=400)
+        state.rmedia_switches += 1
+
+        async def switched() -> None:
+            await asyncio.sleep(state.rmedia_shows_after)  # (answered at once; the drives show a few seconds later)
+            state.rmedia = True
+
+        asyncio.get_running_loop().create_task(switched())
+        return Response(status_code=204)
+
     @app.get(v1 + "/TaskService/Tasks/{at}")
     async def task(at: str) -> Response:
         return JSONResponse(state.tasks[at]) if at in state.tasks else Response(status_code=404)
+
+    @app.get(v1 + "/TaskService/TaskMonitors/{at}")
+    async def task_monitor(at: str) -> Response:
+        """A task monitor (DMTF): 202 while its task runs; once it ended, the action's own answer (here its refusal, 403)."""
+        task = state.tasks.get(state.monitors.get(at, ""))
+        if task is None:
+            return Response(status_code=404)
+        if task["TaskState"] in ("New", "Running"):
+            return JSONResponse(task, status_code=202)
+        if task["TaskState"] == "Exception":
+            return JSONResponse({"error": {"code": "Base.1.5.GeneralError", "message": task["Messages"][0]["Message"]}}, status_code=403)
+        return Response(status_code=204)
 
     @app.get(v1 + "/Chassis")
     async def chassis_list() -> dict[str, Any]:
@@ -638,10 +905,20 @@ def make_fake_bmc(state: BmcState) -> FastAPI:
                 **({"GraphicalConsole": {"ServiceEnabled": True, "MaxConcurrentSessions": 4, "ConnectTypesSupported": ["KVMIP"]}} if state.graphical_console else {}),
                 "Actions": {"#Manager.Reset": {"target": f"{where}/Actions/Manager.Reset", "@Redfish.ActionInfo": f"{where}/ResetActionInfo"}},
             })  # fmt: skip
+        media: dict[str, Any] = {}
+        if state.virtual_media and state.media_under == "manager" and (state.rmedia or not state.media_linked_once_on) and not state.ami_standard_drive:
+            media["VirtualMedia"] = {"@odata.id": f"{where}/VirtualMedia"}
+        oem: dict[str, Any] = {}
+        if state.virtual_media == "ami" and state.rmedia_advertised:
+            oem["#AMIVirtualMedia.EnableRMedia"] = {"target": f"{where}/Actions/Oem/AMIVirtualMedia.EnableRMedia", "RMediaState@Redfish.AllowableValues": ["Enable", "Disable"]}
         return JSONResponse({
             **({"IKVM": {"@odata.id": f"{where}/IKVM"}} if state.console is not None else {}),
-            "Id": name, "ManagerType": "BMC", "FirmwareVersion": state.firmware, **hosts,
-            "Actions": {"#Manager.Reset": {"target": f"{where}/Actions/Manager.Reset", "ResetType@Redfish.AllowableValues": ["ForceRestart"]}},
+            "Id": name, "ManagerType": "BMC", "FirmwareVersion": state.firmware, **hosts, **media,
+            **({"Oem": {"Ami": {"VirtualMedia": {"CDInstances": 1, "RMediaStatus": "Enabled" if state.rmedia else "Disabled"}}}} if state.virtual_media == "ami" else {}),
+            "Actions": {
+                "#Manager.Reset": {"target": f"{where}/Actions/Manager.Reset", "ResetType@Redfish.AllowableValues": ["ForceRestart"]},
+                **({"Oem": oem} if oem else {}),
+            },
         })  # fmt: skip
 
     def firmware_images() -> list[tuple[str, str, str, object]]:

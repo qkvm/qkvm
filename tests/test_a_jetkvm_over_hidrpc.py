@@ -1570,6 +1570,57 @@ def test_p1_a_jetkvm_deaf_to_key_frame_requests_is_not_said_to_have_stopped_send
 
     run(jet, test)
 
+
+def test_a_jetkvm_deaf_to_key_frame_requests_is_made_anew_less_and_less_often(monkeypatch: pytest.MonkeyPatch) -> None:
+    # (0.3.0, section 5.) On a computer too slow for its video, decoding fell behind again on every new connection, and the
+    # JetKVM deaf to the requests was made anew every FRAME_STALE for as long as it was watched: its keys let go of, a
+    # connection opened, every five seconds. Each time in a row it waits twice as long before.
+    from aiortc import rtcrtpsender
+    from aiortc.codecs import h264
+
+    from qkvm import video
+
+    monkeypatch.setattr(rtcrtpsender.RTCRtpSender, "_send_keyframe", lambda self: None)
+    monkeypatch.setattr(h264.H264Encoder, "target_bitrate", property(lambda self: h264.DEFAULT_BITRATE, lambda self, value: None))
+    monkeypatch.setattr(jetkvm, "FRAME_STALE", 0.5)
+    slow = [False]
+    real_decode = video.H264Decoder.decode
+
+    def decode(self: Any, encoded: Any) -> Any:
+        if slow[0]:
+            time.sleep(0.3)
+        return real_decode(self, encoded)
+
+    monkeypatch.setattr(video.H264Decoder, "decode", decode)
+    stalls: list[float] = []  # how long each connection had no picture before it was made anew for that
+    real_anew = jetkvm.JetKvmDevice._make_anew
+
+    def anew(self: jetkvm.JetKvmDevice, session: Any, why: str) -> None:
+        if "key frame" in why and session.anew is None:
+            stalls.append(time.monotonic() - session.frame_at)
+        real_anew(self, session, why)
+
+    monkeypatch.setattr(jetkvm.JetKvmDevice, "_make_anew", anew)
+    jet = FakeJetKvm(JetState(width=640, height=360)).start()
+
+    async def test(wall: jetkvm.JetKvmDevice) -> None:
+        held = await wall.input_ready()
+        assert isinstance(held, jetkvm._Session)
+        until = time.monotonic() + 20
+        while held.frame is None:
+            assert time.monotonic() < until and not held.done.is_set(), "no first picture"
+            await asyncio.sleep(0.05)
+        slow[0] = True
+        until = time.monotonic() + 40
+        while len(stalls) < 3:
+            assert time.monotonic() < until, stalls
+            with contextlib.suppress(kvm.KvmError):
+                await wall.input_ready()  # (watched: connected again after each)
+            await asyncio.sleep(0.1)
+
+    run(jet, test)
+    assert stalls[1] >= 1.0 and stalls[2] >= 2.0, stalls  # (half a second, one, two: each twice the one before)
+
 @pytest.mark.parametrize("end", ["an oversized message", "the decoder failed"])
 def test_r16_on_the_other_ends_the_wall_decides_what_is_down_is_let_go_of_at_once(end: str) -> None:
     # The JetKVM/Proxmox review (R16, a LOW; review-jet2\probes\probe_r16_other_ends_the_wall_decides.py): `_make_anew` wakes

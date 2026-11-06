@@ -57,7 +57,9 @@ def a_release(version: str, starts: bool = True) -> bytes:
             elif name == "qkvm/update.py":
                 data = with_key(data, TRUSTED)  # (the version after this one trusts the same key: it installs the next)
             elif name == "qkvm/cli.py" and not starts:
-                data = b'raise RuntimeError("this version does not start")\n'
+                # It loads (the trial before it is named loads it: one that does not is not named at all, test_libraries), and
+                # fails at its start, when its main is run.
+                data += b'\n\ndef main(*args, **kwargs):\n    raise RuntimeError("this version does not start")\n'
             archive.writestr(name, data)
         archive.writestr(f"qkvm-{version}.dist-info/METADATA", f"Metadata-Version: 2.1\nName: qkvm\nVersion: {version}\nRequires-Python: >=3.11\nRequires-Dist: fastapi>=0.110\n")
     return buffer.getvalue()

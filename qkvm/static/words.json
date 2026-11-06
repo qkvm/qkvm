@@ -50,6 +50,7 @@
     "totp_required": [403],
     "no_console": [404],
     "no_live": [404],
+    "no_virtual_media": [404],
     "no_media": [404],
     "no_picture": [404],
     "not_found": [404],
@@ -112,6 +113,7 @@
     "no_sign_in": [503],
     "no_stream": [503],
     "no_certificate": [507],
+    "no_space": [507],
     "not_saved": [507]
   },
   "kinds": {
@@ -139,6 +141,7 @@
     "console": "Console, signed in",
     "live": "Live picture",
     "control": "Keyboard and mouse",
-    "bios_setup": "Start into BIOS setup"
+    "bios_setup": "Start into BIOS setup",
+    "media": "Virtual media"
   }
 }

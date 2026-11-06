@@ -53,8 +53,8 @@ def pressed_rows(client: Any, device: str) -> list[Any]:
     return [row["ok"] for row in client.get(hist(device, what="events")).json()["rows"] if row["kind"] == "pressed"]
 
 
-def a_board(**how: Any) -> FakeKvm:
-    return FakeKvm(FakeState(atx=True, holds={"power": 0.3, "power_long": 1.2, "reset": 0.3}, **how)).start()
+def a_board(tls_dir: Path | None = None, **how: Any) -> FakeKvm:
+    return FakeKvm(FakeState(atx=True, holds={"power": 0.3, "power_long": 1.2, "reset": 0.3}, **how), tls_dir=tls_dir).start()
 
 
 @pytest.mark.parametrize("status", [500, 502, 503, 504])
@@ -246,10 +246,11 @@ def test_a_board_that_may_be_pressing_stays_left_alone_through_a_client_made_ane
     # Register row 10 of 0.2.1 (fx-a L2): the hold lived in the client and in its successor at the same address, so that the
     # wall locked and opened again (the last person signed out, somebody signs in), an edit to another address of the KVM,
     # or the tile removed and added again, made a client that pressed at once, a second after a press with no clear answer.
+    # (Over HTTPS since 0.3.0: the KVM at another address is known for the same one by its certificate, see the next test.)
     from tests.test_wall import PASSWORD
 
     monkeypatch.setattr(kvm, "BOARD_ANSWER", 30.0, raising=False)  # (held for longer than everything below takes)
-    fake = a_board(atx_reply=(502, "<html><body>502 Bad Gateway</body></html>"))
+    fake = a_board(tls_dir=tmp_path / "kvm", atx_reply=(502, "<html><body>502 Bad Gateway</body></html>"))
     try:
         with wall(tmp_path, locked_start=True) as client:  # (no key of its own: the last person to sign out locks it)
             device = add(client, fake.url)
@@ -263,7 +264,7 @@ def test_a_board_that_may_be_pressing_stays_left_alone_through_a_client_made_ane
             assert client.post("/api/v1/login", json={"password": PASSWORD}).status_code == 200
             _, after_lock = press(client, device, "atx_power")
             assert (after_lock.status_code, after_lock.json()["code"]) == (409, "busy"), after_lock.text
-            # Edited to another address of the same KVM.
+            # Edited to another address of the same KVM (its certificate, the KVM's own, shown there too).
             elsewhere = fake.url.replace("127.0.0.1", "localhost")
             assert client.put(f"/api/v1/devices/{device}", json={"url": elsewhere, "name": "Renamed", "password": "secret"}).status_code == 200
             _, after_edit = press(client, device, "atx_power")
@@ -276,3 +277,61 @@ def test_a_board_that_may_be_pressing_stays_left_alone_through_a_client_made_ane
             assert fake.state.actions == ["atx power"], fake.state.actions
     finally:
         fake.stop()
+
+
+def test_kvms_behind_one_front_door_do_not_share_what_paces_their_power_buttons(tmp_path: Path, quick: dict[str, float], monkeypatch: pytest.MonkeyPatch) -> None:
+    # (The final review of 0.3.0, core L7.) Two KVMs reached through one front door show its certificate, both pinned: the
+    # second is kept beside the first as a device of its own ("own:", see core.identity), and was found by that certificate
+    # all the same. A press of the first with no clear answer had the second "busy", and the second told what the first
+    # said of its Fingerbot. The certificate counts only for a tile known by it; the one edited to another address of the
+    # KVM (the test before) still is.
+    monkeypatch.setattr(kvm, "BOARD_ANSWER", 30.0, raising=False)
+    door = tmp_path / "door"
+    first = a_board(tls_dir=door, atx_reply=(502, "<html><body>502 Bad Gateway</body></html>"))
+    second = a_board(tls_dir=door)
+    try:
+        with wall(tmp_path / "wall") as client:
+            one = add(client, first.url)
+            other = client.post("/api/v1/devices", json={"url": second.url, "password": "secret"})
+            assert (other.status_code, other.json()["code"]) == (409, "same_device"), other.text  # (one certificate: asked)
+            two = add(client, second.url, keep_both=True)
+            for device in (one, two):
+                wait_until(lambda device=device: client.get("/api/v1/status").json()[device]["atx"]["enabled"] is True, "the board was never seen")
+            _, pressed = press(client, one, "atx_power")
+            assert (pressed.status_code, pressed.json()["code"]) == (504, "timeout"), pressed.text
+            _, there = press(client, two, "atx_power")
+            assert there.status_code == 200, there.text
+            assert second.state.actions == ["atx power"] and first.state.actions == ["atx power"]
+            _, again = press(client, one, "atx_power")
+            assert (again.status_code, again.json()["code"]) == (409, "busy"), again.text  # (the first is held as before)
+    finally:
+        first.stop()
+        second.stop()
+
+
+@pytest.mark.parametrize("other", ["another KVM", "the same KVM over plain HTTP"])
+def test_a_tile_edited_to_a_kvm_not_known_for_the_one_that_may_be_pressing_starts_afresh(tmp_path: Path, quick: dict[str, float], monkeypatch: pytest.MonkeyPatch, other: str) -> None:
+    # (0.3.0, section 5.) The hold was found by the tile's id as well, and followed the tile to whatever it was edited to: a
+    # tile pointed at another KVM after a press with no clear answer was refused "busy" there, for a press that KVM never had,
+    # and was told what the KVM before said of its Fingerbot. It is the KVM's: found by its address, and by its certificate
+    # where one is pinned (as core.identity knows a KVM at another address). Where nothing tells the KVM at the new address
+    # from another (plain HTTP), it starts afresh, as its saved password is typed again there.
+    monkeypatch.setattr(kvm, "BOARD_ANSWER", 30.0, raising=False)  # (held for longer than everything below takes)
+    fake = a_board(atx_reply=(502, "<html><body>502 Bad Gateway</body></html>"))
+    another = a_board() if other == "another KVM" else None
+    try:
+        with wall(tmp_path) as client:
+            device = add(client, fake.url)
+            wait_until(lambda: client.get("/api/v1/status").json()[device]["atx"]["enabled"] is True, "the board was never seen")
+            _, first = press(client, device, "atx_power")
+            assert (first.status_code, first.json()["code"]) == (504, "timeout"), first.text
+            fake.state.atx_reply = None
+            to = another.url if another is not None else fake.url.replace("127.0.0.1", "localhost")
+            assert client.put(f"/api/v1/devices/{device}", json={"url": to, "name": "Renamed", "password": "secret"}).status_code == 200
+            _, there = press(client, device, "atx_power")
+            assert there.status_code == 200, there.text
+            assert (another or fake).state.actions[-1] == "atx power", (another or fake).state.actions
+    finally:
+        fake.stop()
+        if another is not None:
+            another.stop()

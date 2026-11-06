@@ -37,10 +37,11 @@ SSO_LIVE_UNCONFIRMED = 600.0
 PRIVATE_SUFFIXES = (".ts.net", ".local", ".lan", ".internal", ".home.arpa")
 
 SECURITY_HEADERS = {
-    # Everything the page needs comes from this server; nothing inline, nothing framed.
+    # Everything the page needs comes from this server; nothing inline, nothing framed. Its one worker (static/push.js,
+    # which shows the alerts told by Web Push) and the description a phone adds it to its Home Screen by are its own too.
     "Content-Security-Policy": (
         "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' blob:; "
-        "connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+        "connect-src 'self'; worker-src 'self'; manifest-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
     ),
     "X-Content-Type-Options": "nosniff",
     "X-Frame-Options": "DENY",
