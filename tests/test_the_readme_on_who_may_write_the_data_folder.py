@@ -30,12 +30,13 @@ def test_the_readme_offers_the_lines_the_start_prints_and_none_goes_into_what_is
         'icacls "D:\\qkvm-data" /inheritance:r /grant:r "PC\\you:(OI)(CI)F" "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F"',
         'icacls "D:\\qkvm-data" /remove:g *S-1-5-',
         'icacls "D:\\qkvm-data" /setowner "PC\\you"',
+        'icacls "D:\\qkvm-data" /grant "PC\\you:F"',
         'takeown /F "D:\\qkvm-data"',
         "`/L`",
     ):
         assert line in WORDS, (line, WORDS)
     offered = [line for line in PASSAGE.replace("`", "\n").splitlines() if line.startswith(("icacls ", "takeown "))]
-    assert len(offered) == 4 and not [line for line in offered if {"/T", "/R", "/D"} & set(line.split())], offered
+    assert len(offered) == 5 and not [line for line in offered if {"/T", "/R", "/D"} & set(line.split())], offered
 
 
 def test_the_security_policy_says_who_may_put_there_what_runs_after_an_update() -> None:
@@ -54,7 +55,7 @@ def test_the_line_the_readme_offers_for_an_open_folder_is_the_one_the_start_prin
     printed = _folders.fix_line(tmp_path).replace(str(tmp_path), "D:\\qkvm-data").replace(_folders._name(win, _folders._me(win)), "PC\\you")
     assert printed in WORDS, (printed, WORDS)
     printed = _folders.owner_line(tmp_path).replace(str(tmp_path), "D:\\qkvm-data").replace(_folders._name(win, _folders._me(win)), "PC\\you")
-    for line in ('icacls "D:\\qkvm-data" /setowner "PC\\you"', 'takeown /F "D:\\qkvm-data"'):
+    for line in ('icacls "D:\\qkvm-data" /setowner "PC\\you"', 'icacls "D:\\qkvm-data" /grant "PC\\you:F"', 'takeown /F "D:\\qkvm-data"'):
         assert line in printed and line in WORDS, (line, printed)
 
 

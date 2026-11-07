@@ -140,21 +140,28 @@ def fix_line(path: Path, link: bool = False) -> str:
     return line + (" /L" if link else "")
 
 
-def setowner_line(path: Path, link: bool = False) -> str:
-    """The line that makes what is at `path` the account qKVM runs as here, named (Windows): not what is in it (no /T); `link`:
-    the link itself (/L)."""
+def setowner_line(path: Path, link: bool = False) -> list[str]:
+    """The two lines that make what is at `path` the account qKVM runs as here, named, and let that account use it (Windows):
+    not what is in it (no /T); `link`: the link itself (/L).
+
+    The second is the account's own entry. Owning a thing lets nobody read it by itself, and where what may use it is said
+    by an entry for OWNER RIGHTS (as Python's mkdir(mode=0o700) makes a folder, and 0.2.0 made its data folder), Windows
+    makes that entry one for what is made inside only, once the owner is set: taken over by the first line alone, a file
+    there was nobody's to open but SYSTEM's and the Administrators', and qKVM, started after it, could not read it. Two
+    lines, each run by itself: Command Prompt has no ";" between two commands."""
     win = _windows()
-    return f'icacls "{path}" /setowner "{_name(win, _me(win))}"' + (" /L" if link else "")
+    name, link_itself = _name(win, _me(win)), " /L" if link else ""
+    return [f'icacls "{path}" /setowner "{name}"{link_itself}', f'icacls "{path}" /grant "{name}:F"{link_itself}']
 
 
 def owner_line(path: Path, link: bool = False) -> str:
     """What to do where what is at `path` is another account's (Windows): give it to the account qKVM runs as, named, or to
     the console's own; neither goes into what is in it (no /T, no /R)."""
-    named = setowner_line(path, link)
+    named = "; ".join(setowner_line(path, link))
     console = "" if link else f', or takeown /F "{path}" the console\'s own'
     return (
-        f"take it over, in an elevated console: {named} makes it the account qKVM runs as here (where it runs as a service, "
-        f"name the service's account instead){console}; or run qKVM as the account that owns it"
+        f"take it over, in an elevated console: {named} make it the account qKVM runs as here, and that account's to use "
+        f"(where it runs as a service, name the service's account instead){console}; or run qKVM as the account that owns it"
     )
 
 
@@ -166,18 +173,18 @@ def for_consoles(advice: str) -> str:
     """What to do, with the console its lines are for (Windows): "in Command Prompt: ...". Where a path in them holds a
     character PowerShell would expand ($, a backtick), the PowerShell form too: pasted there, "qkvm$zz9" was "qkvm", and the
     line made the folder beside the data folder private (the round 4 review, L2). In it every quoted part is in single
-    quotes (taken as it is), and a removal is PowerShell's own (_in_powershell). Advice without such a line is given as it
+    quotes (taken as it is), and a removal is PowerShell's own (in_powershell). Advice without such a line is given as it
     is."""
     commands = _COMMAND.findall(advice)
     if not commands:
         return advice
     said = f"in Command Prompt: {advice}"
     if any(sign in command for command in commands for sign in "$`"):
-        said += "; in PowerShell: " + "; ".join(_in_powershell(command) for command in commands)
+        said += "; in PowerShell: " + "; ".join(in_powershell(command) for command in commands)
     return said
 
 
-def _in_powershell(command: str) -> str:
+def in_powershell(command: str) -> str:
     """The PowerShell form of a line given for Command Prompt: each quoted part in single quotes. A removal never through
     cmd /c, where the quotes were lost and cmd got the path bare: a data folder named "wall$1&old" had the form that removes
     its tls folder remove the folder beside it (the round 5 review). del as Remove-Item -LiteralPath, rmdir /S /Q (a folder,

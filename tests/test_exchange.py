@@ -73,6 +73,26 @@ def test_a_sealed_file_brings_everything_back_and_shows_nothing(tmp_path: Path) 
     assert "KVM-PASSWORD" not in repr(back) and "THE-PASSPHRASE" not in repr(back)  # nor does what was read show them, printed
 
 
+def test_the_password_of_a_tile_of_a_kind_this_version_does_not_know_is_not_opened_for_a_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # (0.3.0, section 5; a low of 0.2.1's final review.) A tile of a kind this version does not know (a later version's
+    # settings, or a file written by hand) is no device it talks to, and a file of this version is refused it on the way
+    # in; its password was opened and written into a file with secrets all the same. It is left out, and said to be.
+    store, safe, _ = a_wall(tmp_path)
+    store.devices.append(DeviceRecord(id="99aa88bb", name="Later", url="https://192.168.1.50", kind="later", secret=safe.encrypt("LATER-PASSWORD", "99aa88bb")))
+    opened: list[str] = []
+    real = safe.read
+
+    def read(blob: Any, context: str) -> Any:
+        opened.append(context)
+        return real(blob, context)
+
+    monkeypatch.setattr(safe, "read", read)
+    not_opened: list[str] = []
+    devices = gather(store, safe, {"devices"}, secrets=True, not_opened=not_opened)["devices"]
+    assert [device["password"] for device in devices] == ["KVM-PASSWORD", "BMC-PASSWORD", "", ""]
+    assert "99aa88bb" not in opened and not_opened == ["Later"], (opened, not_opened)
+
+
 def test_a_plain_file_holds_no_secret_and_reads_without_a_passphrase(tmp_path: Path) -> None:
     store, safe, pem = a_wall(tmp_path)
     text = pack(gather(store, safe, set(exchange.PARTS), secrets=False), "", "0.1.0")

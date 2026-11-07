@@ -44,7 +44,8 @@ import time  # noqa: E402
 from pathlib import Path  # noqa: E402
 from typing import Any  # noqa: E402
 
-from ._where import default_data_dir  # noqa: E402
+# (_where is imported where the data folder is asked for, not here: an update's own copy of this file is loaded by its
+# _libs under a name of its own, for its rules, and is then no part of the package to import from.)
 
 RESTART = 75  # exit status with which the wall asks to be started again
 CHILD = "QKVM_CHILD"  # set in the environment of the process that actually serves
@@ -78,7 +79,56 @@ def data_dir(argv: list[str]) -> Path:
         print("qkvm: --data-dir is given more than once: give it once", file=sys.stderr, flush=True)
         raise SystemExit(2)
     # (Given and empty, it is the folder at home to the program: so it is here, and not "this folder".)
+    from ._where import default_data_dir
+
     return Path(said[0]) if said and said[0] else default_data_dir()
+
+
+LIBRARIES = "libraries.json"  # beside an update's package, where it brings libraries of its own (update.py, _libs.py)
+MAX_LIBRARIES_NOTE = 1_000_000  # bytes: the note names some thirty libraries, a few kilobytes
+
+
+def target() -> str:
+    """This Python, as a release's list of libraries names what its builds are for: cp314-win-amd64, cp313-linux-x86_64,
+    cp312-linux-aarch64. Any other Python is named all the same (a free-threaded one with a t, a 32-bit one, one without
+    glibc), and no release has a build for it."""
+    import sysconfig
+
+    name = f"{'cp' if sys.implementation.name == 'cpython' else sys.implementation.name}{sys.version_info[0]}{sys.version_info[1]}"
+    if sysconfig.get_config_var("Py_GIL_DISABLED"):
+        name += "t"
+    where = sysconfig.get_platform()
+    if sys.maxsize <= 2**32 and where.endswith(("x86_64", "amd64", "aarch64", "arm64")):
+        where += "-32bit"  # (a 32-bit Python on a 64-bit system names the system)
+    if where.startswith("linux"):
+        asked = getattr(os, "confstr", None)  # (Linux has it; the types of Windows do not)
+        try:
+            libc = (asked("CS_GNU_LIBC_VERSION") if asked else "") or ""
+        except (ValueError, OSError):
+            libc = ""
+        if not libc.startswith("glibc"):
+            where += "-nonglibc"  # (musl, as on Alpine)
+    return f"{name}-{where}"
+
+
+def made_for(version_folder: Path) -> "str | None":
+    """The Python an update's libraries were brought for, as `target` names it; None where it brought none (installed by an
+    updater that brings none). ValueError where its note cannot be read."""
+    note = version_folder / LIBRARIES
+    try:
+        with open(note, "rb") as stream:
+            text = stream.read(MAX_LIBRARIES_NOTE + 1)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        raise ValueError("cannot be read") from None
+    try:
+        said = json.loads(text) if len(text) <= MAX_LIBRARIES_NOTE else None
+    except (ValueError, RecursionError):
+        said = None
+    if not isinstance(said, dict) or not isinstance(said.get("target"), str):
+        raise ValueError("cannot be read")
+    return str(said["target"])
 
 
 _folders: list[Any] = []  # (this copy's _folders.py, once loaded)
@@ -292,7 +342,8 @@ def active_update(data: Path, tell: bool = False) -> Path | None:
     if installed is None or shipped is None or installed <= shipped:
         return None  # nothing usable, or this copy has since been replaced by something newer
     # The data folder and the way to it first; the folders it lies in and its pointer, none of them a link (the package's own
-    # folder, followed, would have the walk go where the link leads); then all that is in the package.
+    # folder, followed, would have the walk go where the link leads); then all that is in the version's folder: its package,
+    # and the libraries it brought (lib/) with their note.
     refused: "tuple[Path, str] | None" = not_own_way(data)
     for path in () if refused is not None else (updates, updates / "current.json", package.parent, package):
         try:
@@ -304,7 +355,17 @@ def active_update(data: Path, tell: bool = False) -> Path | None:
             break
     else:
         if refused is None:
-            refused = not_whole(package)
+            refused = not_whole(package.parent)
+    if refused is None:
+        # Libraries brought for another Python do not load under this one (a Python upgraded under the update, or a copy of
+        # this program installed with another Python over the same data folder): this copy's own files run instead.
+        try:
+            made, here = made_for(package.parent), target()
+        except ValueError as ex:
+            refused = package.parent / LIBRARIES, str(ex)
+        else:
+            if made is not None and made != here:
+                refused = package.parent / LIBRARIES, f"names libraries for {made}, and this Python is {here}"
     if refused is not None:
         if tell:
             line = f"the update in {updates} is not used: {refused[0]} {refused[1]}. This runs the version that was installed with the program."

@@ -343,6 +343,40 @@ def test_a_change_answered_204_is_taken_as_made_and_the_restart_follows_at_once(
         assert changed < restarted and asked[changed:restarted].count("GET /redfish/v1/Systems/Self") == 1
 
 
+def test_the_read_after_a_204_is_held_to_its_bound_with_the_connection_it_waits_for(tmp_path: Path, bmc: FakeBmc, monkeypatch: pytest.MonkeyPatch) -> None:
+    # (0.3.0, section 5.) AFTER_204_READ bounded the read's answer alone: a connection to send it on was waited for and made
+    # first (up to 48 s with the usual waits: a line come free, or one made and compared on the controller's root), and in the
+    # busy moment after the change that held the restart back as long. The bound covers all of it.
+    monkeypatch.setattr(redfish.RedfishDevice, "WAITS", httpx.Timeout(1.0, connect=1.0))
+    monkeypatch.setattr(redfish, "AFTER_204_READ", 0.5)
+    bmc.state.busy_after_boot_change = 1.5
+    take = redfish._Lines.take
+
+    async def slow_to_come(self: Any, within: float) -> Any:
+        if time.monotonic() < bmc.state.reads_busy_until:  # (in the busy moment after the change, a line takes two seconds)
+            await asyncio.sleep(min(within, 2.0))
+        return await take(self, within)
+
+    monkeypatch.setattr(redfish._Lines, "take", slow_to_come)
+    took: list[float] = []
+    real = redfish.RedfishDevice._power_after_204
+
+    async def timed(self: redfish.RedfishDevice, *said: Any) -> Any:  # (the place, and the override it follows: 591ccb7e)
+        began = time.monotonic()
+        try:
+            return await real(self, *said)
+        finally:
+            took.append(time.monotonic() - began)
+
+    monkeypatch.setattr(redfish.RedfishDevice, "_power_after_204", timed)
+    with wall(tmp_path) as client:
+        device = add(client, bmc.url)
+        status_of(client, device, state="online")
+        assert client.post(f"/api/v1/devices/{device}/actions", json={"action": "bios_setup"}).status_code == 200
+        assert bmc.state.actions == ["system ForceRestart"]
+    assert len(took) == 1 and took[0] < 1.0, took
+
+
 def test_a_board_that_does_not_allow_a_bios_setup_boot_is_not_offered_it(tmp_path: Path, bmc: FakeBmc) -> None:
     bmc.state.boot_targets = ["None", "Pxe", "Hdd"]  # no "BiosSetup" among the allowed boot overrides
     with wall(tmp_path) as client:
@@ -2987,7 +3021,10 @@ def test_an_openbmc_controller_is_not_offered_the_password_for_keys(tmp_path: Pa
         with wall(tmp_path) as client:
             device = add(client, bmc.url, kind="redfish")
             reply = client.post(f"/api/v1/devices/{device}/actions", json={"action": "keys", "keys": "KeyA"})
-            assert reply.status_code in (409, 422, 503), reply.text
+            # (Since 0.3.0 keys go to OpenBMC's own console, as RFB's events: this stand-in has no VNC server behind it, so
+            # its console ends at once, which is said (502). In 0.2.0 they were refused, 409, 422 or 503.)
+            assert reply.status_code in (409, 422, 502, 503), reply.text
+            assert bmc.state.kvm_upgrades, "the keys did not go to OpenBMC's console"
             assert bmc.state.token_asks == 0 and bmc.state.web_logins == 0
     finally:
         bmc.stop()

@@ -10,6 +10,7 @@ import re
 import stat
 import subprocess
 import sys
+import threading
 import time
 import zipfile
 from collections.abc import Iterator
@@ -332,6 +333,26 @@ def test_a_release_whose_package_comes_too_slowly_is_not_judged_and_holds_nothin
     assert update.view()["in_place"] is True and update.view()["error"] is None
 
 
+def test_a_check_whose_release_description_comes_too_slowly_fails_within_its_bound(github: FakeGitHub, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # (0.3.0, from 0.2.2's review.) The newest release's description was read with 20 s for each piece and no deadline for
+    # the whole: a line that dripped it in held a person's Check for updates, and every other check and installation ("under
+    # way"), for as long as it dripped. It has a deadline (CHECK_WITHIN; the judging after it has its own): run out, the
+    # check failed, and says why.
+    monkeypatch.setattr(update_module, "CHECK_WITHIN", 1.0, raising=False)
+    github.publish("9.9.9", make_wheel("9.9.9"))
+    github.answer_drip = 0.5  # (a dozen pieces: some six seconds)
+    update = updater(github, tmp_path / "data")
+    began = time.monotonic()
+    with pytest.raises(UpdateError):
+        run(asyncio.wait_for(update.check(), 10))
+    assert time.monotonic() - began < 5
+    view = update.view()
+    assert view["state"] == "failed" and view["error"] == "GitHub did not answer within 1 s", view
+    github.answer_drip = 0.0
+    run(update.check())
+    assert update.view()["state"] == "idle" and update.view()["available"] is True
+
+
 def test_the_round_that_locks_up_once_nobody_is_signed_in_never_waits_for_a_release_download(github: FakeGitHub, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     # (0.2.2's review.) The housekeeping round asked for the release check and waited for it, the package's download among
     # it; and that round is what locks the saved passwords once the last sign-in has run out. On a slow line they stayed
@@ -582,6 +603,47 @@ def test_update_from_the_app(github: FakeGitHub, tmp_path: Path, monkeypatch: py
         assert core.exit_status == RESTART
         events = [entry["event"] for entry in client.get("/api/v1/audit").json()["entries"]]
         assert "update_installed" in events
+
+
+def test_an_install_whose_request_is_cut_off_by_a_stop_runs_on_and_is_written_down(github: FakeGitHub, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # (The final review of 0.3.0, core L4.) A stop or a listener reopen cuts off the requests still open after a few seconds
+    # (timeout_graceful_shutdown): the install was cut with its request, and nothing was written in the activity log. It
+    # runs as a task of its own now, as the removal of machines does, given the time a stopping wall gives such a task.
+    from tests.test_live import Wall
+
+    monkeypatch.setattr(vault, "SCRYPT_N", 2**12)
+    github.publish("9.9.9", make_wheel("9.9.9"))
+    real = Updater._try
+
+    def slow(self: Updater, *args: Any) -> None:
+        time.sleep(4.0)  # (past the web server's 3 seconds, within the 5 the wall gives what a request set going)
+        real(self, *args)
+
+    monkeypatch.setattr(Updater, "_try", slow)
+    with Wall(tmp_path / "wall") as live:
+        live.core.updater = updater(github, tmp_path / "wall", current=__version__)
+        admin = live.browser()
+        assert admin.post("/api/v1/update/check").json()["available"] is True
+        asked: list[Any] = []
+        thread = threading.Thread(target=lambda: asked.append(_asked(admin, "/api/v1/update/install", {"password": PASSWORD})), daemon=True)
+        thread.start()
+        deadline = time.monotonic() + 30
+        while not (live.core.updater.progress or "").startswith("Trying"):
+            assert time.monotonic() < deadline, "the install never came to its trial"
+            time.sleep(0.05)
+        live._server.should_exit = True  # (a stop, or the listeners opened again)
+        thread.join(30)
+        live._thread.join(30)
+    assert live.core.updater.state == "ready" and live.core.updater.installed == "9.9.9"
+    live.core.audit.flush()
+    assert "update_installed" in (tmp_path / "wall" / "audit.log").read_text(encoding="utf-8")
+
+
+def _asked(client: Any, path: str, body: dict[str, Any]) -> Any:
+    try:
+        return client.post(path, json=body, timeout=60).status_code
+    except Exception as ex:  # (cut off with the wall)
+        return type(ex).__name__
 
 
 def test_a_container_is_updated_by_replacing_its_image(github: FakeGitHub, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -858,6 +920,81 @@ def test_a_package_that_is_broken_inside_is_a_failed_update_like_any_other(githu
     with pytest.raises(UpdateError, match="could not be unpacked"):
         run(update.install())
     assert update.state != "installing" and starter.active_update(tmp_path) is None
+
+
+def test_the_trial_loads_the_shipped_where_first_as_every_start_does(tmp_path: Path) -> None:
+    # (The final review of 0.3.0, core L2, and 0.2.1's lesson: every start loads the installed copy's _where before the
+    # update's package is put in front, and an update whose cli asks it for a name it does not have never starts. The trial
+    # loaded the update's own _where, and said it went well.)
+    staging = tmp_path / "updates" / "9.9.9.tmp"
+    (staging / "qkvm").mkdir(parents=True)
+    (staging / "qkvm" / "_where.py").write_text("NEW_NAME = 1\n", encoding="utf-8")
+
+    def trial(cli: str) -> subprocess.CompletedProcess[str]:
+        (staging / "qkvm" / "cli.py").write_text(cli, encoding="utf-8")
+        return subprocess.run([sys.executable, "-B", "-P", "-c", update_module.TRIAL, str(staging), "0"], cwd=staging, capture_output=True, text=True, timeout=120)
+
+    failed = trial("from ._where import NEW_NAME\n")
+    assert failed.returncode != 0 and "cannot import name 'NEW_NAME'" in failed.stderr, failed.stdout + failed.stderr
+    went = trial("from ._where import default_data_dir\n")
+    assert went.returncode == 0 and "went well" in went.stdout, went.stdout + went.stderr
+
+
+def test_the_same_version_named_again_keeps_the_running_version_and_what_it_goes_back_to(github: FakeGitHub, tmp_path: Path) -> None:
+    # (The final review of 0.3.0, core L4.) An install cut off once it had named the version, before the wall heard of it, is
+    # offered again: named again, the pointer said that version was the one before itself, and every other folder went,
+    # the running version's among them.
+    running = tmp_path / "updates" / "1.1.0" / "qkvm"
+    running.mkdir(parents=True)
+    (running / "_version.py").write_text('__version__ = "1.1.0"\n', encoding="utf-8")
+    (tmp_path / "updates" / "current.json").write_text(json.dumps({"version": "1.1.0", "previous": None, "proven": True}), encoding="utf-8")
+    github.publish("9.9.9", make_wheel("9.9.9"))
+    update = updater(github, tmp_path, current="1.1.0")
+    run(update.check())
+    assert run(update.install()) == "9.9.9"
+    update.installed = None  # (as the cut left it)
+    assert run(update.install()) == "9.9.9"
+    said = json.loads((tmp_path / "updates" / "current.json").read_text(encoding="utf-8"))
+    assert (said["version"], said["previous"], said["previous_proven"]) == ("9.9.9", "1.1.0", True)
+    assert running.is_dir() and starter.active_update(tmp_path) == tmp_path / "updates" / "9.9.9" / "qkvm"
+
+
+def test_an_install_cut_off_ends_failed_and_says_so(github: FakeGitHub, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # (The final review of 0.3.0, core L4: stopped with the wall, it stayed "installing" for good, and the page with it.)
+    github.publish("9.9.9", make_wheel("9.9.9"))
+    update = updater(github, tmp_path)
+    run(update.check())
+    monkeypatch.setattr(Updater, "_try", lambda self, *args: time.sleep(0.5))
+
+    async def cut() -> None:
+        work = asyncio.ensure_future(update.install())
+        while update.progress is None or not update.progress.startswith("Trying"):
+            await asyncio.sleep(0.01)
+        work.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await work
+
+    run(cut())
+    assert update.state == "failed" and "stopped before it was done" in (update.error or "")
+    assert not update._running
+
+
+def test_an_error_nobody_named_on_the_way_ends_an_installation_failed_not_installing(github: FakeGitHub, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # (0.3.0, from 0.2.2's review.) The installation caught the errors it knew of by name; any other one (a library's error
+    # of a kind not named, a slip in the code) left the update "installing" for good, and the page with it, until a restart.
+    github.publish("9.9.9", make_wheel("9.9.9"))
+    update = updater(github, tmp_path)
+    run(update.check())
+
+    def slipped(version: str, wheel: bytes) -> None:
+        raise KeyError("a name nobody expected")
+
+    monkeypatch.setattr(update, "_activate", slipped)
+    with pytest.raises(UpdateError, match="could not be installed"):
+        run(update.install())
+    assert update.state == "failed" and update.view()["error"] and starter.active_update(tmp_path) is None
+    monkeypatch.delattr(update, "_activate")  # (its own again)
+    assert run(update.install()) == "9.9.9"  # (and it can be tried again)
 
 
 def an_update_that_leaves_a_mark(data: Path, version: str = "9.9.9") -> Path:

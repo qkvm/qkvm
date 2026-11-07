@@ -71,6 +71,10 @@ class ServerSettings:
     # this), which are the record; its index (audit.sqlite) holds what they hold, and takes about two and a half times
     # that. Read at the start. Outside what makes sense, the nearest that does is taken (activity_file_bytes).
     activity_mb: int = 50
+    # Virtual media of servers (0.3.0, A4): the folder on this computer whose ISO images can be mounted on a server, and the
+    # wall's address as the servers' controllers reach it, to read them from ("": where it listens on the network).
+    media_folder: str = ""
+    media_address: str = ""
 
 
 @dataclass
@@ -86,6 +90,9 @@ class AlertSettings:
     recovered: bool = True  # any of those is over
     link: str = ""  # the wall's address as people reach it: an alert points there, at the tile it is about
     paused_until: float = 0.0  # nothing is sent before this time (maintenance); what is still wrong then is told then
+    # The wall's own key for Web Push (webpush.py: VAPID, RFC 8292), sealed by the vault for "alerts:push-key"; made the
+    # first time an account opens its browser's alerts, and never handed out but for its public half. None: not made yet.
+    push_key: dict[str, str] | None = None
 
 
 @dataclass
@@ -110,9 +117,18 @@ class DeviceRecord:
     # the first one seen is taken (DeviceManager._known). A person who types the password in an edit takes what answers.
     machine: str = ""
     fingerbot_strength: str = "firm"  # how hard a Fingerbot paired with the KVM presses its power button: "firm" | "light"
+    # Its screen watched (screens.py): an alert after so many minutes with no video signal, or with a screen that looks the
+    # same; 0: not watched for that. (Read through screens.minutes: what is no whole number above 0 is off, a day the most.)
+    no_signal_minutes: int = 0
+    unchanged_minutes: int = 0
+    # Which of its three views a PC with Intel AMT is in (AMT_VIEWS): "health" (no KVM session is ever opened), "stills" (a
+    # still now and then for its tile, a session while its enlarged or live view is open), "live" (a session held while its
+    # tile is shown as well). An admin's or an operator's to change, by its own route. Kept, unused, for every other kind.
+    amt_view: str = "stills"
 
 
 FINGERBOT_STRENGTHS = ("firm", "light")  # (what fingerbot_strength may be; anything else in a file is taken as the first)
+AMT_VIEWS = ("stills", "health", "live")  # (what amt_view may be; a record without it, or with another word, is the first)
 # The kinds of machine this version has a driver for (DeviceRecord.kind). A device of another kind, as a later version
 # that adds one writes it, read after going back to this version, is kept as it is and left alone (core.UnknownKind).
 KINDS = ("kvmd", "jetkvm", "redfish", "amt", "vnc", "proxmox")
@@ -184,6 +200,20 @@ class TokenRecord:
     created: float = 0.0
     expires: float | None = None  # after this it is nobody; None: until it is taken back
     used: float | None = None  # when it was last used, as far as was saved since
+
+
+@dataclass
+class PushRecord:
+    """A browser the alerts are told to by Web Push (webpush.py): a phone's, most of the time."""
+
+    id: str
+    user: str  # the account it is for: it is told what that account may see, and it goes when the account goes
+    # Where its push service takes messages for it and its two keys (JSON: endpoint, p256dh, auth), sealed by the vault for
+    # "push:" and its id: whoever has its address can send it nothing without the wall's key, and read nothing without its keys.
+    secret: dict[str, str] | None = None
+    name: str = ""  # what browser it is, as the page said when it subscribed: "Chrome on Android"
+    service: str = ""  # its push service's name (fcm.googleapis.com, web.push.apple.com), in clear for the list
+    created: float = 0.0
 
 
 @dataclass
@@ -386,7 +416,7 @@ _CALLED = {"str": "a text", "bool": "true or false", "int": "a whole number", "f
 # as nothing too: whatever answered at that address next was trusted, and sent the saved password. What
 # is there and is no text is kept as a text, which is no certificate either: the tile says that its
 # certificate cannot be read, the device is not talked to, and a person says what is trusted in its place.
-_OPENED_LATER = frozenset({"secret", "webhook", "totp", "cert_pem"})
+_OPENED_LATER = frozenset({"secret", "webhook", "totp", "cert_pem", "push_key"})
 
 
 def _as_declared(record: Any, what: str) -> None:
@@ -437,7 +467,7 @@ def _only_known(cls: type, data: dict[str, Any]) -> dict[str, Any]:
 
 VERSION = 1  # of the settings file as this program writes it
 # The parts of the settings file this program knows of.
-_PARTS = ("version", "recovery", "recovery_created", "unlock", "server", "alerts", "users", "devices", "actions", "tokens")
+_PARTS = ("version", "recovery", "recovery_created", "unlock", "server", "alerts", "users", "devices", "actions", "tokens", "pushes")
 
 
 def _not_known(cls: type, data: Any) -> dict[str, Any]:
@@ -454,7 +484,7 @@ def _beyond(data: dict[str, Any]) -> dict[str, Any]:
     one), and say nothing; updated again, the later version would find its settings gone.
     """
     by_id: dict[str, dict[str, dict[str, Any]]] = {}
-    for part, cls in (("users", UserRecord), ("devices", DeviceRecord), ("actions", ActionRecord), ("tokens", TokenRecord)):
+    for part, cls in (("users", UserRecord), ("devices", DeviceRecord), ("actions", ActionRecord), ("tokens", TokenRecord), ("pushes", PushRecord)):
         found = data.get(part)
         things: list[Any] = found if isinstance(found, list) else []
         by_id[part] = {str(thing["id"]): more for thing in things if isinstance(thing, dict) and "id" in thing and (more := _not_known(cls, thing))}
@@ -521,6 +551,7 @@ class Store:
         self.devices: list[DeviceRecord] = []
         self.actions: list[ActionRecord] = []
         self.tokens: list[TokenRecord] = []
+        self.pushes: list[PushRecord] = []  # the browsers told the alerts by Web Push
         self.alerts = AlertSettings()
         self.recovered_from: Path | None = None  # set when the settings were read from the second copy: the damaged file, or None for one that was not there
         self.restored = False  # ...and this says that they were
@@ -599,6 +630,7 @@ class Store:
         self.devices = [DeviceRecord(**_only_known(DeviceRecord, d)) for d in data.get("devices", [])]
         self.actions = [ActionRecord(**_only_known(ActionRecord, a)) for a in data.get("actions", [])]
         self.tokens = [TokenRecord(**_only_known(TokenRecord, t)) for t in data.get("tokens", [])]
+        self.pushes = [PushRecord(**_only_known(PushRecord, p)) for p in data.get("pushes", [])]
         self.alerts = AlertSettings(**_only_known(AlertSettings, data.get("alerts", {})))
         _as_declared(self.server, "the settings under \"server\"")
         _as_declared(self.alerts, "the settings under \"alerts\"")
@@ -608,9 +640,9 @@ class Store:
         # Written by hand as 0, every browser opened on "Paused"; as less than nothing, every browser asked
         # for pictures without a pause. Neither is a reason not to start: it is the nearest that makes sense.
         self.server.interval = min(60.0, max(0.2, float(self.server.interval)))
-        records: list[Any] = [*self.users, *self.devices, *self.actions, *self.tokens]
+        records: list[Any] = [*self.users, *self.devices, *self.actions, *self.tokens, *self.pushes]
         for number, record in enumerate(records):
-            kind = {UserRecord: "account", DeviceRecord: "device", ActionRecord: "saved action", TokenRecord: "token"}[type(record)]
+            kind = {UserRecord: "account", DeviceRecord: "device", ActionRecord: "saved action", TokenRecord: "token", PushRecord: "browser told the alerts"}[type(record)]
             what = f"the {kind} {record.id!r}" if isinstance(record.id, str) and _ID.fullmatch(record.id) else f"record {number + 1} (a {kind})"
             _as_declared(record, what)
             # And a few that are of the right kind and still no good: every look at the wall asks an
@@ -711,6 +743,7 @@ class Store:
             "devices": things("devices", self.devices),
             "actions": things("actions", self.actions),
             "tokens": things("tokens", self.tokens),
+            "pushes": things("pushes", self.pushes),
             "alerts": {**beyond["alerts"], **asdict(self.alerts)},
         }
 

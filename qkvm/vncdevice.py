@@ -3,9 +3,10 @@
 A VNC server is a viewer's window onto a machine: the wall is that viewer, connected for as long as the
 machine is on the wall, asking for what changed at the pace the wall wants it (every quarter second while
 somebody looks, every few seconds while nobody does, faster for a live viewer), and reading all the same
-what a server sends unasked. Its picture is the screen the reader keeps, made into a JPEG when a tile asks.
-Keys go as X11 keysyms, the pointer as a position and buttons; both through `press` and `pointer` for a live
-line, and through the wall's actions (key combinations, typed text) like any KVM's.
+what a server sends unasked. Its picture is the screen the reader keeps, made into a JPEG when a tile asks,
+and for a live line over the same connection (`live_screen`). Keys go as X11 keysyms, the pointer as a
+position and buttons: from a live line through `ScreenInput` (which a server whose console another driver
+opens, OpenBMC's, is given too), and through the wall's actions (key combinations, typed text) like any KVM's.
 
 A VNC server has no number of its own to be known by: it is known by its address, and by the name it gives
 itself (which the tile is named after). The password goes through the vault like every other, and what the
@@ -22,12 +23,13 @@ import asyncio
 import logging
 import ssl
 import time
-from collections.abc import AsyncIterator, Callable, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from contextlib import asynccontextmanager, contextmanager
 from typing import Any
 from urllib.parse import urlsplit
 
 from . import rfb
+from .jetkvm import _CHARS as US_CHARS  # a character -> (with Shift, its key) on the US keyboard layout
 from .jetkvm import _USAGE as KEY_USAGES  # key names as browsers spell them -> HID usages, typed once for the JetKVM
 from .kvm import (
     DOWN_CODES,
@@ -89,11 +91,13 @@ CUTS_FORGOTTEN_AFTER = 3600.0
 # there at the last end, and asked every half minute it was some hundred connections an hour of its own.
 STILL_THERE_IN_A_WAIT = 120.0
 ACT_WAIT = 10.0  # seconds an action waits for its connection, where none is open (a wait between ends, say)
+LIVE_WAIT = 10.0  # seconds a live line's picture, keys and pointer wait for the connection to be open
 KEYS_AT_ONCE = 32  # key events written in one piece, each piece waited for (the server takes them at its pace)
 
 # The modifier keys as browsers spell them -> HID usages (the JetKVM's table has their report bits, not these).
 MODIFIER_USAGES = {"ControlLeft": 0xE0, "ShiftLeft": 0xE1, "AltLeft": 0xE2, "MetaLeft": 0xE3, "ControlRight": 0xE4, "ShiftRight": 0xE5, "AltRight": 0xE6, "MetaRight": 0xE7}
 CTRL_ALT_DEL = (0xFFE3, 0xFFE9, 0xFFFF)  # Control_L, Alt_L, Delete
+SHIFT = 0xFFE1  # Shift_L
 
 
 def vnc_url(text: str) -> str:
@@ -186,25 +190,50 @@ def key_events(keys: str) -> list[tuple[int, bool]]:
     return _chord(keysyms)
 
 
-def text_events(text: str, enter: bool = False) -> list[tuple[int, bool]]:
-    """What to press, character by character, to type `text`: each as its keysym, which the server's own keyboard layout turns into a key."""
+def text_events(text: str, enter: bool = False, us_shift: bool = False) -> list[tuple[int, bool]]:
+    """What to press, character by character, to type `text`: each as its keysym, which the server's own keyboard layout turns into a key.
+
+    `us_shift`: for a server that makes each keysym into the key of a US keyboard it is on, and holds Shift down only
+    between a Shift key's own events (obmc-ikvm: a capital or a sign sent alone arrives as its key unshifted). Shift goes
+    down around each character the US layout types with it, as for an AMI console and a JetKVM, and a character that
+    layout has no key for is refused before anything is typed (obmc-ikvm would drop it unsaid)."""
     if not text or len(text) > MAX_TEXT:
         raise KvmError("invalid", f"Text must be 1 to {MAX_TEXT} characters", 422)
     events = []
     for place, char in enumerate(text.replace("\r\n", "\n") + ("\n" if enter else ""), 1):
         keysym = rfb.keysym_of(char)
-        if keysym is None:
-            # Where, and never what: the text may be a saved secret, and what is said goes into the activity log.
-            raise KvmError("invalid", f"Character {place} of the text cannot be typed on a VNC server", 422)
-        events += [(keysym, True), (keysym, False)]
+        on_us = US_CHARS.get(char) if us_shift else (False, "")
+        # Where, and never what: the text may be a saved secret, and what is said goes into the activity log.
+        if keysym is None or on_us is None:
+            raise KvmError("invalid", f"Character {place} of the text cannot be typed {'on a US keyboard layout' if us_shift else 'on a VNC server'}", 422)
+        shifted = on_us[0]
+        events += [*([(SHIFT, True)] if shifted else []), (keysym, True), (keysym, False), *([(SHIFT, False)] if shifted else [])]
     return events
+
+
+def _pieces(events: list[tuple[int, bool]], most: int) -> list[list[tuple[int, bool]]]:
+    """Key events in pieces of about `most` each, every piece ending where nothing is held down: a piece is whole key
+    presses and releases, a Shift with the character it was down for, a combination together."""
+    pieces: list[list[tuple[int, bool]]] = [[]]
+    down: set[int] = set()
+    for keysym, pressed in events:
+        if not down and len(pieces[-1]) >= most:
+            pieces.append([])
+        pieces[-1].append((keysym, pressed))
+        if pressed:
+            down.add(keysym)
+        else:
+            down.discard(keysym)
+    return [piece for piece in pieces if piece]
 
 
 class VncDevice(Device):
     """A VNC server on the wall."""
 
     kind = "vnc"
-    can = ("screen", "keys", "text")  # (what a tile of this kind can be asked: see `act`; nothing of power, nothing of the KVM)
+    # What a tile of this kind can be asked: see `act`, and the live line with its keyboard and mouse (`live_screen`,
+    # `rfb_input`); nothing of power, nothing of the KVM.
+    can = ("screen", "keys", "text", "live", "control")
     # What a family whose door opens another way (see `_open`) may say and do otherwise: what it is called in what
     # a tile says, the encodings its server is told of, its paces, and how long nobody may look before the
     # connection is let go of (None: it is held for as long as the machine is on the wall).
@@ -214,10 +243,15 @@ class VncDevice(Device):
     PIXELS = rfb.RGB888
     SIGNS_IN: tuple[int, ...] = (rfb.SECURITY_NONE, rfb.SECURITY_VNC)  # the RFB sign-ins taken (see rfb.Client)
     SETTLED_BY_A_FRAME = True  # a frame drawn on a connection that lasted KEEPALIVE_LASTS is the server there again (False: only one that lasted SETTLED is)
+    US_SHIFT = False  # typed text with the US layout's Shift around what needs it (see text_events): a server's keysyms are its own
     # Whether the saved password answers RFB's VNC authentication where the door handed out none of its own (`one_time`).
     # Not behind a door whose saved secret is another thing (a Proxmox API token, a controller's password).
     SAVED_PASSWORD_TO_RFB = True
     LOOK_PACE, LIVE_PACE, IDLE_PACE = LOOK_PACE, LIVE_PACE, IDLE_PACE
+    LIVE_FOR = 2.0  # seconds after a live line last asked for the screen during which the pace is still a viewer's
+    # Seconds after the handshake before the server takes keys and the pointer: a server that drops what comes sooner
+    # (OpenBMC's obmc-ikvm, by its source) has them wait that long (`taking_input`).
+    INPUT_AFTER = 0.0
     LET_GO_AFTER: float | None = None
     HEARTBEAT_AFTER: float | None = None  # seconds without an update before one pixel is asked for outright; None: HEARTBEAT
     # Whether refusals in a row are counted on until a session has served a while (settled), and not only until the next
@@ -236,6 +270,7 @@ class VncDevice(Device):
         self._wanted_at = float("-inf")  # when a picture was last asked for
         self._wanted = asyncio.Event()  # set when somebody begins to look: the pacer wakes from its idle wait
         self._live = 0  # viewers that have the machine live: the pace is theirs while there is one
+        self._live_at = float("-inf")  # when a live line last asked for the screen (see `live_seen`)
         self._refusal: KvmError | None = None  # what the server sent that this program does not take, while that holds
         self._refusal_until = 0.0
         self._bad = 0  # such connections in a row
@@ -273,13 +308,18 @@ class VncDevice(Device):
 
     def _is_live(self) -> bool:
         """Whether a viewer has the machine live now: the pace is the viewer's then."""
-        return self._live > 0
+        return self._live > 0 or time.monotonic() - self._live_at < self.LIVE_FOR
 
     def live(self, on: bool) -> None:
         """A viewer has the machine live (on), or has left it: the screen is then asked for at a viewer's pace."""
         self._live = max(0, self._live + (1 if on else -1))
         if on:
             self._looking()
+
+    def live_seen(self) -> None:
+        """A live line asks for the screen now: the pace is a viewer's for the next moments (LIVE_FOR)."""
+        self._live_at = time.monotonic()
+        self._looking()
 
     def _looking(self) -> None:
         """Somebody wants pictures now: the pacer is told, in case it was waiting out its idle pace."""
@@ -348,7 +388,8 @@ class VncDevice(Device):
         return client.frames
 
     async def press(self, usage: int, down: bool) -> None:
-        """A key by its HID usage, pressed or let go of (as a live line has them). KvmError for a key there is no keysym for."""
+        """A key by its HID usage, pressed or let go of, on the connection that is up now (a live line's go through
+        `ScreenInput`, which waits for one). KvmError for a key there is no keysym for, or where no connection is up."""
         keysym = rfb.keysym_for(usage)
         if keysym is None:
             raise KvmError("invalid", f"There is no key for usage {usage:#x} to send to a VNC server", 422)
@@ -357,6 +398,79 @@ class VncDevice(Device):
     async def pointer(self, x: int, y: int, buttons: int = 0) -> None:
         """The pointer at (x, y) of the screen with these buttons held: bit 0 the left, 1 the middle, 2 the right, 3 and 4 the wheel."""
         await self._to_server(lambda client: client.pointer(x, y, buttons))
+
+    def size(self) -> tuple[int, int] | None:
+        """The screen's width and height, where a session has said them."""
+        client = self._connected_or_none()
+        return (client.width, client.height) if client is not None and client.width else None
+
+    async def let_go_key(self, usage: int) -> None:
+        """A key let go of, on the session that is open; with none open, nothing (and none is opened for it): a session that
+        ended let go of what it held with it, at the server."""
+        client, keysym = self._connected_or_none(), rfb.keysym_for(usage)
+        if client is not None and keysym is not None:
+            try:
+                await client.key(keysym, False)
+            except rfb.RfbError:
+                pass  # (the session is ending, and the server lets go of what it held with it)
+
+    async def let_go_pointer(self, x: int, y: int, buttons: int) -> None:
+        """Buttons let go of, on the session that is open; as `let_go_key`."""
+        client = self._connected_or_none()
+        if client is not None:
+            try:
+                await client.pointer(x, y, buttons)
+            except rfb.RfbError:
+                pass
+
+    async def taking_input(self, within: float) -> rfb.Client:
+        """The session's client, connecting where there is none, once the server takes keys on it (INPUT_AFTER from its
+        handshake); KvmError where none came within `within` seconds. A session that ended meanwhile: the next one."""
+        deadline = time.monotonic() + within
+        while True:
+            client = await self.ready(max(0.1, deadline - time.monotonic()))
+            session = self._session
+            if self.INPUT_AFTER and session is not None and session.client is client and session.let_in_at is not None:
+                wait = session.let_in_at + self.INPUT_AFTER - time.monotonic()
+                if wait > 0:
+                    await asyncio.sleep(wait)
+            if client is self._connected_or_none():
+                return client
+            if time.monotonic() >= deadline:
+                raise KvmError("no_stream", f"Waiting for {self.THING}", 503)
+
+    # --- the live line (live.py), where this server is the tile: its screen at a viewer's pace, keys and the pointer ---
+
+    @property
+    def console_readable(self) -> bool:
+        """Whether its screen can be had live, as far as is known: what the live line asks before it begins, and when a
+        picture failed (live.Source). Not while the password stands rejected or none is saved, the server is left alone
+        for what it sent, or it shows a certificate that is not the one remembered: the tile says which, and so does the
+        line as it ends. A server that is down is waited for, with a pause that grows, as the tile waits."""
+        now = time.monotonic()
+        if self._login_error is not None and now < self._login_retry_at:
+            return False
+        if self._refusal is not None and now < self._refusal_until:
+            return False
+        down = self._down_error
+        return not (down is not None and now < self._down_until and down.code in ("cert_mismatch", "cert_invalid"))
+
+    async def live_screen(self) -> tuple[int, int, int, bytearray]:
+        """The screen as it stands, for the live line (live.ConsoleSource): frames so far, width, height, three bytes a
+        pixel. On the tile's own connection: one to the server, shared by the tile and every live viewer, asked for what
+        changed at a viewer's pace while one asks (LIVE_PACE). KvmError where there is none to be had."""
+        self.live_seen()
+        client = await self.ready(LIVE_WAIT)
+        if client.frames == 0:
+            await self.next_frame(0, LIVE_WAIT)
+        shown = self.screen()
+        if shown is None:
+            raise KvmError("no_stream", "Waiting for the screen", 503)
+        return shown
+
+    def rfb_input(self) -> ScreenInput:
+        """What a live line's keys and pointer go through (live.RfbHid): this server's own connection."""
+        return ScreenInput(self)
 
     # --- what the wall asks ----------------------------------------------------------------------------------
 
@@ -425,7 +539,7 @@ class VncDevice(Device):
         elif action == "keys":
             events = key_events(keys)
         elif action == "text":
-            events = text_events(text)
+            events = text_events(text, us_shift=self.US_SHIFT)
         else:
             raise KvmError("invalid", "A VNC server cannot do that", 422)
         if still is not None and not still():
@@ -436,12 +550,15 @@ class VncDevice(Device):
         if still is not None and not still():
             raise KvmError("stopped", "It was not done: whoever asked for it may no longer do that", 403)
         try:
-            for at in range(0, len(events), KEYS_AT_ONCE):
+            presses = sum(pressed for _, pressed in events)
+            pressed_so_far = 0
+            for piece in _pieces(events, KEYS_AT_ONCE):
                 # Asked again before every piece: up to 2000 characters take a while, and whoever asked may be signed out
                 # or no longer allowed meanwhile. (A piece is whole key presses and releases: nothing is left held.)
-                if at and still is not None and not still():
-                    raise KvmError("stopped", f"It was stopped after {at // 2} of {len(events) // 2} keys: whoever asked for it may no longer do that", 403)
-                await client.keys(events[at : at + KEYS_AT_ONCE])
+                if pressed_so_far and still is not None and not still():
+                    raise KvmError("stopped", f"It was stopped after {pressed_so_far} of {presses} keys: whoever asked for it may no longer do that", 403)
+                await client.keys(piece)
+                pressed_so_far += sum(pressed for _, pressed in piece)
         except rfb.RfbError as ex:
             raise self._not_taken(ex) from None
 
@@ -929,7 +1046,6 @@ class DoorScreen(VncDevice):
     """
 
     LET_GO_AFTER = 60.0
-    LIVE_FOR = 2.0  # seconds after a live line last asked for the screen during which the pace is still a viewer's
     SAVED_PASSWORD_TO_RFB = False  # (behind a door, RFB is given the password the door was handed, or none: never the saved one)
     REFUSALS_COUNT_TILL_SETTLED = True
     # A still screen sends nothing, and asks nothing back: a proxy in front of the door (a reverse proxy before Proxmox, as
@@ -948,7 +1064,6 @@ class DoorScreen(VncDevice):
 
     def __init__(self, spec: DeviceSpec) -> None:
         super().__init__(spec, None)  # (a certificate is the owning tile's to remember, on its own first look)
-        self._live_at = float("-inf")
         self._cut_in_run = False  # a session that served for a while ended since the last time all was forgiven
         self._quiet_first = False  # the first failure in this run was such an end, and was not said in the log
         self._everyone_waits = False  # the last failure was a moment of the machine's own: a live viewer waits it out too
@@ -1099,38 +1214,7 @@ class DoorScreen(VncDevice):
         super()._settled()
         self.forgive()
 
-    # --- what the owning tile asks -------------------------------------------------------------------------
-
-    def live_seen(self) -> None:
-        """A live line asks for the screen now: the pace is a viewer's for the next moments."""
-        self._live_at = time.monotonic()
-        self._looking()
-
-    def _is_live(self) -> bool:
-        return super()._is_live() or time.monotonic() - self._live_at < self.LIVE_FOR
-
-    def size(self) -> tuple[int, int] | None:
-        """The screen's width and height, where a session has said them."""
-        client = self._connected_or_none()
-        return (client.width, client.height) if client is not None and client.width else None
-
-    async def let_go_key(self, usage: int) -> None:
-        """A key let go of, on the session that is open; with none open, nothing (and none is opened for it)."""
-        client, keysym = self._connected_or_none(), rfb.keysym_for(usage)
-        if client is not None and keysym is not None:
-            try:
-                await client.key(keysym, False)
-            except rfb.RfbError:
-                pass  # (the session is ending, and the server lets go of what it held with it)
-
-    async def let_go_pointer(self, x: int, y: int, buttons: int) -> None:
-        """Buttons let go of, on the session that is open; as `let_go_key`."""
-        client = self._connected_or_none()
-        if client is not None:
-            try:
-                await client.pointer(x, y, buttons)
-            except rfb.RfbError:
-                pass
+    # --- what the owning tile asks (and `live_seen`, `size`, `let_go_key`, `let_go_pointer`, `taking_input`) -------------
 
     def turned_away(self) -> str | None:
         """What keeps the screen away whatever is asked meanwhile: a refusal, a certificate that is not the one remembered,
@@ -1155,3 +1239,54 @@ class DoorScreen(VncDevice):
         if down is not None and now < self._down_until and (down.code in ("cert_mismatch", "cert_invalid") or self._failures > 1):
             return down.message
         return None
+
+
+class ScreenInput:
+    """Keys and the pointer from a live line (live.RfbHid) to a screen read over RFB: a VNC server's own tile, or the
+    console behind another driver's door (OpenBMC's; `allowed` is that driver's say, raised as its KvmError).
+
+    A key or a button pressed, or the pointer put somewhere, waits for the connection (LIVE_WAIT at the most, opening one
+    where none is up; the screen is held all that while, as for any input), and for the server to take input on it
+    (INPUT_AFTER); then `still` is asked, right before it goes, and where that says no it goes nowhere. A key or a button
+    let go of goes to the connection that is up, whatever was found since, and opens none: a connection that ended let
+    go of what it held with it, at the server. RFB has events for keys by keysym and for the pointer at a place, in the
+    screen's pixels, with the buttons held; it has no back and forward buttons (live.RfbHid sends none)."""
+
+    def __init__(self, screen: VncDevice, allowed: Callable[[], Awaitable[None]] | None = None) -> None:
+        self._screen = screen
+        self._allowed = allowed
+
+    async def input_ready(self) -> None:
+        """The connection keys and the pointer go through, open and taking them: KvmError where there is none to be had."""
+        if self._allowed is not None:
+            await self._allowed()
+        with self._screen.inputting():
+            await self._screen.taking_input(LIVE_WAIT)
+
+    def screen_size(self) -> tuple[int, int] | None:
+        return self._screen.size()
+
+    async def press(self, usage: int, down: bool, still: Callable[[], bool] | None = None) -> None:
+        """A key by its HID usage. KvmError `invalid` for one that has no keysym (nothing is waited for, nothing goes)."""
+        if rfb.keysym_for(usage) is None:
+            raise KvmError("invalid", f"There is no key for usage {usage:#x} to send over RFB", 422)
+        if not down:
+            await self._screen.let_go_key(usage)
+            return
+        with self._screen.inputting():
+            await self.input_ready()
+            if still is not None and not still():
+                return  # (the line lost keyboard and mouse while the key waited: it goes to nobody's machine)
+            await self._screen.press(usage, True)
+
+    async def pointer(self, x: int, y: int, buttons: int = 0, letting_go: bool = False, still: Callable[[], bool] | None = None) -> None:
+        """The pointer at (x, y) of the screen with these buttons held (see VncDevice.pointer). `letting_go`: buttons let go
+        of, which go as a key let go of does; `still`: as for `press`."""
+        if letting_go:
+            await self._screen.let_go_pointer(x, y, buttons)
+            return
+        with self._screen.inputting():
+            await self.input_ready()
+            if still is not None and not still():
+                return
+            await self._screen.pointer(x, y, buttons)

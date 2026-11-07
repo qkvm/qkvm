@@ -16,6 +16,20 @@ from qkvm import activity, amt, history, jetkvm, kvm, redfish
 
 TICK = 0.02  # what a clock may be out by: on Windows before Python 3.13 it ticks every sixteen thousandths of a second
 SCALE = 300.0  # how much shorter every wait is for a test that asks for `scaled`: a minute is a fifth of a second
+# The step the clock the program waits by (time.monotonic) moves in, as this Python says: a sixty-fourth of a second on
+# Windows before Python 3.13, next to nothing elsewhere.
+CLOCK_STEP = time.get_clock_info("monotonic").resolution
+
+
+def at_least(seconds: float) -> float:
+    """The least a test measures by time.monotonic of a wait of the program's of `seconds`, made of one sleep and a deadline
+    after it where there is one (a press: the board's hold, then the wait for the change), where it ended when it was to end.
+
+    The event loop runs what is due within one step of that clock (asyncio's own rule), so the sleep ends up to a step early
+    by its readings. The deadline is looked at by a reading, which is never early, and the test's own two readings are of the
+    same clock: one step in all, and no more. (A long press on a Windows runner of Python 3.11 was measured 3.187 s, where
+    the program's waits were 3.2 s: the first run of 0.2.2.)"""
+    return seconds - CLOCK_STEP
 
 
 @pytest.fixture(autouse=True, scope="session")
@@ -64,6 +78,7 @@ def nobody_asked_about_releases(monkeypatch: pytest.MonkeyPatch) -> None:
     stand-in on this computer, sets this again and is not hindered; the programs tests start inherit it.
     """
     monkeypatch.setenv("QKVM_UPDATE_API", "http://127.0.0.1:9")
+    monkeypatch.setenv("QKVM_UPDATE_FILES", "http://127.0.0.1:9")  # (and where the libraries a release lists are fetched)
 
 
 @pytest.fixture(autouse=True)
@@ -169,9 +184,11 @@ def nothing_rejected_before() -> None:
 @pytest.fixture(autouse=True)
 def nothing_paced_before() -> None:
     """What paces a KVM's power buttons and the questions to its Fingerbot is kept beside the connections as well, by the
-    tile's id and the KVM's address, for as long as the program runs (kvm.PACED): the stand-in of one test, at the port
-    another one's had, or a tile with the same id, is not to find that one's press still held."""
+    KVM's address and its pinned certificate, for as long as the program runs (kvm.PACED): the stand-in of one test, at the port
+    another one's had, or a KVM with the same certificate, is not to find that one's press still held. (And a JetKVM's
+    connections made anew in a row for a key frame it did not send, jetkvm._DEAF, by address too.)"""
     kvm.PACED.clear()
+    jetkvm._DEAF.clear()
 
 
 @pytest.fixture(autouse=True)

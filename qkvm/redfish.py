@@ -48,8 +48,10 @@ from .kvm import (
     ABOUT_TTL,
     DOWN_CODES,
     FULL,
+    IMAGE_NAME,
     KEYS,
     MAX_TEXT,
+    MEDIA_BOOTS,
     TIERS,
     AlreadySo,
     LOGIN_RETRY,
@@ -62,6 +64,7 @@ from .kvm import (
     DeviceSpec,
     KvmError,
     Listening,
+    MediaOffer,
     Snapshot,
     _dig,
     _transport_error,
@@ -81,9 +84,11 @@ from .kvm import (
     ws_connect as _to_a_device,
     ws_error,
 )
+from .served import LEND_GRACE, SERVED_PATH, SUFFIX, Lending, Served, Superseded, addresses_of, scrubbed
 
 if TYPE_CHECKING:
     from .openbmc import OpenBmcScreen  # (made where it is needed: it is a VNC reader's, and that reader uses this file)
+    from .vncdevice import ScreenInput
 
 log = logging.getLogger("qkvm")
 
@@ -783,16 +788,64 @@ def boot_targets(system: dict[str, Any]) -> list[str]:
     return [target for target in listed(offered) if isinstance(target, str)]
 
 
-SETUP_OVERRIDE = ("once", "biossetup")  # what Start into BIOS setup sets, as `boot_override` says it
-SETUP_CHANGE = {"Boot": {"BootSourceOverrideEnabled": "Once", "BootSourceOverrideTarget": "BiosSetup"}}
-NOT_CLEARED = "the BIOS setup boot override may be set and could not be cleared, so the next boot may land in the BIOS setup"
-SET_BEFORE = "the BIOS setup boot override was set already before this press, and is left set as it was, so the next boot may land in the BIOS setup"
-# Where the clearing found the override off and went out before a change of the press's that the controller accepted
-# (or whose answer was lost): the clearing cannot undo what comes after it.
-CLEARED_LATE = (
-    "the BIOS setup boot override showed off and was cleared; should this press's change still be made (accepted for later, "
-    "or its answer lost), the next boot will land in the BIOS setup"
-)
+class BootOverride(NamedTuple):
+    """A boot override this driver sets, and the words it is said in: Start into BIOS setup's (SETUP), or a start from the
+    image in the server's virtual CD-ROM drive, once or until it is unmounted (CD_ONCE, CD_ALWAYS: virtual media, 0.3.0).
+    Each goes the same careful way (`_boot_override`): from the moment it may be set, every way out says whether it is."""
+
+    shown: tuple[str, str]  # as `boot_override` says it once it is set: ("once", "biossetup")
+    enabled: str  # BootSourceOverrideEnabled, as it is sent
+    target: str  # BootSourceOverrideTarget, as it is sent and as the controller's AllowableValues must list it
+    own: frozenset[tuple[str, str]]  # what may show that is this action's own, and no other tool's
+    name: str  # "the BIOS setup boot override"
+    boot: str  # "BIOS setup boot": "The BIOS setup boot is set for the next boot"
+    lands: str  # "land in the BIOS setup": "the next boot may land in the BIOS setup"
+    again: str  # "start into BIOS setup again": "Look at the server's boot override, or start into BIOS setup again."
+    doing: str  # "starting into the BIOS setup": the log, where qKVM is stopped meanwhile
+    not_offered: str  # the refusal where the controller does not list `target`
+
+    @property
+    def change(self) -> dict[str, Any]:
+        return {"Boot": {"BootSourceOverrideEnabled": self.enabled, "BootSourceOverrideTarget": self.target}}
+
+    @property
+    def not_cleared(self) -> str:
+        return f"{self.name} may be set and could not be cleared, so the next boot may {self.lands}"
+
+    @property
+    def set_before(self) -> str:
+        return f"{self.name} was set already before this press, and is left set as it was, so the next boot may {self.lands}"
+
+    @property
+    def cleared_late(self) -> str:
+        # Where the clearing found the override off and went out before a change of the press's that the controller accepted
+        # (or whose answer was lost): the clearing cannot undo what comes after it.
+        return f"{self.name} showed off and was cleared; should this press's change still be made (accepted for later, or its answer lost), the next boot will {self.lands}"
+
+    @property
+    def name_first(self) -> str:
+        """`name`, at the start of a sentence."""
+        return self.name[:1].upper() + self.name[1:]
+
+
+SETUP = BootOverride(
+    shown=("once", "biossetup"), enabled="Once", target="BiosSetup", own=frozenset({("once", "biossetup")}), name="the BIOS setup boot override",
+    boot="BIOS setup boot", lands="land in the BIOS setup", again="start into BIOS setup again", doing="starting into the BIOS setup",
+    not_offered="This controller does not offer starting into the BIOS setup (it allows no 'BiosSetup' boot override)",
+)  # fmt: skip
+# A start from the image in the server's virtual CD-ROM drive: for its next start (the controller clears it as it starts),
+# or for every start until the image is unmounted (cleared then, where it is still this one). Either is this action's own.
+CD_ONCE = BootOverride(
+    shown=("once", "cd"), enabled="Once", target="Cd", own=frozenset({("once", "cd"), ("continuous", "cd")}), name="the CD boot override",
+    boot="start from the image", lands="start from the image", again="start it from the image again", doing="starting it from an image",
+    not_offered="This controller does not offer starting the server from its virtual CD-ROM drive (it allows no 'Cd' boot override)",
+)  # fmt: skip
+CD_ALWAYS = CD_ONCE._replace(shown=("continuous", "cd"), enabled="Continuous")
+SETUP_OVERRIDE = SETUP.shown  # what Start into BIOS setup sets, as `boot_override` says it
+SETUP_CHANGE = SETUP.change
+NOT_CLEARED = SETUP.not_cleared
+SET_BEFORE = SETUP.set_before
+CLEARED_LATE = SETUP.cleared_late
 # What tells that a request never went out (nothing it would change was changed): anything else after it was sent may
 # have been done (a timeout, a broken answer, an answer that could not be read, an address it was sent on to that is none).
 NOT_SENT = frozenset({"unreachable", "stopped", "cert_mismatch", "cert_invalid", "no_sign_in", "auth_failed", "no_password", "another_machine"})
@@ -830,12 +883,15 @@ def took_too_long() -> str:
 class SetupSteps:
     """How far one Start into BIOS setup came: "looking" (nothing sent that changes anything), "setting" (the override may
     be set), "clearing" (being set back), "restarting" (the power change may have gone), "waiting" (switched on, not yet
-    seen on); and until when it may go on to its restart (SETUP_WITHIN)."""
+    seen on); and until when it may go on to its restart (SETUP_WITHIN). `ov`: which override it sets (SETUP, or a start from
+    an image); `restart`: whether the server is restarted after (or switched on), or only the override set."""
 
-    def __init__(self) -> None:
+    def __init__(self, ov: BootOverride = SETUP, restart: bool = True) -> None:
         self.at = "looking"
         self.until = time.monotonic() + SETUP_WITHIN
         self.changed_at: float | None = None  # when the controller answered the change of the boot override with a yes
+        self.ov = ov
+        self.restart = restart
 
     def overdue(self, spare: float = 0.0) -> bool:
         """Whether the press's time is up (`spare`: or will be within that many seconds)."""
@@ -1023,6 +1079,142 @@ def is_openbmc(manager: dict[str, Any]) -> bool:
     return manager.get("Model") == "OpenBmc" or isinstance(_dig(manager, "Oem", "OpenBmc"), dict)
 
 
+# --- virtual media (0.3.0, A4): an image qKVM serves, in the server's virtual CD-ROM drive ------------------------------
+# The controller is handed an address qKVM made for that mount alone (served.py), by Redfish's InsertMedia, and reads the
+# image from it for as long as it is mounted; EjectMedia ends that, and the address with it. Starting from it is a boot
+# override of "Cd", once or until it is unmounted (CD_ONCE, CD_ALWAYS), gone the careful way of Start into BIOS setup.
+# AMI's controllers show their CD-ROM drives only once their "remote media" is switched on, by an action of their own
+# (`remote_media_switch`), and take an image over NFS, CIFS or HTTPS alone, with a user and a password.
+MEDIA_LOOK_EVERY = 30.0  # seconds between looks at the drive, at a look at the server (and at once after a change of it)
+MEDIA_WAITS = httpx.Timeout(60.0, connect=4.0, pool=8.0)  # a mount or an unmount: the controller tries the address first
+MEDIA_WITHIN = 120.0  # seconds the task of a mount or an unmount (AMI's answer 202 with one) is followed
+TASK_EVERY = 2.0
+RMEDIA_WITHIN = 90.0  # seconds a CD-ROM drive is looked for after AMI's remote media was switched on (4 to 5 s on Lenovo's; 44 s on a real AMI board)
+# Seconds after the switch of AMI's remote media before what the controller says of it is read: still off, it is said so
+# (a real board says it takes 4 to 5 seconds; one kept it off, its settings wanting an image share of their own).
+RMEDIA_SAYS_WITHIN = 15.0
+MOST_DRIVES = 8  # virtual media of a controller looked at for its CD-ROM drive
+TASK_FAILED = ("exception", "killed", "cancelled")
+
+
+def remote_media_switch(manager: dict[str, Any], place: str | None, ami: bool) -> str | None:
+    """Where AMI's controller is told to switch its remote media on (`AMIVirtualMedia.EnableRMedia`, documented for AMI's
+    MegaRAC as Lenovo's System Manager): the target its manager names for it, or, on a controller whose root says AMI and whose
+    manager keeps virtual media, the place AMI documents under that manager. None for any other."""
+    named = link(_dig(manager, "Actions", "Oem", "#AMIVirtualMedia.EnableRMedia", "target"))
+    if named is not None:
+        return named
+    if ami and place and link(_dig(manager, "VirtualMedia", "@odata.id")):
+        return f"{place.rstrip('/')}/Actions/Oem/AMIVirtualMedia.EnableRMedia"
+    return None
+
+
+def amis(drive: Any) -> bool:
+    """Whether a virtual drive is AMI's own kind (its type `#AMIVirtualMedia...`, or an Oem part of AMI's), which takes an image
+    by its address, the kind of address, and a user and a password, and nothing more (Lenovo's System Manager documents it)."""
+    return "AMIVirtualMedia" in (plain(_dig(drive, "@odata.type"), 100) or "") or isinstance(_dig(drive, "Oem", "Ami"), dict)
+
+
+RMEDIA_STAYED_OFF = (
+    "Nothing was mounted: the controller took the switch of its remote media, and says it is still off. Some firmware keeps "
+    "it off until an image share is set in its own settings (Media Redirection, General Settings, Mount CD/DVD): qKVM cannot "
+    "mount an image there then."
+)
+
+
+# The kinds of transfer a Redfish InsertMedia may name (TransferProtocolType): what is kept of what a drive's description says.
+TRANSFER_KINDS = frozenset({"CIFS", "FTP", "SFTP", "HTTP", "HTTPS", "NFS", "SCP", "TFTP", "OEM"})
+
+
+def port_80_said(drive: Any, base: str) -> str:
+    """What to add to a mount that failed on a drive of AMI's, where qKVM's address names a port other than 80: real AMI
+    boards were seen reading an image over plain HTTP from port 80 alone, whatever port its address named."""
+    if not amis(drive) or not base.startswith("http://"):
+        return ""
+    try:
+        port = urlsplit(base).port
+    except ValueError:
+        return ""
+    if port in (None, 80):
+        return ""
+    return (
+        f" Some AMI controllers read an image from port 80 alone, whatever port its address names ({port} here): name an address "
+        "on port 80 that reaches qKVM, in Settings, Server images (where qKVM listens on another, a port forward from 80 to it)."
+    )
+
+
+def is_cd(drive: Any) -> bool:
+    """Whether a controller's virtual media resource is a CD-ROM drive (its MediaTypes say CD or DVD; or, saying none, it is
+    called so, as AMI's CD1)."""
+    if not isinstance(drive, dict):
+        return False
+    kinds = drive.get("MediaTypes")
+    if isinstance(kinds, list):
+        return any(kind in ("CD", "DVD") for kind in kinds)
+    return "cd" in (plain(drive.get("Id"), 40) or "").lower()
+
+
+def inserted(drive: Any) -> bool:
+    """Whether something is in a virtual drive: as its `Inserted` says, or, saying neither, as it is connected."""
+    said = _dig(drive, "Inserted")
+    if isinstance(said, bool):
+        return said
+    return _dig(drive, "ConnectedVia") in ("URI", "Applet", "Oem")
+
+
+def holds(drive: Any, token: str, names: tuple[str, ...]) -> bool | None:
+    """Whether the image in a virtual drive is the one qKVM serves under `token`: by the address it shows; else, where it
+    shows another address of qKVM's (another mount's, or one from before a restart), not; else by the name it gives (or the
+    last part of the address it shows: a controller may leave the token out of what it shows), of `names`. False where
+    nothing is in it or another image is; None where it says nothing of which (taken as this one: what is served on is
+    better than an install cut off)."""
+    if not inserted(drive):
+        return False
+    image = _dig(drive, "Image")
+    if isinstance(image, str) and token in image:
+        return True
+    if stale(drive, token):
+        return False
+    shown = plain(_dig(drive, "ImageName"), 200) or (image_said(drive) if isinstance(image, str) and image else None)
+    return (shown in names) if shown else None
+
+
+def words(value: Any, limit: int, lending: Lending | None = None) -> str | None:
+    """A controller's words, as they may be said on: with nothing of a mount's in them (served.scrubbed), as one short line."""
+    return plain(scrubbed(value, lending) if isinstance(value, str) else value, limit)
+
+
+def _last_part(address: Any) -> str:
+    """The last part of an address's path, as it reads ("" for what is no address)."""
+    try:
+        return unquote(urlsplit(address).path.rstrip("/").rsplit("/", 1)[-1]) if isinstance(address, str) else ""
+    except ValueError:
+        return ""
+
+
+def image_said(drive: Any) -> str:
+    """What is in a virtual drive, as it may be said to anybody: its name, or the last part of the address it is read from
+    (never the address: it may hold a password, or a token of qKVM's; nor anything with the shape of one)."""
+    name = _dig(drive, "ImageName")
+    if isinstance(name, str) and "://" in name:
+        name = _last_part(name)  # (its address given as its name: said as an address is)
+    if said := words(name, 120):
+        return said
+    return words(_last_part(_dig(drive, "Image")), 120) or "an image put there elsewhere"
+
+
+def stale(drive: Any, token: str | None) -> bool:
+    """Whether the drive shows an address of qKVM's (served.SERVED_PATH) that it does not serve now: made before qKVM was
+    restarted, or for another tile."""
+    image = _dig(drive, "Image")
+    if not inserted(drive) or not isinstance(image, str) or (token is not None and token in image):
+        return False
+    try:
+        return SERVED_PATH.fullmatch(urlsplit(image).path) is not None
+    except ValueError:
+        return False
+
+
 class RedfishDevice(Device):
     """A server's management controller, over Redfish."""
 
@@ -1107,6 +1299,21 @@ class RedfishDevice(Device):
         # what a server known by its controller alone (SAID_NONE), or whose computer says none just now, is judged by. (A few:
         # a read under the one before may come back after a new one was signed in, and is no less this controller's.)
         self._controller_tokens: deque[str] = deque(maxlen=CONTROLLER_SESSIONS)
+        # Its virtual CD-ROM drive (virtual media, 0.3.0): where it is (None: none found), what it said at the last look at
+        # it, and when; when the place was found; where the computer keeps its virtual media (newer controllers), whether it
+        # allows a "Cd" boot override, and its boot override as last read.
+        self._media_place: str | None = None
+        self._media_drive: dict[str, Any] | None = None
+        self._media_at = float("-inf")
+        self._media_found_at = float("-inf")
+        self._media_changed_at = float("-inf")  # (wall-clock) when a mount or an unmount from here last read the drive
+        # What a drive's InsertMedia description (its ActionInfo) says, where the drive itself lists no kinds of transfer: the
+        # last one read, by its address, and only whether HTTP is among them (None: it named none qKVM knows). Nothing else
+        # of it is kept (the outside review's fourth round: a board naming another description at every read grew a cache).
+        self._insert_told: tuple[str, bool | None] | None = None
+        self._system_media: str | None = None
+        self._cd_target = False
+        self._override_seen: tuple[str, str] = ("", "")
 
     def tidy(self) -> None:
         if self._rfb_screen is not None:
@@ -1308,9 +1515,11 @@ class RedfishDevice(Device):
         headers: dict[str, str] | None = None,
         still: Callable[[], bool] | None = None,
         command: bool = False,
+        denied_is_an_answer: bool = False,
         **kwargs: Any,
     ) -> httpx.Response:
-        """Send a signed-in request. `urgent`, `vital` and `still` mean what they mean for a KVM (see KvmDevice._request).
+        """Send a signed-in request. `denied_is_an_answer`: a 401 is handed back as it came, not taken for a session that
+        ran out (an address qKVM guessed, which a controller may answer 401 where there is nothing: never signed in anew for). `urgent`, `vital` and `still` mean what they mean for a KVM (see KvmDevice._request).
 
         `command`: it changes something on the server (or hands out a way into its console), and goes only under the session
         under which the computer was last found to be this tile's (`_checked_token`). A server that took the address since does
@@ -1404,6 +1613,8 @@ class RedfishDevice(Device):
                 except httpx.HTTPError as ex:
                     raise failed(_transport_error(ex, self.spec.tls)) from ex
             self._answered()
+            if reply.status_code == 401 and denied_is_an_answer:
+                return reply
             if reply.status_code != 401:
                 self._answered_token = token  # (read by whoever awaited this, before anything else runs: see `_checked_read`)
                 return reply
@@ -1421,15 +1632,16 @@ class RedfishDevice(Device):
                 self._token = None
 
     async def _read(
-        self, path: str, urgent: bool = False, vital: bool = True, waits: httpx.Timeout | None = None, command: bool = False
+        self, path: str, urgent: bool = False, vital: bool = True, waits: httpx.Timeout | None = None, command: bool = False,
+        denied_is_an_answer: bool = False,
     ) -> tuple[dict[str, Any], str | None]:
         """What is at `path`, and the mark the controller puts on its present state (None: it puts none). `waits`: how long
         its answer is waited for, where not as long as for any other (WAITS). (Never None to httpx: that is no limit.)
         `command`: a read that hands something out (a way into the console), bound as a command is (see `_request`)."""
         if waits is None:
-            reply = await self._request("GET", path, urgent=urgent, vital=vital, command=command)
+            reply = await self._request("GET", path, urgent=urgent, vital=vital, command=command, denied_is_an_answer=denied_is_an_answer)
         else:
-            reply = await self._request("GET", path, urgent=urgent, vital=vital, command=command, timeout=waits)
+            reply = await self._request("GET", path, urgent=urgent, vital=vital, command=command, denied_is_an_answer=denied_is_an_answer, timeout=waits)
         if reply.status_code != 200:
             raise KvmError("bad_response", f"{path} failed (HTTP {reply.status_code})")
         try:
@@ -1617,6 +1829,8 @@ class RedfishDevice(Device):
                 "console": link(_dig(manager, "IKVM", "@odata.id")),
                 "rfb": rfb_console(manager),  # OpenBMC's console (openbmc.py)
                 "openbmc": is_openbmc(manager),
+                "media": link(_dig(manager, "VirtualMedia", "@odata.id")),  # its virtual media, where the controller keeps them
+                "rmedia": remote_media_switch(manager, place, self._ami_root),  # AMI's switch for them (see `remote_media_switch`)
                 "known": True,
             }
             self._controller_at = time.monotonic()
@@ -2187,13 +2401,32 @@ class RedfishDevice(Device):
         width, height, shown = console.screen.shown
         return console.frames, width, height, shown
 
-    # --- keys and the mouse, over the console this program holds (AMI's firmware only) ------------------------
+    # --- keys and the mouse, over the console this program holds: AMI's as USB reports, OpenBMC's as RFB's events ---
 
     @property
     def takes_keys(self) -> bool:
-        """Whether this console takes keyboard and mouse from qKVM, as far as is known: AMI's does, OpenBMC's does
-        not yet. Said None (not asked yet) is taken as yes, as the screen is: whoever asks finds out (see `input_ready`)."""
+        """Whether AMI's console takes keyboard and mouse from qKVM here, as far as is known (as USB reports: live.RedfishHid).
+        Said None (not asked yet) is taken as yes, as the screen is: whoever asks finds out (see `input_ready`). OpenBMC's
+        console takes them as RFB's key and pointer events instead (`rfb_input`)."""
         return self._controller.get("rfb") is None and self._has_console is not False and not self._closed
+
+    def rfb_input(self) -> ScreenInput | None:
+        """What a live line's keys and pointer go through where this controller's console is OpenBMC's (live.RfbHid): RFB's
+        key and pointer events, over the console the screen comes on (one seat for both). None for any other."""
+        rfb_screen = self._openbmc_screen()
+        if rfb_screen is None:
+            return None
+        from .vncdevice import ScreenInput
+
+        return ScreenInput(rfb_screen, allowed=self._rfb_input_allowed)
+
+    async def _rfb_input_allowed(self) -> None:
+        """KvmError where keys may not go to OpenBMC's console just now: another server answers at the address, or the
+        controller turned out to be of another make since."""
+        if self._other is not None:
+            raise self._other.with_traceback(None)
+        if await self._openbmc_known() is None:
+            raise KvmError("no_input", "This server's controller has changed since: ask for keyboard and mouse again", 409)
 
     @property
     def mouse_absolute(self) -> bool:
@@ -2235,7 +2468,8 @@ class RedfishDevice(Device):
         if self._other is not None:
             raise self._other.with_traceback(None)
         if await self._openbmc_known() is not None:
-            raise KvmError("no_input", "This server's console (OpenBMC) takes no keyboard or mouse from qKVM yet", 409)
+            # (A line that asked before the controller had said what it is: its keys go another way, `rfb_input`.)
+            raise KvmError("no_input", "This server's console is OpenBMC's, as the controller has just said: ask for keyboard and mouse again", 409)
         if not self._controller:
             # (Not known to be AMI's: its web page is not offered the password on the strength of nothing.)
             raise KvmError("no_stream", "Waiting for the server's controller", 503)
@@ -2347,6 +2581,24 @@ class RedfishDevice(Device):
         the whole keyboard; a key held is let go of by a report without it, so a combination goes down together and
         a typed character is pressed and released. The console is kept from being given back while a long text goes."""
         from .jetkvm import key_report, text_reports  # (the USB HID key and character tables, shared with a JetKVM)
+
+        rfb_screen = await self._openbmc_known()
+        if rfb_screen is not None:
+            # OpenBMC's console: RFB's key events, as to a VNC server (keysyms, with the US layout's Shift around what
+            # needs it: see openbmc.OpenBmcScreen.US_SHIFT), once obmc-ikvm takes input on it; the console held all that
+            # while. What cannot be sent is said before the console is opened for it.
+            from .vncdevice import key_events, text_events
+
+            if action == "keys":
+                key_events(keys)
+            elif action == "text":
+                text_events(text, us_shift=rfb_screen.US_SHIFT)
+            async with self._typing:
+                await self._rfb_input_allowed()
+                with rfb_screen.inputting():
+                    await rfb_screen.taking_input(OPENBMC_WAIT)
+                    await rfb_screen.act(action, keys=keys, text=text, still=still)
+            return
 
         def typeable(char: str) -> bool:
             try:
@@ -3068,6 +3320,7 @@ class RedfishDevice(Device):
         # a setting may have been changed, whoever had the console may have left.
         no_screen = self._no_screen if time.monotonic() < self._console_retry_at else None
         itself = await self._itself()  # (first: it may say there is no console of either kind)
+        await self._media_look(system)  # (its virtual CD-ROM drive: what is in it, said on the tile)
         has_screen = self._has_console is not False and no_screen is None
         rfb_screen = self._openbmc_screen()
         if rfb_screen is not None:
@@ -3079,10 +3332,12 @@ class RedfishDevice(Device):
         light = locator(system)[0]  # the light to find it by in a rack: on, off, or None where there is none
         # Where its screen is being had over AMI's console, so can keys, typed text and the pointer. Only once the
         # console is known to be AMI's (not optimistically, as the screen is): keys offered on a controller that
-        # turns out to have none would mislead. OpenBMC's console (rfb_screen) is read only, and has no keys.
+        # turns out to have none would mislead. OpenBMC's console (rfb_screen) carries them as RFB's events, on the
+        # session the screen comes on: where the screen can be had, so can they.
         keys_now = has_screen and rfb_screen is None and self._has_console is True and not self._handed_over
         # ...and not while a session of this program's is open that another holds (a holder coming back, picture only).
         keys_now = keys_now and (self._accepted_at is None or self._live_send is not None)
+        keys_now = keys_now or (rfb_screen is not None and has_screen)
         found = {
             "state": state,
             "error": error,
@@ -3099,7 +3354,9 @@ class RedfishDevice(Device):
                 "live" if has_screen else None,
                 "bios_setup" if "BiosSetup" in boot_targets(system) else None,
                 *(("keys", "text", "control") if keys_now else ()),
+                "media" if self.media_offer() is not None else None,
             ),
+            "media": self.media_now(),  # what is in its virtual CD-ROM drive (said to everybody who sees the tile)
             "video": {"signal": on, "width": width, "height": height, "fps": None},
             "usb": {"keyboard": None, "mouse": None},
             "atx": {"enabled": True, "power": on, "hdd": None},
@@ -3225,18 +3482,26 @@ class RedfishDevice(Device):
         power change went out or one was refused for certain (no ordinary boot, an update at night or a crash, is to land
         in the setup), and left set, and said so, wherever a power change may have gone through. A press that has not come
         to its restart within SETUP_WITHIN goes no further (see `SetupSteps`); nothing under way is cut off for it."""
-        steps = SetupSteps()
+        await self._boot_override(SETUP, still)
+
+    async def _boot_override(self, ov: BootOverride, still: Callable[[], bool] | None, restart: bool = True) -> str | None:
+        """Set the boot override `ov` (Start into BIOS setup's, or a start from the image in the virtual CD-ROM drive), then,
+        where `restart` says so, switch the server on where it is off or restart it where it is on: as `_boot_into_setup`
+        says, each step and each way out the same for either. A sentence where there is more to say than that it was done
+        (without a restart: the override taken and not read back)."""
+        steps = SetupSteps(ov, restart)
         try:
-            await self._setup_steps(still, steps)
+            return await self._setup_steps(still, steps)
         except asyncio.CancelledError:
             if steps.at != "looking":
                 # qKVM is being stopped: nothing is awaited here (it must not hold the stop up), and whoever reads the log
                 # learns what may be left on the server.
-                log.warning("%s: stopped while starting into the BIOS setup: its one-time boot override may be set for the next boot", self.label)
+                log.warning("%s: stopped while %s: its %s boot override may be set for the next boot", self.label, ov.doing, ov.enabled.lower().replace("once", "one-time"))
             raise
 
-    async def _setup_steps(self, still: Callable[[], bool] | None, steps: SetupSteps) -> None:
-        """`_boot_into_setup`'s steps, saying in `steps` how far they came."""
+    async def _setup_steps(self, still: Callable[[], bool] | None, steps: SetupSteps) -> str | None:
+        """`_boot_override`'s steps, saying in `steps` how far they came."""
+        ov = steps.ov
         try:
             place = (await self._find(urgent=True))["system"]
             system, mark = await self._checked_read(place, urgent=True)  # (which server answers: see `_judge`)
@@ -3246,13 +3511,13 @@ class RedfishDevice(Device):
                 why = "the tile was changed meanwhile" if ex is RETIRED else ex.message
                 raise KvmError("action_failed", f"Nothing was done: the controller could not be read ({why}).") from None
             raise
-        if "BiosSetup" not in boot_targets(system):
-            raise KvmError("invalid", "This controller does not offer starting into the BIOS setup (it allows no 'BiosSetup' boot override)", 422)
-        self._no_other_override(system)
+        if ov.target not in boot_targets(system):
+            raise KvmError("invalid", ov.not_offered, 422)
+        self._no_other_override(system, ov)
         before = boot_override(system)
-        running, kind, target = await self._planned(system, before)
+        running, kind, target = await self._planned(system, before, ov) if steps.restart else (True, "", None)
         if steps.overdue():
-            raise self._before_said(KvmError("action_failed", f"Nothing was done: {took_too_long()}."), before)
+            raise self._before_said(KvmError("action_failed", f"Nothing was done: {took_too_long()}."), before, ov)
         steps.at = "setting"
         reply = await self._setting(place, mark, still, before, steps)
         if reply.status_code in (412, 428):
@@ -3266,23 +3531,31 @@ class RedfishDevice(Device):
                 if ex.code == "another_machine":
                     raise ex.with_traceback(None) from None  # (nothing was set: said as it is)
                 why = "the tile was changed meanwhile" if ex is RETIRED else ex.message
-                failed = KvmError("action_failed", f"Nothing was done: the controller did not take the BIOS setup boot override, and could not be read again ({why}).")
-                raise self._before_said(failed, before) from None
-            self._no_other_override(system)
+                failed = KvmError("action_failed", f"Nothing was done: the controller did not take {ov.name}, and could not be read again ({why}).")
+                raise self._before_said(failed, before, ov) from None
+            self._no_other_override(system, ov)
             before = boot_override(system)
-            running, kind, target = await self._planned(system, before)
+            running, kind, target = await self._planned(system, before, ov) if steps.restart else (True, "", None)
             if steps.overdue():
-                raise self._before_said(KvmError("action_failed", f"Nothing was done: {took_too_long()}."), before)
+                raise self._before_said(KvmError("action_failed", f"Nothing was done: {took_too_long()}."), before, ov)
             steps.at = "setting"
             reply = await self._setting(place, "*", still, before, steps)
         if reply.status_code not in (200, 202, 204):
             # (A 4xx: refused for certain, and nothing was set; any other is a "maybe", said above.)
-            raise self._before_said(self._refused(reply), before)
+            raise self._before_said(self._refused(reply), before, ov)
         steps.changed_at = time.monotonic()
         shown, seen = await self._setup_shown(place, reply, steps)
         pending, whole = shown is not True, shown is True  # (see `_clear_setup_override`)
+        if not steps.restart:
+            # The override alone, for the server's next start (a start from an image until it is unmounted, the server left as
+            # it is): set where it shows so, or where it could not be read back (the controller said yes to it).
+            if shown is False:
+                steps.at = "clearing"
+                left = await self._clear_setup_override(place, before, True, False, ov)
+                raise self._left(f"Nothing was set: the controller took {ov.name} and does not show it set", left, True, ov)
+            return None if shown is True else f"The controller took {ov.name}, which could not be read back to see it set."
         if shown is True and seen is None and not steps.overdue():
-            seen = await self._power_after_204(place)  # (a 204: taken as made, and nothing read back; its power read once)
+            seen = await self._power_after_204(place, ov)  # (a 204: taken as made, and nothing read back; its power read once)
         if shown is True and seen is not None and plain(seen.get("PowerState"), 20) is not None:
             # Read after the change (a 200 that shows it, a read back after a 202, the one read after a 204): the power as that
             # read has it decides what goes out, not the read before the change. A server switched on meanwhile (at its button,
@@ -3293,29 +3566,29 @@ class RedfishDevice(Device):
                 running, kind, target = await self._setup_plan({**system, "PowerState": power})
             except KvmError as ex:
                 steps.at = "clearing"
-                left = await self._clear_setup_override(place, before, pending, whole)
+                left = await self._clear_setup_override(place, before, pending, whole, ov)
                 if power not in ("On", "Off", "Paused"):
-                    lead = f"Nothing was restarted: the server began to change its state ({power}) while the BIOS setup boot override was being set"
+                    lead = f"Nothing was restarted: the server began to change its state ({power}) while {ov.name} was being set"
                 else:
                     lead = f"Nothing was restarted: the server is {str(power).lower()} now, and {ex.message[:1].lower()}{ex.message[1:]}"
-                raise self._left(lead, left, pending) from None
+                raise self._left(lead, left, pending, ov) from None
         if steps.overdue():
             # Too late for a restart: whoever pressed may have stopped waiting for it. Nothing is restarted, and the override
             # cleared again.
             steps.at = "clearing"
-            left = await self._clear_setup_override(place, before, pending, whole)
-            raise self._left(f"Nothing was restarted: {took_too_long()} before the restart", left, pending)
+            left = await self._clear_setup_override(place, before, pending, whole, ov)
+            raise self._left(f"Nothing was restarted: {took_too_long()} before the restart", left, pending, ov)
         if shown is False:
             # It took the change and does not show it (or not yet): no restart, since it would not land in the setup, and the
             # override cleared, in case it is made later.
             steps.at = "clearing"
-            left = await self._clear_setup_override(place, before, True, False)
-            raise self._left("Nothing was restarted: the controller took the BIOS setup boot override and does not show it set", left, True)
+            left = await self._clear_setup_override(place, before, True, False, ov)
+            raise self._left(f"Nothing was restarted: the controller took {ov.name} and does not show it set", left, True, ov)
         what = "restart" if running else "switching on"
         target = target or f"{place.rstrip('/')}/Actions/ComputerSystem.Reset"
         steps.at = "restarting"
         # (Seen set, or not read back: the override "is", or "may be", set for the next boot where the restart may have gone.)
-        is_set, lands = ("is set", "will land") if shown is True else ("may be set", "may land")
+        is_set, may = ("is set", "will") if shown is True else ("may be set", "may")
         # On the HTTP library's connections (a certificate this tile alone has pinned) the press's time is asked before its wait
         # for a connection and the connect, which can take this long; on a line of the tile's own, right before it is written.
         spare = (BOOT_WAITS.pool or 0.0) + (BOOT_WAITS.connect or 0.0) if self._pinned_alone() else 0.0
@@ -3339,60 +3612,64 @@ class RedfishDevice(Device):
                 # Gone, or perhaps gone, and its answer lost or not read: the restart may have been done, and the override is
                 # set for the next boot.
                 why = "the tile was changed meanwhile" if ex is RETIRED else ex.message
-                raise KvmError("timeout", f"The BIOS setup boot {is_set} for the next boot, and the {what} may or may not have gone through ({why}). Look at the server: if it did not start, the next boot of any kind {lands} in the BIOS setup.", 504) from None
+                raise KvmError("timeout", f"The {ov.boot} {is_set} for the next boot, and the {what} may or may not have gone through ({why}). Look at the server: if it did not start, the next boot of any kind {may} {ov.lands}.", 504) from None
             steps.at = "clearing"
-            left = await self._clear_setup_override(place, before, pending, whole)
+            left = await self._clear_setup_override(place, before, pending, whole, ov)
             # (Why it was not sent, as `in_time` said it: a clearing that ran past the press's time after a right was lost
             # said "took more than 120 seconds".)
             if ex.code == "stopped" and refused_for[-1:] == ["late"]:
-                raise self._left(f"Nothing was restarted: {took_too_long()} before the restart", left, pending) from None
-            raise self._unset(ex, left, self._may_be_set(left, pending)) from None  # (it never went out)
+                raise self._left(f"Nothing was restarted: {took_too_long()} before the restart", left, pending, ov) from None
+            raise self._unset(ex, left, self._may_be_set(left, pending, ov), ov) from None  # (it never went out)
         if 400 <= reply.status_code < 500:
             # Refused, for certain: the override is cleared again, so no ordinary boot lands in the setup.
             steps.at = "clearing"
-            left = await self._clear_setup_override(place, before, pending, whole)
-            raise self._unset(self._refused(reply), left, self._may_be_set(left, pending))
+            left = await self._clear_setup_override(place, before, pending, whole, ov)
+            raise self._unset(self._refused(reply), left, self._may_be_set(left, pending, ov), ov)
         if reply.status_code not in (200, 202, 204):
             # An error of the controller's own, or an answer no command has: whether the restart was done is not said. The
             # override is left set (it may be what the server is starting into now), and that is said.
             why = f"{'an error of its own' if reply.status_code >= 500 else 'an answer a command does not have'} ({self._said(reply) or f'HTTP {reply.status_code}'})"
-            raise KvmError("timeout", f"The BIOS setup boot {is_set} for the next boot, and the controller answered the {what} with {why}: it may or may not have gone through. Look at the server: if it did not start, the next boot of any kind {lands} in the BIOS setup.", 504)
+            raise KvmError("timeout", f"The {ov.boot} {is_set} for the next boot, and the controller answered the {what} with {why}: it may or may not have gone through. Look at the server: if it did not start, the next boot of any kind {may} {ov.lands}.", 504)
         self._accepted(reply)
         if running:
-            return
+            return None
         steps.at = "waiting"
         # (Through the minute after the change in which the board answered no read, and CONFIRM_WITHIN after it.)
-        busy = max(0.0, steps.changed_at + BOOT_BUSY - time.monotonic())
+        busy = max(0.0, (steps.changed_at or time.monotonic()) + BOOT_BUSY - time.monotonic())
         try:
             await self._carried_out(place, True, within=busy + CONFIRM_WITHIN)
         except KvmError as ex:
             # Taken, and not seen done (or the wait cut short): the server may still start into its setup later, so the
             # override is left set (clearing it could race a slow start), and that is said.
             if ex is RETIRED:
-                raise KvmError("timeout", "The server was told to switch on, and it was not seen to start, the tile being changed meanwhile: it may have been done. The BIOS setup boot override stays set for the server's next start.", 504) from None
-            raise KvmError(ex.code, f"{ex.message} The BIOS setup boot override stays set for the server's next start.", ex.status) from None
+                raise KvmError("timeout", f"The server was told to switch on, and it was not seen to start, the tile being changed meanwhile: it may have been done. {ov.name_first} stays set for the server's next start.", 504) from None
+            raise KvmError(ex.code, f"{ex.message} {ov.name_first} stays set for the server's next start.", ex.status) from None
+        return None
 
-    async def _power_after_204(self, place: str) -> dict[str, Any] | None:
+    async def _power_after_204(self, place: str, ov: BootOverride = SETUP) -> dict[str, Any] | None:
         """The computer, read once after a change answered 204 (the standard's word that it was made in full, so it is not read
         back), for its power now: within AFTER_204_READ, as the server it is (another that took the address meanwhile is no
         read of it). None where no answer came in that time, or none of this server's (the board this was built on answered no
-        read for about a minute after the change): the power read before the change decides then, as it did before 0.2.1."""
+        read for about a minute after the change): the power read before the change decides then, as it did before 0.2.1.
+        (Within it as a whole: a line to send it on, waited for or made, and the read. Until 0.3.0 the line came first, up to
+        48 s with the usual waits, and the read's own time after it.)"""
         usual = self._waits()
         waits = httpx.Timeout(AFTER_204_READ, connect=usual.connect, pool=usual.pool, write=usual.write)
         try:
-            system, _ = await self._checked_read(place, urgent=True, vital=False, waits=waits)
-        except KvmError as ex:
+            async with asyncio.timeout(AFTER_204_READ):
+                system, _ = await self._checked_read(place, urgent=True, vital=False, waits=waits)
+        except (KvmError, TimeoutError) as ex:
             if ex is RETIRED or self._closed:
-                raise KvmError("timeout", "Nothing was restarted, and the BIOS setup boot override may be set: the tile was changed meanwhile. Look at the server's boot override, or start into BIOS setup again.", 504) from None
+                raise KvmError("timeout", f"Nothing was restarted, and {ov.name} may be set: the tile was changed meanwhile. Look at the server's boot override, or {ov.again}.", 504) from None
             return None  # (another server's answer included: the restart, bound to this server's session, is refused)
         return system
 
-    async def _planned(self, system: dict[str, Any], before: tuple[str, str]) -> tuple[bool, str, str | None]:
+    async def _planned(self, system: dict[str, Any], before: tuple[str, str], ov: BootOverride = SETUP) -> tuple[bool, str, str | None]:
         """`_setup_plan`, its refusals (nothing done) saying an override set before the press (see `_before_said`)."""
         try:
             return await self._setup_plan(system)
         except KvmError as ex:
-            raise self._before_said(ex, before) from None
+            raise self._before_said(ex, before, ov) from None
 
     async def _setting(self, place: str, mark: str | None, still: Callable[[], bool] | None, before: tuple[str, str], steps: SetupSteps) -> httpx.Response:
         """`_set_setup_override`, a change that never went out saying an override set before the press (see `_before_said`)."""
@@ -3400,32 +3677,32 @@ class RedfishDevice(Device):
             return await self._set_setup_override(place, mark, still, before, steps)
         except KvmError as ex:
             if never_sent(ex):
-                raise self._before_said(ex, before) from None
+                raise self._before_said(ex, before, steps.ov) from None
             raise
 
     @staticmethod
-    def _before_said(ex: KvmError, before: tuple[str, str]) -> KvmError:
-        """What a press that set nothing says (refused, never sent, too late, a server between states), where the BIOS setup
-        boot override was set already before it: that it is set still, and the next boot may land in the setup, as well (so it
-        was before the press too; said nowhere, the answer read as if nothing were pending)."""
-        if before != SETUP_OVERRIDE or ex is RETIRED or ex.code == "another_machine":
+    def _before_said(ex: KvmError, before: tuple[str, str], ov: BootOverride = SETUP) -> KvmError:
+        """What a press that set nothing says (refused, never sent, too late, a server between states), where the override
+        was set already before it: that it is set still, and the next boot may land in the setup (or start from the image), as
+        well (so it was before the press too; said nowhere, the answer read as if nothing were pending)."""
+        if before != ov.shown or ex is RETIRED or ex.code == "another_machine":
             return ex
         kind = type(ex) if type(ex) in (KvmError, NothingSent) else KvmError
-        return kind(ex.code, f"{ex.message.rstrip('.')}; {SET_BEFORE}.", ex.status)
+        return kind(ex.code, f"{ex.message.rstrip('.')}; {ov.set_before}.", ex.status)
 
     @staticmethod
-    def _may_be_set(left: str | None, pending: bool) -> bool:
+    def _may_be_set(left: str | None, pending: bool, ov: BootOverride = SETUP) -> bool:
         """Whether what a clearing said (`_clear_setup_override`) leaves the override perhaps set: it could not be cleared;
         it showed off and was cleared before a change of this press's that may yet be made (CLEARED_LATE); or another tool's
         override was found where this press's change may yet be made."""
-        return left in (NOT_CLEARED, CLEARED_LATE) or (pending and left is not None and left != SET_BEFORE)
+        return left in (ov.not_cleared, ov.cleared_late) or (pending and left is not None and left != ov.set_before)
 
-    def _left(self, lead: str, left: str | None, pending: bool) -> KvmError:
+    def _left(self, lead: str, left: str | None, pending: bool, ov: BootOverride = SETUP) -> KvmError:
         """What a press that restarted nothing says, `lead` first, then what became of the override."""
         if left is None:
-            return KvmError("action_failed", f"{lead}; the BIOS setup boot override was cleared again.")
-        if self._may_be_set(left, pending):
-            return KvmError("timeout", f"{lead}; {left}. Look at the server's boot override, or start into BIOS setup again.", 504)
+            return KvmError("action_failed", f"{lead}; {ov.name} was cleared again.")
+        if self._may_be_set(left, pending, ov):
+            return KvmError("timeout", f"{lead}; {left}. Look at the server's boot override, or {ov.again}.", 504)
         return KvmError("action_failed", f"{lead}; {left}.")
 
     async def _setup_plan(self, system: dict[str, Any]) -> tuple[bool, str, str | None]:
@@ -3446,57 +3723,59 @@ class RedfishDevice(Device):
         return running, kind, target
 
     @staticmethod
-    def _no_other_override(system: dict[str, Any]) -> None:
+    def _no_other_override(system: dict[str, Any], ov: BootOverride = SETUP) -> None:
         """KvmError (409) where another tool's boot override is set: it is not replaced (a provisioning tool's network boot,
         say, or an override for every boot). One that is what this action sets (pressed before, and not booted since) is set
         again. Compared without regard to case (see `boot_override`)."""
-        said = RedfishDevice._another_override(system)
+        said = RedfishDevice._another_override(system, ov)
         if said is not None:
             raise KvmError("action_failed", f"Nothing was done: the controller has a boot override set already ({said}). Clear it first.", 409)
 
     @staticmethod
-    def _another_override(system: dict[str, Any]) -> str | None:
-        """Another tool's boot override as the controller shows it ("Pxe, Once"); None where there is none, or only this
-        action's own."""
+    def _another_override(system: dict[str, Any], ov: BootOverride = SETUP) -> str | None:
+        """Another tool's boot override as the controller shows it ("Pxe, Once"); None where there is none, or only one this
+        action may have set (`ov.own`)."""
         enabled, target = boot_override(system)
-        if enabled in ("", "disabled") or (enabled, target) == SETUP_OVERRIDE:
+        if enabled in ("", "disabled") or (enabled, target) in ov.own:
             return None
         boot = _dig(system, "Boot")
         return f"{plain(_dig(boot, 'BootSourceOverrideTarget'), 30) or 'another target'}, {plain(_dig(boot, 'BootSourceOverrideEnabled'), 30)}"
 
     @staticmethod
-    def _not_ours(system: dict[str, Any], before: tuple[str, str], whole: bool) -> str | None:
+    def _not_ours(system: dict[str, Any], before: tuple[str, str], whole: bool, ov: BootOverride = SETUP) -> str | None:
         """For the clearing: another tool's override as the controller shows it, or None where what shows may be this press's
         own: none, Once/BiosSetup, or, where its change was not seen whole (`whole`), Once with the target there was before
         (its change made in part: Once taken, the target not)."""
         enabled, target = boot_override(system)
-        if not whole and enabled == "once" and before[0] in ("", "disabled") and target == before[1]:
+        if not whole and enabled == ov.shown[0] and before[0] in ("", "disabled") and target == before[1]:
             return None
-        return RedfishDevice._another_override(system)
+        return RedfishDevice._another_override(system, ov)
 
     async def _set_setup_override(self, place: str, mark: str | None, still: Callable[[], bool] | None, before: tuple[str, str], steps: SetupSteps) -> httpx.Response:
-        """Send the change that sets the BIOS setup boot override, shown `mark` (If-Match; None: none shown), and hand back its
-        answer where it says yes (200, 202, 204) or no (4xx). Where it went out and no answer came back, or another answer
-        (an error of the controller's own, or one a change does not have), the override may be set: cleared again where the
-        controller can be reached, and said either way (KvmError). `before`: the override as it was before (see `_not_ours`)."""
+        """Send the change that sets the override, shown `mark` (If-Match; None: none shown), and hand back its answer where it
+        says yes (200, 202, 204) or no (4xx). Where it went out and no answer came back, or another answer (an error of the
+        controller's own, or one a change does not have), the override may be set: cleared again where the controller can be
+        reached, and said either way (KvmError). `before`: the override as it was before (see `_not_ours`)."""
+        ov = steps.ov
         try:
             reply = await self._request(
-                "PATCH", place, urgent=True, headers={"If-Match": mark} if mark else {}, still=still, command=True, json=SETUP_CHANGE, timeout=BOOT_WAITS
+                "PATCH", place, urgent=True, headers={"If-Match": mark} if mark else {}, still=still, command=True, json=ov.change, timeout=BOOT_WAITS
             )
         except KvmError as ex:
             if never_sent(ex):
                 raise  # (it never went out: nothing was set)
             if ex is RETIRED:
-                raise KvmError("timeout", "Nothing was restarted, and the BIOS setup boot override may be set: the tile was changed while it was being set. Look at the server's boot override, or start into BIOS setup again.", 504) from None
+                raise KvmError("timeout", f"Nothing was restarted, and {ov.name} may be set: the tile was changed while it was being set. Look at the server's boot override, or {ov.again}.", 504) from None
             # (Gone, and no answer came back, or one that could not be read: it may have been made.)
             steps.at = "clearing"
-            raise self._left(f"Nothing was restarted: the controller's answer to the BIOS setup boot override did not come or could not be read ({ex.message})", await self._clear_setup_override(place, before, True, False), True) from None
+            left = await self._clear_setup_override(place, before, True, False, ov)
+            raise self._left(f"Nothing was restarted: the controller's answer to {ov.name} did not come or could not be read ({ex.message})", left, True, ov) from None
         if reply.status_code in (200, 202, 204) or 400 <= reply.status_code < 500:
             return reply
         how = "an error of its own" if reply.status_code >= 500 else "an answer a change does not have"
         steps.at = "clearing"
-        left = await self._clear_setup_override(place, before, True, False)
-        raise self._left(f"Nothing was restarted: the controller answered the BIOS setup boot override with {how} ({self._said(reply) or f'HTTP {reply.status_code}'})", left, True)
+        left = await self._clear_setup_override(place, before, True, False, ov)
+        raise self._left(f"Nothing was restarted: the controller answered {ov.name} with {how} ({self._said(reply) or f'HTTP {reply.status_code}'})", left, True, ov)
 
     async def _setup_shown(self, place: str, reply: httpx.Response, steps: SetupSteps) -> tuple[bool | None, dict[str, Any] | None]:
         """Whether the override just set shows as set: True; False where the controller shows that it is not (it took the
@@ -3509,12 +3788,13 @@ class RedfishDevice(Device):
         the real board this was built on answered 204, and two reads right after its change went unanswered (it was busy for
         about a minute). A 200 shows the resource as it now is; a 202 (accepted, to be done) or a 200 that does not show it
         is read back until it shows, as the server it is (another one that took the address meanwhile is no read of it)."""
+        ov = steps.ov
         if reply.status_code == 204:
             return True, None
         if reply.status_code == 200:
             with contextlib.suppress(ValueError):
                 answered = read_json(reply)
-                if isinstance(answered, dict) and boot_override(answered) == SETUP_OVERRIDE:
+                if isinstance(answered, dict) and boot_override(answered) == ov.shown:
                     return True, answered
         seen = None
         deadline = min(time.monotonic() + CONFIRM_WITHIN, steps.until)
@@ -3526,11 +3806,11 @@ class RedfishDevice(Device):
                 seen = boot_override(system)
             except KvmError as ex:
                 if ex is RETIRED or self._closed:
-                    raise KvmError("timeout", "Nothing was restarted, and the BIOS setup boot override may be set: the tile was changed meanwhile. Look at the server's boot override, or start into BIOS setup again.", 504) from None
+                    raise KvmError("timeout", f"Nothing was restarted, and {ov.name} may be set: the tile was changed meanwhile. Look at the server's boot override, or {ov.again}.", 504) from None
                 if ex.code == "another_machine":
                     return None, None  # (nothing more is read of it: the restart, bound to this server's session, is refused)
             else:
-                if seen == SETUP_OVERRIDE:
+                if seen == ov.shown:
                     return True, system
             if time.monotonic() >= deadline:
                 return (None if seen is None else False), None
@@ -3539,35 +3819,35 @@ class RedfishDevice(Device):
                 return (None if seen is None else False), None  # (nor a read after the pause that is past the press's time)
 
     @staticmethod
-    def _unset(ex: KvmError, left: str | None, maybe: bool) -> KvmError:
-        """What a Start into BIOS setup whose power change was refused (or never went out) says: what became of the override."""
+    def _unset(ex: KvmError, left: str | None, maybe: bool, ov: BootOverride = SETUP) -> KvmError:
+        """What a press whose power change was refused (or never went out) says: what became of the override."""
         if left is None:
-            return KvmError(ex.code, f"Nothing was done: the power change did not go through ({ex.message}); the BIOS setup boot override was cleared again.", ex.status)
+            return KvmError(ex.code, f"Nothing was done: the power change did not go through ({ex.message}); {ov.name} was cleared again.", ex.status)
         if maybe:
             # (A "maybe" as everywhere else, and so in the history: the override may be set.)
-            return KvmError("timeout", f"The power change did not go through ({ex.message}); {left}. Look at the server's boot override, or start into BIOS setup again.", 504)
+            return KvmError("timeout", f"The power change did not go through ({ex.message}); {left}. Look at the server's boot override, or {ov.again}.", 504)
         return KvmError(ex.code, f"Nothing was done: the power change did not go through ({ex.message}); {left}.", ex.status)
 
-    async def _clear_setup_override(self, place: str, before: tuple[str, str], pending: bool, whole: bool) -> str | None:
-        """Set the one-time boot override back to Disabled, to the end (each request bounded by its own wait, and nothing cut
-        off for the press's time). None where the controller took that (a 200 or 202 only once it shows it); else what is to
-        be said of it: SET_BEFORE (set before this press, and showing so still: left as it was), CLEARED_LATE (taken, where
+    async def _clear_setup_override(self, place: str, before: tuple[str, str], pending: bool, whole: bool, ov: BootOverride = SETUP) -> str | None:
+        """Set the boot override back to Disabled, to the end (each request bounded by its own wait, and nothing cut off for
+        the press's time). None where the controller took that (a 200 or 202 only once it shows it); else what is to be said
+        of it: `ov.set_before` (set before this press, and showing so still: left as it was), `ov.cleared_late` (taken, where
         it showed off already), another tool's override (left as it is: only what may be this press's own is cleared), or
-        NOT_CLEARED. Sent also where it shows no override: a change the controller accepted for later (202), or whose answer
-        was lost, may be made after this read, and the clearing is to come after it.
+        `ov.not_cleared`. Sent also where it shows no override: a change the controller accepted for later (202), or whose
+        answer was lost, may be made after this read, and the clearing is to come after it.
 
         `pending`: this press's change may yet be made. `whole`: it was seen made in full (see `_not_ours`)."""
         change = {"Boot": {"BootSourceOverrideEnabled": "Disabled"}}
-        late = ", though this press's change may yet be made late and set the BIOS setup boot" if pending else ""
+        late = f", though this press's change may yet be made late and set the {ov.boot}" if pending else ""
         off_first = False
         try:
             for shown in ("mark", "*"):
                 # (Read as the server it is: another one that took the address meanwhile is neither read for this one nor
                 # cleared, and what this one has may be set still.)
                 system, mark = await self._checked_read(place, urgent=True, waits=BOOT_WAITS)
-                if before == SETUP_OVERRIDE and boot_override(system) == SETUP_OVERRIDE:
-                    return SET_BEFORE
-                other = self._not_ours(system, before, whole)
+                if before == ov.shown and boot_override(system) == ov.shown:
+                    return ov.set_before
+                other = self._not_ours(system, before, whole, ov)
                 if other is not None:
                     return f"the boot override is another tool's now ({other}), and was left as it is{late}"
                 if shown == "mark":
@@ -3577,37 +3857,37 @@ class RedfishDevice(Device):
                 if reply.status_code in (412, 428):
                     continue  # (the state changed meanwhile: read and looked at again, then "*")
                 if reply.status_code in (200, 202):
-                    left = await self._cleared_shown(place, before, whole, late)
+                    left = await self._cleared_shown(place, before, whole, late, ov)
                 elif reply.status_code == 204:
                     left = None
                 else:
-                    return NOT_CLEARED
+                    return ov.not_cleared
                 # (Where it showed off before the clearing, its showing off now proves nothing of a change of this press's
                 # that may come late: the clearing went after it, and that is what is said.)
-                return CLEARED_LATE if left is None and pending and off_first else left
+                return ov.cleared_late if left is None and pending and off_first else left
         except KvmError:
             pass
-        return NOT_CLEARED
+        return ov.not_cleared
 
-    async def _cleared_shown(self, place: str, before: tuple[str, str], whole: bool, late: str) -> str | None:
+    async def _cleared_shown(self, place: str, before: tuple[str, str], whole: bool, late: str, ov: BootOverride = SETUP) -> str | None:
         """A clearing answered 200 or 202 ("accepted, to be done"): None once the override shows Disabled, read for up to
-        CONFIRM_WITHIN; NOT_CLEARED where it does not by then, or cannot be read (a controller that accepts and does nothing
-        has been met, for a reset); another tool's override where one shows."""
+        CONFIRM_WITHIN; `ov.not_cleared` where it does not by then, or cannot be read (a controller that accepts and does
+        nothing has been met, for a reset); another tool's override where one shows."""
         deadline = time.monotonic() + CONFIRM_WITHIN
         while True:
             try:
                 system, _ = await self._checked_read(place, urgent=True, vital=False)
             except KvmError as ex:
                 if ex is RETIRED or self._closed or ex.code == "another_machine":
-                    return NOT_CLEARED  # (another server's override says nothing of this one's)
+                    return ov.not_cleared  # (another server's override says nothing of this one's)
             else:
                 if isinstance(system.get("Boot"), dict) and boot_override(system)[0] == "disabled":
                     return None
-                other = self._not_ours(system, before, whole)
+                other = self._not_ours(system, before, whole, ov)
                 if other is not None:
                     return f"the boot override is another tool's now ({other}), and was left as it is{late}"
             if time.monotonic() >= deadline:
-                return NOT_CLEARED
+                return ov.not_cleared
             await asyncio.sleep(CONFIRM_EVERY)
 
     async def _carried_out(self, place: str, on: bool, within: float | None = None) -> None:
@@ -3641,15 +3921,16 @@ class RedfishDevice(Device):
             await asyncio.sleep(CONFIRM_EVERY)
 
     @staticmethod
-    def _said(reply: httpx.Response) -> str | None:
-        """What the controller said in an error answer, in its own words (None: it said nothing that reads as words)."""
+    def _said(reply: httpx.Response, lending: Lending | None = None) -> str | None:
+        """What the controller said in an error answer, in its own words (None: it said nothing that reads as words), with
+        nothing of a mount's in them (`lending`'s, and whatever has the shape of a token of qKVM's)."""
         try:
             said = read_json(reply)
             detail = _dig(said, "error", "@Message.ExtendedInfo") or []
             detail = _dig(detail[0], "Message") if detail else _dig(said, "error", "message")
         except (ValueError, LookupError, TypeError):  # not JSON, or not shaped the way an error is
             detail = None
-        return plain(detail, 200)
+        return words(detail, 200, lending)
 
     def _refused(self, reply: httpx.Response) -> KvmError:
         return KvmError("action_failed", self._said(reply) or f"The controller refused (HTTP {reply.status_code})")
@@ -3697,3 +3978,530 @@ class RedfishDevice(Device):
         if reply.status_code in (412, 428):
             reply = await self._request("PATCH", place, urgent=True, headers={"If-Match": "*"}, still=still, command=True, json=change)
         self._accepted(reply)
+
+    # --- virtual media (0.3.0, A4): an image qKVM serves, in the server's virtual CD-ROM drive -------------------------
+    # The images are in the folder the admin named (served.py), served to the controller from its own address alone, by an
+    # address made for that mount, for as long as it is mounted. Every change goes as a command does: which server answers
+    # asked first, under the session the command then goes with (`_request`), on lines compared as they were made.
+
+    def _served(self) -> Served:
+        if self.served is None:
+            raise KvmError("no_virtual_media", "This server has no virtual media from here", 404)
+        return cast("Served", self.served)
+
+    def _lending(self) -> Lending | None:
+        """What qKVM serves to this tile's server now: none where the tile's address changed since the mount (another
+        controller's, and served no more)."""
+        if self.served is None:
+            return None
+        lending = cast("Served", self.served).of(self.spec.id)
+        if lending is not None and lending.tile_url != self.spec.base_url:
+            cast("Served", self.served).end(self.spec.id, lending)
+            return None
+        return lending
+
+    def media_offer(self) -> MediaOffer | None:
+        # (Where the controller shows a CD-ROM drive, or AMI's switch for its remote media: a mount switches that on.)
+        if self.served is None or (self._media_place is None and self._controller.get("rmedia") is None):
+            return None
+        return MediaOffer(drives=("cd",), boot=MEDIA_BOOTS if self._cd_target else (), restart=True, upload=False, where="qkvm")
+
+    def _drive_said(self, drive: dict[str, Any]) -> dict[str, Any]:
+        """What is in the drive, as `media_now` says it: qKVM's image by its name (the one in the folder), another by the name
+        the controller gives it."""
+        lending = self._lending()
+        first = True if self._override_seen[1] == "cd" and self._override_seen[0] in ("once", "continuous") else None
+        if lending is not None and holds(drive, lending.token, (lending.name, lending.url_name)):
+            return {"drive": "cd", "image": lending.name, "name": lending.name, "where": "qKVM", "read_only": True, "first": first, "by": lending.by, "at": lending.at, "sha256": None}
+        name = image_said(drive)
+        return {"drive": "cd", "image": name, "name": name, "where": None, "read_only": drive.get("WriteProtected") is not False, "first": first, "by": None, "at": None, "sha256": None}
+
+    def media_now(self) -> dict[str, Any] | None:
+        drive = self._media_drive
+        if drive is None or self._other is not None or not inserted(drive):
+            return None
+        return self._drive_said(drive)
+
+    def _media_collections(self, guess: bool = True) -> list[tuple[str, bool]]:
+        """Where the controller keeps its virtual media: under the computer (newer controllers), under itself (most); and, on
+        a controller with AMI's switch for them, the place AMI documents under the manager, where it links none (a real AMI
+        board, before the release of 0.3.0, never linked its list, whose CD1 was there all the same). Each with whether it
+        is that guess: one that does not answer there (401 too: never taken for a refused session) is none."""
+        guessed = None
+        if guess and self._controller.get("rmedia") is not None and (manager := self._places.get("manager")):
+            guessed = f"{manager.rstrip('/')}/VirtualMedia"
+        said = [place for place in (self._system_media, self._controller.get("media")) if place]
+        return [(place, False) for place in dict.fromkeys(said)] + ([(guessed, True)] if guessed and guessed not in said else [])
+
+    def _system_seen(self, system: dict[str, Any]) -> None:
+        """What a read of the computer says of its virtual media: where it keeps them, the "Cd" boot target, the override."""
+        self._cd_target = "Cd" in boot_targets(system)
+        self._override_seen = boot_override(system)
+        self._system_media = link(_dig(system, "VirtualMedia", "@odata.id"))
+
+    async def _media_look(self, system: dict[str, Any], urgent: bool = False, force: bool = False) -> None:
+        """The drive, read at a look at the server (every MEDIA_LOOK_EVERY seconds; `force`: now), for the tile. A read that
+        fails leaves what was read before (one of the controller's moments), and is asked again at the next turn."""
+        self._system_seen(system)
+        if self.served is None or (not force and time.monotonic() - self._media_at < MEDIA_LOOK_EVERY):
+            return
+        self._media_at = time.monotonic()
+        if not self._media_collections():
+            self._media_place = self._media_drive = None
+            return
+        began = time.time()
+        try:
+            place, drive = await self._cd_drive(urgent)
+        except KvmError as ex:
+            if ex is RETIRED or ex.code == "another_machine":
+                raise
+            return
+        if self._media_changed_at >= began:
+            return  # (a mount or an unmount from here read it since this read began: that one is newer)
+        self._media_place, self._media_drive = place, drive
+        self._media_kept(began)
+
+    async def _cd_drive(self, urgent: bool, guess: bool = True) -> tuple[str | None, dict[str, Any] | None]:
+        """As `_drive_read`, and what kinds of transfer its InsertMedia takes, where only its description says (`_told_kinds`)."""
+        place, drive = await self._drive_read(urgent, guess)
+        await self._told_kinds(drive, urgent)
+        return place, drive
+
+    async def _told_kinds(self, drive: dict[str, Any] | None, urgent: bool) -> None:
+        """The kinds of transfer the drive's InsertMedia takes, read from its description (`@Redfish.ActionInfo`) where the drive
+        lists none: once for each description (a real AMI board's drive, of AMI's kind, lists none, and its description lists
+        HTTP and HTTPS). Not kept where it could not be read: asked again at the next read of the drive."""
+        described = _dig(drive, "Actions", "#VirtualMedia.InsertMedia")
+        info = link(_dig(described, "@Redfish.ActionInfo"))
+        inline = _dig(described, "TransferProtocolType@Redfish.AllowableValues")
+        if not info or (isinstance(inline, list) and inline) or (self._insert_told is not None and self._insert_told[0] == info):
+            return
+        try:
+            parameters = (await self._get(info, urgent, vital=False)).get("Parameters")
+        except KvmError as ex:
+            if ex is RETIRED:
+                raise
+            return
+        kinds = next((p.get("AllowableValues") for p in listed(parameters) if isinstance(p, dict) and p.get("Name") == "TransferProtocolType"), None)
+        told = {kind.strip().upper() for kind in listed(kinds)[:16] if isinstance(kind, str) and len(kind) <= 10} & TRANSFER_KINDS
+        self._insert_told = (info, ("HTTP" in told) if told else None)
+
+    async def _drive_read(self, urgent: bool, guess: bool = True) -> tuple[str | None, dict[str, Any] | None]:
+        """The server's virtual CD-ROM drive, read now: (its place, what it says); (None, None) where the controller lists none
+        (AMI's lists none while its remote media is switched off). The one that holds qKVM's image, else the first that holds
+        nothing, else the first. Its place is kept for ABOUT_TTL, and that one alone is read meanwhile (a controller is slow
+        over every read)."""
+        lending = self._lending()
+        if self._media_place is not None and time.monotonic() - self._media_found_at < ABOUT_TTL:
+            try:
+                drive: dict[str, Any] | None = await self._get(self._media_place, urgent, vital=False)
+            except KvmError as ex:
+                if ex is RETIRED:
+                    raise
+                drive = None  # (gone, as AMI's drives are where their remote media is switched off: looked for anew)
+            if drive is not None and is_cd(drive):
+                return self._media_place, drive
+        found: list[tuple[str, dict[str, Any]]] = []
+        for collection, guessed in self._media_collections(guess):
+            try:
+                members = (await self._read(collection, urgent, False, denied_is_an_answer=guessed))[0].get("Members")
+            except KvmError as ex:
+                if ex is RETIRED or not guessed:
+                    raise
+                continue  # (not there: AMI's lists none while its remote media is off)
+            places = [place for one in listed(members)[:MOST_DRIVES] if isinstance(one, dict) and (place := link(one.get("@odata.id")))]
+            places.sort(key=lambda place: "cd" not in place.rstrip("/").rsplit("/", 1)[-1].lower())  # (AMI's CD1, CD2, ... first)
+            for place in places:
+                drive = await self._get(place, urgent, vital=False)
+                if not is_cd(drive):
+                    continue
+                found.append((place, drive))
+                if not inserted(drive) or (lending is not None and holds(drive, lending.token, (lending.name, lending.url_name))):
+                    break
+            if found:
+                break
+        self._media_found_at = time.monotonic()
+        if not found:
+            return None, None
+        ours = next((one for one in found if lending is not None and holds(one[1], lending.token, (lending.name, lending.url_name))), None)
+        return ours or next((one for one in found if not inserted(one[1])), found[0])
+
+    def _media_kept(self, began: float) -> None:
+        """A mount from qKVM whose drive shows it gone (empty, or another image in it) is served no more: by a read of the drive
+        that `began` LEND_GRACE after it was mounted, or later (a controller may show it only once it has read the image; and a
+        read begun before the mount, which comes back after it, says nothing of it)."""
+        lending, drive = self._lending(), self._media_drive
+        if lending is None or drive is None or began - lending.at < LEND_GRACE:
+            return
+        if holds(drive, lending.token, (lending.name, lending.url_name)) is False:
+            self._served().end(self.spec.id, lending)
+            log.info("%s: %s is not in its virtual CD-ROM drive any more, and is served no more", self.label, lending.name)
+
+    def _https_only(self, drive: dict[str, Any] | None) -> bool:
+        """Whether the controller takes an image over HTTPS and not over plain HTTP: as its drive's InsertMedia says the kinds it
+        takes (or, where it says none, its description: `_told_kinds`), without HTTP among them; where neither says, a drive
+        of AMI's own kind (NFS, CIFS or HTTPS), or no drive shown yet on a controller whose root says AMI (its remote media
+        switched off)."""
+        kinds = _dig(drive, "Actions", "#VirtualMedia.InsertMedia", "TransferProtocolType@Redfish.AllowableValues")
+        if isinstance(kinds, list) and kinds:  # (an empty list says nothing: as none)
+            return "HTTP" not in kinds
+        info = link(_dig(drive, "Actions", "#VirtualMedia.InsertMedia", "@Redfish.ActionInfo"))
+        if info and self._insert_told is not None and self._insert_told[0] == info and self._insert_told[1] is not None:
+            return not self._insert_told[1]
+        # (Not assumed of an AMI board before its drive is seen: a real one, whose drive is the standard's kind, refused
+        # HTTPS and took HTTP. A drive of AMI's own kind takes HTTPS alone, as Lenovo's System Manager documents.)
+        return amis(drive) if drive is not None else False
+
+    def _media_notes(self, served: Served) -> list[str]:
+        """What stands against a mount now (the listing's `notes`)."""
+        base, drive, lending = served.base(), self._media_drive, self._lending()
+        notes = []
+        if base is None:
+            notes.append(
+                "qKVM has no address that servers reach it at: it listens on this computer alone. Let it listen on the network "
+                "(Settings, Network), or name the address servers reach it at (Settings, Server images)."
+            )
+        elif base.startswith("http://") and self._https_only(drive):
+            notes.append(
+                f"This server's controller takes an image over HTTPS only, and servers reach qKVM at {base}, over plain HTTP: "
+                "switch HTTPS on (Settings, Network), or name an HTTPS address (Settings, Server images)."
+            )
+        if drive is not None and stale(drive, lending.token if lending is not None else None):
+            notes.append("The image in its drive was mounted from qKVM before qKVM was restarted, and is not served any more: unmount it, and mount it again.")
+        return notes
+
+    async def media_images(self) -> dict[str, Any]:
+        served = self._served()
+        place = (await self._find(urgent=True))["system"]
+        system, _ = await self._checked_read(place, urgent=True)  # (which server answers: what is in its drive is this one's)
+        await self._itself(urgent=True)  # (where the controller keeps its virtual media, and AMI's switch for them)
+        await self._media_look(system, urgent=True, force=True)
+        images, unseen, left_out = await served.images()
+        return {
+            "images": [{"id": one.name, "name": one.name, "where": None, "size": one.size, "partial": False, "sha256": None} for one in images],
+            "unseen": unseen, "left_out": left_out, "notes": self._media_notes(served), "space": None, "served_from": served.base(),
+        }  # fmt: skip
+
+    def _media_changed(self) -> None:
+        self._media_changed_at = time.time()
+        self._status_at = 0.0
+        self._media_at = float("-inf")
+        self._refresh_soon()
+
+    async def _which_server_for_media(self) -> tuple[str, dict[str, Any]]:
+        """Which server answers, asked before anything of its virtual media is changed: (where its computer is, as read now)."""
+        try:
+            place = (await self._find(urgent=True))["system"]
+            system, _ = await self._checked_read(place, urgent=True)
+            await self._itself(urgent=True)  # (where the controller keeps its virtual media, and AMI's switch for them)
+        except KvmError as ex:
+            raise self._not_done(ex) from None  # (only reads so far: nothing was sent)
+        self._system_seen(system)
+        return place, system
+
+    async def _drive_for_a_mount(self, still: Callable[[], bool] | None) -> tuple[str, dict[str, Any], str | None]:
+        """The CD-ROM drive, read now, for a mount: (its place, what it says, a sentence where its remote media was switched
+        on for it). Where it lists none and has AMI's switch, that is switched on (a command, as any), and the drive looked
+        for until it shows (RMEDIA_WITHIN)."""
+        try:
+            # (The controller read afresh: an AMI board links its virtual media once its remote media is on, and the
+            # reading kept from before that links none.)
+            self._controller_at = float("-inf")
+            await self._itself(urgent=True)
+            place, drive = await self._cd_drive(urgent=True)
+        except KvmError as ex:
+            raise self._not_done(ex) from None
+        if place is not None and drive is not None:
+            return place, drive, None
+        switch = self._controller.get("rmedia")
+        if switch is None:
+            raise KvmError("no_virtual_media", "Nothing was sent: the server's controller lists no virtual CD-ROM drive.", 404)
+        try:
+            reply = await self._request("POST", switch, urgent=True, still=still, command=True, json={"RMediaState": "Enable"}, timeout=MEDIA_WAITS)
+        except KvmError as ex:
+            if never_sent(ex):
+                raise
+            why = "the tile was changed meanwhile" if ex is RETIRED else ex.message
+            raise KvmError("timeout", f"Nothing was mounted, and the controller's remote media may have been switched on ({why}). Look again in a moment.", 504) from None
+        switched = True
+        if 400 <= reply.status_code < 500:
+            said = self._said(reply)
+            if reply.status_code in (401, 403) or "already enabled" not in (said or "").lower():
+                raise KvmError("action_failed", f"Nothing was mounted: the controller would not switch its remote media on ({said or f'HTTP {reply.status_code}'}).")
+            # (On already: "RMediaState is already enabled and can no longer take incoming requests", a real AMI board, while
+            # its drive was not listed yet. Taken as on, and the drive waited for.)
+            switched = False
+        if switched and reply.status_code not in (200, 202, 204):
+            raise KvmError("timeout", f"Nothing was mounted: the controller answered the switch of its remote media with HTTP {reply.status_code}, and it may have been switched on. Look again in a moment.", 504)
+        self._media_found_at = float("-inf")
+        deadline = time.monotonic() + RMEDIA_WITHIN
+        says_at: float | None = time.monotonic() + RMEDIA_SAYS_WITHIN
+        while True:
+            await asyncio.sleep(TASK_EVERY)
+            if says_at is not None and time.monotonic() >= says_at:
+                says_at = None
+                if await self._rmedia_off():
+                    raise KvmError("action_failed", RMEDIA_STAYED_OFF, 409)
+            with contextlib.suppress(KvmError):
+                place, drive = await self._cd_drive(urgent=True)
+                if place is not None and drive is not None:
+                    self._controller_at = float("-inf")  # (read afresh at the next look: it links them now)
+                    return place, drive, "Remote media was switched on in the controller's settings for it, and stays on." if switched else None
+            if self._closed:
+                raise RETIRED.with_traceback(None)
+            if time.monotonic() >= deadline:
+                how = "was switched on" if switched else "is on"
+                raise KvmError("action_failed", f"Nothing was mounted: the controller's remote media {how}, and no virtual CD-ROM drive showed within {RMEDIA_WITHIN:.0f} seconds. Try again in a moment.", 409)
+            self._media_found_at = float("-inf")
+
+    async def _rmedia_off(self) -> bool:
+        """Whether AMI's controller says its remote media is off (its manager's Oem Ami VirtualMedia RMediaStatus "Disabled");
+        False where it says nothing of it, or could not be read."""
+        manager = self._places.get("manager")
+        if not manager:
+            return False
+        try:
+            said = await self._get(manager, True, vital=False)
+        except KvmError as ex:
+            if ex is RETIRED:
+                raise
+            return False
+        status = _dig(said, "Oem", "Ami", "VirtualMedia", "RMediaStatus")
+        return isinstance(status, str) and status.strip().lower() == "disabled"
+
+    async def _task_done(self, reply: httpx.Response, what: str, lending: Lending | None = None) -> None:
+        """A change answered 202 with a task to follow (AMI's mount and unmount): followed for MEDIA_WITHIN until it ends.
+        KvmError "action_failed" where it ended in an exception (not done, for certain: in the controller's words), "timeout"
+        where it had not ended by then (it may yet be done). Nothing where no task is named, or it cannot be read: what the
+        drive shows then decides."""
+        # The task itself first (its state and its words), named in the answer's body; else what Location names, which may
+        # be a task monitor (DMTF): 202 while the task runs, and once it ended the action's own answer. (The real AMI board
+        # named a monitor there, whose 403 once the task failed was taken for a task that could not be read: its words were
+        # lost, and "does not show the image" said instead.)
+        located: str | None = None
+        with contextlib.suppress(ValueError):
+            located = link(urlsplit(reply.headers.get("location", "")).path) if reply.headers.get("location") else None
+        named: str | None = None
+        with contextlib.suppress(ValueError):
+            named = link(_dig(read_json(reply), "@odata.id"))
+        places = [one for one in (named, located) if one is not None and one.startswith("/redfish/v1/TaskService/")]
+        places.sort(key=lambda one: "/Tasks/" not in one or one.rstrip("/").endswith("/Monitor"))
+        if not places:
+            return
+        place = places[0]
+        deadline = time.monotonic() + MEDIA_WITHIN
+        while True:
+            try:
+                answer = await self._request("GET", place, urgent=True, vital=False)
+            except KvmError as ex:
+                if ex is RETIRED:
+                    raise
+                return  # (not to be read: what the drive shows decides)
+            if answer.status_code == 202:  # (a monitor: still under way)
+                if time.monotonic() >= deadline:
+                    raise KvmError("timeout", f"The controller took it, and had not done it after {MEDIA_WITHIN:.0f} seconds: it may yet be done. Look again in a moment.", 504)
+                await asyncio.sleep(TASK_EVERY)
+                continue
+            if answer.status_code in (200, 204) and (answer.status_code == 204 or not answer.content):
+                return  # (a monitor's end: the action's own answer, and it did it)
+            if answer.status_code >= 400:
+                if answer.status_code == 404 or ("/Tasks/" in place and not place.rstrip("/").endswith("/Monitor")):
+                    return  # (a task gone, or not to be read: what the drive shows decides)
+                said = self._said(answer, lending)  # (scrubbed whole, then shortened: the second round, R2-L3)
+                raise KvmError("action_failed", f"The controller did not {what}: {said or f'it answered HTTP {answer.status_code}'}.")
+            try:
+                task = read_json(answer)
+            except ValueError:
+                return
+            if not isinstance(task, dict):
+                return
+            state = (plain(task.get("TaskState"), 20) or "").lower()
+            failed = state in TASK_FAILED or (state == "completed" and (plain(task.get("TaskStatus"), 20) or "").lower() == "critical")
+            if failed:
+                messages = listed(task.get("Messages"))
+                said = words(_dig(messages[0], "Message"), 200, lending) if messages else None
+                raise KvmError("action_failed", f"The controller did not {what}: {said or f'its task ended in {state}'}.")
+            if state == "completed":
+                return
+            if time.monotonic() >= deadline:
+                raise KvmError("timeout", f"The controller took it, and had not done it after {MEDIA_WITHIN:.0f} seconds: it may yet be done. Look again in a moment.", 504)
+            await asyncio.sleep(TASK_EVERY)
+
+    async def _drive_shows(self, place: str, wanted: Callable[[dict[str, Any]], bool]) -> bool:
+        """Whether the drive shows what is wanted, read for up to CONFIRM_WITHIN (a controller does it a little after it says yes)."""
+        deadline = time.monotonic() + CONFIRM_WITHIN
+        while True:
+            try:
+                drive = await self._get(place, urgent=True, vital=False)
+            except KvmError as ex:
+                if ex is RETIRED:
+                    raise
+                drive = None
+            if drive is not None:
+                self._media_place, self._media_drive = place, drive
+                if wanted(drive):
+                    return True
+            if time.monotonic() >= deadline:
+                return False
+            await asyncio.sleep(CONFIRM_EVERY)
+
+    async def media_mount(self, image: str, *, drive: str = "cd", writable: bool = False, by: str, still: Callable[[], bool] | None = None) -> str | None:
+        if drive != "cd" or writable:
+            raise KvmError("invalid", "A server takes an image in its virtual CD-ROM drive, read-only", 422)
+        served = self._served()
+        if not IMAGE_NAME.fullmatch(image) or not image.lower().endswith(SUFFIX):
+            raise KvmError("invalid", "That is not an image of the folder qKVM serves them from", 422)
+        found = await served.image(image)
+        if found is None:
+            raise KvmError("changed", f"{image} is not in the folder for server images: look again.", 409)
+        base = served.base()
+        if base is None:
+            raise KvmError("action_failed", self._media_notes(served)[0], 409)
+        await self._which_server_for_media()
+        place, now, note = await self._drive_for_a_mount(still)
+        self._media_place, self._media_drive = place, now  # (as a look would have it: the notes say of this drive)
+        # Read again, once, for all that follows: the settings may have changed while the drive was looked for, and one
+        # reading makes the image's address, its kind and its password (the outside review's fourth round).
+        base = served.base()
+        if base is None:
+            raise KvmError("action_failed", self._media_notes(served)[0], 409)
+        if base.startswith("http://") and self._https_only(now):
+            refusal = self._media_notes(served)[0]
+            raise KvmError("action_failed", f"Nothing was mounted: {refusal} {note}" if note else f"Nothing was sent: {refusal}", 409)
+        lending = self._lending()
+        if inserted(now):
+            if lending is not None and lending.name == image and holds(now, lending.token, (lending.name, lending.url_name)):
+                return "It was in the server's virtual CD-ROM drive already."
+            raise KvmError("busy", f"Another image is in the server's virtual CD-ROM drive ({image_said(now)}): unmount it first. Nothing was sent.", 409)
+        addresses = await addresses_of(self.spec.base_url)
+        if not addresses:
+            raise KvmError("action_failed", "Nothing was sent: the address of the server's controller could not be looked up, and its image is served to that address alone.", 409)
+        checked = self.spec.cert_pem if self.spec.tls == "pinned" and self.spec.base_url.startswith("https://") else None
+        try:
+            lending = served.lend(self.spec.id, self.spec.base_url, addresses, found, base=base, by=by, cert_checked=checked, kind=self.spec.kind)
+        except Superseded as ex:
+            raise KvmError("changed", f"Nothing was sent: {ex}. Mount it again.", 409) from None
+        body: dict[str, Any] = {"Image": lending.url, "TransferProtocolType": "HTTPS" if lending.credentials else "HTTP"}
+        if not amis(now):
+            body.update(Inserted=True, WriteProtected=True)  # (AMI's takes a CD-ROM drive's alone, read-only by itself)
+            if "TransferMethod" in now:
+                body["TransferMethod"] = "Stream"  # (read from qKVM while it is mounted, not copied: nothing to copy it to)
+        if lending.credentials is not None:
+            body.update(UserName=lending.credentials[0], Password=lending.credentials[1])
+        target = link(_dig(now, "Actions", "#VirtualMedia.InsertMedia", "target")) or f"{place.rstrip('/')}/Actions/VirtualMedia.InsertMedia"
+        try:
+            reply = await self._request("POST", target, urgent=True, still=still, command=True, json=body, timeout=MEDIA_WAITS)
+        except KvmError as ex:
+            if never_sent(ex):
+                served.end(self.spec.id, lending)
+                raise
+            # (It may have been taken: it is served on, for the controller to read, until a look finds the drive empty.)
+            why = "the tile was changed meanwhile" if ex is RETIRED else ex.message
+            raise KvmError("timeout", f"The controller's answer to the mount did not come ({why}): it may have been mounted. Look again before trying again.", 504) from None
+        if 400 <= reply.status_code < 500:
+            served.end(self.spec.id, lending)
+            raise KvmError("action_failed", f"The controller did not mount it: {self._said(reply, lending) or f'HTTP {reply.status_code}'}.")
+        if reply.status_code not in (200, 202, 204):
+            how = "an error of its own" if reply.status_code >= 500 else "an answer a change does not have"
+            raise KvmError("timeout", f"The controller answered the mount with {how} ({self._said(reply, lending) or f'HTTP {reply.status_code}'}): it may or may not have been mounted. Look again before trying again.", 504)
+        if reply.status_code == 202:
+            try:
+                await self._task_done(reply, "mount it", lending)
+            except KvmError as ex:
+                if ex.code == "action_failed":
+                    served.end(self.spec.id, lending)
+                if hint := port_80_said(now, base):
+                    raise KvmError(ex.code, ex.message + hint, ex.status) from None
+                raise
+        self._media_changed()
+        if not await self._drive_shows(place, lambda drive: holds(drive, lending.token, (lending.name, lending.url_name)) is not False):
+            said = "The controller took the mount, and does not show the image in its drive: look again in a moment. qKVM serves it to the controller meanwhile."
+            raise KvmError("timeout", said + port_80_said(now, base), 504)
+        return note
+
+    async def media_boot(self, how: str, *, restart: bool, still: Callable[[], bool] | None = None) -> str | None:
+        if how not in MEDIA_BOOTS:
+            raise KvmError("invalid", "A server starts from an image once, or until it is unmounted", 422)
+        lending = self._lending()
+        if lending is None:
+            raise KvmError("action_failed", "Nothing from qKVM is in the server's virtual CD-ROM drive to start from", 409)
+        ov = CD_ONCE if how == "once" else CD_ALWAYS
+        lending.override = ov  # (cleared again at the unmount, where it still shows: set from the moment it may be)
+        restarting = how == "once" or restart
+        note = await self._boot_override(ov, still, restart=restarting)
+        if how == "until_unmounted":
+            self._override_seen = ov.shown  # (set, and seen so or not read back: the tile says it before its next look)
+        self._media_changed()
+        if note is not None:
+            return note
+        if how == "once":
+            return "It starts from the image this once; after that its controller starts it as before."
+        return None if restarting else "It starts from the image at its next start, until the image is unmounted."
+
+    async def media_restart(self, *, still: Callable[[], bool] | None = None) -> str | None:
+        # (A controller that does not allow a "Cd" boot override: restarted, for its firmware to find the drive.)
+        await self.act("power_on" if self._power is False else "atx_reset", still=still)
+        return None
+
+    async def _override_back(self, place: str, system: dict[str, Any], lending: Lending | None) -> str | None:
+        """At an unmount: the CD boot override set from qKVM for it, cleared again where it still shows (`system` as read
+        before); a sentence where it could not be, or where one shows that qKVM did not set."""
+        enabled, target = boot_override(system)
+        if target != "cd" or enabled in ("", "disabled"):
+            return None
+        ov = lending.override if lending is not None else None
+        if not isinstance(ov, BootOverride):
+            return "Its boot override still says CD (not set from qKVM, or qKVM was restarted since), and is left as it is."
+        left = await self._clear_setup_override(place, ("", ""), False, True, ov)
+        return None if left is None else f"{left[:1].upper()}{left[1:]}."
+
+    async def media_unmount(self, image: str, *, still: Callable[[], bool] | None = None) -> str | None:
+        served = self._served()
+        system_place, system = await self._which_server_for_media()
+        try:
+            place, drive = await self._cd_drive(urgent=True)
+        except KvmError as ex:
+            raise self._not_done(ex) from None
+        lending = self._lending()
+        self._media_place, self._media_drive = place, drive
+        if place is None or drive is None or not inserted(drive):
+            if lending is not None:
+                served.end(self.spec.id, lending)
+            back = await self._override_back(system_place, system, lending)
+            self._media_changed()
+            raise AlreadySo("nothing was mounted" + (f". {back}" if back else ""))
+        shown = self._drive_said(drive)
+        if shown["image"] != image:
+            raise KvmError("changed", f"Another image is in the server's virtual CD-ROM drive now ({shown['name']}): nothing was taken out. Look again.", 409)
+        target = link(_dig(drive, "Actions", "#VirtualMedia.EjectMedia", "target")) or f"{place.rstrip('/')}/Actions/VirtualMedia.EjectMedia"
+        try:
+            reply = await self._request("POST", target, urgent=True, still=still, command=True, json={}, timeout=MEDIA_WAITS)
+        except KvmError as ex:
+            if never_sent(ex):
+                raise
+            if lending is not None:
+                served.end(self.spec.id, lending)
+            why = "the tile was changed meanwhile" if ex is RETIRED else ex.message
+            raise KvmError("timeout", f"The controller's answer to the unmount did not come ({why}): it may have been taken out. qKVM serves the image no more. Look again before trying again.", 504) from None
+        if 400 <= reply.status_code < 500:
+            raise KvmError("action_failed", f"The controller did not take it out: {self._said(reply, lending) or f'HTTP {reply.status_code}'}.")
+        if reply.status_code not in (200, 202, 204):
+            if lending is not None:
+                served.end(self.spec.id, lending)
+            raise KvmError("timeout", f"The controller answered the unmount with HTTP {reply.status_code}: it may or may not have been taken out. qKVM serves the image no more. Look again before trying again.", 504)
+        if reply.status_code == 202:
+            try:
+                await self._task_done(reply, "take it out", lending)
+            except KvmError as ex:
+                if ex.code != "action_failed" and lending is not None:
+                    served.end(self.spec.id, lending)
+                raise
+        if lending is not None:
+            served.end(self.spec.id, lending)
+        notes = []
+        if not await self._drive_shows(place, lambda drive: not inserted(drive)):
+            notes.append("The controller took the unmount, and still shows an image in its drive: look again in a moment. qKVM serves it no more.")
+        back = await self._override_back(system_place, system, lending)
+        notes += [back] if back else []
+        self._media_changed()
+        return " ".join(notes) or None

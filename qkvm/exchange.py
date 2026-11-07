@@ -34,10 +34,10 @@ from cryptography import x509
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives import serialization
 
-from . import alerts
+from . import alerts, screens
 from .amt import at_its_port
 from .kvm import KEYS, MAX_TEXT, POWER_KEY_REFUSED, names_the_power_key
-from .store import FINGERBOT_STRENGTHS, Store, as_a_line, device_url, jetkvm_machine_from_before, machine_from_before
+from .store import AMT_VIEWS, FINGERBOT_STRENGTHS, Store, as_a_line, device_url, jetkvm_machine_from_before, machine_from_before
 from .store import KINDS as STORE_KINDS
 from .vault import Vault, VaultLocked
 from .proxmox import address_of as proxmox_address
@@ -89,6 +89,9 @@ class Device:
     keep_both: bool = False  # on the wall it comes from, somebody said it is to have a tile of its own though another tile is the same device
     machine: str = ""  # the machine its tile was added for, by the number it gives for itself (store.DeviceRecord.machine)
     fingerbot_strength: str = "firm"  # how hard a Fingerbot paired with it presses: "firm" | "light"
+    no_signal_minutes: int = 0  # its screen watched (screens.py): minutes with no signal before an alert; 0: not watched
+    unchanged_minutes: int = 0  # ...and minutes with a screen that looks the same
+    amt_view: str = "stills"  # a PC with Intel AMT: which of its three views its tile is in (store.AMT_VIEWS)
 
 
 @dataclass(frozen=True)
@@ -164,8 +167,14 @@ def gather(store: Store, vault: Vault, what: set[str], secrets: bool, not_opened
     file that is kept for the passwords in it has to say which of them it is without.
     """
 
-    def opened(blob: dict[str, str] | None, context: str, whose: str) -> str:
+    def opened(blob: dict[str, str] | None, context: str, whose: str, known: bool = True) -> str:
         if not secrets or not blob:
+            return ""
+        if not known:
+            # A tile of a kind this version does not know (a later version's settings, a file written by hand): no device it
+            # talks to, and refused on the way in (KINDS). Its password is not opened for a file, and is said to be left out.
+            if not_opened is not None:
+                not_opened.append(whose)
             return ""
         # (None: sealed under a key from before a reset, or not what this program writes. As good as not
         # saved, here as for the wall itself: see Vault.read.)
@@ -183,7 +192,7 @@ def gather(store: Store, vault: Vault, what: set[str], secrets: bool, not_opened
                 "name": device.name,
                 "url": device.url,
                 "username": device.username,
-                **({"password": opened(device.secret, device.id, device.name or device.url)} if secrets else {}),
+                **({"password": opened(device.secret, device.id, device.name or device.url, device.kind in KINDS)} if secrets else {}),
                 "kind": device.kind,
                 "group": device.group,
                 "tls": device.tls,
@@ -191,6 +200,10 @@ def gather(store: Store, vault: Vault, what: set[str], secrets: bool, not_opened
                 "open_url": device.open_url,
                 "alerts": device.alerts,
                 "fingerbot_strength": device.fingerbot_strength if device.fingerbot_strength in FINGERBOT_STRENGTHS else FINGERBOT_STRENGTHS[0],
+                "no_signal_minutes": screens.minutes(device.no_signal_minutes),
+                "unchanged_minutes": screens.minutes(device.unchanged_minutes),
+                # (A PC with Intel AMT's alone: a file without it is of 0.2.x or before, whose PCs are taken in as stills.)
+                **({"amt_view": device.amt_view if device.amt_view in AMT_VIEWS else AMT_VIEWS[0]} if device.kind == "amt" else {}),
                 "ident": device.ident if _IDENT.fullmatch(device.ident) else "",
                 **({"keep_both": True} if device.ident.startswith("own:") else {}),
                 # (Apart from `ident`, which a tile kept beside its twin does not carry: it is checked before anything is sent.)
@@ -348,6 +361,16 @@ def _flag(value: Any, default: bool) -> bool:
     return value if isinstance(value, bool) else default
 
 
+def _watch_minutes(value: Any) -> int:
+    """The minutes of one of its screen watches (screens.py), as the form takes them: a whole number from 0 (not watched) to
+    a day; left out or null: not watched. ValueError for anything else, as the form refuses it."""
+    if value is None:
+        return 0
+    if type(value) is not int or not 0 <= value <= screens.MOST_MINUTES:
+        raise ValueError("how long its screen is watched for is not said in a way this version knows")
+    return value
+
+
 MOST_ODD = 256  # different certificates of one file that are tried the slow way (see _Odd)
 
 
@@ -499,6 +522,11 @@ def _devices(said: Any, left_out: list[str]) -> list[Device]:
             strength = FINGERBOT_STRENGTHS[0] if strength is None else strength  # (null: not said, as the form has it)
             if strength not in FINGERBOT_STRENGTHS:
                 raise ValueError("how hard its Fingerbot presses is not said in a way this version knows")
+            watches = {name: _watch_minutes(entry.get(name)) for name in ("no_signal_minutes", "unchanged_minutes")}
+            view = entry.get("amt_view")
+            view = AMT_VIEWS[0] if view is None else view  # (not said: a file of 0.2.x or before, as a record without it)
+            if view not in AMT_VIEWS:
+                raise ValueError("the view of its tile is not said in a way this version knows")
             ident, machine = entry.get("ident", ""), entry.get("machine", "")
             if not (isinstance(machine, str) and (machine == "" or _IDENT.fullmatch(machine))):
                 # (What its tile checks before anything is sent to the machine: one that is no such number is not "none",
@@ -524,6 +552,8 @@ def _devices(said: Any, left_out: list[str]) -> list[Device]:
                 keep_both=entry.get("keep_both") is True,
                 machine=machine,
                 fingerbot_strength=strength,
+                **watches,
+                amt_view=view if kind == "amt" else AMT_VIEWS[0],
             )
         except ValueError as ex:
             left_out.append(f"Device {number}: {ex}")

@@ -27,6 +27,9 @@ from qkvm.core import Core
 from tests.fake_amt import AmtState, FakeAmt
 from tests.fake_jetkvm import FakeJetKvm, JetState
 from tests.fake_kvm import FakeKvm, FakeState
+from tests.fake_proxmox import SECRET as PVE_SECRET
+from tests.fake_proxmox import TOKEN_ID as PVE_TOKEN_ID
+from tests.fake_proxmox import FakeProxmox, PveState
 from tests.fake_redfish import BmcState, FakeBmc
 from tests.test_meanwhile import in_background
 from tests.test_redfish import a_screen
@@ -39,8 +42,9 @@ CHAPTER = README.split("\n## The API\n", 1)[1].split("\n## Clients and versions\
 TABLE = CHAPTER.split("### The requests", 1)[1].split("### A machine", 1)[0]
 PAGES_OWN = CHAPTER.split("### The page's own", 1)[1]
 NAMED = re.compile(r"{[^}]+}")  # where a path has a name in it: {device_id}, {id}
-# Served beside the API, and documented elsewhere: the page itself, its files, and the collector's numbers (Metrics).
-OUTSIDE = {("GET", "/"), ("GET", "/static/{}"), ("GET", "/metrics")}
+# Served beside the API, and documented elsewhere: the page itself, its files, and the collector's numbers (Metrics). And an
+# image mounted on a server, read by its controller by an address made for that mount (Virtual media; 0.3.0, A4).
+OUTSIDE = {("GET", "/"), ("GET", "/static/{}"), ("GET", "/metrics"), ("GET", "/media/{}/{}"), ("HEAD", "/media/{}/{}")}
 
 # What a value is read as, by a client. "null" where the table says it may be nothing.
 STR, INT, NUM, BOOL, LIST, DICT = (str,), (int,), (int, float), (bool,), (list,), (dict,)
@@ -82,7 +86,7 @@ def served(app: Any) -> dict[tuple[str, str], str]:
         if getattr(route, "methods", None) is None:
             continue  # a WebSocket (the live line, let in by a pass: its row in the table names no method, and the pass's row is asked)
         for method in route.methods:
-            public = sample in server.PUBLIC or sample.startswith("/static/")
+            public = sample in server.PUBLIC or sample.startswith(server.PUBLIC_UNDER)
             found[(method, NAMED.sub("{}", route.path))] = "nobody" if public else server.required_role(method, sample)
     return found
 
@@ -154,9 +158,13 @@ class Seen:
         assert set(self.rows) - set(self.names) == set(), sorted(set(self.rows) - set(self.names))
 
 
+MEDIA_LISTED = {"images": LIST, "unseen": LIST, "left_out": INT, "notes": LIST, "space": NULL, "mounted": NULL, "offers": DICT, "uploading": NULL}
+MEDIA_IMAGE = {"id": STR, "name": STR, "where": STR, "size": INT + NULL, "partial": BOOL, "sha256": NULL}
+MEDIA_OFFERS = {"drives": LIST, "boot": LIST, "restart": BOOL, "upload": BOOL, "where": STR, "writable": LIST, "delete": BOOL, "drops_input": BOOL}
+MEDIA_NOW = {"drive": STR, "image": STR, "name": STR, "where": STR, "read_only": BOOL, "first": BOOL, "by": STR, "at": NUM, "sha256": NULL}
 ACCOUNT = {"id": STR, "name": STR, "role": STR, "totp": BOOL, "must_enroll": BOOL, "sso": BOOL, "recovery_codes": INT, "token": BOOL}
 TILE = {"id": STR, "name": STR, "host": STR, "open_url": STR, "kind": STR, "picture": BOOL, "group": STR, "same_as": LIST, "can": LIST}
-ADMINS_TILE = {**TILE, "url": STR, "custom_open_url": STR, "username": STR, "tls": STR, "fingerprint": STR + NULL, "has_password": BOOL, "alerts": BOOL, "fingerbot_strength": STR}
+ADMINS_TILE = {**TILE, "url": STR, "custom_open_url": STR, "username": STR, "tls": STR, "fingerprint": STR + NULL, "has_password": BOOL, "alerts": BOOL, "fingerbot_strength": STR, "no_signal_minutes": INT, "unchanged_minutes": INT}
 STATUS = {
     "can": LIST, "state": STR, "error": DICT + NULL, "last_seen_ago": INT + NULL, "video": DICT, "usb": DICT, "atx": DICT, "health": DICT,
     "about": DICT, "ports": DICT + NULL,
@@ -172,7 +180,10 @@ def one_of_each() -> Iterator[tuple[FakeKvm, FakeJetKvm, FakeBmc, FakeAmt]]:
     """A KVM with a power board and two inputs, a JetKVM with its ATX extension on, a server's controller (each with something to wake), and a PC
     with Intel AMT that asks for the code on its screen (so that it shows what a machine whose screen cannot be had answers; its screen is
     tests/test_amt_screen.py's)."""
-    comet = FakeKvm(FakeState(atx=True, ports=[(32, 74, 135), None], wol=[{"mac": "02:00:00:00:00:01", "name": "The build machine"}])).start()
+    comet = FakeKvm(FakeState(
+        atx=True, ports=[(32, 74, 135), None], wol=[{"mac": "02:00:00:00:00:01", "name": "The build machine"}],
+        msd=True, msd_images={"rescue.iso": {"complete": True, "removable": True, "size": 1000, "mod_ts": 1.0, "sha256": ""}},
+    )).start()  # fmt: skip
     jet = FakeJetKvm(JetState(extension="atx-power", wol=[{"name": "The other one", "macAddress": "02:00:00:00:00:02"}])).start()
     bmc = FakeBmc(BmcState()).start()
     pc = FakeAmt(AmtState(consent=True)).start()
@@ -305,15 +316,15 @@ def test_every_promised_request_answers_as_the_table_says(tmp_path: Path, monkey
         seen.shaped(("GET", "/api/v1/wall"), the_wall, {"interval": NUM, "live": INT, "devices": LIST})
         assert the_wall["live"] == 2  # (the form of the live line, read by a program as a number)
         for tile in the_wall["devices"]:
-            seen.shaped("A machine, as the wall lists it", tile, TILE)
+            seen.shaped("A machine, as the wall lists it", tile, {**TILE, "amt_view": STR} if tile["kind"] == "amt" else TILE)  # (a PC's alone)
         for tile in admin.get("/api/v1/wall").json()["devices"]:
-            seen.shaped("A machine, as the wall lists it", tile, ADMINS_TILE)
+            seen.shaped("A machine, as the wall lists it", tile, {**ADMINS_TILE, "amt_view": STR} if tile["kind"] == "amt" else ADMINS_TILE)
         by_id = {tile["id"]: tile for tile in the_wall["devices"]}
         assert by_id[kvm_id]["kind"] == "kvmd" and by_id[jet_id]["kind"] == "jetkvm" and by_id[bmc_id]["kind"] == "redfish" and by_id[amt_id]["kind"] == "amt"
         assert by_id[kvm_id]["picture"] is True and by_id[bmc_id]["picture"] is False and by_id[amt_id]["picture"] is False
         # What each can be asked: the driver's, and what the look at the device added (a power board, inputs, a light, a way in).
-        assert by_id[kvm_id]["can"] == ["screen", "keys", "text", "jiggler", "power", "reset", "wol", "ports", "reboot", "live", "control"]
-        assert by_id[jet_id]["can"] == ["screen", "keys", "text", "jiggler", "power", "reset", "wol", "reboot", "resume", "live", "control"]
+        assert by_id[kvm_id]["can"] == ["screen", "keys", "text", "jiggler", "power", "reset", "wol", "ports", "reboot", "live", "control", "media"]
+        assert by_id[jet_id]["can"] == ["screen", "keys", "text", "jiggler", "power", "reset", "wol", "reboot", "resume", "live", "control", "media"]
         # (The server's screen: not asked for yet, and so not known to be missing; asking is what finds that out, below.)
         # (And Start into BIOS setup, where its controller allows the "BiosSetup" boot override, as the stand-in's does.)
         assert by_id[bmc_id]["can"] == ["screen", "power", "reset", "power_state", "reboot", "locator", "console", "live", "bios_setup"]
@@ -321,9 +332,9 @@ def test_every_promised_request_answers_as_the_table_says(tmp_path: Path, monkey
         assert by_id[amt_id]["can"] == ["power", "reset", "power_state", "bios_setup"]
         status = victor.get("/api/v1/status").json()
         assert set(status) == {kvm_id, jet_id, bmc_id, amt_id}
-        seen.shaped("How a machine is", status[kvm_id], {**STATUS, "fingerbot": DICT + NULL})  # (null: no Fingerbot is paired with it)
-        seen.shaped("How a machine is", status[jet_id], {**STATUS, "kind": STR})
-        seen.shaped("How a machine is", status[bmc_id], {**STATUS, "kind": STR, "picture": BOOL, "screen": BOOL, "console": BOOL, "server": DICT})
+        seen.shaped("How a machine is", status[kvm_id], {**STATUS, "fingerbot": DICT + NULL, "media": NULL})  # (null: no Fingerbot is paired with it, nothing is mounted)
+        seen.shaped("How a machine is", status[jet_id], {**STATUS, "kind": STR, "media": NULL})
+        seen.shaped("How a machine is", status[bmc_id], {**STATUS, "kind": STR, "picture": BOOL, "screen": BOOL, "console": BOOL, "server": DICT, "media": NULL})
         seen.shaped("How a machine is", status[amt_id], {**STATUS, "kind": STR, "picture": BOOL, "screen": BOOL, "console": BOOL, "server": DICT})
         for device_id in (kvm_id, jet_id, bmc_id, amt_id):
             assert status[device_id]["can"] == by_id[device_id]["can"], device_id  # (the status's list is the wall's, as of the same look)
@@ -349,9 +360,10 @@ def test_every_promised_request_answers_as_the_table_says(tmp_path: Path, monkey
         )  # fmt: skip
         seen.shaped(
             "How a machine is", status[amt_id]["server"]["amt"],
-            {"power": INT + NULL, "control": STR + NULL, "kvm": STR + NULL, "consent": BOOL + NULL, "listener": BOOL + NULL, "session_timeout": INT + NULL, "make": STR + NULL, "model": STR + NULL, "serial": STR + NULL, "bios": STR + NULL, "plain": BOOL},
+            {"power": INT + NULL, "control": STR + NULL, "kvm": STR + NULL, "consent": BOOL + NULL, "listener": BOOL + NULL, "session_timeout": INT + NULL, "make": STR + NULL, "model": STR + NULL, "serial": STR + NULL, "bios": STR + NULL, "plain": BOOL, "view": STR},
         )  # fmt: skip
         assert status[amt_id]["screen"] is False and status[amt_id]["console"] is False and status[amt_id]["server"]["power"] == "On"
+        assert by_id[amt_id]["amt_view"] == status[amt_id]["server"]["amt"]["view"] == "stills"
 
         # --- what the wall saw of a machine: its history, kept beside the settings
         hist = f"/api/v1/devices/{kvm_id}/history"
@@ -424,6 +436,13 @@ def test_every_promised_request_answers_as_the_table_says(tmp_path: Path, monkey
         assert "uptime" not in olga.get("/api/v1/actions").text  # never the text
         by_name = {action["name"]: action for action in actions["actions"]}
         seen.refused("GET", "/api/v1/actions", victor.get("/api/v1/actions"), 403, "not_allowed")
+        # A PC's view: an operator's to change as an admin's, and a PC's alone.
+        view_of = f"/api/v1/devices/{amt_id}/view"
+        seen.shaped(("PUT", view_of), olga.put(view_of, json={"view": "health"}).json(), {"ok": BOOL, "amt_view": STR})
+        seen.shaped(("PUT", view_of), olga.put(view_of, json={"view": "stills"}).json(), {"ok": BOOL, "amt_view": STR})
+        seen.refused("PUT", f"/api/v1/devices/{kvm_id}/view", olga.put(f"/api/v1/devices/{kvm_id}/view", json={"view": "health"}), 422, "invalid")
+        seen.refused("PUT", "/api/v1/devices/nosuch01/view", olga.put("/api/v1/devices/nosuch01/view", json={"view": "health"}), 404, "not_found")
+        seen.refused("PUT", view_of, victor.put(view_of, json={"view": "health"}), 403, "not_allowed")
         for device_id in (kvm_id, jet_id):
             targets = olga.get(f"/api/v1/devices/{device_id}/wol").json()
             seen.shaped(("GET", f"/api/v1/devices/{device_id}/wol"), targets, {"targets": LIST})
@@ -483,6 +502,77 @@ def test_every_promised_request_answers_as_the_table_says(tmp_path: Path, monkey
         assert way_in.status_code == 200, way_in.text
         seen.shaped(("POST", f"/api/v1/devices/{bmc_id}/console"), way_in.json(), {"url": STR})
         assert way_in.json()["url"].startswith(bmc.url) and way_in.json()["url"] not in admin.get("/api/v1/audit").text
+
+        # --- virtual media (0.3.0): an admin's, in person, named in a confirmation; on a guest of Proxmox, taken off again after
+        pve = FakeProxmox(PveState(), tls_dir=tmp_path / "pve").start()
+        try:
+            guest_id = add(admin, pve.guest_url(100), name="A guest", username=PVE_TOKEN_ID, password=PVE_SECRET, kind="proxmox")
+            media = f"/api/v1/devices/{guest_id}/media"
+            seen.refused("GET", f"/api/v1/devices/{amt_id}/media", admin.get(f"/api/v1/devices/{amt_id}/media"), 404, "no_virtual_media")
+            seen.refused("GET", media, olga.get(media), 403, "not_allowed")
+            seen.refused("GET", media, robot.get(media), 403, "not_allowed")
+            seen.refused("GET", "/api/v1/devices/nosuch01/media", admin.get("/api/v1/devices/nosuch01/media"), 404, "not_found")
+            listed = admin.get(media)
+            assert listed.status_code == 200, listed.text
+            seen.shaped(("GET", media), listed.json(), MEDIA_LISTED)
+            seen.shaped(("GET", media), listed.json()["images"][0], MEDIA_IMAGE)
+            seen.shaped(("GET", media), listed.json()["offers"], MEDIA_OFFERS)
+            image = listed.json()["images"][0]["id"]
+            seen.refused("POST", media, admin.post(media, json={"image": image, "machine": "Another guest"}), 409, "changed")
+            seen.refused("POST", media, olga.post(media, json={"image": image, "machine": "A guest"}), 403, "not_allowed")
+            mounted = admin.post(media, json={"image": image, "machine": "A guest"})
+            assert mounted.status_code == 200, mounted.text
+            seen.shaped(("POST", media), mounted.json(), {"ok": BOOL, "note": NULL, "mounted": DICT})
+            seen.shaped("How a machine is", mounted.json()["mounted"], {**MEDIA_NOW, "where": STR, "first": BOOL, "sha256": NULL})
+            unmount = f"{media}/unmount"
+            seen.refused("POST", unmount, admin.post(unmount, json={"image": "local:iso/another.iso", "machine": "A guest"}), 409, "changed")
+            taken_out = admin.post(unmount, json={"image": image, "machine": "A guest"})
+            assert taken_out.status_code == 200, taken_out.text
+            seen.shaped(("POST", unmount), taken_out.json(), {"ok": BOOL, "note": NULL, "mounted": NULL})
+            # A guest's images are Proxmox's: none is carried there through qKVM, nor deleted from here.
+            seen.refused("POST", f"{media}/upload", admin.post(f"{media}/upload", params={"name": "x.iso", "machine": "A guest"}, content=b"x"), 422, "invalid")
+            seen.refused("POST", f"{media}/delete", admin.post(f"{media}/delete", json={"image": image, "machine": "A guest"}), 422, "invalid")
+            assert admin.delete(f"/api/v1/devices/{guest_id}").status_code == 200
+        finally:
+            pve.stop()
+        # ...and on a KVM's own storage: an image carried there (streamed, hashed on its way), how far an upload has come, one
+        # mounted as a USB flash drive, writable as it was chosen, and one deleted.
+        media = f"/api/v1/devices/{kvm_id}/media"
+        kvm_name = by_id[kvm_id]["name"]
+        listed = admin.get(media)
+        assert listed.status_code == 200, listed.text
+        seen.shaped(("GET", media), listed.json(), {**MEDIA_LISTED, "space": DICT})
+        seen.shaped(("GET", media), listed.json()["images"][0], {**MEDIA_IMAGE, "where": NULL})
+        seen.shaped(("GET", media), listed.json()["space"], {"free": INT, "size": INT})
+        seen.shaped(("GET", media), listed.json()["offers"], MEDIA_OFFERS)
+        seen.shaped(("GET", f"{media}/upload"), admin.get(f"{media}/upload").json(), {"uploading": NULL})
+        seen.refused("GET", f"{media}/upload", olga.get(f"{media}/upload"), 403, "not_allowed")
+
+        def upload(who: Any, name: str, body: bytes, machine: str = kvm_name, **more: Any) -> Any:
+            return who.post(f"{media}/upload", params={"name": name, "machine": machine}, content=body, **more)
+
+        seen.refused("POST", f"{media}/upload", upload(olga, "new.iso", b"x" * 100), 403, "not_allowed")
+        seen.refused("POST", f"{media}/upload", upload(admin, "new.iso", b"x" * 100, machine="another"), 409, "changed")
+        seen.refused("POST", f"{media}/upload", upload(admin, "rescue.iso", b"x" * 100), 409, "duplicate")
+        seen.refused("POST", f"{media}/upload", upload(admin, "../x.iso", b"x" * 100), 422, "invalid")
+        comet.state.msd_free = 50
+        seen.refused("POST", f"{media}/upload", upload(admin, "new.iso", b"x" * 100), 507, "no_space")
+        comet.state.msd_free = 6_000_000_000
+        uploaded = upload(admin, "new.iso", b"x" * 100)
+        assert uploaded.status_code == 200, uploaded.text
+        seen.shaped(("POST", f"{media}/upload"), uploaded.json(), {"ok": BOOL, "image": DICT, "sha256": STR})
+        seen.shaped(("POST", f"{media}/upload"), uploaded.json()["image"], {**MEDIA_IMAGE, "where": NULL, "sha256": STR})
+        mounted = admin.post(media, json={"image": "new.iso", "machine": kvm_name, "drive": "flash", "writable": True})
+        assert mounted.status_code == 200, mounted.text
+        seen.shaped("How a machine is", mounted.json()["mounted"], {**MEDIA_NOW, "where": NULL, "first": NULL, "sha256": STR})
+        seen.refused("POST", media, admin.post(media, json={"image": "rescue.iso", "machine": kvm_name, "drive": "cd", "writable": True}), 422, "invalid")
+        seen.refused("POST", f"{media}/delete", admin.post(f"{media}/delete", json={"image": "new.iso", "machine": kvm_name}), 409, "busy")
+        assert admin.post(f"{media}/unmount", json={"image": "new.iso", "machine": kvm_name}).status_code == 200
+        deleted = admin.post(f"{media}/delete", json={"image": "new.iso", "machine": kvm_name})
+        assert deleted.status_code == 200, deleted.text
+        seen.shaped(("POST", f"{media}/delete"), deleted.json(), {"ok": BOOL, "note": NULL})
+        seen.refused("POST", f"{media}/delete", olga.post(f"{media}/delete", json={"image": "rescue.iso", "machine": kvm_name}), 403, "not_allowed")
+        seen.refused("POST", f"{media}/delete", admin.post(f"{media}/delete", json={"image": "rescue.iso", "machine": "another"}), 409, "changed")
 
         # --- the order of the tiles, for everybody
         seen.refused("PUT", "/api/v1/wall/order", olga.put("/api/v1/wall/order", json={"ids": [bmc_id]}), 403, "not_allowed")

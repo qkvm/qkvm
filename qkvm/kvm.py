@@ -60,8 +60,164 @@ ACTIONS: dict[str, tuple[str, dict[str, str]]] = {
 # labels the page shows for them are in static/words.json; one that is not in there is a mistake.
 ABILITIES = (
     "screen", "keys", "text", "jiggler", "power", "reset", "fingerbot", "power_state", "wol", "ports", "reboot", "resume",
-    "locator", "console", "live", "control", "bios_setup",
+    "locator", "console", "live", "control", "bios_setup", "media",
 )  # fmt: skip
+
+
+# --- virtual media (0.3.0): what every family's driver fills in ------------------------------------------------------
+# Mounting an image is root on that machine (an installer, a rescue system): a right of its own (the server's MEDIA_ROLE,
+# an admin's), a person's and never a token's, every mount, unmount and start from it in the activity log, and a device
+# only ever handed what qKVM itself listed or made: never an address somebody typed (a device that fetches an address is
+# a way into the network it stands in). A driver says what this machine can do (`Device.media_offer`, a MediaOffer, by
+# what the last look at it found: a KVM whose own storage is switched off offers none) and does it (`Device.media_*`);
+# the server and the page go by that, never by the kind.
+
+# How a machine can be told to start from what is mounted: for its next start only, or for as long as it is mounted.
+MEDIA_BOOTS = ("once", "until_unmounted")
+# What an image is mounted as: a CD-ROM drive (always read-only), a USB flash drive (kvmd: read-only unless the person
+# chooses it writable), a disk (a JetKVM's: read-only, its own drive has no other way).
+MEDIA_DRIVES = ("cd", "flash", "disk")
+MOST_UPLOAD = 16_000_000_000  # bytes: the largest image carried through qKVM to a device's own storage (the owner's, 2026-11-03)
+# The name of an image on a device's own storage, as qKVM lists it and hands it back: printable ASCII that no device takes
+# for a path or an option (no slash, no leading dot or space), 200 characters at most. One of a KVM that keeps images in
+# folders is such names joined by slashes (kvmd lists them so); an upload is always one name.
+IMAGE_NAME = re.compile(r"[A-Za-z0-9_+()\[\]~-](?:[A-Za-z0-9 _.,+()\[\]~-]{0,198}[A-Za-z0-9_+()\[\]~-])?")
+DEVICE_IMAGE = re.compile(rf"{IMAGE_NAME.pattern}(?:/{IMAGE_NAME.pattern}){{0,3}}")
+# The drive of a kvmd KVM and of a JetKVM is Linux's USB gadget, whose CD-ROM drive takes an image of 300 sectors of 2048
+# bytes at least ("the smallest track is 300 frames", storage_common.c) and refuses a smaller one with a word of the
+# kernel's (errno 525, seen on a real JetKVM); of one larger than 256*60*75 sectors it gives the machine only the start,
+# MOST_CD bytes, and says so in the kernel's log alone (the page says it at the mount).
+LEAST_CD = 300 * 2048
+# kvmd lists an image once its watch on the storage has seen the file: some two seconds after its write was answered, on
+# kvmd's own test environment (a trial before the release of 0.3.0). Asked again until then, at most this long.
+LISTED_WITHIN = 10.0  # seconds, after a write answered whole
+LISTED_FOR_A_DISCARD = 3.0  # seconds, before what a cut-off write left is taken to be nothing
+MOST_CD = (256 * 60 * 75 - 1) * 2048
+
+
+def too_small_for_a_cd(name: str, size: int, other: str) -> KvmError | None:
+    """Where `size` is less than a CD-ROM drive of Linux's USB gadget takes: the refusal, naming `other`, the drive that does."""
+    if size >= LEAST_CD:
+        return None
+    return KvmError("invalid", f"{name} is {size:,} bytes, and a CD-ROM drive takes an image of {LEAST_CD:,} bytes at least (300 sectors of 2,048 bytes): mount it as {other}.", 422)
+
+
+PARTIAL = ".incomplete"  # what a JetKVM adds to the name of an image while it is being uploaded (and after an upload cut off)
+NAME_RULE = (
+    "An image's name is of letters, digits, spaces and . _ + - ( ) [ ] ~ , (200 at the most), and neither begins nor ends with "
+    "a space or a dot. Rename the file and upload it again."
+)
+MOST_DEVICE_IMAGES = 2000  # images of a device's own storage listed to pick from
+# An upload is carried on a connection of its own to the device: it may take seconds to connect, as any request, and the
+# device as long as UPLOAD_ANSWER to say it has the image once the last byte is out (kvmd writes the rest of it to its
+# storage first); a device that takes nothing for UPLOAD_STALL seconds meanwhile has the upload ended. UPLOAD_MOST, the
+# longest an upload may take all told: sixteen gigabytes at a megabyte a second, and more.
+UPLOAD_STALL = 60.0
+UPLOAD_ANSWER = 300.0
+UPLOAD_MOST = 24 * 3600.0
+UPLOAD_WAITS = httpx.Timeout(connect=4.0, read=UPLOAD_ANSWER, write=UPLOAD_STALL, pool=4.0)
+DISCARD_WAIT = 15.0  # seconds what an upload cut off left waits to be removed, while the device is still busy with its end
+
+
+@dataclass(frozen=True)
+class MediaOffer:
+    """What a machine's virtual media can do, as its driver says it."""
+
+    drives: tuple[str, ...]  # of MEDIA_DRIVES: what an image can be mounted as
+    boot: tuple[str, ...]  # of MEDIA_BOOTS: how it can be told to start from it; () where it cannot (a KVM is no firmware)
+    restart: bool  # it can be restarted from here: to start from it now, or (with no `boot`) for its firmware to find it
+    upload: bool  # an image can be streamed through qKVM into the device's own storage, and kept nowhere on the way
+    where: str  # where the images are: "proxmox" (its storages), "device" (the KVM's own), "qkvm" (a folder qKVM serves)
+    writable: tuple[str, ...] = ()  # of `drives`: those an image may be mounted writable in, where the person chooses that
+    delete: bool = False  # an image can be deleted from where it is (the device's own storage)
+    # A mount or an unmount, where it changes the drive from one kind to the other, drops the machine's keyboard and mouse
+    # for a moment (a JetKVM binds its whole USB device anew): the page says so first.
+    drops_input: bool = False
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "drives": list(self.drives), "boot": list(self.boot), "restart": self.restart, "upload": self.upload, "where": self.where,
+            "writable": list(self.writable), "delete": self.delete, "drops_input": self.drops_input,
+        }  # fmt: skip
+
+
+class UploadCut(Exception):
+    """An image on its way through qKVM stopped before its last byte: the sender stopped or went quiet, or sent more."""
+
+
+class Carried:
+    """An image on its way through qKVM to a device's own storage: `size` bytes, counted and hashed as they pass and kept
+    nowhere (a piece at a time in memory, no file). Iterated once, by the driver that hands it on; UploadCut, raised from
+    inside the iteration, where the pieces end before `size` bytes or go beyond it (`cut` says why, however the HTTP
+    library hands the error on). `sha256` once the last byte has passed."""
+
+    def __init__(self, pieces: Any, size: int) -> None:
+        self.size = size
+        self.sent = 0
+        self.cut: str | None = None
+        self.sha256: str | None = None
+        self._pieces = pieces  # an async iterator of bytes
+        self._hash = hashlib.sha256()
+        self._begun = False
+
+    async def __aiter__(self) -> Any:
+        if self._begun:
+            raise UploadCut("An image is carried once")
+        self._begun = True
+        try:
+            async for piece in self._pieces:
+                if self.sent + len(piece) > self.size:
+                    raise UploadCut("More came than the upload said it would be")
+                self._hash.update(piece)
+                self.sent += len(piece)
+                yield piece
+        except UploadCut as ex:
+            self.cut = self.cut or str(ex)
+            raise
+        if self.sent != self.size:
+            self.cut = self.cut or "The upload ended before the image came in full"
+            raise UploadCut(self.cut)
+        self.sha256 = self._hash.hexdigest()
+
+
+class MediaNotes:
+    """What qKVM did to a device's virtual media, kept while it runs beside the tiles (which are made anew at every edit):
+    who mounted which image from here, and the SHA-256 of each image it carried to the device, with the size and the time
+    the device gave it (a hash is said of an image only while both are still those: another image of the same name, put
+    there on the device itself, is not said to be it). Gone at a restart of qKVM."""
+
+    MOST = 2048
+
+    def __init__(self) -> None:
+        self.mounted: dict[str, tuple[str, str, float]] = {}  # device -> (image, by, at)
+        self.hashes: dict[str, tuple[str, int, Any]] = {}  # device \0 image -> (sha256, size, the device's time of it)
+
+    @staticmethod
+    def _keep(table: dict[str, Any], key: str, value: Any) -> None:
+        table.pop(key, None)  # (the newest last)
+        table[key] = value
+        while len(table) > MediaNotes.MOST:
+            del table[next(iter(table))]
+
+    def mounted_by(self, device: str, image: str, by: str) -> None:
+        self._keep(self.mounted, device, (image, by, time.time()))
+
+    def who(self, device: str, image: str) -> tuple[str | None, float | None]:
+        found = self.mounted.get(device)
+        return (found[1], found[2]) if found is not None and found[0] == image else (None, None)
+
+    def carried(self, device: str, image: str, sha256: str, size: int, stamp: Any) -> None:
+        self._keep(self.hashes, f"{device}\0{image}", (sha256, size, stamp))
+
+    def hash_of(self, device: str, image: str, size: Any, stamp: Any) -> str | None:
+        found = self.hashes.get(f"{device}\0{image}")
+        return found[0] if found is not None and found[1] == size and found[2] == stamp else None
+
+    def forget(self, device: str, image: str) -> None:
+        self.hashes.pop(f"{device}\0{image}", None)
+
+
+MEDIA_NOTES = MediaNotes()
 
 
 # How a machine's pointer is moved over the live line (`Device.pointer_kind`): to a place, by steps, or either.
@@ -139,6 +295,15 @@ EVENTS_PING = 5.0
 EVENTS_QUIET = 12.0
 MOST_EVENT = 2**20  # bytes one message on that line may be (what arrives is mostly thrown away, but is held in memory first)
 MOST_BOARD_WORD = 4096  # ...and the longest that is read as the board's state (a Comet's is some 90 bytes)
+# kvmd's `msd` event on that line: the state of its drive and of its own storage (every image named in it: kilobytes), read
+# up to this length. What is mounted is said there as it changes; where no line is held, a look asks /api/msd, every this
+# many seconds at the most (a GL.iNet KVM looks at its storage's partitions for every such answer).
+MOST_MSD_WORD = 2**18
+# What qKVM reads of kvmd's state of its drive (GET /api/msd, the line's `msd` event), and all it keeps of it: a KVM may
+# say more, and with every word of the line; what is kept is replaced key by key, each from one word or answer.
+MSD_KEPT = ("enabled", "online", "busy", "drive", "drive_partition")
+MSD_STORAGE_KEPT = ("images", "parts")
+MSD_EVERY = 30.0
 # Set once the KVM has answered a power button's click, for the time the button is held and its change waited for: a
 # request cut off after that (the wall stopped) was pressed, and is said so, not "may have been done" and offered again.
 PRESS_ANSWERED: contextvars.ContextVar[bool] = contextvars.ContextVar("press_answered", default=False)
@@ -218,57 +383,73 @@ class _AllPaced:
     a client made anew (an edit, at its address or another; the wall locked and opened again; the tile removed and added
     again at its address) finds what paces its KVM as the client before left it (register row 10 of 0.2.1, fx-a L2,
     w16c: each of them started afresh, and a press with no clear answer could be followed by another at once). Found by
-    the tile's id and by the KVM's address: a tile edited to another address keeps its id, one removed and added again
-    keeps its address. Not across a restart of the program."""
+    the KVM's address, and by its certificate where one is pinned (as core.identity knows a KVM at another of its
+    addresses): a tile removed and added again keeps its address, one edited to another address of the KVM is shown the
+    KVM's certificate there. Not by the tile's id (until 0.3.0): a tile edited to another KVM took the hold along, the KVM
+    there was "busy" with a press it never had, and the tile was told what the KVM before said of its Fingerbot. Where
+    nothing tells the KVM at a new address from another (plain HTTP), it starts afresh there, as its saved password is
+    typed again. Nor by a certificate the tile is not known by: one kept beside another that shows it ("own:", see
+    core.identity; KVMs behind one front door, which all show the door's) is found by its own address alone, apart
+    from what the others found there. Not across a restart of the program."""
 
     MOST = 4096  # entries kept before those that pace nothing any more are let go of
 
     def __init__(self) -> None:
-        self._by_id: dict[str, Paced] = {}
+        self._by_mark: dict[str, Paced] = {}
         self._by_address: dict[str, Paced] = {}
 
-    def find(self, device_id: str, address: str) -> Paced:
+    @staticmethod
+    def _keys(spec: DeviceSpec) -> tuple[str | None, str]:
+        if spec.ident.startswith("own:"):
+            return None, f"own\0{spec.base_url}"
+        return (saved_mark(spec.cert_pem) if spec.tls == "pinned" else None), spec.base_url
+
+    def find(self, spec: DeviceSpec) -> Paced:
         """What paces this KVM; a Paced of nothing where nothing does (not kept: write through `of`). One found by the
-        tile's id is kept under the address it is at now as well, and one found by the address under the id: a tile edited
-        to another address, and then removed and added again there, still finds it."""
-        mine = self._by_id.get(device_id) if device_id else None
+        KVM's certificate is kept under the address it is at now as well, and one found by the address under the
+        certificate: a tile edited to another address of the KVM, and then removed and added again there, still finds it.
+        (Asked afresh each time: a certificate is pinned at the first contact, after the client is made.)"""
+        mark, address = self._keys(spec)
+        mine = self._by_mark.get(mark) if mark else None
         there = self._by_address.get(address)
         if mine is not None and there is None:
             self._by_address[address] = mine
-        elif there is not None and mine is None and device_id:
-            self._by_id[device_id] = there
+        elif there is not None and mine is None and mark:
+            self._by_mark[mark] = there
         return mine or there or Paced()
 
-    def of(self, device_id: str, address: str) -> Paced:
-        """What paces this KVM, kept from now on under its id and its address."""
-        mine = self._by_id.get(device_id) if device_id else None
+    def of(self, spec: DeviceSpec) -> Paced:
+        """What paces this KVM, kept from now on under its certificate and its address."""
+        mark, address = self._keys(spec)
+        mine = self._by_mark.get(mark) if mark else None
         there = self._by_address.get(address)
         found = mine or there
         if found is None:
-            if len(self._by_id) + len(self._by_address) > self.MOST:
+            if len(self._by_mark) + len(self._by_address) > self.MOST:
                 now = time.monotonic()
-                self._by_id = {key: paced for key, paced in self._by_id.items() if not paced.idle(now)}
+                self._by_mark = {key: paced for key, paced in self._by_mark.items() if not paced.idle(now)}
                 self._by_address = {key: paced for key, paced in self._by_address.items() if not paced.idle(now)}
             found = Paced()
         elif mine is not None and there is not None and mine is not there:
-            # A tile edited to an address another tile has: one KVM there, and what paced either paces it from now on.
+            # A KVM's certificate shown at an address another tile had (with no certificate, or another one): one KVM
+            # there, and what paced either paces it from now on.
             mine.held_until, mine.board_until = max(mine.held_until, there.held_until), max(mine.board_until, there.board_until)
             if there.fingerbot_heard_at > mine.fingerbot_heard_at:
                 mine.fingerbot, mine.fingerbot_heard_at = there.fingerbot, there.fingerbot_heard_at
             if there.battery_asked_at > mine.battery_asked_at:
                 mine.battery, mine.battery_next, mine.battery_asked_at = there.battery, there.battery_next, there.battery_asked_at
             mine.fingerbot_silent_at = max(mine.fingerbot_silent_at, there.fingerbot_silent_at)
-            for keys in (self._by_id, self._by_address):
+            for keys in (self._by_mark, self._by_address):
                 for key in [key for key, paced in keys.items() if paced is there]:
                     keys[key] = mine
             found = mine
-        if device_id:
-            self._by_id[device_id] = found
+        if mark:
+            self._by_mark[mark] = found
         self._by_address[address] = found
         return found
 
     def clear(self) -> None:
-        self._by_id.clear()
+        self._by_mark.clear()
         self._by_address.clear()
 
 
@@ -282,25 +463,25 @@ class FingerbotTurn:
     KVM's power board (`board_until`, see BOARD_ANSWER): the machine's power buttons, which are one. The two times are
     kept in PACED, beside the connections, where a client made anew finds them."""
 
-    def __init__(self, device_id: str = "", address: str = "") -> None:
+    def __init__(self, spec: DeviceSpec) -> None:
         self.lock = asyncio.Lock()
-        self._where = (device_id, address)
+        self._spec = spec  # (the client's own: the certificate pinned at its first contact is in it from then on)
 
     @property
     def held_until(self) -> float:
-        return PACED.find(*self._where).held_until
+        return PACED.find(self._spec).held_until
 
     @held_until.setter
     def held_until(self, value: float) -> None:
-        PACED.of(*self._where).held_until = value
+        PACED.of(self._spec).held_until = value
 
     @property
     def board_until(self) -> float:
-        return PACED.find(*self._where).board_until
+        return PACED.find(self._spec).board_until
 
     @board_until.setter
     def board_until(self, value: float) -> None:
-        PACED.of(*self._where).board_until = value
+        PACED.of(self._spec).board_until = value
 
     def held(self) -> float:
         """Seconds it may still be pressing; 0 where it is not."""
@@ -537,7 +718,11 @@ class DeviceSpec:
     # The machine behind the address, by the number it gave for itself when it was added (store.DeviceRecord.machine):
     # a driver that can tell checks it before anything is sent to the machine. "": none remembered.
     machine: str = ""
+    # What the tile is known by where it is not its certificate (store.DeviceRecord.ident): "own:...", kept beside another
+    # tile that shows the same certificate (a front door's), is not found by that certificate (see _AllPaced).
+    ident: str = ""
     fingerbot_strength: str = "firm"  # how hard a Fingerbot paired with the KVM presses: "firm" | "light" (FINGERBOT_STRENGTHS)
+    amt_view: str = "stills"  # a PC with Intel AMT: "health", "stills" or "live" (store.DeviceRecord.amt_view); changed in place
 
 
 @dataclass(frozen=True)
@@ -1348,6 +1533,9 @@ class Device:
         # the first one it saw, where none was remembered; or a server's controller's beside its computer's. Called with what
         # was remembered until then and what is from now on; kept with the tile from then on (DeviceManager._known).
         self.on_known: Callable[[str, str], Awaitable[None]] | None = None
+        # The images the wall serves to servers' controllers for a mount (served.Served), given to every tile by the wall;
+        # None for a client that is not on the wall (one tried out before it is added).
+        self.served: Any = None
         self._closed = False  # retired: whatever is still under way on it ends, and nothing new starts
         self._client: httpx.AsyncClient | None = None
         self._tls: ssl.SSLContext | None = None  # how the device's certificate is checked; None without TLS
@@ -1416,6 +1604,67 @@ class Device:
     async def console(self) -> str:
         """The way into the device's own console for one use, signed in: a path on the device. Few can give one."""
         raise KvmError("no_console", "This device does not hand out a way into its console", 404)
+
+    # --- virtual media (MediaOffer): a driver whose media_offer() is not None provides these -----------------------
+
+    def media_offer(self) -> MediaOffer | None:
+        """What this machine's virtual media can do, as the last look at it found it; None: it has none (none found yet)."""
+        return None
+
+    async def media_images(self) -> dict[str, Any]:
+        """The images that can be mounted, asked now: `images` (each `id`, `name`, `where`, `size`, `partial` (an upload cut
+        off: only to delete), `sha256` (where qKVM carried it there, and it is still that image; else None)), `unseen` (a
+        sentence for each place whose images could not be listed, or what stands against a mount), `left_out` (entries that
+        were not images qKVM hands on), `space` (the device's own storage: `free` and `size` in bytes, or None). A mount names
+        an `id`, and is refused where that is not listed at that moment. Afterwards `media_now` says what is mounted."""
+        raise KvmError("no_virtual_media", "This machine has no virtual media", 404)
+
+    def media_now(self) -> dict[str, Any] | None:
+        """What is mounted, as it was last found (the status's `media`): None where nothing is, or nothing is known yet; else
+        `drive`, `image` (its id, or what the machine says is in it), `name`, `where`, `read_only`, `first` (the machine starts
+        from it first at its next start; None where nothing here can tell), `by` and `at` (who mounted it from qKVM, and
+        when; None where that is not known), `sha256` (where qKVM carried it there; else None)."""
+        return None
+
+    async def media_mount(self, image: str, *, drive: str, writable: bool, by: str, still: Callable[[], bool] | None = None) -> str | None:
+        """Mount the image `image` (an id as listed) as `drive` (of the offer's `drives`), read-only unless `writable` (only
+        for a drive of the offer's `writable`), for `by` (whose doing it is, said on the tile). A sentence where there is
+        more to say than that it was done."""
+        raise KvmError("no_virtual_media", "This machine has no virtual media", 404)
+
+    async def media_boot(self, how: str, *, restart: bool, still: Callable[[], bool] | None = None) -> str | None:
+        """Have the machine start from what is mounted (`how`, of the offer's `boot`): "once", restarted now and its own
+        order after; or "until_unmounted", restarted now where `restart` says so. A sentence where there is more to say."""
+        raise KvmError("no_virtual_media", "This machine has no virtual media", 404)
+
+    async def media_restart(self, *, still: Callable[[], bool] | None = None) -> str | None:
+        """Restart the machine, for its firmware to find what is mounted (an offer with `restart` and no `boot`: a KVM is no
+        firmware, and the person picks the drive in the machine's boot menu): its reset button where it is on, its power
+        button where it is off. A sentence where there is more to say."""
+        raise KvmError("no_virtual_media", "This machine has no virtual media", 404)
+
+    async def media_unmount(self, image: str, *, still: Callable[[], bool] | None = None) -> str | None:
+        """Take out what is mounted, where it is `image` (what the person was shown: KvmError `changed` where another is
+        mounted now), and start the machine as before. AlreadySo where nothing is mounted."""
+        raise KvmError("no_virtual_media", "This machine has no virtual media", 404)
+
+    async def media_upload(self, name: str, carried: Carried, *, by: str, still: Callable[[], bool] | None = None) -> dict[str, Any]:
+        """Carry an image into the device's own storage under `name` (an offer with `upload`): `carried`, iterated once,
+        handed on a piece at a time. The image as it is listed afterwards (as in `media_images`). Where it ends before its
+        last byte, or the device does not have it whole afterwards, what was written is removed from the device where it
+        allows that, and KvmError says so (`changed`, where nothing was sent)."""
+        raise KvmError("no_virtual_media", "This machine has no virtual media", 404)
+
+    async def media_discard(self, name: str) -> str | None:
+        """Remove what an upload of `name` that was cut off may have left on the device, where the device allows that (asked
+        by the server of a client made anew where the one that carried it was retired meanwhile). A sentence where it could
+        not be; None where nothing is left."""
+        return None
+
+    async def media_delete(self, image: str, *, still: Callable[[], bool] | None = None) -> str | None:
+        """Delete the image `image` (an id as listed) from the device's own storage (an offer with `delete`): refused where
+        it is mounted. AlreadySo where it is not there any more."""
+        raise KvmError("no_virtual_media", "This machine has no virtual media", 404)
 
     async def probe(self) -> str:
         """The device's state, for the alert watcher. Must not get in the way of anyone using the device."""
@@ -1782,13 +2031,18 @@ class KvmDevice(Device):
         self._fingerbot_words = 0  # how often that changed (a look under way when it does is not the last word: see _refresh_status)
         # The Comet talks to its Fingerbot one request at a time (a press sent while another was being taken failed): a
         # press and a question of the battery never go out together from here.
-        self._fingerbot_turn = FingerbotTurn(spec.id, spec.base_url)
-        PACED.find(spec.id, spec.base_url)  # (what paces this KVM, kept under this address too from now on: see _AllPaced.find)
+        self._fingerbot_turn = FingerbotTurn(spec)
+        PACED.find(spec)  # (what paces this KVM, kept under this address too from now on: see _AllPaced.find)
         # Its battery in percent as last answered (see FINGERBOT_BATTERY_EVERY), when it may be asked again, and when it was last
         # asked: `_battery`, `_battery_next`, `_battery_asked_at`, kept in PACED with the rest of what paces the Fingerbot: the
         # listeners opened again make every client anew, and the battery was asked again at once.
         self._battery_task: asyncio.Task[None] | None = None
         self._owed: set[asyncio.Future[None]] = set()  # lines asked for the Fingerbot, being closed in a task of their own
+        # Its drive and image storage as kvmd last said them (GET /api/msd, or its `msd` event on the keepalive's line), and when;
+        # when the line last said it (see `_msd_look`).
+        self._msd: dict[str, Any] | None = None
+        self._msd_at = float("-inf")
+        self._msd_heard_at = float("-inf")
         self._keepalive: asyncio.Task[None] | None = None
         self._keepalive_fails = 0  # keepalives in a row that did not get, or did not keep, their connection
         self._keepalive_again_at = 0.0  # ...and when one may be begun again
@@ -1819,51 +2073,51 @@ class KvmDevice(Device):
     # Whether a Fingerbot is paired, as the KVM said last, and when: kept beside the connections (PACED), not in this client.
     @property
     def _fingerbot(self) -> bool | None:
-        return PACED.find(self.spec.id, self.spec.base_url).fingerbot
+        return PACED.find(self.spec).fingerbot
 
     @_fingerbot.setter
     def _fingerbot(self, value: bool | None) -> None:
-        PACED.of(self.spec.id, self.spec.base_url).fingerbot = value
+        PACED.of(self.spec).fingerbot = value
 
     @property
     def _fingerbot_heard_at(self) -> float:
-        return PACED.find(self.spec.id, self.spec.base_url).fingerbot_heard_at
+        return PACED.find(self.spec).fingerbot_heard_at
 
     @_fingerbot_heard_at.setter
     def _fingerbot_heard_at(self, value: float) -> None:
-        PACED.of(self.spec.id, self.spec.base_url).fingerbot_heard_at = value
+        PACED.of(self.spec).fingerbot_heard_at = value
 
     @property
     def _fingerbot_silent_at(self) -> float:
-        return PACED.find(self.spec.id, self.spec.base_url).fingerbot_silent_at
+        return PACED.find(self.spec).fingerbot_silent_at
 
     @_fingerbot_silent_at.setter
     def _fingerbot_silent_at(self, value: float) -> None:
-        PACED.of(self.spec.id, self.spec.base_url).fingerbot_silent_at = value
+        PACED.of(self.spec).fingerbot_silent_at = value
 
     @property
     def _battery(self) -> int | None:
-        return PACED.find(self.spec.id, self.spec.base_url).battery
+        return PACED.find(self.spec).battery
 
     @_battery.setter
     def _battery(self, value: int | None) -> None:
-        PACED.of(self.spec.id, self.spec.base_url).battery = value
+        PACED.of(self.spec).battery = value
 
     @property
     def _battery_next(self) -> float:
-        return PACED.find(self.spec.id, self.spec.base_url).battery_next
+        return PACED.find(self.spec).battery_next
 
     @_battery_next.setter
     def _battery_next(self, value: float) -> None:
-        PACED.of(self.spec.id, self.spec.base_url).battery_next = value
+        PACED.of(self.spec).battery_next = value
 
     @property
     def _battery_asked_at(self) -> float:
-        return PACED.find(self.spec.id, self.spec.base_url).battery_asked_at
+        return PACED.find(self.spec).battery_asked_at
 
     @_battery_asked_at.setter
     def _battery_asked_at(self, value: float) -> None:
-        PACED.of(self.spec.id, self.spec.base_url).battery_asked_at = value
+        PACED.of(self.spec).battery_asked_at = value
 
     def tidy(self) -> None:
         if (self._frames or self._fetching) and time.monotonic() - self._wanted_at > KEEPALIVE_IDLE:
@@ -2269,7 +2523,14 @@ class KvmDevice(Device):
         too, a megabyte each at the most). A word that says what was said before is no news: a KVM that repeated its
         state would otherwise have the tile looked at again at every repetition, every question of the look with it.
         """
-        if not isinstance(message, str) or len(message) > MOST_BOARD_WORD or ('"atx"' not in message and '"fingerbot"' not in message):
+        if not isinstance(message, str):
+            return
+        if len(message) <= MOST_MSD_WORD and '"msd"' in message:
+            heard = event_of(message)
+            if heard is not None and heard[0] == "msd":
+                self._msd_said(heard[1])
+                return
+        if len(message) > MOST_BOARD_WORD or ('"atx"' not in message and '"fingerbot"' not in message):
             return
         said = event_of(message)
         if said is not None and said[0] == "fingerbot":
@@ -2763,6 +3024,370 @@ class KvmDevice(Device):
                 targets.append({"mac": mac, "name": name})
         return targets
 
+    # --- virtual media (0.3.0, A2): the KVM's own image storage (kvmd's MSD) ----------------------------------------
+    # kvmd's mass storage drive: images in the KVM's own storage, one of them in its drive at a time, as a CD-ROM drive or a
+    # USB flash drive (read-only unless the person chooses it writable). Read from kvmd's source (GL.iNet's tree, 4.16, and
+    # stock kvmd's): GET /api/msd says it all (`enabled`, `online`, `busy`, `drive`, `storage`); the drive's image is chosen
+    # with set_params (only while it is disconnected), and connected with set_connected; an image is written with
+    # POST /api/msd/write, its length said in advance (kvmd takes it from Content-Length), `remove_incomplete=1` (what a
+    # write cut off leaves is removed by kvmd itself; and by qKVM after it where kvmd did not), and removed with remove.
+    # Never write_remote, nor an image by address (kvmd fetches it: a way into the network it stands in), nor read (an
+    # image back off the KVM), nor set_enabled (a machine that cannot have a drive and a keyboard on one port is the
+    # owner's to switch), nor GL.iNet's partition routes, some of which change things on a GET (partition_format formats).
+    # What is mounted is said on the line for events the keepalive holds while the picture is watched (kvmd's `msd` event:
+    # the whole state as a line opens, then what changed), and asked of /api/msd otherwise, every MSD_EVERY seconds at a look.
+
+    @property
+    def _media_key(self) -> str:
+        """What MEDIA_NOTES knows this KVM by: its tile and its address."""
+        return f"{self.spec.id}\0{self.spec.base_url}"
+
+    def _media_offer(self, board: bool) -> MediaOffer | None:
+        if flag(_dig(self._msd, "enabled")) is not True:
+            return None  # (none found yet, or its own drive switched off in its settings: no box, and nothing asked)
+        return MediaOffer(drives=("cd", "flash"), boot=(), restart=board, upload=True, where="device", writable=("flash",), delete=True)
+
+    def media_offer(self) -> MediaOffer | None:
+        return self._media_offer("reset" in self.abilities())
+
+    @staticmethod
+    def _msd_kept(state: dict[str, Any]) -> dict[str, Any]:
+        """Of kvmd's state of its drive (or a part of one): what qKVM reads (MSD_KEPT), and nothing else."""
+        kept = {key: state[key] for key in MSD_KEPT if key in state}
+        if isinstance(storage := state.get("storage"), dict):
+            kept["storage"] = {key: storage[key] for key in MSD_STORAGE_KEPT if key in storage}
+        return kept
+
+    def _msd_said(self, event: Any) -> None:
+        """kvmd's `msd` event on the keepalive's line: the whole state (it has `online`), or what changed of it, merged in;
+        of either, what qKVM reads alone. The tile is looked at again where what it says of the drive changed."""
+        if not isinstance(event, dict):
+            return
+        before = self._msd
+        if "online" in event or not isinstance(before, dict):
+            if "online" not in event:
+                return  # (a part of a state nothing is known of yet: the next whole one, or a question, says it)
+            merged = self._msd_kept(event)
+        else:
+            said = self._msd_kept(event)
+            merged = {**before, **{key: value for key, value in said.items() if key != "storage"}}
+            if "storage" in said:
+                storage = merged.get("storage")
+                merged["storage"] = {**(storage if isinstance(storage, dict) else {}), **said["storage"]}
+        self._msd, self._msd_at = merged, time.monotonic()
+        self._msd_heard_at = self._msd_at
+        if (_dig(before, "enabled"), _dig(before, "drive")) != (merged.get("enabled"), merged.get("drive")):
+            self._status_at = 0.0  # (what the tile says of its drive changed: looked at again when next asked)
+
+    async def _msd_asked(self, urgent: bool = False, vital: bool = True) -> dict[str, Any]:
+        """kvmd's state of its drive and storage, asked now (what qKVM reads of it)."""
+        state = await self._get_result("/api/msd", urgent=urgent, vital=vital)
+        if not isinstance(state, dict):
+            raise KvmError("bad_response", "The KVM did not say how its drive is")
+        kept = self._msd_kept(state)
+        self._msd, self._msd_at = kept, time.monotonic()
+        return kept
+
+    async def _msd_look(self) -> Any:
+        """For a look: as the line said it of late, or as it was asked within MSD_EVERY seconds; asked otherwise."""
+        heard = self._keepalive is not None and not self._keepalive.done() and time.monotonic() - self._msd_heard_at < EVENTS_QUIET
+        if self._msd is not None and (heard or time.monotonic() - self._msd_at < MSD_EVERY):
+            return self._msd
+        try:
+            return await self._msd_asked(vital=False)
+        except KvmError:
+            # (Asked again at the next look after the pause, not at every one: one that has none answers no differently.)
+            self._msd_at = time.monotonic()
+            return self._msd
+
+    @staticmethod
+    def _msd_name(name: Any) -> str | None:
+        """An image's name as kvmd says it, as qKVM hands it back (DEVICE_IMAGE); None for what is no such name."""
+        return name if isinstance(name, str) and DEVICE_IMAGE.fullmatch(name) else None
+
+    def _msd_listed(self, state: Any) -> tuple[list[dict[str, Any]], int]:
+        """The images of the KVM's own storage by what kvmd says, each by its kind; and how many entries were left out."""
+        found = _dig(state, "storage", "images")
+        images: list[dict[str, Any]] = []
+        left_out = 0
+        for name, about in found.items() if isinstance(found, dict) else ():
+            if self._msd_name(name) is None or not isinstance(about, dict) or len(images) >= MOST_DEVICE_IMAGES:
+                left_out += 1
+                continue
+            size = number(about.get("size"), 0, 2**50)
+            partial = flag(about.get("complete")) is False
+            sha = None if partial else MEDIA_NOTES.hash_of(self._media_key, name, size, number(about.get("mod_ts"), 0, 1e11))
+            images.append({"id": name, "name": name, "where": None, "size": size, "partial": partial, "sha256": sha})
+        images.sort(key=lambda one: one["name"].casefold())
+        return images, left_out
+
+    def _msd_stands_against(self, state: Any) -> KvmError | None:
+        """What stands against a change of the KVM's drive or storage, as kvmd says it now; None where nothing does."""
+        if flag(_dig(state, "enabled")) is not True:
+            return KvmError("no_virtual_media", "The KVM's own drive is switched off in its own settings", 404)
+        if flag(_dig(state, "online")) is not True:
+            return KvmError("action_failed", "The KVM says its drive is not there just now (offline): look at it on its own page", 409)
+        if flag(_dig(state, "busy")) is True:
+            return KvmError("busy", "The KVM's drive is busy with something else (an upload, or its own page): try again in a moment", 409)
+        if flag(_dig(state, "drive_partition", "connected")) is True:
+            # (GL.iNet's File Sharing: the whole image storage open to the machine, read-write. Nothing is written beside it.)
+            return KvmError("action_failed", "The KVM's File Sharing is on: its whole image storage is open to the machine, read-write. Switch it off on the KVM's own page first.", 409)
+        return None
+
+    def media_now(self) -> dict[str, Any] | None:
+        msd = self._msd
+        drive = _dig(msd, "drive")
+        if flag(_dig(msd, "enabled")) is not True or not isinstance(drive, dict) or flag(drive.get("connected")) is not True:
+            return None
+        image = drive.get("image")
+        raw = image.get("name") if isinstance(image, dict) else None
+        name = self._msd_name(raw) or plain(raw, 200) or "an image"
+        cd = flag(drive.get("cdrom")) is True
+        by, at = MEDIA_NOTES.who(self._media_key, name)
+        sha = MEDIA_NOTES.hash_of(self._media_key, name, number(_dig(image, "size"), 0, 2**50), number(_dig(image, "mod_ts"), 0, 1e11))
+        return {
+            "drive": "cd" if cd else "flash", "image": name, "name": name, "where": None,
+            "read_only": cd or flag(drive.get("rw")) is not True, "first": None, "by": by, "at": at, "sha256": sha,
+        }  # fmt: skip
+
+    async def media_images(self) -> dict[str, Any]:
+        state = await self._msd_asked(urgent=True)
+        if flag(state.get("enabled")) is not True:
+            raise KvmError("no_virtual_media", "The KVM's own drive is switched off in its own settings", 404)
+        images, left_out = self._msd_listed(state)
+        against = self._msd_stands_against(state)
+        free, size = number(_dig(state, "storage", "parts", "", "free"), 0, 2**60), number(_dig(state, "storage", "parts", "", "size"), 0, 2**60)
+        return {
+            "images": images, "unseen": [], "left_out": left_out, "notes": [against.message] if against is not None else [],
+            "space": {"free": free, "size": size} if free is not None and size is not None else None,
+        }  # fmt: skip
+
+    async def _msd_post(self, path: str, params: dict[str, str], what: str, still: Callable[[], bool] | None) -> None:
+        """One of kvmd's changes of its drive or storage, sent once (`what`, for the words of a refusal)."""
+        resp = await self._request("POST", path, urgent=True, params=params, still=still)
+        if resp.status_code == 200:
+            return
+        try:
+            detail = plain(_dig(read_json(resp), "result", "error_msg"), 200)
+        except ValueError:
+            detail = None
+        if resp.status_code == 409:
+            raise KvmError("busy", f"The KVM's drive is busy with something else: {detail or 'try again in a moment'}", 409)
+        raise KvmError("action_failed", f"The KVM did not {what}: {detail}" if detail else f"The KVM did not {what} (HTTP {resp.status_code})")
+
+    async def media_mount(self, image: str, *, drive: str, writable: bool, by: str, still: Callable[[], bool] | None = None) -> str | None:
+        if drive not in ("cd", "flash") or (writable and drive != "flash"):
+            raise KvmError("invalid", "A kvmd KVM takes an image as a CD-ROM drive (read-only) or as a USB flash drive", 422)
+        if self._msd_name(image) is None:
+            raise KvmError("invalid", "That is not an image of the KVM's that qKVM lists", 422)
+        state = await self._msd_asked(urgent=True)
+        if (against := self._msd_stands_against(state)) is not None:
+            raise against
+        found = next((one for one in self._msd_listed(state)[0] if one["id"] == image), None)
+        if found is None:
+            raise KvmError("changed", f"{image} is not on the KVM's own storage any more: look again.", 409)
+        if found["partial"]:
+            raise KvmError("changed", f"{image} is not on the KVM whole (an upload of it was cut off): delete it, or upload it again.", 409)
+        if drive == "cd" and isinstance(found.get("size"), int) and (small := too_small_for_a_cd(image, found["size"], "a USB flash drive")):
+            raise small
+        now = self.media_now()
+        if now is not None:
+            if (now["image"], now["drive"], now["read_only"]) == (image, drive, not writable):
+                return "It was mounted so already."
+            raise KvmError("changed", f"{now['name']} is mounted on it now: unmount it first.", 409)
+        # (CD-ROM: always read-only, `rw` ignored by kvmd; a USB flash drive read-only unless chosen.)
+        await self._msd_post("/api/msd/set_params", {"image": image, "cdrom": "1" if drive == "cd" else "0", "rw": "1" if writable else "0"}, "choose the image", still)
+        await self._msd_post("/api/msd/set_connected", {"connected": "1"}, "connect its drive", still)
+        MEDIA_NOTES.mounted_by(self._media_key, image, by)
+        self._status_at = 0.0
+        await self._msd_asked(urgent=True)
+        now = self.media_now()
+        if now is None or (now["image"], now["drive"], now["read_only"]) != (image, drive, not writable):
+            # Not as it was asked: another image, another kind of drive, writable where it was to be read-only. Taken out
+            # again at once, where it is in, and said.
+            if now is not None:
+                try:
+                    await self._msd_post("/api/msd/set_connected", {"connected": "0"}, "disconnect its drive", None)
+                    await self._msd_asked(urgent=True)
+                except KvmError as ex:
+                    raise KvmError("action_failed", f"The KVM did not mount it as it was asked, and could not be told to take it out again ({ex.message}): look at it on its own page.") from None
+            raise KvmError("action_failed", "The KVM did not mount it as it was asked, and it is not mounted: look at it on its own page.")
+        return None
+
+    async def media_restart(self, *, still: Callable[[], bool] | None = None) -> str | None:
+        if "reset" not in self.abilities():
+            raise KvmError("invalid", "This KVM has no power board to restart the machine with", 422)
+        on, _ = await self._board_now(ask=True)
+        action = "atx_power" if on is False else "atx_reset"
+        said = "It was off, and was switched on with its power button" if action == "atx_power" else "It was restarted with its reset button"
+        try:
+            await self.act(action, still=still)
+        except AlreadySo as so:
+            said = f"{said} ({so})"
+        return f"{said}: pick the KVM's drive in its boot menu where it does not start from it by itself."
+
+    async def media_unmount(self, image: str, *, still: Callable[[], bool] | None = None) -> str | None:
+        state = await self._msd_asked(urgent=True)
+        if flag(state.get("enabled")) is not True:
+            raise KvmError("no_virtual_media", "The KVM's own drive is switched off in its own settings", 404)
+        now = self.media_now()
+        if now is None:
+            raise AlreadySo("nothing was mounted")
+        if now["image"] != image:
+            raise KvmError("changed", f"{now['name']} is mounted on it now, and not {image}: nothing was taken out. Look at it again.", 409)
+        if flag(state.get("busy")) is True:
+            raise KvmError("busy", "The KVM's drive is busy with something else (an upload, or its own page): try again in a moment", 409)
+        await self._msd_post("/api/msd/set_connected", {"connected": "0"}, "disconnect its drive", still)
+        MEDIA_NOTES.mounted.pop(self._media_key, None)
+        self._status_at = 0.0
+        await self._msd_asked(urgent=True)
+        if self.media_now() is not None:
+            raise KvmError("action_failed", "The KVM says the image is still in its drive: look at it on its own page.")
+        return None
+
+    async def media_delete(self, image: str, *, still: Callable[[], bool] | None = None) -> str | None:
+        if self._msd_name(image) is None:
+            raise KvmError("invalid", "That is not an image of the KVM's that qKVM lists", 422)
+        state = await self._msd_asked(urgent=True)
+        if (against := self._msd_stands_against(state)) is not None:
+            raise against
+        if not any(one["id"] == image for one in self._msd_listed(state)[0]):
+            raise AlreadySo("it was not on the KVM any more")
+        if (now := self.media_now()) is not None and now["image"] == image:
+            raise KvmError("busy", f"{image} is mounted: unmount it first.", 409)
+        await self._msd_post("/api/msd/remove", {"image": image}, "delete it", still)
+        MEDIA_NOTES.forget(self._media_key, image)
+        _, left = await self._msd_listing(image, LISTED_WITHIN, gone=True)  # (listed a moment longer: see LISTED_WITHIN)
+        if left is not None:
+            raise KvmError("action_failed", "The KVM says the image is still on its storage: look at it on its own page.")
+        return None
+
+    async def _msd_listing(self, name: str, within: float, gone: bool = False, whole_at: int | None = None) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        """kvmd's state, asked again (half a second apart, for `within` seconds at most) until it lists `name` (until it no
+        longer does, `gone`; until it lists it whole at `whole_at` bytes): it lists a file, and stops listing one, as its
+        watch on the storage last saw it (LISTED_WITHIN), which may be mid-write. The state, and the image as it is listed
+        or None. Only the first question's failure is raised: one of the later ones is asked again."""
+        until = time.monotonic() + within
+        state: dict[str, Any] | None = None
+        listed: dict[str, Any] | None = None
+        while True:
+            try:
+                state = await self._msd_asked(urgent=True)
+            except KvmError:
+                if state is None:
+                    raise
+            else:
+                listed = next((one for one in self._msd_listed(state)[0] if one["id"] == name), None)
+                if gone:
+                    done = listed is None
+                elif whole_at is not None:
+                    done = listed is not None and not listed["partial"] and listed["size"] == whole_at
+                else:
+                    done = listed is not None
+                if done:
+                    return state, listed
+            if time.monotonic() >= until:
+                return state, listed
+            await asyncio.sleep(0.5)
+
+    async def media_discard(self, name: str) -> str | None:
+        if self._msd_name(name) is None:
+            return None
+        try:
+            state = await self._msd_asked(urgent=True)
+            # (A write cut off is over for kvmd once it has read to the cut: it is busy with it until then, a moment.)
+            until = time.monotonic() + DISCARD_WAIT
+            while flag(state.get("busy")) is True and time.monotonic() < until:
+                await asyncio.sleep(0.25)
+                state = await self._msd_asked(urgent=True)
+            state, left = await self._msd_listing(name, LISTED_FOR_A_DISCARD)
+            if left is None:
+                return None
+            if not left["partial"]:
+                # (Whole after all: an image like any other, which stays. Said so: "nothing is left" was said of it.)
+                size = f" ({left['size']:,} bytes)" if isinstance(left["size"], int) else ""
+                return f"It is on the KVM whole all the same{size}, and stays there: delete it there if it is not wanted."
+            await self._msd_post("/api/msd/remove", {"image": name}, "delete what was written of it", None)
+            _, left = await self._msd_listing(name, LISTED_WITHIN, gone=True)
+        except KvmError as ex:
+            return f"What was written of it may be on the KVM still ({ex.message}): delete it there."
+        if left is not None:
+            return "What was written of it is on the KVM still: delete it there."
+        return None
+
+    async def media_upload(self, name: str, carried: Carried, *, by: str, still: Callable[[], bool] | None = None) -> dict[str, Any]:
+        if not IMAGE_NAME.fullmatch(name) or name.endswith(PARTIAL):
+            raise KvmError("invalid", NAME_RULE, 422)
+        state = await self._msd_asked(urgent=True)  # (signed in anew where its session ran out: the upload goes on a fresh one)
+        if (against := self._msd_stands_against(state)) is not None:
+            raise against
+        if any(one["id"] == name for one in self._msd_listed(state)[0]):
+            raise KvmError("duplicate", f"{name} is on the KVM's own storage already: delete it first, or upload it under another name.", 409)
+        free = number(_dig(state, "storage", "parts", "", "free"), 0, 2**60)
+        if free is not None and carried.size > free:
+            raise KvmError("no_space", f"The KVM's own storage has {free:,} bytes free, and the image is {carried.size:,}: delete an image there first.", 507)
+        if still is not None and not still():
+            raise KvmError("stopped", "It was not done: whoever asked for it may no longer do that", 403)
+        try:
+            reply = await self._carry(carried, name)
+        except BaseException as ex:
+            # (Whatever it was: what came of it on the KVM is removed where kvmd did not remove it itself, and said.)
+            if isinstance(ex, (KvmError, UploadCut, httpx.HTTPError)) and not self._closed and ex is not RETIRED:
+                left = await self.media_discard(name)
+                raise self._cut_said(ex, carried, left) from None
+            raise
+        said: Any = None
+        try:
+            said = read_json(reply)
+        except ValueError:
+            pass
+        written = number(_dig(said, "result", "image", "written"), 0, 2**60)
+        if reply.status_code != 200 or written != carried.size:
+            left = await self.media_discard(name)
+            detail = plain(_dig(said, "result", "error_msg"), 200)
+            if reply.status_code == 507:
+                raise KvmError("no_space", f"The KVM's own storage has not got room for it. {left or 'Nothing of it is left on the KVM.'}", 507)
+            if reply.status_code in (401, 403):
+                self._token = None
+                raise KvmError("action_failed", f"The KVM did not take qKVM's session for the upload: try again. {left or 'Nothing of it is left on the KVM.'}")
+            why = detail or (f"it says {written:,} of {carried.size:,} bytes were written" if reply.status_code == 200 else f"HTTP {reply.status_code}")
+            raise KvmError("action_failed", f"The KVM did not take the image whole ({why}). {left or 'Nothing of it is left on the KVM.'}")
+        # Written whole, it says: listed so a moment later (as its watch on the storage saw it last, mid-write, meanwhile).
+        state, _ = await self._msd_listing(name, LISTED_WITHIN, whole_at=carried.size)
+        about = _dig(state, "storage", "images", name)
+        if not isinstance(about, dict) or flag(about.get("complete")) is False or number(about.get("size"), 0, 2**60) != carried.size:
+            # (Never taken off: kvmd said it wrote every byte. The delta review of 0.3.0: an image written whole was
+            # deleted for a listing that lagged.)
+            raise KvmError("action_failed", f"The KVM said it wrote all of the image, and after {LISTED_WITHIN:.0f} seconds still does not list it whole: look at it on the KVM's own page before mounting it.")
+        assert carried.sha256 is not None  # (every byte passed: kvmd said so, and the carrying said nothing else)
+        MEDIA_NOTES.carried(self._media_key, name, carried.sha256, carried.size, number(about.get("mod_ts"), 0, 1e11))
+        return next(one for one in self._msd_listed(state)[0] if one["id"] == name)
+
+    def _cut_said(self, ex: BaseException, carried: Carried, left: str | None) -> KvmError:
+        """What an upload that ended before its answer is said as: the sender's doing, or the device's."""
+        rest = left or "Nothing of it is left on the KVM."
+        if carried.cut is not None:
+            return KvmError("disconnected", f"{carried.cut}. {rest}", 400)
+        if isinstance(ex, httpx.HTTPError):
+            ex = _transport_error(ex, self.spec.tls)
+        if isinstance(ex, KvmError):
+            return KvmError(ex.code if ex.code in ("timeout", "dropped", "unreachable", "stopped") else "action_failed", f"The upload did not get through to the KVM ({ex.message}). {rest}", ex.status)
+        return KvmError("action_failed", f"The upload did not get through to the KVM. {rest}")
+
+    async def _carry(self, carried: Carried, name: str) -> httpx.Response:
+        """POST /api/msd/write with the image as its body, its length said, on a connection of its own (closed after it,
+        whatever comes: a long upload cut off is no state for the connections every look uses), a piece at a time."""
+        await self._http()  # (how the certificate is checked is settled there)
+        token = self._token or await self._login()
+        verify = self._tls if self._tls is not None else await system_context()
+        async with httpx.AsyncClient(base_url=self.spec.base_url, verify=verify, timeout=UPLOAD_WAITS, trust_env=False) as client:
+            request = client.build_request(
+                "POST", "/api/msd/write", params={"image": name, "remove_incomplete": "1"},
+                headers={"Cookie": f"auth_token={token}", "Content-Length": str(carried.size), "Content-Type": "application/octet-stream"},
+                content=carried,
+            )  # fmt: skip
+            return await self._send(client, request, MAX_REPLY, UPLOAD_MOST)
+
     # --- status -------------------------------------------------------------
 
     async def _read_about(self) -> dict[str, Any]:
@@ -2818,12 +3443,13 @@ class KvmDevice(Device):
 
         # The device is there: it has just answered. Whether each of these details arrives changes what
         # the tile can tell, not whether the device counts as down (which would take its picture away).
-        info, hid, atx, about, ports = await asyncio.gather(
+        info, hid, atx, about, ports, _ = await asyncio.gather(
             self._get_result("/api/info", vital=False),
             self._get_result("/api/hid", vital=False),
             self._board_word(),
             self._read_about(),
             self._read_ports(),
+            self._msd_look(),  # (its drive: what is mounted, and whether it has one: `media`)
             return_exceptions=True,
         )
         source = _dig(streamer, "streamer", "source")
@@ -2884,7 +3510,7 @@ class KvmDevice(Device):
                 *(word for word in self.can if not (word == "jiggler" and self._jiggler_off)),
                 "wol" if glinet else None, "reboot" if glinet else None,
                 "power" if has_atx else None, "reset" if has_atx else None, "ports" if has_ports else None,
-                "fingerbot" if fingerbot else None,
+                "fingerbot" if fingerbot else None, "media" if self._media_offer(has_atx) is not None else None,
             ),
             "video": {
                 "signal": signal,
@@ -2909,4 +3535,5 @@ class KvmDevice(Device):
             },
             "about": {"model": _dig(about, "model"), "version": _dig(about, "version")},
             "ports": ports if has_ports else None,
+            "media": self.media_now(),  # what is in its drive (said to everybody who sees the tile)
         }

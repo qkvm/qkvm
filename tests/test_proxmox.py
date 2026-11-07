@@ -175,7 +175,7 @@ def test_a_guest_is_added_and_shows_its_screen(tmp_path: Path, pve: FakeProxmox)
         assert consoles_opened(pve) == 0  # adding it reads its state: no console, and no task in Proxmox's log
         status = state_of(client, device)
         assert status["state"] == "online" and status["screen"] is True and status["atx"] == {"enabled": True, "power": True, "hdd": None}
-        assert status["can"] == ["screen", "keys", "text", "power", "reset", "power_state", "live", "control"]
+        assert status["can"] == ["screen", "keys", "text", "power", "reset", "power_state", "live", "control", "media"]
         assert status["server"]["proxmox"] == {"node": "pve1", "vmid": 100, "status": "running", "qmpstatus": "running", "uptime": 1234}
         assert (status["server"]["power"], status["server"]["processors"], status["server"]["memory_gib"]) == ("Running", 2, 2.0)
         frame = picture(client, device)
@@ -313,7 +313,7 @@ def test_a_stopped_guest_is_said_off_and_no_console_is_asked_for(tmp_path: Path,
         device = client.post("/api/v1/devices", json={"url": pve.guest_url(101), **TOKEN}).json()["device"]["id"]
         status = state_of(client, device)
         assert status["state"] == "no_signal" and status["screen"] is False and status["atx"]["power"] is False
-        assert status["can"] == ["power", "reset", "power_state"] and status["server"]["power"] == "Stopped"
+        assert status["can"] == ["power", "reset", "power_state", "media"] and status["server"]["power"] == "Stopped"
         assert status["health"] == {"temp": None, "cpu": None, "mem": None}
         for _ in range(5):
             reply = client.get(snap(device))
@@ -2813,5 +2813,64 @@ def test_many_guests_with_the_right_token_looking_at_once_are_all_online_at_thei
         states = asyncio.run(run())
         assert states == ["online"] * guests, states
         assert pve.state.refused == 0
+    finally:
+        pve.stop()
+
+
+def _guests_on_one_token(pve: FakeProxmox, guests: int) -> list[ProxmoxGuest]:
+    return [
+        ProxmoxGuest(DeviceSpec(id=f"g{i}", name=f"g{i}", base_url=pve.guest_url(100 + i), username=TOKEN_ID, password=SECRET, tls="pinned", cert_pem=None, kind="proxmox"))
+        for i in range(guests)
+    ]
+
+
+def test_many_guests_on_one_token_at_a_start_go_on_together_once_the_token_is_taken(tmp_path: Path) -> None:
+    # (0.3.0, section 5.) The guests that waited for the first one's sign-in went on one after the other: each signed in
+    # itself, and the next waited for that one's answer in turn, twelve guests twelve sign-ins' time. A token taken is taken
+    # for every guest of that Proxmox (one verdict, see above): they go on together at its answer, and sign in no more.
+    guests, takes = 12, 0.4
+    pve = FakeProxmox(PveState(guests={100 + i: Guest(100 + i, f"g{i}") for i in range(guests)}, version_takes=takes), tls_dir=tmp_path / "pve").start()
+
+    async def run() -> tuple[list[str], float]:
+        tiles = _guests_on_one_token(pve, guests)
+        try:
+            began = time.monotonic()
+            said = await asyncio.gather(*(tile._read_status() for tile in tiles))
+            return [str(one["state"]) for one in said], time.monotonic() - began
+        finally:
+            for tile in tiles:
+                await tile.close()
+
+    try:
+        states, took = asyncio.run(run())
+        assert states == ["online"] * guests, states
+        assert pve.state.requests.count("GET /version") == 1, pve.state.requests
+        assert took < guests * takes / 2, f"{took:.1f} s for {guests} guests"
+    finally:
+        pve.stop()
+
+
+def test_a_token_made_anew_just_after_the_first_guest_was_let_in_is_one_no_for_all(tmp_path: Path) -> None:
+    # The guests that went on at the first one's answer carry the token with their next question; told 401 there (the token
+    # was made anew in Proxmox just then), each signs in once more, and those sign-ins share one verdict as the first did:
+    # one no, held a minute, not one for each guest.
+    guests = 6
+    state = PveState(guests={100 + i: Guest(100 + i, f"g{i}") for i in range(guests)}, version_takes=0.3, secret_after_version="99999999-8888-7777-6666-555555555555")
+    pve = FakeProxmox(state, tls_dir=tmp_path / "pve").start()
+
+    async def run() -> tuple[list[str], int, float]:
+        tiles = _guests_on_one_token(pve, guests)
+        try:
+            said = await asyncio.gather(*(tile._read_status() for tile in tiles))
+            return [str(one["state"]) for one in said], REJECTED.times(tiles[0]._offered()), REJECTED.wait_left(tiles[0]._offered())
+        finally:
+            for tile in tiles:
+                await tile.close()
+
+    try:
+        states, noes, held = asyncio.run(run())
+        assert set(states) == {"auth"}, states
+        assert (noes, pve.state.refused_paths.count("GET /version")) == (1, 1), (noes, pve.state.refused_paths)
+        assert 0 < held <= kvm.wait_after_rejections(1)
     finally:
         pve.stop()

@@ -21,20 +21,41 @@ from its documentation of the API:
   or what went wrong); a guest under Proxmox's high availability is started or stopped by it, the command's own task
   (`hastart`, `hastop`) ending at once.
 
-What the wall did is kept for the tests to look at: every request, every task, every ticket, every upgrade.
+And its virtual media, as Proxmox's own source says it (qemu-server's Qemu.pm and QemuServer.pm, pve-storage's
+Storage.pm; the research of 0.3.0, kept beside it), for the 0.3.0 media of a guest:
+
+- `GET /nodes/<node>/storage?content=iso` lists the storages of that node that hold ISO images and that the token may
+  see (Datastore.Audit or Datastore.AllocateSpace on /storage/<id>; one it may not is not listed at all), and
+  `GET /nodes/<node>/storage/<id>/content?content=iso` the images on one (`volid` `<id>:iso/<name>`, `format`, `size`),
+  refused 403 "Permission check failed (/storage/<id>, Datastore.AllocateSpace|Datastore.Audit)" where it may not;
+- `GET .../config` holds the guest's drives (`ide2: local:iso/x.iso,media=cdrom` or `none,media=cdrom`) and its boot
+  order (`boot: order=scsi0;ide2;net0`), with what is pending merged in, and `digest`, the SHA-1 of the file;
+- `PUT .../config` (answered at once) and `POST .../config` (answered with a task) change them: a disc in a CD-ROM
+  drive needs VM.Config.CDROM (a new CD-ROM drive as well), the boot order VM.Config.Disk, an image on a storage
+  Datastore.Audit there; a `digest` that is not the file's is refused 500 "checksum mismatch (file change by other
+  user?)". A running guest has a new disc at once, and a new boot order, or a new drive, only from its next start
+  (Proxmox's `start`, which a `reset` is not);
+- `download-url` and `upload` are not served: a test asks of `requests` that nothing went there.
+
+What the wall did is kept for the tests to look at: every request, every task, every ticket, every upgrade, every change
+of a guest's settings, and what each start and reset of a guest began from.
 """
 
 from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
+import json
 import os
+import re
 import secrets
 import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qsl
 from uuid import uuid4
 
 import uvicorn
@@ -74,6 +95,34 @@ class Guest:
     said_stopped: int = 0  # (how often it said so)
     ha: bool = False  # under Proxmox's high availability: started and stopped by it, `power_takes` after the command's task
     screen: VncState = field(default_factory=lambda: VncState(width=320, height=200, name="QEMU (web)"))
+    # Its drives and its boot order, as its settings file has them; and what is pending, for its next start.
+    config: dict[str, str] = field(default_factory=lambda: {
+        "boot": "order=scsi0;ide2;net0", "ide2": "none,media=cdrom", "scsi0": "local-lvm:vm-disk-0,size=8G",
+        "net0": "virtio=BC:24:11:5E:1A:01,bridge=vmbr0",
+    })  # fmt: skip
+    pending: dict[str, str] = field(default_factory=dict)
+    may_cdrom: bool = True  # the token has VM.Config.CDROM on it
+    may_disk: bool = True  # ...VM.Config.Disk
+    running_order: str = ""  # the boot order its running process was started with
+    booted: list[str] = field(default_factory=list)  # what each start and reset began from: "ide2 local:iso/x.iso", "scsi0"
+
+    def __post_init__(self) -> None:
+        if self.status == "running" and not self.running_order:
+            self.running_order = self.config.get("boot", "")
+
+
+@dataclass
+class Storage:
+    """A storage of Proxmox's, with the ISO images on it (name: bytes)."""
+
+    images: dict[str, int] = field(default_factory=dict)
+    may_see: bool = True  # the token has Datastore.Audit (or Datastore.AllocateSpace) on it
+    active: bool = True
+    content: str = "iso,vztmpl,backup"
+    nodes: list[str] | None = None  # the nodes it is on; None: shared, on every node
+
+
+DRIVE = re.compile(r"(ide[0-3]|sata[0-5]|scsi([0-9]|[12][0-9]|30)|virtio([0-9]|1[0-5]))")
 
 
 @dataclass
@@ -93,9 +142,12 @@ class PveState:
     secret: str = SECRET
     nodes: list[str] = field(default_factory=lambda: ["pve1"])
     guests: dict[int, Guest] = field(default_factory=lambda: {100: Guest(100)})
+    storages: dict[str, Storage] = field(default_factory=lambda: {"local": Storage({"debian-13.iso": 700_000_000, "alpine-3.21.iso": 62_000_000})})
     containers: list[int] = field(default_factory=list)  # containers it has besides (listed, never asked about)
     version: str = "9.2.21"
     refuse_after: float = 0.0  # seconds a 401 is held back (a real one: 3)
+    version_takes: float = 0.0  # seconds its version (a sign-in) takes to be answered
+    secret_after_version: str = ""  # the token's secret once a version was answered (the token made anew in Proxmox just then)
     window: float = 10.0  # seconds a console's port waits for its one connection
     ticket_life: float = 40.0
     password_life: float = 30.0  # seconds after the connection after which the console's password no longer opens it
@@ -120,6 +172,8 @@ class PveState:
     hung: int = 0  # upgrades that got no answer
     consoles: int = 0  # consoles open right now
     in_the_clear: list[str] = field(default_factory=list)  # any request whose address had the token's secret in it
+    changes: list[dict[str, Any]] = field(default_factory=list)  # every change of a guest's settings taken: vmid and what it set
+    images_take: float = 0.0  # seconds the images of a storage take to be listed (a slow storage: NFS, say)
 
 
 def task(state: PveState, kind: str, vmid: int, status: str = "OK") -> dict[str, Any]:
@@ -129,6 +183,46 @@ def task(state: PveState, kind: str, vmid: int, status: str = "OK") -> dict[str,
     }  # fmt: skip
     state.tasks.append(made)
     return made
+
+
+def settings_of(guest: Guest) -> dict[str, str]:
+    """A guest's drives and boot order as `GET .../config` says them: with what is pending merged in, as Proxmox does."""
+    return {**guest.config, **guest.pending}
+
+
+def digest_of(guest: Guest) -> str:
+    """The SHA-1 of the guest's settings file, as Proxmox says it with them (`digest`): anything of it changed changes it."""
+    return hashlib.sha1(json.dumps([guest.uuid, guest.name, guest.config, guest.pending], sort_keys=True).encode()).hexdigest()
+
+
+def began_from(guest: Guest, order: str) -> str:
+    """What a start (or a reset) of the guest begins from, by a boot order: the first of its devices that holds something to
+    start from. An empty CD-ROM drive is passed over, as SeaBIOS and OVMF pass it over."""
+    for device in order.removeprefix("order=").split(";"):
+        said = guest.config.get(device)
+        if said is None:
+            continue
+        if ",media=cdrom" in said:
+            disc = said.split(",", 1)[0]
+            if disc != "none":
+                return f"{device} {disc}"
+            continue
+        return device
+    return "nothing"
+
+
+def started(guest: Guest) -> None:
+    """A start by Proxmox: a new process, which takes what was pending (the boot order, a drive added), and begins."""
+    guest.config.update(guest.pending)
+    guest.pending.clear()
+    guest.running_order = guest.config.get("boot", "")
+    guest.booted.append(began_from(guest, guest.running_order))
+
+
+def become(guest: Guest, status: str) -> None:
+    if status == "running" and guest.status != "running":
+        started(guest)
+    guest.status = status
 
 
 def make_fake_proxmox(state: PveState, stopping: asyncio.Event | None = None) -> FastAPI:
@@ -179,6 +273,10 @@ def make_fake_proxmox(state: PveState, stopping: asyncio.Event | None = None) ->
             return Response("[" * 100_000, media_type="application/json")
         if state.hostile == "not_proxmox":
             return JSONResponse({"data": {"product": "something else"}})
+        if state.version_takes:
+            await asyncio.sleep(state.version_takes)
+        if state.secret_after_version:
+            state.secret = state.secret_after_version
         return JSONResponse({"data": {"version": state.version, "release": state.version.rsplit(".", 1)[0], "repoid": "0123456789abcdef"}})
 
     @app.get(API + "/cluster/resources")
@@ -253,7 +351,103 @@ def make_fake_proxmox(state: PveState, stopping: asyncio.Event | None = None) ->
         if isinstance(guest, Response):
             return guest
         smbios = {"smbios1": f"uuid={guest.uuid}"} if guest.uuid else {}  # (a guest made before Proxmox gave each one has none)
-        return JSONResponse({"data": {"name": guest.name, **smbios, "cores": guest.cpus, "memory": str(guest.maxmem // 2**20)}})
+        return JSONResponse({"data": {
+            "name": guest.name, **smbios, "cores": guest.cpus, "memory": str(guest.maxmem // 2**20), **settings_of(guest), "digest": digest_of(guest),
+        }})  # fmt: skip
+
+    async def change_config(node: str, vmid: int, request: Request, as_a_task: bool) -> Response:
+        """`PUT` (answered when done) and `POST` (answered with a task) of a guest's settings: its drives and its boot order,
+        each checked as Proxmox checks it."""
+        guest = guest_at(node, vmid, "VM.Audit")
+        if isinstance(guest, Response):
+            return guest
+        asked = dict(parse_qsl((await request.body()).decode(), keep_blank_values=True))
+        digest = asked.pop("digest", None)
+        if any(key != "boot" and not DRIVE.fullmatch(key) for key in asked):
+            return refusal(400, f"only drives and the boot order are spoken here, not {sorted(asked)}")
+        # (What is no drive is checked first, before the file is read: the boot order is one of the disk options.)
+        if "boot" in asked and not guest.may_disk:
+            return refusal(403, f"Permission check failed (/vms/{vmid}, VM.Config.Disk)")
+        if digest is not None and digest != digest_of(guest):
+            return refusal(500, "checksum mismatch (file change by other user?)")
+        now = settings_of(guest)
+        for key, value in asked.items():
+            if key == "boot":
+                if not re.fullmatch(r"order=[a-z0-9]+(;[a-z0-9]+)*", value):
+                    return refusal(400, f"invalid format - format error\nboot.order: invalid boot device '{value}'")
+                continue
+            disc, *options = value.split(",")
+            cdrom = "media=cdrom" in options
+            was = now.get(key)
+            if was is not None and ",media=cdrom" not in was and not guest.may_disk:
+                return refusal(403, f"Permission check failed (/vms/{vmid}, VM.Config.Disk)")  # (a disk changed into something else)
+            if not (guest.may_cdrom if cdrom else guest.may_disk):
+                return refusal(403, f"Permission check failed (/vms/{vmid}, {'VM.Config.CDROM' if cdrom else 'VM.Config.Disk'})")
+            if disc not in ("none", "cdrom"):
+                storage_id, _, volume = disc.partition(":")
+                storage = state.storages.get(storage_id)
+                if storage is None or not volume.startswith("iso/") or volume[4:] not in storage.images:
+                    return refusal(500, f"volume '{disc}' does not exist")
+                if not storage.may_see:
+                    return refusal(403, f"Permission check failed (/storage/{storage_id}, Datastore.AllocateSpace|Datastore.Audit)")
+                if not cdrom:
+                    return refusal(400, f"unable to use volume {disc} - content type needs to be 'images'")
+        for key, value in asked.items():
+            # A disc goes into a running guest's drive at once; a new boot order, and a new drive, wait for its next start.
+            if guest.status == "running" and (key == "boot" or key not in guest.config):
+                guest.pending[key] = value
+            else:
+                guest.config[key] = value
+                guest.pending.pop(key, None)
+        state.changes.append({"vmid": vmid, **asked})
+        if as_a_task:
+            return JSONResponse({"data": task(state, "qmconfig", vmid)["upid"]})
+        return JSONResponse({"data": None})
+
+    @app.put(API + "/nodes/{node}/qemu/{vmid}/config")
+    async def put_config(node: str, vmid: int, request: Request) -> Response:
+        return await change_config(node, vmid, request, as_a_task=False)
+
+    @app.post(API + "/nodes/{node}/qemu/{vmid}/config")
+    async def post_config(node: str, vmid: int, request: Request) -> Response:
+        return await change_config(node, vmid, request, as_a_task=True)
+
+    @app.get(API + "/nodes/{node}/storage")
+    async def storages(node: str, content: str = "") -> Response:
+        if node not in state.nodes:
+            return refusal(500, f"hostname lookup '{node}' failed - failed to get address info for: {node}: Name or service not known")
+        listed: list[Any] = [
+            {"storage": name, "type": "dir", "content": one.content, "active": int(one.active), "enabled": 1, "shared": int(one.nodes is None),
+             "total": 100 * 2**30, "used": sum(one.images.values()), "avail": 100 * 2**30 - sum(one.images.values())}
+            for name, one in state.storages.items()
+            if one.may_see and (one.nodes is None or node in one.nodes) and (not content or content in one.content.split(","))
+        ]  # fmt: skip
+        if state.hostile == "odd_storages":
+            listed += [None, "local", {"storage": 5}, {"storage": "../x", "content": "iso", "active": 1}, {"storage": "zz", "content": "iso", "active": 0}]
+        return JSONResponse({"data": listed})
+
+    @app.get(API + "/nodes/{node}/storage/{storage}/content")
+    async def images(node: str, storage: str, content: str = "") -> Response:
+        one = state.storages.get(storage)
+        if one is None or not (one.nodes is None or node in one.nodes):
+            return refusal(500, f"storage '{storage}' does not exist")
+        if not one.may_see:
+            return refusal(403, f"Permission check failed (/storage/{storage}, Datastore.AllocateSpace|Datastore.Audit)")
+        if not one.active:
+            return refusal(500, f"storage '{storage}' is not online")
+        if state.images_take:
+            await asyncio.sleep(state.images_take)
+        listed: list[Any] = [
+            {"volid": f"{storage}:iso/{name}", "format": "iso", "size": size, "ctime": 1762000000, "content": "iso"}
+            for name, size in one.images.items() if content in ("", "iso")
+        ]  # fmt: skip
+        if state.hostile == "odd_images":
+            listed += [
+                None, "x", {"volid": 5}, {"volid": f"other:iso/{storage}.iso", "content": "iso"}, {"volid": f"{storage}:images/vm-100-disk-0.raw", "content": "images"},
+                {"volid": f"{storage}:iso/../../etc/passwd.iso", "content": "iso"}, {"volid": f"{storage}:iso/two.iso,media=disk", "content": "iso"},
+                {"volid": f"{storage}:iso/odd.iso", "content": "iso", "size": "big"},
+            ]  # fmt: skip
+        return JSONResponse({"data": listed})
 
     @app.post(API + "/nodes/{node}/qemu/{vmid}/vncproxy")
     async def vncproxy(node: str, vmid: int, request: Request) -> Response:
@@ -297,12 +491,17 @@ def make_fake_proxmox(state: PveState, stopping: asyncio.Event | None = None) ->
         loop = asyncio.get_running_loop()
 
         def carried_out() -> None:
-            if becomes is None or not (made["status"] == "OK" or made["status"].startswith("WARNINGS: ")):  # (warnings: done all the same)
+            if not (made["status"] == "OK" or made["status"].startswith("WARNINGS: ")):  # (warnings: done all the same)
+                return
+            if verb == "reset" and guest.status == "running":
+                # (The same process begins again: what is pending stays pending, and it begins from the order it started with.)
+                guest.booted.append(began_from(guest, guest.running_order))
+            if becomes is None:
                 return
             if state.power_takes:
-                loop.call_later(state.power_takes, setattr, guest, "status", becomes)
+                loop.call_later(state.power_takes, become, guest, becomes)
             else:
-                guest.status = becomes
+                become(guest, becomes)
 
         def ended() -> None:
             made["status"] = state.task_fails or "OK"

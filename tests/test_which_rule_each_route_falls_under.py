@@ -37,6 +37,10 @@ ROUTES: dict[tuple[str, str], tuple[str, str]] = {
     ("GET", "/healthz"): ("nobody", ""),
     ("GET", "/metrics"): ("nobody", ""),  # (asks for a token of its own)
     ("GET", "/static/{name}"): ("nobody", ""),
+    # An image mounted on a server, read by its controller (0.3.0, A4): by an address made for that mount alone, from the
+    # controller's own address alone, with the mount's user and password over HTTPS (served.py). It changes nothing.
+    ("GET", "/media/{token}/{name}"): ("nobody", ""),
+    ("HEAD", "/media/{token}/{name}"): ("nobody", ""),
     ("GET", "/api/v1/session"): ("nobody", ""),
     ("POST", "/api/v1/setup"): ("nobody", "C"),
     ("POST", "/api/v1/login"): ("nobody", "T"),  # (for a code that is used up; the session itself is kept in memory)
@@ -61,12 +65,23 @@ ROUTES: dict[tuple[str, str], tuple[str, str]] = {
     ("POST", "/api/v1/devices/{device_id}/live"): ("viewer", ""),  # a pass for a live line, in memory (live.py)
     ("POST", "/api/v1/devices/{device_id}/console"): ("operator", ""),  # asks the device for a way in
     ("POST", "/api/v1/devices/{device_id}/kvm"): ("admin", ""),  # a setting of the PC's, changed on its engine; nothing of the wall's is saved
+    # Virtual media (0.3.0): the media right's (server.MEDIA_ROLE, an admin's); done on the machine, nothing of the wall's is saved.
+    ("GET", "/api/v1/devices/{device_id}/media"): ("admin", ""),
+    ("POST", "/api/v1/devices/{device_id}/media"): ("admin", ""),
+    ("POST", "/api/v1/devices/{device_id}/media/unmount"): ("admin", ""),
+    # ...and an image carried through to the device's own storage (its body read by its route as it comes, server._UPLOAD),
+    # how far one has come, and one deleted from there.
+    ("POST", "/api/v1/devices/{device_id}/media/upload"): ("admin", ""),
+    ("GET", "/api/v1/devices/{device_id}/media/upload"): ("admin", ""),
+    ("POST", "/api/v1/devices/{device_id}/media/delete"): ("admin", ""),
+    ("PUT", "/api/v1/devices/{device_id}/view"): ("operator", "C"),  # a PC's view (health only, stills, live KVM), kept with its tile
     ("PUT", "/api/v1/wall/order"): ("admin", "C"),
     ("POST", "/api/v1/devices"): ("admin", "T"),
     ("PUT", "/api/v1/devices/{device_id}"): ("admin", "T"),
     ("DELETE", "/api/v1/devices/{device_id}"): ("admin", "C"),
     ("POST", "/api/v1/devices/remove"): ("admin", "C"),  # several at once: all of them, or none
     ("GET", "/api/v1/devices/{device_id}/certificate"): ("admin", ""),
+    ("GET", "/api/v1/devices/{device_id}/alert-picture/{stamp}"): ("admin", ""),  # the picture of a screen alert, as the activity log names it
     ("POST", "/api/v1/devices/{device_id}/trust"): ("admin", "T"),
     ("POST", "/api/v1/discover"): ("admin", ""),  # looks, and saves nothing
     ("POST", "/api/v1/proxmox/guests"): ("admin", ""),  # asks a Proxmox which guests a token sees, and saves nothing
@@ -86,10 +101,18 @@ ROUTES: dict[tuple[str, str], tuple[str, str]] = {
     ("POST", "/api/v1/recovery"): ("admin", "T"),
     ("GET", "/api/v1/settings"): ("admin", ""),
     ("PUT", "/api/v1/settings"): ("admin", "C"),
+    ("GET", "/api/v1/settings/media"): ("admin", ""),  # the folder of images for servers, and the address they reach the wall at
+    ("PUT", "/api/v1/settings/media"): ("admin", "C"),
     ("GET", "/api/v1/alerts"): ("admin", ""),
     ("PUT", "/api/v1/alerts"): ("admin", "C"),
     ("POST", "/api/v1/alerts/pause"): ("admin", "C"),
     ("POST", "/api/v1/alerts/test"): ("admin", ""),  # sends one, and saves nothing
+    # An account's own browsers told the alerts by Web Push: any account's, for itself; a token has none.
+    ("GET", "/api/v1/push"): ("viewer", "O"),
+    ("POST", "/api/v1/push/key"): ("viewer", "CO"),  # the wall's key, made once
+    ("POST", "/api/v1/push"): ("viewer", "CO"),
+    ("DELETE", "/api/v1/push/{push_id}"): ("viewer", "CO"),
+    ("POST", "/api/v1/push/{push_id}/test"): ("viewer", "TO"),  # sends one; a browser its push service says is gone is taken off in the turn
     ("GET", "/api/v1/metrics"): ("admin", ""),
     ("POST", "/api/v1/metrics/token"): ("admin", "C"),
     ("DELETE", "/api/v1/metrics/token"): ("admin", "C"),
@@ -128,7 +151,7 @@ def test_every_route_falls_under_the_rule_it_is_meant_to(app: object) -> None:
             continue
         for method in route.methods:
             call = f"{method} {sample}"
-            role = "nobody" if sample in server.PUBLIC or sample.startswith("/static/") else server.required_role(method, sample)
+            role = "nobody" if sample in server.PUBLIC or sample.startswith(server.PUBLIC_UNDER) else server.required_role(method, sample)
             marks = "".join(
                 letter
                 for letter, holds in (
@@ -146,9 +169,12 @@ def test_every_route_falls_under_the_rule_it_is_meant_to(app: object) -> None:
     assert lines == LINES
     # Everything of the wall's own is under the one version, and nothing without one.
     api = [path for _, path in found if path.startswith("/api/")]
-    assert len(api) == 63 and all(path.startswith("/api/v1/") for path in api) and all(path.startswith("/api/v1/") for path in lines)
-    # What was public before a sign-in, and no more than that.
-    assert {path for (_, path), (role, _) in ROUTES.items() if role == "nobody" and not path.startswith("/static/")} == server.PUBLIC
+    assert len(api) == 78 and all(path.startswith("/api/v1/") for path in api) and all(path.startswith("/api/v1/") for path in lines)
+    # What was public before a sign-in, and no more than that: the paths of PUBLIC, and what is below PUBLIC_UNDER, which is
+    # the page's files and a mounted image, nothing else.
+    assert {path for (_, path), (role, _) in ROUTES.items() if role == "nobody" and not path.startswith(server.PUBLIC_UNDER)} == server.PUBLIC
+    assert server.PUBLIC_UNDER == ("/static/", "/media/")
+    assert {path for _, path in ROUTES if path.startswith(server.PUBLIC_UNDER)} == {"/static/{name}", "/media/{token}/{name}"}
 
 
 def test_what_the_rules_are_asked_is_the_same_whatever_stands_for_a_name(app: object) -> None:

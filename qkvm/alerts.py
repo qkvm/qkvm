@@ -33,7 +33,7 @@ SEND_TIMEOUT = 15.0  # seconds one attempt at delivering may take, start to fini
 
 @dataclass
 class Alert:
-    kind: str  # "offline" | "no_signal" | "problem" | "recovered" | "test"
+    kind: str  # "offline" | "no_signal" | "problem" | "recovered" | "unchanged" (a screen that looked the same: screens.py) | "test"
     device: str
     address: str
     state: str
@@ -179,6 +179,36 @@ def describe(name: str, address: str, previous: str, state: str, detail: str = "
             return Alert("recovered", name, address, state, previous, f"{name} is powered on", "The server is running again.")
         return Alert("recovered", name, address, state, previous, f"{name} has a picture again", "The video signal is back.")
     return Alert("recovered", name, address, state, previous, f"{name} is back", f"{box} answers again.")
+
+
+def lasted(seconds: float) -> str:
+    """How long something lasted, in words: "45 min", "2 h 10 min", "3 d 4 h"."""
+    whole = max(1, round(seconds / 60))
+    if whole < 60:
+        return f"{whole} min"
+    if whole < 24 * 60:
+        hours, left = divmod(whole, 60)
+        return f"{hours} h {left} min" if left else f"{hours} h"
+    days, left = divmod(whole // 60, 24)
+    return f"{days} d {left} h" if left else f"{days} d"
+
+
+def describe_watch(name: str, address: str, watch: str, minutes: int, back: bool, seconds: float = 0.0, kept: bool = False) -> Alert:
+    """What to say of a machine's screen watch (screens.py): `watch` "no_signal" or "unchanged" went off after `minutes`, or
+    is over (`back`) after `seconds` of being so. `kept`: the picture that set it off is kept on the wall."""
+    if watch == "no_signal":
+        if back:
+            text = f"The video signal is back, after {lasted(seconds)} without." if seconds else "The video signal is back."
+            return Alert("recovered", name, address, "online", "no_signal", f"{name} has a picture again", text)
+        text = f"No video signal for {minutes} min: the computer is off, asleep or no longer plugged into the KVM."
+        text += " Its last picture is kept on the wall." if kept else ""
+        return Alert("no_signal", name, address, "no_signal", "online", f"{name} has had no video signal for {minutes} min", text)
+    if back:
+        text = f"Its screen changed after looking the same for {lasted(seconds)}." if seconds else "Its screen changed again."
+        return Alert("recovered", name, address, "online", "unchanged", f"{name}: the screen changes again", text)
+    text = f"Its screen has looked the same for {minutes} min. That is not always a hang: a screen nobody uses looks the same too."
+    text += " Its picture is kept on the wall." if kept else ""
+    return Alert("unchanged", name, address, "unchanged", "online", f"{name}: screen unchanged for {minutes} min", text)
 
 
 def wanted(alert: Alert, settings: Any) -> bool:

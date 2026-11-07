@@ -33,11 +33,14 @@ from fastapi.responses import JSONResponse, PlainTextResponse, Response, Streami
 from pydantic import BaseModel, Field, field_validator
 from starlette.requests import ClientDisconnect
 
-from . import about, activity, alerts, amt, discover, exchange, history, live, metrics, proxmox, qr, totp, vncdevice
+from . import about, activity, alerts, amt, discover, exchange, history, live, metrics, proxmox, qr, screens, totp, vncdevice, webpush
 from ._version import __version__
 from .core import Core, DeviceManager, auth_mark, driver_for, identity, unknown_kind
-from .kvm import FINGERBOT_PRESSES, KEYS, MAX_PROBE, MAX_TEXT, POWER_KEY_REFUSED, PRESS_ANSWERED, PRESS_SENT, REJECTED, RETIRED, AlreadySo, Device, KvmError, bounded, can_do, fetch_certificate, fingerprint, listens, names_the_power_key, other_way, plain, publicly_trusted, read_json, saved_fingerprint, saved_mark
+from .kvm import FINGERBOT_PRESSES, KEYS, MAX_PROBE, MAX_TEXT, MOST_UPLOAD, POWER_KEY_REFUSED, PRESS_ANSWERED, PRESS_SENT, REJECTED, RETIRED, AlreadySo, Carried, Device, KvmError, MediaOffer, UploadCut, bounded, can_do, fetch_certificate, fingerprint, listens, names_the_power_key, other_way, plain, publicly_trusted, read_json, saved_fingerprint, saved_mark
 from .netbind import BindError, lan_ip, normalize, resolve, tailscale_ip
+from .served import SERVED_PATH, MOST_AT_ONCE, Binding, identity_follows, MOST_REFUSED_SAID, Lending, Opening, Slot, address_of, basic_matches, byte_range, hand_to_readers, let_go_and_give_back, read_at, same_address, scrubbed
+from .served import READERS as SERVED_READERS
+from .served import PIECE as SERVED_PIECE
 from .security import (
     COOKIE,
     REMEMBER_TTL,
@@ -53,7 +56,7 @@ from .security import (
     shares_our_name,
     sso_name,
 )
-from .store import FINGERBOT_STRENGTHS, KINDS, ROLES, ActionRecord, AuditLog, DeviceRecord, TokenRecord, UserRecord, as_a_line, device_url
+from .store import AMT_VIEWS, FINGERBOT_STRENGTHS, KINDS, ROLES, ActionRecord, AuditLog, DeviceRecord, PushRecord, TokenRecord, UserRecord, as_a_line, device_url
 from .update import NoLongerAllowed, Unfit, UpdateError
 from .vault import NoMemory, Vault, VaultLocked, new_recovery_key, tidy_recovery_key
 
@@ -65,6 +68,10 @@ ASSET_TYPES = {
     "app.css": "text/css",
     "theme.js": "text/javascript",
     "favicon.svg": "image/svg+xml",
+    # The service worker that shows the alerts a browser is told by Web Push (webpush.py), and nothing else; and what a
+    # phone needs to add the wall to its Home Screen as an app of its own, which an iPhone asks before it takes them.
+    "push.js": "text/javascript",
+    "manifest.webmanifest": "application/manifest+json",
     # The words the page shows for a state, a device's trouble and a kind of device, and every code the wall
     # answers with: one file, read by the page, and by the other programs that talk to a wall when they are built.
     "words.json": "application/json",
@@ -78,6 +85,9 @@ ASSET_TYPES = {
 API_VERSIONS = ("v1",)
 
 PUBLIC = {"/", "/healthz", "/metrics", "/api/v1/session", "/api/v1/setup", "/api/v1/login", "/api/v1/recover", "/api/v1/display"}
+# ...and what is below these: the page's files, and an image mounted on a server, which its controller reads by an address
+# made for that mount alone, from its own address alone (served.py; "/media/{token}/{name}").
+PUBLIC_UNDER = ("/static/", "/media/")
 MAX_BODY = 64 * 1024  # nothing the page sends is larger; anything bigger is refused unread
 # ...but for a file that is handed in to be read: as large as such a file may be, written as a string inside a request.
 MAX_FILE_BODY = 2 * exchange.MAX_FILE + MAX_BODY
@@ -118,13 +128,28 @@ IDENT = re.compile(r"[a-z]{2,12}:[0-9a-f]{16,64}")  # what a driver may say a de
 RANK = {role: rank for rank, role in enumerate(reversed(ROLES))}  # viewer 0, operator 1, admin 2
 _DEVICE = r"/api/v1/devices/[^/]+"
 _VIEWER = re.compile(
-    rf"GET (/api/v1/wall|/api/v1/status|/api/v1/about|{_DEVICE}/snapshot|{_DEVICE}/history)|POST (/api/v1/logout|/api/v1/password|/api/v1/totp/(begin|enable|disable|codes)|{_DEVICE}/live)"
+    rf"GET (/api/v1/wall|/api/v1/status|/api/v1/about|{_DEVICE}/snapshot|{_DEVICE}/history|/api/v1/push)"
+    rf"|POST (/api/v1/logout|/api/v1/password|/api/v1/totp/(begin|enable|disable|codes)|{_DEVICE}/live|/api/v1/push(/key|/[^/]+/test)?)"
+    r"|DELETE /api/v1/push/[^/]+"
 )
-# What an account does for itself. A token is nobody's account: it has no password to change or to be asked for.
-_OWN_ACCOUNT = re.compile(r"POST /api/v1/(password|totp/(begin|enable|disable|codes))")
+# What an account does for itself. A token is nobody's account: it has no password to change or to be asked for, and no
+# browser of its own to be told the alerts in (Web Push: a phone is a person's).
+_OWN_ACCOUNT = re.compile(r"POST /api/v1/(password|totp/(begin|enable|disable|codes))|(GET|POST|DELETE) /api/v1/push(/[^/]+(/test)?)?")
 # All that an account can do while it has to set up two-factor sign-in and has not: set it up, or leave.
 _ENROLLING = re.compile(r"POST /api/v1/(logout|totp/(begin|enable))")
-_OPERATOR = re.compile(rf"GET (/api/v1/actions|{_DEVICE}/wol)|POST {_DEVICE}/(actions|console)")
+_OPERATOR = re.compile(rf"GET (/api/v1/actions|{_DEVICE}/wol)|POST {_DEVICE}/(actions|console)|PUT {_DEVICE}/view")
+# Virtual media: an image mounted on a machine, and the machine started from it, is root on that machine (an installer, a
+# rescue system). A right of its own, for this role and above: an admin's (the owner's decision for 0.3.0). A token is never
+# an admin, and the routes refuse one besides.
+_MEDIA = re.compile(rf"(GET|POST) {_DEVICE}/media(/upload)?|POST {_DEVICE}/media/(unmount|delete)")
+MEDIA_ROLE = "admin"
+# The one request whose body is an image, carried through to the device a piece at a time as it comes (never read in
+# full, never kept): its own rule for its length (MOST_UPLOAD, said in advance), and no time for the whole of it, only for
+# each piece (UPLOAD_QUIET).
+_UPLOAD = re.compile(rf"POST {_DEVICE}/media/upload")
+UPLOAD_QUIET = 60.0  # seconds an upload may send nothing before it is cut off
+UPLOAD_ASK_EVERY = 5.0  # ...and how often, while it comes, it is asked whether whoever sends it may still
+MEDIA_DRIVE_SAID = {"cd": "a CD-ROM drive", "flash": "a USB flash drive", "disk": "a disk"}
 
 # Requests that change what is saved: accounts, KVMs, saved actions, settings. They are handled one at
 # a time, so that no two can interleave a check ("is that name free?") with each other's write.
@@ -136,8 +161,9 @@ _OPERATOR = re.compile(rf"GET (/api/v1/actions|{_DEVICE}/wol)|POST {_DEVICE}/(ac
 # again whether what they checked still holds: see `one_change` in their handlers.
 _CHANGES = re.compile(
     r"(POST|PUT|DELETE) /api/v1/(setup|totp/enable|users(/[^/]+)?"
-    r"|actions(/[^/]+)?|settings|alerts(/pause)?|update|metrics/token|security|tokens(/[^/]+)?|wall/order)|DELETE /api/v1/devices/[^/]+"
-    r"|POST /api/v1/devices/remove"
+    r"|actions(/[^/]+)?|settings(/media)?|alerts(/pause)?|update|metrics/token|security|tokens(/[^/]+)?|wall/order)|DELETE /api/v1/devices/[^/]+"
+    r"|POST /api/v1/devices/remove|POST /api/v1/push(/key)?|DELETE /api/v1/push/[^/]+"
+    r"|PUT /api/v1/devices/[^/]+/view"
 )
 
 # What no path of this program has in it: a character that is none (a line feed, a tab, a zero).
@@ -150,6 +176,8 @@ acting: contextvars.ContextVar[str] = contextvars.ContextVar("acting", default="
 def required_role(method: str, path: str) -> str:
     """The least role that may make this request. Whatever is not listed here takes an admin."""
     call = f"{method} {path}"
+    if _MEDIA.fullmatch(call):
+        return MEDIA_ROLE
     if _VIEWER.fullmatch(call):
         return "viewer"
     if _OPERATOR.fullmatch(call):
@@ -253,6 +281,20 @@ class AlertsIn(BaseModel):
     link: str | None = Field(None, max_length=300)  # the wall's own address, for alerts to point at; None: as it was
 
 
+class PushKeysIn(BaseModel):
+    p256dh: str = Field(max_length=200)
+    auth: str = Field(max_length=100)
+
+
+class PushIn(BaseModel):
+    """A browser's subscription to the alerts by Web Push, as its PushSubscription.toJSON() gives it (webpush.py)."""
+
+    endpoint: str = Field(max_length=webpush.LONGEST_ENDPOINT)
+    keys: PushKeysIn
+    name: str = Field("", max_length=100)  # what browser it is, for the list: "Chrome on Android"
+    key: str = Field("", max_length=200)  # the wall's key the browser subscribed with (GET /api/v1/push), where the page says it
+
+
 class OrderIn(BaseModel):
     ids: list[str] = Field(max_length=5000)  # device ids, first to last
 
@@ -282,6 +324,10 @@ class SecurityIn(BaseModel):
 
 
 LONGEST_PAUSE = 7 * 24 * 60  # minutes alerts can be paused for
+PUSH_KEY_FOR = "alerts:push-key"  # what the wall's key for Web Push is sealed for (store.AlertSettings.push_key)
+MOST_BROWSERS_EACH = 10  # browsers one account may have told the alerts by Web Push
+MOST_BROWSERS = 200  # ...and all accounts together
+PUSH_TEST_EVERY = 5.0  # seconds between two test alerts of one account to its browsers
 
 
 class PauseIn(BaseModel):
@@ -353,6 +399,10 @@ class DeviceIn(BaseModel):
     alerts: bool | None = None  # whether anybody is told when it changes; None: as it was (told, for a new one)
     # How hard a Fingerbot paired with the KVM presses its power button; None: as it was ("firm", for a new one).
     fingerbot_strength: Literal["firm", "light"] | None = None
+    # Its screen watched (screens.py): an alert after so many minutes with no video signal, or with a screen that looks the
+    # same; 0: not watched for that; None: as it was (not watched, for a new one).
+    no_signal_minutes: int | None = Field(None, ge=0, le=screens.MOST_MINUTES)
+    unchanged_minutes: int | None = Field(None, ge=0, le=screens.MOST_MINUTES)
     force: bool = False  # save even though the device could not be checked
     keep_both: bool = False  # it is the same device as one already on the wall, and is to have a tile of its own all the same
 
@@ -390,6 +440,31 @@ class ActionIn(BaseModel):
 
 class KvmSwitchIn(BaseModel):
     on: bool  # a PC's Intel AMT KVM on (true) or off, on its management engine
+
+
+class MediaIn(BaseModel):
+    image: str = Field(min_length=1, max_length=300)  # an image's `id`, as GET .../media listed it
+    machine: str = Field(min_length=1, max_length=4 * 60)  # the machine's name, as the confirmation named it
+    drive: Literal["cd", "flash", "disk"] = "cd"  # what it goes in as, of the offer's `drives`
+    writable: bool = False  # the machine may change what is on it: only for a drive of the offer's `writable`, and chosen
+    boot: Literal["none", "once", "until_unmounted"] = "none"  # start it from the image: not, once (restarted now), until unmounted
+    # Restart it now: to start from the image (with "until_unmounted"; "once" always restarts), or, where it cannot be told to
+    # start from it (a KVM: no `boot` in its offer), for its firmware to find it (its boot menu).
+    restart: bool = False
+
+
+class UnmountIn(BaseModel):
+    image: str = Field(min_length=1, max_length=300)  # what is mounted (`image` of `mounted`), as the confirmation named it
+    machine: str = Field(min_length=1, max_length=4 * 60)
+
+
+class DeleteIn(BaseModel):
+    image: str = Field(min_length=1, max_length=300)  # an image's `id`, as GET .../media listed it, as the confirmation named it
+    machine: str = Field(min_length=1, max_length=4 * 60)
+
+
+class AmtViewIn(BaseModel):
+    view: Literal["health", "stills", "live"]  # which of its three views a PC with Intel AMT is in (store.AMT_VIEWS)
 
 
 class CustomActionIn(BaseModel):
@@ -431,6 +506,11 @@ class SettingsIn(BaseModel):
     port: int = Field(ge=1, le=65535)
     https: bool
     interval: float = Field(ge=0.2, le=60)
+
+
+class MediaSettingsIn(BaseModel):
+    folder: str = Field("", max_length=1000)  # where the images for servers are, on the computer qKVM runs on ("": none)
+    address: str = Field("", max_length=300)  # the wall's address as servers' controllers reach it ("": where it listens)
 
 
 def tidy_groups(names: list[str]) -> list[str]:
@@ -523,6 +603,28 @@ class Handed(StreamingResponse):
             self._done()
 
 
+class CarriedThrough:
+    """Outside the guard: the one way an upload's route reads its body (an image, up to MOST_UPLOAD), from the web server
+    itself, a piece at a time, and nothing else does.
+
+    The guard is a middleware of Starlette's, which hands each piece of a body on to the app inside it through a task of its
+    own, and keeps something of each until the request ends: measured, some 45 KB for every megabyte that came, which for
+    a 16 GB image is the better part of a gigabyte. Everything else the page sends is 64 KiB at the most, and read whole by
+    the guard. The guard still decides whether the upload may come in at all (it does not read its body: see `screened`).
+    """
+
+    KEY = "qkvm.carried_through"
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        # (By the path the request is routed by, as the guard has it; set for that route alone.)
+        if scope["type"] == "http" and _UPLOAD.fullmatch(f"{scope.get('method')} {scope.get('path')}"):
+            scope[CarriedThrough.KEY] = receive
+        await self.app(scope, receive, send)
+
+
 class SentOnlyWhile:
     """Outside every other part of the app: a piece of an answer that says what it may be sent while (Handed's
     `sent_while`) goes to the connection only while that is so, asked as it goes.
@@ -567,6 +669,35 @@ class SentOnlyWhile:
                 raise
 
         await self.app(scope, receive, asked)
+
+
+class SpelledOut:
+    """Outside every other part of the app: the answer to a server's controller reading a served image names its headers as
+    they are usually spelled ("Content-Length", "Accept-Ranges"), where the web framework writes them in lowercase. Names
+    are not case-sensitive, but a controller's own reader may look for them as spelled (a real AMI board reads with
+    httpfs2 0.1.5a, which looks for "Accept-Ranges: bytes" and "Content-Length: "). That board's mount still failed with
+    them spelled out ("Error code: 416", after one HEAD): this is not what it wanted, and is kept as the usual spelling.
+    """
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope["type"] != "http" or not SERVED_PATH.fullmatch(scope.get("path") or ""):
+            await self.app(scope, receive, send)
+            return
+
+        async def spelled(message: Any) -> None:
+            if message["type"] == "http.response.start":
+                message = {**message, "headers": [(spelled_out(name), value) for name, value in message.get("headers") or []]}
+            await send(message)
+
+        await self.app(scope, receive, spelled)
+
+
+def spelled_out(name: bytes) -> bytes:
+    """A header's name as it is usually spelled: each of its parts capitalized (content-range: Content-Range)."""
+    return b"-".join(part[:1].upper() + part[1:].lower() for part in name.split(b"-"))
 
 
 class TurnRefused(Exception):
@@ -816,6 +947,8 @@ def view(record: DeviceRecord, editing: bool = True) -> dict[str, Any]:
         "kind": record.kind,
         "picture": driver_for(record.kind).picture,  # False: its tile shows how a server is, not a screen
         "group": record.group,
+        # A PC with Intel AMT: which of its three views its tile is in (said to everybody: the tile says it).
+        **({"amt_view": record.amt_view if record.amt_view in AMT_VIEWS else AMT_VIEWS[0]} if record.kind == "amt" else {}),
     }
     if not editing:
         return shown
@@ -829,6 +962,8 @@ def view(record: DeviceRecord, editing: bool = True) -> dict[str, Any]:
         "has_password": record.secret is not None,
         "alerts": record.alerts,
         "fingerbot_strength": record.fingerbot_strength if record.fingerbot_strength in FINGERBOT_STRENGTHS else FINGERBOT_STRENGTHS[0],
+        "no_signal_minutes": screens.minutes(record.no_signal_minutes),
+        "unchanged_minutes": screens.minutes(record.unchanged_minutes),
     }
 
 
@@ -996,6 +1131,7 @@ def create_app(core: Core) -> FastAPI:
                 await client.close()
                 return
             store.devices[store.devices.index(record)] = changed
+            core.served.changed(device_id)  # (another address)
             refused_after_sign_in.pop(device_id, None)
             await manager.adopt(client)
             try:
@@ -1007,14 +1143,16 @@ def create_app(core: Core) -> FastAPI:
 
     manager.moved = moved
 
-    async def known(device_id: str, url: str, was: str, mark: str) -> None:
+    async def known(device_id: str, url: str, was: str, mark: str, current: Callable[[], bool] | None = None) -> None:
         """A driver took a number its machine gives for itself (see DeviceManager._known): kept with the tile as a person's
         change is, one change at a time and with a new record in the old one's place (so that an edit under way notices),
         and only where what is kept is still what the driver had, at the address it was seen at. A save that fails leaves
         it in memory, as for a first certificate, and it is written with the next change that is saved."""
         async with one_change:
             record = store.device(device_id)
-            if record is None or record.url != url or record.machine != was:
+            # (`current`: the driver that saw it still speaks for the tile, now that its turn has come; one replaced meanwhile
+            # has nothing to say of the record that took its place. The outside review's fourth round.)
+            if record is None or record.url != url or record.machine != was or (current is not None and not current()):
                 return
             changed = dataclasses.replace(record, machine=mark)
             store.devices[store.devices.index(record)] = changed
@@ -1068,6 +1206,78 @@ def create_app(core: Core) -> FastAPI:
 
     outbox = alerts.Outbox(alert_address, delivered)
 
+    # --- alerts by Web Push (webpush.py): the wall's key, and the browsers each account has them told to ---------------
+    push_opened: list[Any] = [None, None]  # the sealed key last opened, and what it opened as
+
+    def push_key() -> webpush.WallKey | None:
+        """The wall's key for Web Push. None where it is not made yet, the saved passwords are locked, or it does not open."""
+        blob = store.alerts.push_key
+        if blob is None or not core.vault.unlocked:
+            return None
+        if push_opened[0] is not blob:
+            text = core.vault.read(blob, PUSH_KEY_FOR)
+            try:
+                opened = webpush.WallKey(text) if text is not None else None
+            except ValueError:
+                opened = None
+            if opened is None:
+                log.error("the wall's key for push does not open (the settings file was edited, or is damaged): no browser is told the alerts")
+            push_opened[:] = [blob, opened]
+        key: webpush.WallKey | None = push_opened[1]
+        return key
+
+    def push_target(record: PushRecord) -> webpush.Target | None:
+        """A browser's subscription, opened from the vault. None where it does not open, or the saved passwords are locked."""
+        if record.secret is None or not core.vault.unlocked:
+            return None
+        text = core.vault.read(record.secret, f"push:{record.id}")
+        try:
+            said = json.loads(text) if text is not None else None
+            subscription = webpush.check(said["endpoint"], said["p256dh"], said["auth"])  # type: ignore[index]
+        except (ValueError, TypeError, KeyError, RecursionError):
+            return None
+        return webpush.Target(record.id, subscription)
+
+    async def push_gone(push_id: str) -> None:
+        """A browser its push service says is no longer subscribed (it was unsubscribed there, or its site data cleared):
+        taken off the list, in the turn of changes."""
+        async with one_change:
+            record = next((p for p in store.pushes if p.id == push_id), None)
+            if record is None:
+                return
+            place = store.pushes.index(record)
+            store.pushes.remove(record)
+            try:
+                await save()
+            except OSError as ex:
+                store.pushes.insert(place, record)  # (asked again at its next alert, which is told the same)
+                log.error("a browser that is no longer subscribed could not be taken off the list: %s", ex)
+                return
+        pusher.told.pop(push_id, None)
+        core.audit.write("push_removed", "", account=account_named(record.user), browser=record.name, why="gone")
+
+    def push_allowed(push_id: str, device_id: str | None) -> bool:
+        """Whether a browser may be told an alert about this machine now: its record there, its account there, not
+        suspended, and the machine one it may see (asked before each attempt: webpush.Pusher)."""
+        record = next((one for one in store.pushes if one.id == push_id), None)
+        user = store.user(record.user) if record is not None else None
+        return user is not None and not user.suspended and (device_id is None or may_see(user, device_id))
+
+    pusher = webpush.Pusher(push_key, push_gone, push_allowed)
+
+    def push_out(alert: alerts.Alert, device_id: str) -> None:
+        """An alert about this machine, to every browser subscribed for an account that may see it: put in for each, never
+        waited for (the browsers' own tasks send it, webpush.Pusher)."""
+        if not store.pushes or push_key() is None:
+            return
+        said = webpush.payload(alert, device_id)
+        for record in store.pushes:
+            user = store.user(record.user)
+            if user is None or user.suspended or not may_see(user, device_id):
+                continue
+            if (target := push_target(record)) is not None:
+                pusher.put(target, said, webpush.urgency(alert.kind), device_id)
+
     held = watcher.held  # device id -> what it was before it changed while alerts were paused
 
     def pausing() -> bool:
@@ -1089,6 +1299,8 @@ def create_app(core: Core) -> FastAPI:
         alert = alerts.describe(device.spec.name, address, previous, state, detail, server=not device.picture, off=off)
         if not alerts.wanted(alert, store.alerts) or (record is not None and not record.alerts):
             return
+        if record is not None and device.picture and screens.minutes(record.no_signal_minutes) and (state == "no_signal" or (previous, state) == ("no_signal", "online")):
+            return  # its screen is watched for no signal: that is told by the watch, after its minutes (see `watch_screens`)
         if paused:
             # Not sent, and not forgotten: when the pause is over, what is not as it was before it is told.
             held.setdefault(device_id, previous)
@@ -1098,6 +1310,7 @@ def create_app(core: Core) -> FastAPI:
         core.audit.write("alert", "", device=alert.device, device_id=device_id, state=alert.state, was=alert.previous)
         log.info("alert: %s (%s -> %s)", alert.title, alert.previous, alert.state)
         outbox.put(alert)  # delivered from there: the watching does not wait for somebody else's server
+        push_out(alert, device_id)  # ...nor for a push service
 
     async def look() -> None:
         """One look at every KVM, for the changes worth telling someone about."""
@@ -1121,14 +1334,52 @@ def create_app(core: Core) -> FastAPI:
             if change is not None:
                 announce(device_id, device, *change, paused=paused)
 
+    screen_watch = core.screens  # kept with the program, as the watcher is
+
+    async def watch_screens() -> None:
+        """After a look: the screens of the machines that have a watch on them (screens.py), told through the alerts."""
+        paused = pausing()
+        watched = []
+        for device_id, device in manager.devices.items():
+            record = store.device(device_id)
+            if record is None or not record.alerts or not device.picture:
+                continue
+            dark, same = screens.minutes(record.no_signal_minutes), screens.minutes(record.unchanged_minutes)
+            if dark or same:
+                watched.append(screens.Watched(device_id, watcher.state(device_id), dark, same))
+        for event in await screen_watch.round(watched, set(manager.devices), paused):
+            live, record = manager.devices.get(event.device_id), store.device(event.device_id)
+            if live is None or record is None:
+                continue  # removed meanwhile
+            address = urlsplit(live.spec.base_url).netloc
+            alert = alerts.describe_watch(live.spec.name, address, event.watch, event.minutes, event.back, event.lasted, kept=bool(event.stamp))
+            if event.back and not store.alerts.recovered:
+                continue  # (what is over is told where the admin asked to hear what is back to normal)
+            picture = {"picture": event.stamp, "picture_at": round(event.picture.at, 3)} if event.stamp and event.picture is not None else {}
+            core.audit.write(
+                "alert", "", device=alert.device, device_id=event.device_id, state=alert.state, was=alert.previous, watch=event.watch,
+                minutes=event.minutes, **({"back": True} if event.back else {}), **picture,
+            )  # fmt: skip
+            alert.link = alerts.link_for(store.alerts.link, event.device_id)
+            log.info("alert: %s", alert.title)
+            outbox.put(alert)
+            push_out(alert, event.device_id)
+
     async def watch() -> None:
         """Notice KVMs changing state, also while nobody has the wall open."""
         while True:
             await asyncio.sleep(alerts.CHECK_EVERY)
             if not (store.alerts.enabled and core.vault.unlocked):
+                try:
+                    # (The pictures kept for screen alerts go with time and with their machine all the same: by the
+                    # settings' machines, which are there while the saved passwords are locked.)
+                    await screen_watch.sweep({record.id for record in store.devices})
+                except Exception:
+                    log.exception("the pictures kept for screen alerts could not be looked through")
                 continue
             try:
                 await look()
+                await watch_screens()
                 # What each machine is taken to be is written down when it changes, for the start after this one.
                 if (text := watcher.to_write()) is not None:
                     await asyncio.to_thread(watcher.write, text)
@@ -1293,6 +1544,7 @@ def create_app(core: Core) -> FastAPI:
             task.cancel()
         await asyncio.gather(*tasks, *background, return_exceptions=True)
         await outbox.close()
+        await pusher.close()  # (what still waits for a browser is not sent: the push service keeps nothing of it either)
         await lines.close()  # (what a live line still has down on a machine is let go of before the machine's connection goes)
         await manager.close()
         said_left_out()
@@ -1302,6 +1554,7 @@ def create_app(core: Core) -> FastAPI:
         await asyncio.to_thread(indexed.stop)
         await asyncio.to_thread(core.sessions.flush)  # ...and so is who signed out last
         await asyncio.to_thread(kept.flush)  # ...and what the wall saw last, with when it last looked (history: W4)
+        await asyncio.to_thread(screen_watch.close)  # ...and the video worker the screens were compared in goes
 
     app = FastAPI(title="qKVM", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None, **TELEMETRY_OFF)
     app.state.trusted_proxies = core.trusted_proxies
@@ -1321,7 +1574,7 @@ def create_app(core: Core) -> FastAPI:
             )
         changing = request.method not in ("GET", "HEAD")
         length = request.headers.get("content-length", "")
-        public = path in PUBLIC or path.startswith("/static/")
+        public = path in PUBLIC or path.startswith(PUBLIC_UNDER)
         user, sent = (None, None) if public else asking(request)
         # A cross-site page cannot make a browser send a token: that is no ambient credential like a cookie.
         # So a script is not asked for the headers by which the page's own requests are known.
@@ -1330,7 +1583,14 @@ def create_app(core: Core) -> FastAPI:
         if changing and "transfer-encoding" in request.headers:
             # A body of unknown size could be endless; everything the page sends states its length.
             return fail(411, "length_required", "The request must say how long it is")
-        if changing and length and (not length.isdigit() or int(length) > (MAX_FILE_BODY if path in _FILES else MAX_BODY)):
+        # An image carried through to a device's own storage (an admin's: the media right) says its length, and is read as it
+        # comes, by its route, never in full here: the one request of its kind.
+        upload = changing and _UPLOAD.fullmatch(f"{request.method} {path}") is not None
+        if upload and not length.isdigit():
+            return fail(411, "length_required", "An upload must say how long it is")
+        if upload and int(length) > MOST_UPLOAD:
+            return fail(413, "too_large", f"An image carried through qKVM may be {MOST_UPLOAD // 10**9} GB at the most")
+        if changing and not upload and length and (not length.isdigit() or int(length) > (MAX_FILE_BODY if path in _FILES else MAX_BODY)):
             return fail(413, "too_large", "The request is too large")
         if not public and user is None:
             return fail(401, "unauthorized", "Sign in first")
@@ -1348,9 +1608,10 @@ def create_app(core: Core) -> FastAPI:
         if user is not None and must_enroll(user, request) and not _ENROLLING.fullmatch(f"{request.method} {path}"):
             # Signed in by password alone where that is not enough: all there is to do is to put that right.
             return fail(403, "totp_required", "Two-factor sign-in is required for your account. Set it up first.")
-        if changing:
+        if changing and not upload:
             # The whole request is in hand before anything is done or held for it. A sender that
             # stops halfway (by accident or to be a nuisance) holds up nobody but itself, and not for long.
+            # (An upload is read by its route a piece at a time, each within UPLOAD_QUIET, and holds up nobody else either.)
             try:
                 async with asyncio.timeout(BODY_TIMEOUT):  # (never wait_for, which loses a stop up to Python 3.11: see kvm.Listening.message)
                     await request.body()
@@ -1394,16 +1655,19 @@ def create_app(core: Core) -> FastAPI:
         except Exception:
             # A bug in a check or in a handler: record it, keep serving, and tell the page nothing about
             # the internals. Whatever happened, the answer leaves with the security headers below.
-            log.exception("unhandled error in %s %s", request.method, path)
+            # (Not the address of an image mounted on a server, which is that controller's alone: see served.py.)
+            log.exception("unhandled error in %s %s", request.method, "/media/..." if path.startswith("/media/") else path)
             response = fail(500, "internal", "Something went wrong inside qKVM. The details are in its log.")
         response.headers.update(SECURITY_HEADERS)
         if is_secure(request):
             response.headers["Strict-Transport-Security"] = "max-age=31536000"
-        if path.startswith("/api/"):
+        if path.startswith(("/api/", "/media/")):
             response.headers.setdefault("Cache-Control", "no-store")
         return response
 
     app.add_middleware(SentOnlyWhile)  # (added last: outside the guard, where a piece of an answer goes out)
+    app.add_middleware(SpelledOut)  # (outside that: what a served image's answer is headed with, spelled out)
+    app.add_middleware(CarriedThrough)  # (outside the guard too: an upload's own way to its body)
 
     @app.exception_handler(RequestValidationError)
     async def invalid(_: Request, exc: RequestValidationError) -> JSONResponse:
@@ -2462,10 +2726,19 @@ def create_app(core: Core) -> FastAPI:
             return fail(409, "yourself", "You cannot remove the account you are signed in with")
         if user.role == "admin" and not user.suspended and admins() == 1:
             return fail(409, "last_admin", "This is the only admin")
-        place = store.users.index(user)
+        place, pushes = store.users.index(user), store.pushes
         store.users.remove(user)
-        if refused := await saved("Removing this account", lambda: store.users.insert(place, user)):
+        store.pushes = [push for push in pushes if push.user != user.id]  # its browsers are told nothing more (Web Push)
+
+        def undo() -> None:
+            store.users.insert(place, user)
+            store.pushes = pushes
+
+        if refused := await saved("Removing this account", undo):
             return refused  # said: an account taken for removed would be back, password and all, after a restart
+        for push in pushes:
+            if push.user == user.id:
+                pusher.forget(push.id)
         core.sessions.drop_user(user.id)
         audit.write("user_removed", client_ip(request), account=user.name)
         return JSONResponse({"ok": True})
@@ -2547,12 +2820,28 @@ def create_app(core: Core) -> FastAPI:
             return fail(ex.status, ex.code, ex.message)
         if refused := still_shown(request, device_id):
             return refused
+        if manager.devices.get(device_id) is device:
+            screen_watch.saw(device_id, frame)  # (a reference, where its screen is watched: screens.py)
         headers = {"Cache-Control": "no-store", "X-KVM-Signal": "1" if frame.signal else "0"}
         if frame.still:
             # A still kept between sessions (a PC with Intel AMT whose tile is only shown): the page says its age.
             headers["X-KVM-Still"] = "1"
             headers["X-KVM-Age"] = str(max(0, round(time.monotonic() - frame.taken_at)))
         return Response(frame.data, media_type=frame.content_type, headers=headers)
+
+    @app.get("/api/v1/devices/{device_id}/alert-picture/{stamp}")
+    async def alert_picture(device_id: str, stamp: str, request: Request) -> Response:
+        """The picture that set off an alert of a machine's screen watch (screens.py), by the stamp its entry in the activity
+        log names: for an admin, as that log is. Only the last one of each machine is kept, for some days."""
+        if store.device(device_id) is None or not allowed(request, device_id):
+            return fail(404, "not_found", "Unknown device")
+        found = await asyncio.to_thread(screen_watch.picture, device_id, stamp)
+        if refused := still_shown(request, device_id):
+            return refused
+        if found is None:
+            return fail(404, "no_picture", "That picture is no longer kept: only the last alert's is, and for some days")
+        data, kind = found
+        return Response(data, media_type=kind, headers={"Cache-Control": "no-store"})
 
     # --- history (W4): the one route that reads it; what feeds it stands above the lifespan ----------------------
 
@@ -2649,12 +2938,29 @@ def create_app(core: Core) -> FastAPI:
         said = f"This {'says it is' if said_so else 'is'} the same device as {twin.name}, which is on the wall already" + ("" if twin.name == host else f" ({host})")
         return JSONResponse({"code": "same_device", "message": said, "same_as": {"id": twin.id, "name": twin.name, "host": host}}, status_code=409)
 
+    def not_taken(ex: ValueError) -> JSONResponse:
+        """What was typed, refused: said as the check says it (capitalize() wrote the rest small, qKVM as qkvm)."""
+        said = str(ex)
+        return fail(422, "invalid", said[:1].upper() + said[1:])
+
+    def console_link_of(body: DeviceIn, own: DeviceRecord | None) -> str:
+        """The console link to save (`_open_url`). One 0.2.0 saved as typed, in a form not taken since 0.2.1 (a host written as
+        numbers another way, 127.1), that an edit sends back unchanged is kept as it was saved: the edit of the rest was
+        refused for it until the link was written again. (No way into a console is made out to such a host: shares_our_name
+        takes one that looks like numbers and cannot be read so for the wall's own; and the page reads it as a browser does.)"""
+        if own is not None and own.open_url and body.open_url.strip() == own.open_url:
+            try:
+                return _open_url(body.open_url)
+            except ValueError:
+                return own.open_url
+        return _open_url(body.open_url)
+
     def parse_vnc(body: DeviceIn, own: DeviceRecord | None) -> tuple[str, str, str] | JSONResponse:
         """A VNC server, said so by the kind chosen or by its address (vnc://, vncs://): it speaks no HTTP, and is not asked what it is."""
         try:
-            url, open_url = vncdevice.vnc_url(body.url), _open_url(body.open_url)
+            url, open_url = vncdevice.vnc_url(body.url), console_link_of(body, own)
         except ValueError as ex:
-            return fail(422, "invalid", str(ex).capitalize())
+            return not_taken(ex)
         if any(d.url == url and d is not own for d in store.devices):
             return fail(409, "duplicate", "This device is already on the wall")
         return url, open_url, "vnc"
@@ -2664,9 +2970,9 @@ def create_app(core: Core) -> FastAPI:
         Where only its number is given, its node is asked of Proxmox with the token typed (or, at the address it was
         saved for, the saved one: never sent anywhere else on the strength of an address typed in an edit)."""
         try:
-            found, open_url = proxmox.address_of(body.url), _open_url(body.open_url)
+            found, open_url = proxmox.address_of(body.url), console_link_of(body, own)
         except ValueError as ex:
-            return fail(422, "invalid", str(ex).capitalize())
+            return not_taken(ex)
         if found.vmid is None:
             return fail(422, "invalid", "Name the guest: the Proxmox's address with the guest's ID after it (pve.lan/100), or pick guests from its list")
         node = found.node
@@ -2702,9 +3008,9 @@ def create_app(core: Core) -> FastAPI:
         if body.kind == "proxmox" or (body.kind == "auto" and own is not None and own.kind == "proxmox"):
             return await parse_proxmox(body, own)
         try:
-            url, open_url = device_url(body.url), _open_url(body.open_url)
+            url, open_url = device_url(body.url), console_link_of(body, own)
         except ValueError as ex:
-            return fail(422, "invalid", str(ex).capitalize())
+            return not_taken(ex)
         kind: str = body.kind
         try:
             typed = urlsplit(body.url.strip() if "://" in body.url else f"https://{body.url.strip()}").port
@@ -2749,6 +3055,8 @@ def create_app(core: Core) -> FastAPI:
             group=" ".join(body.group.split()),
             alerts=body.alerts is not False,
             fingerbot_strength=body.fingerbot_strength or FINGERBOT_STRENGTHS[0],
+            no_signal_minutes=body.no_signal_minutes or 0,
+            unchanged_minutes=body.unchanged_minutes or 0,
         )
         if body.tls is None and url.startswith("https") and await publicly_trusted(url):
             # Reached through somebody's front door, whose certificate changes every few weeks: not one to remember.
@@ -2777,7 +3085,7 @@ def create_app(core: Core) -> FastAPI:
                 await client.close()
                 return refusal
             if twin is not None:
-                record.ident = f"own:{record.id}"  # told to keep both: from here on it is a device of its own
+                record.ident = client.spec.ident = f"own:{record.id}"  # told to keep both: from here on it is a device of its own
             if body.password:
                 record.secret = core.vault.encrypt(body.password, record.id)
             # What is on the wall and what is saved change together, before the disk is waited for, and go
@@ -2829,6 +3137,8 @@ def create_app(core: Core) -> FastAPI:
             group=" ".join(body.group.split()),
             alerts=record.alerts if body.alerts is None else body.alerts,
             fingerbot_strength=body.fingerbot_strength or record.fingerbot_strength,
+            no_signal_minutes=record.no_signal_minutes if body.no_signal_minutes is None else body.no_signal_minutes,
+            unchanged_minutes=record.unchanged_minutes if body.unchanged_minutes is None else body.unchanged_minutes,
         )
         moved, typed = url != record.url, bool(body.password)
         # A new address, and no password typed: the saved one is about to be used somewhere it was not saved
@@ -2909,7 +3219,7 @@ def create_app(core: Core) -> FastAPI:
             if refusal is None and store.device(device_id) is not record:
                 refusal = fail(409, "conflict", "This KVM was changed or removed by someone else just now. Look at it again.")
             if refusal is None and body.keep_both and twin_of(changed) is not None:
-                changed.ident = f"own:{record.id}"  # the two are to stay, and nobody is to be asked about them again
+                changed.ident = client.spec.ident = f"own:{record.id}"  # the two are to stay, and nobody is to be asked about them again
             if refusal is None and any(d.url == url and d is not record for d in store.devices):
                 refusal = fail(409, "duplicate", "This device is already on the wall")
             if refusal is not None:
@@ -2919,6 +3229,11 @@ def create_app(core: Core) -> FastAPI:
                 changed.secret = core.vault.encrypt(body.password, changed.id)
             at = store.devices.index(record)
             store.devices[at] = changed
+            # Another address, kind or check, or another controller (not the same one known better: identity_follows): what
+            # was lent to the one before ends, and a mount of it under way hands out nothing (the outside review's fourth round)
+            before = (record.cert_pem, record.machine, record.ident)
+            if (record.url, record.kind, record.tls) != (changed.url, changed.kind, changed.tls) or identity_follows(before, (changed.cert_pem, changed.machine, changed.ident)) is None:
+                core.served.changed(device_id)
             await manager.adopt(client)
             for url_ in (record.url, changed.url):
                 vncdevice.forget_pace(url_)
@@ -2931,11 +3246,19 @@ def create_app(core: Core) -> FastAPI:
         # (Where the password typed took a machine that gives another number than the one the tile knew, that is said: a person
         # who typed it for a tile that said "it may be another one" is to find what became of it.)
         notes = [not_followed] if not_followed else []
+        kept = ""  # (a console link 0.2.0 saved in a form not taken since, kept as it was: see console_link_of)
+        if open_url and open_url == record.open_url:
+            try:
+                _open_url(open_url)
+            except ValueError as ex:
+                kept = f"The console link is kept as it was saved, in a form qKVM no longer takes ({ex}): write it again to change it"
+                notes.append(kept)
         if typed and record.machine and changed.machine and changed.machine != record.machine:
             notes.append("It takes the machine that answers now, which gives another number for itself than the one this tile was known by")
         note = ". ".join(notes)
         audit.write("device_changed", client_ip(request), device=changed.name, device_id=changed.id, url=url, **({"note": note} if note else {}))
-        return JSONResponse({"device": view(changed), **({"note": not_followed} if not_followed else {})})
+        said = ". ".join(word for word in (not_followed, kept) if word)
+        return JSONResponse({"device": view(changed), **({"note": said} if said else {})})
 
     @app.delete("/api/v1/devices/{device_id}")
     async def delete_device(device_id: str, request: Request) -> Response:
@@ -2991,12 +3314,15 @@ def create_app(core: Core) -> FastAPI:
         try:
             return await asyncio.shield(work)
         except asyncio.CancelledError:
-            work.add_done_callback(unheard)  # (cut off: should it fail now, nobody else would hear of it)
+            work.add_done_callback(unheard("removing machines"))  # (cut off: should it fail now, nobody else would hear of it)
             raise
 
-    def unheard(work: asyncio.Task[Response]) -> None:
-        if not work.cancelled() and (ex := work.exception()) is not None:
-            log.error("removing machines failed after its request was cut off", exc_info=ex)
+    def unheard(what: str) -> Callable[[asyncio.Task[Response]], None]:
+        def heard(work: asyncio.Task[Response]) -> None:
+            if not work.cancelled() and (ex := work.exception()) is not None:
+                log.error("%s failed after its request was cut off", what, exc_info=ex)
+
+        return heard
 
     async def take_off(going: frozenset[str], what: str, ip: str) -> Response:
         """The part of removing one machine or several that waits: the file, then the wall, then the connections.
@@ -3014,11 +3340,14 @@ def create_app(core: Core) -> FastAPI:
         # Written down. From here to the end of what goes with them nothing is waited for: no other change sees half of it.
         places = [record for record in store.devices if record.id in going]
         store.devices[:] = [record for record in store.devices if record.id not in going]
+        for gone in going:
+            core.served.changed(gone)  # (what was lent to them ends, and a mount of them under way hands out nothing)
         taken = manager.take(going)
         try:
             together = {"note": f"one of {len(places)} removed together"} if len(places) > 1 else {}
             for record in places:
                 watcher.forget(record.id)
+                screen_watch.forget(record.id)  # (and the picture kept for an alert of its screen, at the next round)
             kept.forget(*(record.id for record in places))  # their history goes with them (never dropped, however full the history's queue)
             for record in places:
                 audit.write("device_removed", ip, device=record.name, device_id=record.id, url=record.url, **together)
@@ -3078,6 +3407,8 @@ def create_app(core: Core) -> FastAPI:
             trusted = dataclasses.replace(record, cert_pem=pem, tls="pinned")
             at = store.devices.index(record)
             store.devices[at] = trusted
+            if trusted.cert_pem != record.cert_pem:
+                core.served.changed(device_id)  # (a certificate trusted anew: what was lent before ends; mount again)
             vncdevice.forget_pace(trusted.url)  # (a console behind a door that met the other certificate is asked for again at once)
             await manager.replace(trusted)
             vncdevice.forget_pace(trusted.url)  # (and what the client before it wrote while it was retired)
@@ -3356,6 +3687,480 @@ def create_app(core: Core) -> FastAPI:
         audit.write("kvm_switched", client_ip(request), device=record.name, device_id=device_id, on=body.on)
         return JSONResponse({"ok": True})
 
+    # --- virtual media: an image mounted on a machine, and the machine started from it (0.3.0) -------------------------
+    # Root on that machine: the media right's (MEDIA_ROLE, in required_role, asked again by still_allowed whenever time has
+    # passed), a person's and never a token's, named in a confirmation (the machine, by the name the person was shown, and
+    # the image), one thing at a time per machine, every mount, unmount, start, upload and deletion in the activity log.
+    # What is mounted is only ever what the driver itself listed, by its id: never an address. An image carried to a
+    # device's own storage goes through a piece at a time as it comes (never read in full, never written anywhere here),
+    # counted and hashed on its way (kvm.Carried).
+
+    uploads: dict[str, dict[str, Any]] = {}  # device id -> the upload under way to it: its name, who, since when, what carries it
+
+    def media_target(request: Request, device_id: str) -> tuple[Device, DeviceRecord, MediaOffer] | JSONResponse:
+        device, record = manager.devices.get(device_id), store.device(device_id)
+        if device is None or record is None or not allowed(request, device_id):
+            return fail(404, "not_found", "Unknown device")
+        if is_token(request.state.user):
+            return fail(403, "not_allowed", "Virtual media is for a person, not for a token")
+        offer = device.media_offer()  # (this machine's, as the last look at it found it)
+        if offer is None:
+            return fail(404, "no_virtual_media", f"{record.name} has no virtual media")
+        return device, record, offer
+
+    def media_named(machine: str, record: DeviceRecord, what: str) -> JSONResponse | None:
+        """The confirmation named this machine as it is called now: otherwise nothing is done, and it is said why."""
+        if machine != record.name:
+            return fail(409, "changed", f"The confirmation named {machine}, and this machine is called {record.name} now. Nothing was {what}: look at it again.")
+        return None
+
+    def media_failed(event: str, ex: KvmError, detail: dict[str, Any], request: Request, record: DeviceRecord, mounted: str = "") -> JSONResponse:
+        """A refusal of the device's, written down and said; `mounted`: the image is mounted, and what failed came after it
+        (what was not done, for the sentence: "started from it", "restarted")."""
+        if ex is RETIRED:
+            # (As for an action: the connection it went out on was taken away meanwhile, and it may have been done.)
+            ex = KvmError("timeout", f"{record.name} was being changed while this was under way. It may have been done all the same: look at the machine before trying again.", 504)
+        said = scrubbed(ex.message)  # (nothing of a mount's that the controller said back, whatever passed it on)
+        audit.write(event, client_ip(request), error=said, **detail)
+        message = f"The image is mounted, and {record.name} was not {mounted}: {said}" if mounted else said
+        return JSONResponse({"code": ex.code, "message": message, "mounted": bool(mounted)}, status_code=ex.status)
+
+    def media_held(request: Request, device_id: str, record: DeviceRecord, image: str, restart: bool, drops: bool = False) -> JSONResponse | None:
+        """One thing at a time per machine, as for an action: and a restart, as a power button, not while somebody has its
+        keyboard and mouse over a live line; nor, where a mount or an unmount drops them for a moment (`drops`: the offer
+        says so), while somebody else has them (whoever asks has been told, in the box). Nor anything of the image that is
+        being uploaded to it (by its name, or as a JetKVM lists it meanwhile: `<name>.incomplete`). None: it is the caller's
+        now (acted_on), and is let go of by it."""
+        if device_id in acted_on:
+            return fail(409, "busy", f"Something else is being done to {record.name} at this moment. Wait for it to finish.")
+        if (up := uploads.get(device_id)) is not None and image in (up["name"], up["name"] + ".incomplete"):
+            return fail(409, "busy", f"{image} is being uploaded to {record.name} at this moment. Wait for it to finish.")
+        by = lines.held_by(device_id)
+        if by is not None and (restart or (drops and by != request.state.user.name)):
+            return keyboard_held(record.name, by, request)
+        return None
+
+    def still_theirs_of(request: Request, device_id: str) -> Callable[[], bool]:
+        def still_theirs() -> bool:
+            """Whether whoever asked may still have it done: asked before every change the driver makes (as for an action)."""
+            return still_allowed(request) is None and allowed(request, device_id)
+
+        return still_theirs
+
+    def uploading(device_id: str) -> dict[str, Any] | None:
+        """The upload under way to this machine, as far as it has come: None where there is none."""
+        up = uploads.get(device_id)
+        if up is None:
+            return None
+        carried: Carried = up["carried"]
+        return {"name": up["name"], "size": carried.size, "sent": carried.sent, "by": up["by"], "at": up["at"]}
+
+    @app.get("/api/v1/devices/{device_id}/media")
+    async def media_list(device_id: str, request: Request) -> Response:
+        """The images that can be mounted on this machine, what is mounted, and what its virtual media can do."""
+        found = media_target(request, device_id)
+        if isinstance(found, JSONResponse):
+            return found
+        device, _, offer = found
+        try:
+            listed = await device.media_images()
+        except KvmError as ex:
+            return fail(ex.status, ex.code, ex.message)
+        said = {**listed, "mounted": device.media_now(), "offers": (device.media_offer() or offer).as_dict(), "uploading": uploading(device_id)}
+        return still_shown(request, device_id) or JSONResponse(said)
+
+    @app.get("/api/v1/devices/{device_id}/media/upload")
+    async def media_upload_now(device_id: str, request: Request) -> Response:
+        """How far the upload under way to this machine has come (asked by the page while its own is out): nothing is asked of
+        the machine for it."""
+        found = media_target(request, device_id)
+        if isinstance(found, JSONResponse):
+            return found
+        return JSONResponse({"uploading": uploading(device_id)})
+
+    @app.post("/api/v1/devices/{device_id}/media")
+    async def media_mount(device_id: str, body: MediaIn, request: Request) -> Response:
+        found = media_target(request, device_id)
+        if isinstance(found, JSONResponse):
+            return found
+        device, record, offer = found
+        if refused := media_named(body.machine, record, "mounted"):
+            return refused
+        restart = body.restart or body.boot == "once"
+        if body.drive not in offer.drives:
+            return fail(422, "invalid", f"{record.name} takes no image as {MEDIA_DRIVE_SAID[body.drive]}")
+        if body.writable and body.drive not in offer.writable:
+            return fail(422, "invalid", f"{record.name} takes an image as {MEDIA_DRIVE_SAID[body.drive]} read-only, and only so")
+        if body.boot != "none" and body.boot not in offer.boot:
+            return fail(422, "invalid", f"{record.name} cannot be told to start from an image that way")
+        if body.restart and body.boot == "none" and offer.boot:
+            return fail(422, "invalid", "A restart that does not start from the image is a power button's: use the power buttons")
+        if restart and not offer.restart:
+            return fail(422, "invalid", f"{record.name} cannot be restarted from here")
+        if refused := media_held(request, device_id, record, body.image, restart, offer.drops_input):
+            return refused
+        acted_on.add(device_id)
+        try:
+            # (A restart is a power button's: the last holder's keys are let go of first, as for an action.)
+            refusal = waited_for(request, device_id, device) if restart and await lines.handed_over(device_id) else None
+        except BaseException:
+            acted_on.discard(device_id)
+            raise
+        if refusal is not None:
+            acted_on.discard(device_id)
+            return refusal
+        still_theirs = still_theirs_of(request, device_id)
+        detail: dict[str, Any] = {
+            "device": record.name, "device_id": device_id, "image": body.image, "drive": body.drive, "writable": body.writable,
+            "boot": body.boot, "restart": restart,
+        }  # fmt: skip
+        notes: list[str] = []
+        # Bound to the controller as it is known now, before anything is asked of it: an edit that slips in meanwhile (to
+        # another controller at the same address) changes the record, not this (the outside review's third round).
+        core.served.binding[device_id] = Binding((record.cert_pem, record.machine, record.ident), record.kind, core.served.epoch(device_id))
+        try:
+            try:
+                note = await device.media_mount(body.image, drive=body.drive, writable=body.writable, by=request.state.user.name, still=still_theirs)
+            except KvmError as ex:
+                return media_failed("media_mount_failed", ex, detail, request, record)
+            except asyncio.CancelledError:
+                audit.write("media_mount_failed", client_ip(request), error="qKVM was stopped or restarted before the machine answered: it may have been mounted", **detail)
+                raise
+            mounted = device.media_now()
+            if mounted is not None and mounted.get("image") == body.image and mounted.get("sha256"):
+                detail["sha256"] = mounted["sha256"]  # (an image qKVM carried there, and still that one)
+            audit.write("media_mounted", client_ip(request), **detail, **({"note": note} if note else {}))
+            notes += [note] if note else []
+            if body.boot != "none":
+                try:
+                    note = await device.media_boot(body.boot, restart=restart, still=still_theirs)
+                except KvmError as ex:
+                    return media_failed("media_boot_failed", ex, detail, request, record, mounted="started from it")
+                except asyncio.CancelledError:
+                    audit.write("media_boot_failed", client_ip(request), error="qKVM was stopped or restarted while the machine was being started from the image: look at it", **detail)
+                    raise
+                audit.write("media_booted", client_ip(request), **detail, **({"note": note} if note else {}))
+                notes += [note] if note else []
+            elif restart:
+                # (A machine that cannot be told to start from it, restarted for its firmware to find it: a power button's press.)
+                try:
+                    note = await device.media_restart(still=still_theirs)
+                except KvmError as ex:
+                    return media_failed("media_restart_failed", ex, detail, request, record, mounted="restarted")
+                except asyncio.CancelledError:
+                    audit.write("media_restart_failed", client_ip(request), error="qKVM was stopped or restarted while the machine was being restarted: look at it", **detail)
+                    raise
+                audit.write("media_restarted", client_ip(request), **detail, **({"note": note} if note else {}))
+                notes += [note] if note else []
+        finally:
+            core.served.binding.pop(device_id, None)
+            acted_on.discard(device_id)
+        return JSONResponse({"ok": True, "note": " ".join(notes) or None, "mounted": device.media_now()})
+
+    @app.post("/api/v1/devices/{device_id}/media/unmount")
+    async def media_unmount(device_id: str, body: UnmountIn, request: Request) -> Response:
+        found = media_target(request, device_id)
+        if isinstance(found, JSONResponse):
+            return found
+        device, record, offer = found
+        if refused := media_named(body.machine, record, "taken out"):
+            return refused
+        if refused := media_held(request, device_id, record, "", restart=False, drops=offer.drops_input):
+            return refused
+        acted_on.add(device_id)
+        detail: dict[str, Any] = {"device": record.name, "device_id": device_id, "image": body.image}
+        if (was := device.media_now()) is not None and was.get("image") == body.image and was.get("sha256"):
+            detail["sha256"] = was["sha256"]
+        try:
+            note = await device.media_unmount(body.image, still=still_theirs_of(request, device_id))
+        except AlreadySo as so:
+            note = str(so)
+        except KvmError as ex:
+            return media_failed("media_unmount_failed", ex, detail, request, record)
+        except asyncio.CancelledError:
+            audit.write("media_unmount_failed", client_ip(request), error="qKVM was stopped or restarted before the machine answered: it may have been taken out", **detail)
+            raise
+        finally:
+            acted_on.discard(device_id)
+        audit.write("media_unmounted", client_ip(request), **detail, **({"note": note} if note else {}))
+        return JSONResponse({"ok": True, "note": note, "mounted": device.media_now()})
+
+    @app.post("/api/v1/devices/{device_id}/media/delete")
+    async def media_delete(device_id: str, body: DeleteIn, request: Request) -> Response:
+        """Delete an image from the device's own storage: what qKVM carried there, or anything else it lists."""
+        found = media_target(request, device_id)
+        if isinstance(found, JSONResponse):
+            return found
+        device, record, offer = found
+        if not offer.delete:
+            return fail(422, "invalid", f"{record.name} has no images of its own that qKVM deletes")
+        if refused := media_named(body.machine, record, "deleted"):
+            return refused
+        if refused := media_held(request, device_id, record, body.image, restart=False):
+            return refused
+        acted_on.add(device_id)
+        detail: dict[str, Any] = {"device": record.name, "device_id": device_id, "image": body.image}
+        try:
+            note = await device.media_delete(body.image, still=still_theirs_of(request, device_id))
+        except AlreadySo as so:
+            note = str(so)
+        except KvmError as ex:
+            return media_failed("media_delete_failed", ex, detail, request, record)
+        except asyncio.CancelledError:
+            audit.write("media_delete_failed", client_ip(request), error="qKVM was stopped or restarted before the device answered: it may have been deleted", **detail)
+            raise
+        finally:
+            acted_on.discard(device_id)
+        audit.write("media_deleted", client_ip(request), **detail, **({"note": note} if note else {}))
+        return JSONResponse({"ok": True, "note": note})
+
+    async def upload_pieces(request: Request, still: Callable[[], bool]) -> AsyncIterator[bytes]:
+        """The image as the browser sends it, a piece at a time as it arrives (bounded: the web server reads no further ahead
+        than a piece or two). Cut off where nothing comes for UPLOAD_QUIET seconds, where the sender stops, and where whoever
+        sends it may no longer (asked every UPLOAD_ASK_EVERY seconds): kvm.UploadCut, raised inside the driver's carrying."""
+        receive = request.scope.get(CarriedThrough.KEY)  # (the web server's own: see CarriedThrough)
+        if receive is None:
+            raise UploadCut("The upload did not come the way an upload comes")
+        asked_at = time.monotonic()
+        more = True
+        while more:
+            try:
+                async with asyncio.timeout(UPLOAD_QUIET):  # (never wait_for: see kvm.Listening.message)
+                    message = await receive()
+            except TimeoutError:
+                raise UploadCut(f"Nothing of the image came for {round(UPLOAD_QUIET)} seconds, and its upload was stopped") from None
+            if message.get("type") != "http.request":
+                raise UploadCut("The upload was stopped before the image came in full")
+            piece, more = message.get("body", b""), bool(message.get("more_body", False))
+            if time.monotonic() - asked_at >= UPLOAD_ASK_EVERY:
+                asked_at = time.monotonic()
+                if not still():
+                    raise UploadCut("Whoever uploads it may no longer do that, and its upload was stopped")
+            if piece:
+                yield piece
+
+    @app.post("/api/v1/devices/{device_id}/media/upload")
+    async def media_upload(
+        device_id: str, request: Request,
+        name: Annotated[str, Query(min_length=1, max_length=300)], machine: Annotated[str, Query(min_length=1, max_length=4 * 60)],
+    ) -> Response:  # fmt: skip
+        """Carry the image in the body into the device's own storage, as `name`: streamed through as it comes, kept nowhere."""
+        found = media_target(request, device_id)
+        if isinstance(found, JSONResponse):
+            return found
+        device, record, offer = found
+        if not offer.upload:
+            return fail(422, "invalid", f"Images are not carried through qKVM to {record.name}")
+        if refused := media_named(machine, record, "uploaded"):
+            return refused
+        size = int(request.headers["content-length"])  # (said, a number, and no more than MOST_UPLOAD: the guard saw to it)
+        if size <= 0:
+            return fail(422, "invalid", "An empty file is no image")
+        if (up := uploads.get(device_id)) is not None:
+            return fail(409, "busy", f"{up['name']} is being uploaded to {record.name} at this moment, by {up['by']}. Wait for it to finish.")
+        user: UserRecord = request.state.user
+        still_theirs = still_theirs_of(request, device_id)
+        carried = Carried(upload_pieces(request, still_theirs), size)
+        uploads[device_id] = {"name": name, "by": user.name, "at": time.time(), "carried": carried}
+        detail: dict[str, Any] = {"device": record.name, "device_id": device_id, "image": name, "size": size}
+        try:
+            try:
+                listed = await device.media_upload(name, carried, by=user.name, still=still_theirs)
+            except KvmError as ex:
+                message = ex.message
+                if ex is RETIRED and (other := manager.devices.get(device_id)) is not None and other is not device:
+                    # (The tile was edited meanwhile. What the cut-off upload left is taken off by the client that took its place
+                    # only where that client is for the same device: its address, its kind, its pinned certificate and its
+                    # identity marks unchanged. Moved to another device, nothing is touched there: a partial image of the
+                    # same name on it is none of this upload's (the outside review of 0.3.0, Codex's M3).)
+                    same = [(spec.base_url, spec.kind, spec.cert_pem, spec.machine, spec.ident) for spec in (device.spec, other.spec)]
+                    if same[0] == same[1]:
+                        try:
+                            left = await other.media_discard(name)
+                        except KvmError as again:
+                            left = f"What it left on the device could not be taken off: {again.message}"
+                        left = left or "Nothing of it is left on the device."
+                    else:
+                        left = f"What came of it may be on the device it was going to, at {device.spec.base_url}: look there."
+                    message = f"{record.name} was changed while its image was on its way, and the upload was stopped. {left}"
+                    ex = KvmError("timeout", message, 504)
+                audit.write("media_upload_failed", client_ip(request), error=message, sent=carried.sent, **detail)
+                return JSONResponse({"code": ex.code, "message": message, "sent": carried.sent}, status_code=ex.status)
+            except asyncio.CancelledError:
+                audit.write("media_upload_failed", client_ip(request), error="qKVM was stopped or restarted while the image was on its way: what came of it is on the device as the device left it", sent=carried.sent, **detail)
+                raise
+        finally:
+            uploads.pop(device_id, None)
+        audit.write("media_uploaded", client_ip(request), sha256=carried.sha256, **detail)
+        return JSONResponse({"ok": True, "image": listed, "sha256": carried.sha256})
+
+    # --- an image mounted on a server, as its controller reads it (served.py, 0.3.0 A4) ------------------------------
+    # Public: the controller has no session here. By the address made for that one mount, to the controller's own address
+    # alone (where the connection comes from, or a believed proxy says it does), with the user and the password made for that
+    # mount where there are some; to anything else there is nothing at this address, the same answer whatever was wrong.
+    # Only while it is mounted, on the tile it was mounted for at the address it had then; only the file that was mounted,
+    # unchanged; a range of it as asked (a controller reads it a piece at a time), GET and HEAD alone. Cut off where its
+    # mount ends meanwhile. Nothing is written in the activity log for a read (a controller reads an image in thousands).
+    # The file is opened, read and let go of in threads of its own (served.READERS), never on the loop: on a share that
+    # stalls, a close waits for the read under way, and a read's place among MOST_AT_ONCE is given back once its thread
+    # has let go of the file.
+
+    def nothing_here() -> Response:
+        return PlainTextResponse("There is nothing at this address.", status_code=404)
+
+    def still_lent(lending: Lending) -> bool:
+        """Whether what a mount lends is served still: not ended, and its tile on the wall at the address it had. A tile
+        removed or moved to another address ends it there and then, a reading under way included (the outside review of
+        0.3.0, Codex's M2: a reading went on to its end after its tile was removed; only a new one found it gone)."""
+        if lending.ended:
+            return False
+        record = store.device(lending.device_id)
+        if record is None or record.url != lending.tile_url or (lending.kind and record.kind != lending.kind) or not same_controller(lending, record):
+            # (Removed, moved, or another controller accepted at the same address since: its certificate trusted, its
+            # numbers taken. The outside review's second round, R2-M2.)
+            core.served.end(lending.device_id, lending)
+            return False
+        return True
+
+    def same_controller(lending: Lending, record: DeviceRecord) -> bool:
+        """Whether the tile's controller is still the one a mount was bound to (served.identity_follows), and the binding
+        takes what was learned of it (the outside review's third round: a look that learned the numbers ended a good mount;
+        its fourth: a mount known by nothing learned another controller's)."""
+        follows = identity_follows(lending.identity, (record.cert_pem, record.machine, record.ident))
+        if follows is None:
+            return False
+        lending.identity = follows
+        return True
+
+    @app.api_route("/media/{token}/{name}", methods=["GET", "HEAD"])
+    async def served_image(token: str, name: str, request: Request) -> Response:
+        lending = core.served.find(token)
+        if lending is None or name != lending.url_name or not still_lent(lending):
+            return nothing_here()
+        record = store.device(lending.device_id)
+        assert record is not None  # (still_lent)
+        asker = same_address(client_ip(request)) or "?"
+        if asker not in lending.addresses:
+            if asker not in lending.refused and len(lending.refused) < MOST_REFUSED_SAID:
+                lending.refused.add(asker)
+                log.warning("%s: its mounted image was asked for from %s, which is not its controller's address, and nothing was answered", record.name, asker)
+            return nothing_here()
+        # (As the controller says it, with nothing of the mount's in it, then cut short: the second round, R2-L2.)
+        asked = plain(scrubbed(request.headers.get("range") or "", lending), 60) or ""
+        if "asked" not in lending.refused:
+            # Its first ask, once a mount: whether a controller that took a mount ever came for the image is said (a real
+            # AMI board took one over plain HTTP and showed nothing: a read is said only once it went out whole).
+            lending.refused.add("asked")
+            log.info("%s: its controller asks for %s (%s%s)", record.name, lending.name, request.method, f", {asked}" if asked else "")
+        if lending.credentials is not None and not basic_matches(request.headers.get("authorization", ""), lending.credentials):
+            if "credentials" not in lending.refused:
+                lending.refused.add("credentials")
+                how = "with another user or password" if request.headers.get("authorization") else "without a user and a password (a client may send them once asked)"
+                log.info("%s: its controller asked for %s %s, and was refused: it is read with those it was mounted with", record.name, lending.name, how)
+            return PlainTextResponse("This image is read with the user and the password it was mounted with.", status_code=401, headers={"WWW-Authenticate": 'Basic realm="qKVM"'})
+        wanted = byte_range(request.headers.get("range"), lending.image.size)
+        if wanted is None:
+            if "range" not in lending.refused:
+                lending.refused.add("range")
+                log.info("%s: its controller asked for %s with a range that could not be read as asked (%s), and was refused", record.name, lending.name, asked or "none")
+            return Response(status_code=416, headers={"Content-Range": f"bytes */{lending.image.size}", "Accept-Ranges": "bytes"})
+        # Its place among MOST_AT_ONCE is taken here, before the first wait, by a HEAD as well: reads that come together are
+        # counted together (Codex's M1: it was taken after the file was open, and never by a HEAD: 32 at once were all
+        # taken). It is given back once, on every road, by the reader thread that lets go of the file: never by this
+        # loop, which a restart of the listeners ends first (the second round, R2-M1).
+        if not lending.take(MOST_AT_ONCE):
+            return PlainTextResponse("Too many reads of this image at once.", status_code=503, headers={"Retry-After": "1"})
+        slot = Slot(lending)
+        loop = asyncio.get_running_loop()
+
+        def readers() -> Any:
+            return SERVED_READERS  # (as it is now: a test puts its own in place)
+
+        opening = Opening(lending, slot, readers)
+        try:
+            opening.pending = SERVED_READERS.submit(opening.run)
+        except RuntimeError:  # (the readers have stopped: qKVM stops)
+            slot.give_back()
+            return PlainTextResponse("qKVM is stopping.", status_code=503)
+        try:
+            handle = await asyncio.wrap_future(opening.pending)
+        except asyncio.CancelledError:
+            opening.abandon()  # (cut off while the file was being opened: the thread that opens it lets go of it)
+            raise
+        except OSError as ex:
+            slot.give_back()
+            if "changed" not in lending.refused:
+                lending.refused.add("changed")
+                log.warning("%s: its mounted image %s was changed, moved or removed in the folder, and is served no more: %s", record.name, lending.name, ex)
+            return PlainTextResponse("The image was changed or removed since it was mounted.", status_code=410)
+        first, last, part = wanted
+        headers = {"Accept-Ranges": "bytes", "Content-Length": str(last - first + 1)}
+        if part:
+            headers["Content-Range"] = f"bytes {first}-{last}/{lending.image.size}"
+        assert handle is not None  # (None only for a read that was cut off: it has not come back here)
+        if request.method == "HEAD":
+            hand_to_readers(readers, let_go_and_give_back, handle, slot)
+            return Response(status_code=206 if part else 200, headers=headers, media_type="application/octet-stream")
+        if lending.served == 0 and first == 0:
+            log.info("%s: its controller reads %s from qKVM", record.name, lending.name)
+        let_go: list[bool] = []
+
+        def done() -> None:
+            if let_go:
+                return
+            let_go.append(True)
+            hand_to_readers(readers, let_go_and_give_back, handle, slot)
+
+        async def pieces() -> AsyncIterator[bytes]:
+            at, left = first, last - first + 1
+            while left > 0 and still_lent(lending):
+                try:
+                    piece = await loop.run_in_executor(SERVED_READERS, read_at, handle, at, min(SERVED_PIECE, left))
+                except (OSError, ValueError):  # (the disk would not, or the file was closed under it as the answer was cut off)
+                    return
+                if not piece:
+                    return  # (shorter than it was: the answer ends short of its length)
+                at, left = at + len(piece), left - len(piece)
+                lending.served += len(piece)
+                yield piece
+
+        return Handed(pieces(), done, sent_while=lambda: still_lent(lending), status_code=206 if part else 200, headers=headers, media_type="application/octet-stream")
+
+    @app.put("/api/v1/devices/{device_id}/view")
+    async def set_amt_view(device_id: str, body: AmtViewIn, request: Request) -> Response:
+        """Which of its three views a PC with Intel AMT is in: health only (no KVM session at all), stills (a still now and
+        then for its tile; a session while its enlarged or live view is open), live KVM (a session held while its tile is
+        shown as well). A setting of the tile and of nothing else, so an operator may change it as an admin may (an operator
+        edits no tile otherwise); kept with the tile, in effect at once, and written down. One change at a time (_CHANGES)."""
+        record = store.device(device_id)
+        if record is None or not allowed(request, device_id):
+            return fail(404, "not_found", "Unknown device")
+        if is_token(request.state.user):
+            # (A token changes no setting of a tile, this one included: it looks and acts, as SECURITY.md says.)
+            return fail(403, "not_allowed", "A token does not change how a tile is set. Change its view on the wall's page.")
+        if record.kind != "amt":
+            return fail(422, "invalid", "Only a PC with Intel AMT has these views")
+        was = record.amt_view if record.amt_view in AMT_VIEWS else AMT_VIEWS[0]
+        if body.view == was:
+            return JSONResponse({"ok": True, "amt_view": was})  # (nothing changes, and nothing is written down)
+        changed = dataclasses.replace(record, amt_view=body.view)
+        at = store.devices.index(record)
+        store.devices[at] = changed  # (a new record in the old one's place: an edit under way notices)
+        device = manager.devices.get(device_id)
+        if isinstance(device, amt.AmtDevice):  # (none while the saved passwords are locked: the one made later reads the record)
+            device.set_view(body.view)
+
+        def undo() -> None:
+            if store.devices[at] is changed:
+                store.devices[at] = record
+            if isinstance(device, amt.AmtDevice) and manager.devices.get(device_id) is device:
+                device.set_view(was)
+
+        if refused := await saved("The view of this PC", undo):
+            return refused
+        audit.write("amt_view_changed", client_ip(request), device=record.name, device_id=device_id, view=body.view, was=was)
+        return JSONResponse({"ok": True, "amt_view": body.view})
+
     # --- the live line: one WebSocket per viewer, the picture down, keys and the mouse up (live.py) ---------------
     # The two calls of desktop/SPEC.md section 6.2: a pass, then the line that shows it. Everything behind them is in
     # live.py; what is here is who may ask, and what the guard above does for a request over HTTP and not for a WebSocket.
@@ -3430,7 +4235,7 @@ def create_app(core: Core) -> FastAPI:
         if device is None or not allowed(request, device_id):
             return fail(404, "not_found", "Unknown device")
         if not lines.offers(device):
-            return fail(404, "no_live", "This machine has no live picture")
+            return fail(404, "no_live", lines.why_no_live(device))
         user: UserRecord = request.state.user
         _, sent = asking(request)
         holder = live.Holder(
@@ -3618,6 +4423,38 @@ def create_app(core: Core) -> FastAPI:
         return JSONResponse(
             {"restart": restart, "urls": urls, "cert_fingerprint": core.cert_fingerprint if core.https else None}
         )
+
+    # Virtual media of servers (0.3.0, A4): the folder whose ISO images can be mounted on a server, and the wall's address as
+    # the servers' controllers reach it to read them (served.py).
+
+    @app.get("/api/v1/settings/media")
+    async def get_media_settings() -> dict[str, Any]:
+        return {"folder": store.server.media_folder, "address": store.server.media_address, "serving_at": core.served.base(), "https": core.https}
+
+    @app.put("/api/v1/settings/media")
+    async def put_media_settings(body: MediaSettingsIn, request: Request) -> Response:
+        folder, address = body.folder.strip(), body.address.strip()
+        if folder and not (os.path.isabs(folder) and await asyncio.to_thread(os.path.isdir, folder)):
+            return fail(422, "invalid", f"{folder} is no folder on the computer qKVM runs on: name the whole path of a folder that is there.")
+        if address:
+            said = address_of(address)
+            if said is None:
+                return fail(422, "invalid", "The address is http:// or https://, a host and a port, and nothing after them, as https://192.168.1.10:8787")
+            if not host_allowed(urlsplit(said).netloc, store.server.allowed_hosts):
+                # (A controller asks for the image by this name: refused as any request by a name qKVM is not told it has.)
+                return fail(422, "invalid", f"qKVM answers no request made to {urlsplit(said).hostname}: add that name to allowed_hosts first (see the README), or name the address by its number.")
+            address = said
+        server = store.server
+        before = (server.media_folder, server.media_address)
+        server.media_folder, server.media_address = folder, address
+
+        def as_it_was() -> None:
+            server.media_folder, server.media_address = before
+
+        if refused := await saved("These settings", as_it_was):
+            return refused
+        audit.write("media_settings_changed", client_ip(request), folder=folder, address=address)
+        return JSONResponse({"ok": True, "serving_at": core.served.base()})
 
     # --- the wall as a file: to keep, or to take to another wall ------------------
 
@@ -3855,7 +4692,8 @@ def create_app(core: Core) -> FastAPI:
                     record = DeviceRecord(
                         id=new_id(), name=device.name, url=device.url, username=device.username, open_url=device.open_url, tls=device.tls,
                         cert_pem=device.cert_pem, kind=device.kind, group=device.group, ident=device.ident, alerts=device.alerts,
-                        fingerbot_strength=device.fingerbot_strength,
+                        fingerbot_strength=device.fingerbot_strength, no_signal_minutes=device.no_signal_minutes,
+                        unchanged_minutes=device.unchanged_minutes, amt_view=device.amt_view,
                     )  # fmt: skip
                     # The machine it was added for, which its driver checks before anything is sent to it (DeviceSpec.machine). Where
                     # the file has none, the first look takes it.
@@ -3957,20 +4795,41 @@ def create_app(core: Core) -> FastAPI:
 
     @app.post("/api/v1/update/install")
     async def update_install(body: UpdateInstallIn, request: Request) -> Response:
-        ip = client_ip(request)
         if core.container:
             # An image is replaced as a whole; unpacking program files inside one would be undone by the next start.
             return fail(409, "container", "This copy runs from a container image: update by pulling the new image")
         if refused := await own_password(request, body.password):
             return refused
+        # As a task of its own that the request waits for, as removing machines is: cut off (a stop, the listeners opened
+        # again), the request lets go of it, and it runs on for the time a stopping wall gives such a task (lifespan), its
+        # activity entry written whichever way it ends; and no other install begins while it runs.
+        work = asyncio.ensure_future(installing(request))
+        background.add(work)
+        work.add_done_callback(background.discard)
+        try:
+            return await asyncio.shield(work)
+        except asyncio.CancelledError:
+            work.add_done_callback(unheard("installing an update"))
+            raise
+
+    async def installing(request: Request) -> Response:
+        """The installation of an update, and its activity entry (update_install)."""
+        ip = client_ip(request)
 
         def still_theirs() -> bool:
-            """Whether whoever asked may still have it installed: asked after the download, before anything is written, and
-            again once it is written, before qKVM is restarted into it."""
+            """Whether whoever asked may still have it installed: asked after the download, before anything is written, again
+            once all of it is written and tried, before it is named, and once it is named, before qKVM is restarted into it."""
             return still_allowed(request) is None
+
+        def brought() -> dict[str, list[str]]:
+            """What the activity entry names beside the version: the libraries it brought, where it brought any."""
+            return {"libraries": core.updater.brought} if core.updater.brought else {}
 
         try:
             version = await core.updater.install(still=still_theirs)
+        except asyncio.CancelledError:
+            audit.write("update_failed", ip, error="qKVM was stopped, or its listeners opened again, before it was done")
+            raise
         except NoLongerAllowed as ex:
             # (As for an action whose right was lost while it was under way: refused, and written down as not done.)
             audit.write("update_failed", ip, error=str(ex))
@@ -3994,9 +4853,9 @@ def create_app(core: Core) -> FastAPI:
             else:
                 note = "whoever asked for it lost the right while it was being installed"
                 said = "It was installed, and takes effect the next time qKVM starts. Whoever asked for it may not see more of it now"
-            audit.write("update_installed", ip, version=version, note=note)
+            audit.write("update_installed", ip, version=version, note=note, **brought())
             return fail(403, "stopped", said)
-        audit.write("update_installed", ip, version=version)
+        audit.write("update_installed", ip, version=version, **brought())
         if core.supervised:
             # Let this answer reach the browser, then leave; the starter runs the new version.
             asyncio.get_running_loop().call_later(1.0, core.restart_program)
@@ -4039,7 +4898,7 @@ def create_app(core: Core) -> FastAPI:
         try:
             found = proxmox.address_of(body.url)
         except ValueError as ex:
-            return fail(422, "invalid", str(ex).capitalize())
+            return not_taken(ex)
         def number_on_its_proxmox(url: str) -> tuple[str, int] | None:
             try:
                 where = proxmox.address_of(url)
@@ -4157,6 +5016,150 @@ def create_app(core: Core) -> FastAPI:
             return fail(502, "not_delivered", str(ex))
         delivered(None)
         return JSONResponse(alerts_view())
+
+    # --- alerts by Web Push: the browsers of each account (webpush.py) --------------------------------------------------
+    # Any account may have the alerts told to its own browsers, of the machines it may see; an admin sees and may remove
+    # everybody's. A token has no browser of its own (_OWN_ACCOUNT).
+
+    def push_view(record: PushRecord, user: UserRecord) -> dict[str, Any]:
+        sent, problem = pusher.told.get(record.id, (None, None))
+        if push_target(record) is None:
+            problem = "Its subscription does not open any more (the settings file was edited, or is damaged): remove it, and turn alerts on again in that browser."
+        return {
+            "id": record.id, "name": record.name, "service": record.service, "created": record.created,
+            "account": account_named(record.user), "mine": record.user == user.id, "last_sent": sent, "last_error": problem,
+        }  # fmt: skip
+
+    def own_push(push_id: str, user: UserRecord, admins_too: bool) -> PushRecord | None:
+        return next((p for p in store.pushes if p.id == push_id and (p.user == user.id or (admins_too and user.role == "admin"))), None)
+
+    @app.get("/api/v1/push")
+    async def push_state(request: Request) -> dict[str, Any]:
+        """The wall's key a browser subscribes with (null until one is made), whether the wall sends alerts at all, and the
+        browsers told them: the account's own, and for an admin everybody's."""
+        user: UserRecord = request.state.user
+        key = push_key()
+        shown = [p for p in store.pushes if p.user == user.id or user.role == "admin"]
+        return {"key": key.public_text if key is not None else None, "alerts": store.alerts.enabled, "browsers": [push_view(p, user) for p in shown]}
+
+    @app.post("/api/v1/push/key")
+    async def push_key_made(request: Request) -> Response:
+        """Make the wall's key for Web Push where it has none (the first browser to be told the alerts asks); its public half."""
+        if (key := push_key()) is not None:
+            return JSONResponse({"key": key.public_text})
+        if not core.vault.unlocked:
+            return fail(503, "locked", "The saved passwords are locked just now. Sign in again and try once more.")
+        before, pushes = store.alerts.push_key, store.pushes
+        store.alerts.push_key = core.vault.encrypt(webpush.new_key(), PUSH_KEY_FOR)
+        if before is not None:
+            # Made anew over one that does not open: a browser that subscribed to that one hears nothing from this one.
+            store.pushes = []
+
+        def undo() -> None:
+            store.alerts.push_key, store.pushes = before, pushes
+
+        if refused := await saved("The wall's key for push", undo):
+            return refused
+        for record in pushes if before is not None else []:
+            pusher.forget(record.id)
+        audit.write("push_key_made", client_ip(request), **({"replaced": True} if before is not None else {}))
+        made = push_key()
+        return JSONResponse({"key": made.public_text if made is not None else None})
+
+    @app.post("/api/v1/push")
+    async def push_subscribe(body: PushIn, request: Request) -> Response:
+        """This browser, told the alerts from now on: its subscription, as its push service gave it to it."""
+        user: UserRecord = request.state.user
+        key = push_key()
+        if key is None:
+            return fail(409, "conflict", "The wall has no key for push yet. Open Settings > Alerts again, and turn alerts on there.")
+        if body.key and body.key != key.public_text:
+            return fail(409, "changed", "The wall's key for push is another one by now. Turn alerts on again in this browser.")
+        try:
+            subscription = webpush.check(body.endpoint, body.keys.p256dh, body.keys.auth)
+        except ValueError as ex:
+            return fail(422, "invalid", str(ex))
+        name = " ".join((as_a_line(body.name) or "").split())[:60] or "A browser"
+        # The same browser again (turned on once more, or by another account signed in there now): the one record, for whoever
+        # turned it on last, where that is its own account or an admin (whoever has a browser's address would otherwise have it
+        # told their alerts). Known by its address, which is its own: opened from the vault to be compared.
+        same = next((p for p in store.pushes if (t := push_target(p)) is not None and t.subscription.endpoint == subscription.endpoint), None)
+        if same is not None and same.user != user.id and user.role != "admin":
+            return fail(409, "conflict", "This browser is told another account's alerts. That account or an admin removes it first (Settings > Alerts).")
+        if sum(p.user == user.id and p is not same for p in store.pushes) >= MOST_BROWSERS_EACH:
+            return fail(409, "conflict", f"An account has {MOST_BROWSERS_EACH} browsers told the alerts at the most. Remove one first.")
+        if same is None and len(store.pushes) >= MOST_BROWSERS:
+            return fail(409, "conflict", f"The wall tells {MOST_BROWSERS} browsers the alerts at the most. An admin removes some first.")
+        sealed = json.dumps({"endpoint": subscription.endpoint, "p256dh": webpush.b64(subscription.p256dh), "auth": webpush.b64(subscription.auth)})
+        if same is not None:
+            record, before = same, dataclasses.replace(same)
+            record.user, record.name, record.service = user.id, name, subscription.host
+            record.secret = core.vault.encrypt(sealed, f"push:{record.id}")
+
+            def undo() -> None:
+                for each in dataclasses.fields(before):
+                    setattr(record, each.name, getattr(before, each.name))
+
+        else:
+            taken = {p.id for p in store.pushes}
+            while (made := secrets.token_hex(4)) in taken:
+                pass
+            record = PushRecord(id=made, user=user.id, name=name, service=subscription.host, created=time.time())
+            record.secret = core.vault.encrypt(sealed, f"push:{record.id}")
+            store.pushes.append(record)
+
+            def undo() -> None:
+                store.pushes.remove(record)
+
+        if refused := await saved("This browser's alerts", undo):
+            return refused
+        pusher.told.pop(record.id, None)
+        audit.write("push_subscribed", client_ip(request), browser=record.name, service=record.service)
+        return JSONResponse(push_view(record, user), status_code=201)
+
+    @app.delete("/api/v1/push/{push_id}")
+    async def push_remove(push_id: str, request: Request) -> Response:
+        """A browser told the alerts no more: the account's own, or for an admin anybody's."""
+        user: UserRecord = request.state.user
+        record = own_push(push_id, user, admins_too=True)
+        if record is None:
+            return fail(404, "not_found", "No such browser is told the alerts")
+        place = store.pushes.index(record)
+        store.pushes.remove(record)
+        if refused := await saved("Taking this browser off", lambda: store.pushes.insert(place, record)):
+            return refused
+        pusher.forget(record.id)
+        audit.write("push_removed", client_ip(request), account=account_named(record.user), browser=record.name, why="removed")
+        return JSONResponse({"ok": True})
+
+    @app.post("/api/v1/push/{push_id}/test")
+    async def push_test(push_id: str, request: Request) -> Response:
+        """A test alert to one of the account's own browsers: at once and one attempt, for whoever pressed the button is waiting."""
+        user: UserRecord = request.state.user
+        record = own_push(push_id, user, admins_too=False)
+        if record is None:
+            return fail(404, "not_found", "No such browser of yours is told the alerts")
+        target = push_target(record)
+        if target is None:
+            return fail(502, "not_delivered", "This browser's subscription does not open any more. Turn alerts on again in it.")
+        # A request to the address the browser gave, which an account may choose: one every few seconds of each account.
+        tested, now = core.push_tested, time.monotonic()
+        if (wait := PUSH_TEST_EVERY - (now - tested.get(user.id, -PUSH_TEST_EVERY))) > 0:
+            return fail(429, "rate_limited", f"A test was sent a moment ago. Try again in {math.ceil(wait)} s.", **{"Retry-After": str(math.ceil(wait))})
+        if len(tested) >= 1000:
+            tested.clear()  # (as many accounts as there may be: forgetting them all lets each one test once more)
+        tested[user.id] = now
+        sample = alerts.Alert("test", "qKVM", "", "online", "online", "Test alert from qKVM", "If you can read this, alerts will reach this browser.")
+        try:
+            await pusher.send(target, webpush.payload(sample), webpush.urgency(sample.kind))
+        except webpush.NotDelivered as ex:
+            pusher.told[record.id] = (pusher.told.get(record.id, (None, None))[0], str(ex))
+            if not ex.gone:
+                return fail(502, "not_delivered", str(ex))
+            await push_gone(record.id)  # (taken off in the turn of changes, one_change, as one that is gone at an alert)
+            return fail(502, "not_delivered", f"{ex}. It was taken off the list: turn alerts on again in this browser.")
+        pusher.told[record.id] = (time.time(), None)
+        return JSONResponse(push_view(record, user))
 
     def asked_of(
         q: list[str] | None, kind: str, before: float | None, since: float | None, until: float | None, user: str | None, device: str | None

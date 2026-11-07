@@ -81,6 +81,11 @@ core-metadata-version = "2.4"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# A test that hangs ends the run with the stack of every thread, rather than hold a runner until its job is cancelled (0.2.2:
+# a run on GitHub's Windows 3.12 said nothing for twenty minutes after a test of the activity log, until the job's ninety ran
+# out). Fifteen minutes for each test with its fixtures: the slowest take a few on a slow runner. (pytest's own faulthandler.)
+faulthandler_timeout = 900
+faulthandler_exit_on_timeout = true
 
 # What is checked on every push, besides the tests:  ruff check .   and   mypy
 [tool.ruff]

@@ -27,6 +27,7 @@ import uvicorn
 from qkvm import __main__ as starter
 from qkvm import _folders, activity, cli, store
 from qkvm.alerts import Watcher
+from qkvm.screens import ScreenWatch, Seen
 from qkvm.security import Sessions
 from tests.test_control import free_port, served_and_left
 
@@ -103,6 +104,9 @@ def test_what_is_kept_over_a_restart_and_what_the_starter_writes_are_their_own(t
     sessions = Sessions(folder / "sessions.json")
     sessions._write("{}")
     Watcher(folder / "watch.json").write("{}")
+    screens = ScreenWatch(folder)  # (which screen alerts stand, and the picture one kept: whatever that screen showed)
+    screens._write('{"told": {}}')
+    stamp = screens.keep("ab12cd34", Seen(b"\xff\xd8 a picture", "image/jpeg", True, 0.0, 0.0, 1))
     cli.leave_request(folder, "stop")
     (folder / "updates").mkdir()
     starter.written(folder / "updates" / "current.json", '{"version": "9.9.9"}')
@@ -114,6 +118,7 @@ def test_what_is_kept_over_a_restart_and_what_the_starter_writes_are_their_own(t
     cli.remember(elsewhere)
     made = {**everything_in(folder), **everything_in(home)}
     assert {"sessions.json", "watch.json", cli.ASK_FILE, str(Path("updates") / "current.json"), "qkvm.log", cli.KNOWN} <= set(made), made
+    assert {"screens.json", str(Path("alert-pictures") / f"ab12cd34-{stamp}.jpg")} <= set(made), made
     assert {name: why for name, why in made.items() if why is not None} == {}, made
 
 

@@ -9,3 +9,4 @@ qkvm/**/__pycache__
 !.github
 !.github/security
 !.github/security/assemble-runtime.py
+!.github/security/image-libraries.txt

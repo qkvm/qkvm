@@ -1,0 +1,7 @@
+# What makes a release's lock (make-libraries.py), each pinned by the hash of its universal wheel, and nothing else:
+#     python -m venv locker && locker/bin/python -m pip install --require-hashes --no-deps --only-binary :all: -r .github/security/lock-requirements.txt
+# pip resolves each target's closure (--dry-run --report); packaging reads wheel names and tags, as the program's own
+# reader of the lock does. pip 26.0.1 is the wheel CPython 3.14 bundles (ensurepip), byte for byte PyPI's; packaging is the
+# build's (build-requirements.txt).
+pip==26.0.1 --hash=sha256:bdb1b08f4274833d62c1aa29e20907365a2ceb950410df15fc9521bad440122b
+packaging==26.3 --hash=sha256:d7193f7c8e4e93f444fde0262bf90af30e16fa0ad0ad44cb553c87339b23cd1c

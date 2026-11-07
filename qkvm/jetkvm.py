@@ -53,6 +53,7 @@ from websockets.exceptions import ConnectionClosed, InvalidStatus, WebSocketExce
 from .kvm import (
     DOWN_CODES,
     FULL,
+    IMAGE_NAME,
     KEYS,
     LOGIN_BACKOFF,
     LOGIN_RETRY,
@@ -60,15 +61,26 @@ from .kvm import (
     MAX_TEXT,
     MAX_PROBE,
     MAX_REPLY,
+    MEDIA_NOTES,
+    MOST_DEVICE_IMAGES,
+    NAME_RULE,
+    PARTIAL,
     REJECTED,
     RETIRED,
     TIERS,
     TOKEN,
+    UPLOAD_MOST,
+    UPLOAD_WAITS,
+    AlreadySo,
+    Carried,
     Device,
     DeviceSpec,
     KvmError,
     Listening,
+    MediaOffer,
     Snapshot,
+    UploadCut,
+    _dig,
     _looked_at,
     _transport_error,
     as_text,
@@ -82,7 +94,9 @@ from .kvm import (
     said_cookie,
     share_window,
     sign_in_waits,
+    system_context,
     tier_for,
+    too_small_for_a_cd,
     unverified_context,
     went_out,
     ws_connect,
@@ -115,6 +129,14 @@ FRAME_STALE = 5.0
 # FRAME_STALE (a real one once sent none on the connection it had when its computer was woken, and a new connection had
 # the picture at once). Longer than the slowest first picture a real one gave a connection after a long rest (some fifteen).
 PICTURE_AFTER_SIGNAL = 20.0
+# A JetKVM that sends no key frame when asked for one (decoding fell behind on a busy computer, and what comes is let go of up
+# to one) is made anew: a new connection begins with one. On a computer too slow for its video that came about again on every
+# new connection, every FRAME_STALE, its keys let go of each time: each time in a row it waits twice as long before (the
+# connection kept meanwhile, its keys and viewer with it), DEAF_MOST at the most; a row ends DEAF_FORGIVEN after its last.
+# Kept by address, beside the connections (a client made anew, at an edit or an unlock, began the row again).
+DEAF_MOST = 40.0
+DEAF_FORGIVEN = 600.0
+_DEAF: dict[str, tuple[int, float]] = {}  # by address: connections made anew for that in a row, and when the last one was
 RETRY_PAUSE = 3.0  # after a refusal (wrong password, ...), wait this long before asking again
 JET_NO_SAID = "Login rejected - check the password"  # what its tile says where it does not take the saved one
 LOGIN_WAIT_MOST = 3600.0  # the longest a JetKVM that refuses logins can have the wall wait before it tries again
@@ -169,6 +191,10 @@ UNWATCHED = 300.0
 # Which JetKVM answers at a tile's address (see JetKvmDevice._same_jetkvm): while another one does, it is asked again this
 # often, and not at every look.
 SAME_JETKVM_EVERY = 60.0
+# A mount or an unmount that binds its USB device anew (a change between CD-ROM and disk) takes it a second and more: it
+# is waited for this long. And the id of an upload, as it hands one out ("upload_" and a UUID).
+MOUNT_WITHIN = 30.0
+UPLOAD_ID = re.compile(r"upload_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 # What a tile says, and a key, a text or a button is answered with, where the JetKVM at its address is not the one it was
 # added for.
 ANOTHER_JETKVM = (
@@ -556,6 +582,11 @@ class JetKvmDevice(Device):
         # The number the JetKVM that answers gave for itself, as last asked (own_number): "" where it gives none, None where it
         # was not read (what `identify` says, see the server's connect).
         self._seen: str | None = None
+        # Its virtual media as it said it last (getVirtualMediaState), and whether it has any (an older one has no such
+        # question); the images of its own storage as listed last, by name: their size and their time.
+        self._vm: dict[str, Any] | None = None
+        self._vm_known = False
+        self._listed: dict[str, tuple[Any, Any]] = {}
 
     def takes_over(self, retired: Device) -> None:
         # Somebody opened the JetKVM's own console and so took its one viewer: the wall stepped aside, and
@@ -1003,6 +1034,11 @@ class JetKvmDevice(Device):
             return session
         if self._displaced:
             raise IN_USE.with_traceback(None)
+        if self._offer_failed is not None and not (urgent or asked):
+            # A tile's look that came while the connection was being made, and waited for it: it came to nothing meanwhile (see
+            # `_note_offer`), and the look says what every look after it says. Said as how that connection ended ("timeout"),
+            # it was "offline" of a JetKVM that answers, between looks that said it has a problem (0.2.2, a loaded runner).
+            raise self._offer_failed.with_traceback(None)
         # (`session.lost`: it closed the channel it is asked over a moment ago, and the connection is on its
         # way out. That is the device having dropped out, and nothing was sent: said as "taking too long",
         # the page showed a key press as one that "may have been done".)
@@ -1198,9 +1234,13 @@ class JetKvmDevice(Device):
                     stalled = time.monotonic() - session.frame_at > FRAME_STALE
                 if stalled and session.frame is not None and getattr(session.decoding, "awaiting_key_frame", False):
                     # Its video comes, and is let go of up to a key frame it does not send when asked: not a JetKVM that stopped
-                    # sending video, nor one that is down. Made anew: a new connection begins with one (the review's P1).
-                    self._make_anew(session, "it sent no key frame when asked for one")
-                    continue
+                    # sending video, nor one that is down. Made anew: a new connection begins with one (the review's P1). After
+                    # one made anew for that a moment ago, once it waited longer (DEAF_MOST); meanwhile it is the connection.
+                    if time.monotonic() - session.frame_at > self._deaf_wait():
+                        self._deaf_once_more()
+                        self._make_anew(session, "it sent no key frame when asked for one")
+                        continue
+                    stalled = False
                 if stalled and session.ready_said is not False and session.lost is None:
                     session.lost = KvmError("dropped", "The JetKVM sent no picture" if session.frame is None else "The JetKVM stopped sending video")
                 ended = session.video_ended_at
@@ -1292,6 +1332,20 @@ class JetKvmDevice(Device):
         if session.lost is not None:
             return session.lost.with_traceback(None)
         return KvmError("dropped", "The connection to the JetKVM ended")
+
+    def _deaf_wait(self) -> float:
+        """How long a connection whose JetKVM sends no key frame when asked has no picture before it is made anew (DEAF_MOST)."""
+        times, last = _DEAF.get(self.spec.base_url, (0, float("-inf")))
+        if time.monotonic() - last > DEAF_FORGIVEN:
+            times = 0
+        return float(min(FRAME_STALE * 2 ** min(times, 10), max(DEAF_MOST, FRAME_STALE)))
+
+    def _deaf_once_more(self) -> None:
+        now = time.monotonic()
+        times, last = _DEAF.pop(self.spec.base_url, (0, float("-inf")))
+        _DEAF[self.spec.base_url] = (1 if now - last > DEAF_FORGIVEN else times + 1, now)  # (the newest last)
+        while len(_DEAF) > 1024:
+            del _DEAF[next(iter(_DEAF))]
 
     def _ask_key_frame(self, session: _Session, receiver: Any) -> None:
         """Decoding fell behind the JetKVM's video (a busy computer), and what waited was let go of (video.BoundedDecoderQueue):
@@ -2535,6 +2589,282 @@ class JetKvmDevice(Device):
                 targets.append({"mac": mac, "name": plain(entry.get("name")) or ""})
         return targets
 
+    # --- virtual media (0.3.0, A3): the JetKVM's own image storage ---------------------------------------------------
+    # Read from its firmware's source (jsonrpc.go and usb_mass_storage.go at dev d646be8, the same in release 0.5.9). Over the
+    # `rpc` channel of the connection the wall holds, which is only ever arranged with the JetKVM this tile was added for (it
+    # is asked which it is before every connection: `_same_jetkvm`): getVirtualMediaState (null, or `source` "Storage" or
+    # "HTTP", `mode` "CDROM" or "Disk", `filename`, `size`), listStorageFiles (`files`: `filename`, `size`, `createdAt`),
+    # getStorageSpace (`bytesUsed`, `bytesFree`), mountWithStorage (`filename`, `mode`), unmountImage, deleteStorageFile
+    # (`filename`), and startStorageFileUpload (`filename`, `size`: an upload it opens as `<name>.incomplete`, answered with
+    # `alreadyUploadedBytes` and the upload's id, and drops where nothing claims it within a minute), whose bytes go by
+    # POST /storage/upload?uploadId= under the same sign-in, on a connection of their own: before it, the JetKVM that answers
+    # at the address is asked again which it is, under the session the upload goes with (and the id is one only the JetKVM
+    # that handed it out knows). One image at a time. Its drive is read-only whichever it is (the firmware's gadget has
+    # `ro` set for good); a change between CD-ROM and disk binds its whole USB device anew, and its keyboard and mouse drop
+    # for a moment (`drops_input`). Never mountWithHTTP nor checkMountUrl (the JetKVM fetches the address: a way into the
+    # network it stands in), nor its built-in images, nor setMassStorageMode.
+
+    @property
+    def _media_key(self) -> str:
+        return f"{self.spec.id}\0{self.spec.base_url}"
+
+    def _media_offer(self, atx: bool) -> MediaOffer | None:
+        if not self._vm_known:
+            return None  # (not asked yet, or an older JetKVM that has no such methods)
+        return MediaOffer(drives=("cd", "disk"), boot=(), restart=atx, upload=True, where="device", delete=True, drops_input=True)
+
+    def media_offer(self) -> MediaOffer | None:
+        return self._media_offer("reset" in self.abilities())
+
+    def _vm_said(self, said: Any) -> None:
+        """What getVirtualMediaState answered (a KvmError where it did not): kept, and whether the JetKVM has the methods."""
+        if isinstance(said, KvmError):
+            if said.code == "action_failed" and said.message == "Method not found":
+                self._vm_known, self._vm = False, None
+            return  # (anything else: no answer, and what was known stays)
+        self._vm_known, self._vm = True, said if isinstance(said, dict) else None
+
+    def media_now(self) -> dict[str, Any] | None:
+        vm = self._vm
+        if not self._vm_known or not isinstance(vm, dict):
+            return None
+        drive = "cd" if vm.get("mode") == "CDROM" else "disk"
+        if vm.get("source") == "Storage" and isinstance(vm.get("filename"), str) and IMAGE_NAME.fullmatch(vm["filename"]):
+            image = name = vm["filename"]
+        elif vm.get("source") == "Storage":
+            image = name = plain(vm.get("filename"), 200) or "an image"
+        else:
+            # (Mounted at the JetKVM's own page from an address: what the address is, is not said, it may hold a password.)
+            image, name = "(an address)", "an image from an address, mounted at the JetKVM's own page"
+        by, at = MEDIA_NOTES.who(self._media_key, image)
+        stamp = self._listed.get(image)
+        sha = MEDIA_NOTES.hash_of(self._media_key, image, *stamp) if stamp is not None else None
+        return {"drive": drive, "image": image, "name": name, "where": None, "read_only": True, "first": None, "by": by, "at": at, "sha256": sha}
+
+    async def _vm_asked(self, session: _Session) -> dict[str, Any] | None:
+        said = await self._call(session, "getVirtualMediaState")
+        self._vm_said(said)
+        return self._vm
+
+    async def _files(self, session: _Session) -> tuple[list[dict[str, Any]], int]:
+        """The images of its own storage, each by its kind, partial ones (an upload under way or cut off) as such; and how
+        many entries were left out."""
+        said = await self._call(session, "listStorageFiles")
+        found = said.get("files") if isinstance(said, dict) else None
+        images: list[dict[str, Any]] = []
+        left_out = 0
+        listed: dict[str, tuple[Any, Any]] = {}
+        for entry in found if isinstance(found, list) else ():
+            filename = entry.get("filename") if isinstance(entry, dict) else None
+            partial = isinstance(filename, str) and filename.endswith(PARTIAL)
+            base = filename[: -len(PARTIAL)] if partial and isinstance(filename, str) else filename
+            if not isinstance(filename, str) or not isinstance(base, str) or not IMAGE_NAME.fullmatch(base) or len(images) >= MOST_DEVICE_IMAGES:
+                left_out += 1
+                continue
+            size = number(entry.get("size"), 0, 2**50)
+            stamp = plain(entry.get("createdAt"), 60)
+            listed[filename] = (size, stamp)
+            sha = None if partial else MEDIA_NOTES.hash_of(self._media_key, filename, size, stamp)
+            images.append({"id": filename, "name": base, "where": None, "size": size, "partial": partial, "sha256": sha})
+        images.sort(key=lambda one: (one["name"].casefold(), one["partial"]))
+        self._listed = listed
+        return images, left_out
+
+    async def _media_session(self) -> _Session:
+        """The connection a call of its virtual media goes over: the one held, or one made now (as for a key)."""
+        session = await self._connected(urgent=True)
+        if session.taken:
+            raise IN_USE.with_traceback(None)
+        return session
+
+    async def media_images(self) -> dict[str, Any]:
+        session = await self._media_session()
+        await self._vm_asked(session)
+        if not self._vm_known:
+            raise KvmError("no_virtual_media", "This JetKVM has no virtual media that qKVM can use", 404)
+        images, left_out = await self._files(session)
+        space: dict[str, Any] | None = None
+        try:
+            said = await self._call(session, "getStorageSpace")
+            used, free = number(_dig(said, "bytesUsed"), 0, 2**60), number(_dig(said, "bytesFree"), 0, 2**60)
+            space = {"free": free, "size": used + free} if used is not None and free is not None else None
+        except KvmError as ex:
+            if ex.code in ("in_use", "dropped") or self._closed:
+                raise
+        return {"images": images, "unseen": [], "left_out": left_out, "notes": [], "space": space}
+
+    async def media_mount(self, image: str, *, drive: str, writable: bool, by: str, still: Callable[[], bool] | None = None) -> str | None:
+        if drive not in ("cd", "disk") or writable:
+            raise KvmError("invalid", "A JetKVM takes an image as a CD-ROM drive or a disk, read-only either way", 422)
+        if not IMAGE_NAME.fullmatch(image) or image.endswith(PARTIAL):
+            raise KvmError("invalid", "That is not an image of the JetKVM's that qKVM lists", 422)
+        session = await self._media_session()
+        images, _ = await self._files(session)
+        found = next((one for one in images if one["id"] == image), None)
+        if found is None:
+            raise KvmError("changed", f"{image} is not on the JetKVM's own storage any more: look again.", 409)
+        if drive == "cd" and isinstance(found.get("size"), int) and (small := too_small_for_a_cd(image, found["size"], "a disk")):
+            raise small
+        await self._vm_asked(session)
+        now = self.media_now()
+        if now is not None:
+            if (now["image"], now["drive"]) == (image, drive):
+                return "It was mounted so already."
+            raise KvmError("changed", f"{now['name']} is mounted on it now: unmount it first.", 409)
+        if still is not None and not still():
+            raise KvmError("stopped", "It was not done: whoever asked for it may no longer do that", 403)
+        try:
+            await self._call(session, "mountWithStorage", {"filename": image, "mode": "CDROM" if drive == "cd" else "Disk"}, within=MOUNT_WITHIN)
+        except KvmError as ex:
+            if ex.code == "dropped":
+                raise _not_sent("media", ex) from None
+            raise
+        MEDIA_NOTES.mounted_by(self._media_key, image, by)
+        self._status_at = 0.0
+        await self._vm_asked(session)
+        now = self.media_now()
+        if now is None or (now["image"], now["drive"]) != (image, drive):
+            raise KvmError("action_failed", "The JetKVM does not say it has the image in its drive as it was asked: look at it on its own page.")
+        return None
+
+    async def media_restart(self, *, still: Callable[[], bool] | None = None) -> str | None:
+        if "reset" not in self.abilities():
+            raise KvmError("invalid", "This JetKVM has no ATX power extension switched on to restart the machine with", 422)
+        on = flag(_dig(_dig(self._status, "atx"), "power"))
+        action = "atx_power" if on is False else "atx_reset"
+        await self.act(action, still=still)
+        said = "It was off, and was switched on with its power button" if action == "atx_power" else "It was restarted with its reset button"
+        return f"{said}: pick the JetKVM's drive in its boot menu where it does not start from it by itself."
+
+    async def media_unmount(self, image: str, *, still: Callable[[], bool] | None = None) -> str | None:
+        session = await self._media_session()
+        await self._vm_asked(session)
+        now = self.media_now()
+        if now is None:
+            raise AlreadySo("nothing was mounted")
+        if now["image"] != image:
+            raise KvmError("changed", f"{now['name']} is mounted on it now, and not {image}: nothing was taken out. Look at it again.", 409)
+        if still is not None and not still():
+            raise KvmError("stopped", "It was not done: whoever asked for it may no longer do that", 403)
+        try:
+            await self._call(session, "unmountImage", within=MOUNT_WITHIN)
+        except KvmError as ex:
+            if ex.code == "dropped":
+                raise _not_sent("media", ex) from None
+            raise
+        MEDIA_NOTES.mounted.pop(self._media_key, None)
+        self._status_at = 0.0
+        if await self._vm_asked(session) is not None:
+            raise KvmError("action_failed", "The JetKVM says the image is still in its drive: look at it on its own page.")
+        return None
+
+    async def media_delete(self, image: str, *, still: Callable[[], bool] | None = None) -> str | None:
+        base = image[: -len(PARTIAL)] if image.endswith(PARTIAL) else image
+        if not IMAGE_NAME.fullmatch(base):
+            raise KvmError("invalid", "That is not an image of the JetKVM's that qKVM lists", 422)
+        session = await self._media_session()
+        images, _ = await self._files(session)
+        if not any(one["id"] == image for one in images):
+            raise AlreadySo("it was not on the JetKVM any more")
+        await self._vm_asked(session)
+        if (now := self.media_now()) is not None and now["image"] == image:
+            raise KvmError("busy", f"{image} is mounted: unmount it first.", 409)
+        if still is not None and not still():
+            raise KvmError("stopped", "It was not done: whoever asked for it may no longer do that", 403)
+        await self._call(session, "deleteStorageFile", {"filename": image})
+        MEDIA_NOTES.forget(self._media_key, image)
+        images, _ = await self._files(session)
+        if any(one["id"] == image for one in images):
+            raise KvmError("action_failed", "The JetKVM says the image is still on its storage: look at it on its own page.")
+        return None
+
+    async def media_discard(self, name: str) -> str | None:
+        if not IMAGE_NAME.fullmatch(name):
+            return None
+        try:
+            session = await self._media_session()
+            images, _ = await self._files(session)
+            if not any(one["id"] == name + PARTIAL for one in images):
+                return None
+            await self._call(session, "deleteStorageFile", {"filename": name + PARTIAL})
+            images, _ = await self._files(session)
+        except KvmError as ex:
+            return f"What was written of it may be on the JetKVM still, as {name}{PARTIAL} ({ex.message}): delete it there."
+        if any(one["id"] == name + PARTIAL for one in images):
+            return f"What was written of it is on the JetKVM still, as {name}{PARTIAL}: delete it there."
+        return None
+
+    async def media_upload(self, name: str, carried: Carried, *, by: str, still: Callable[[], bool] | None = None) -> dict[str, Any]:
+        if not IMAGE_NAME.fullmatch(name) or name.endswith(PARTIAL):
+            raise KvmError("invalid", NAME_RULE, 422)
+        session = await self._media_session()
+        images, _ = await self._files(session)
+        if any(one["id"] == name for one in images):
+            raise KvmError("duplicate", f"{name} is on the JetKVM's own storage already: delete it first, or upload it under another name.", 409)
+        if any(one["id"] == name + PARTIAL for one in images):
+            # (Resumed, the JetKVM would add to it: not this image whole, and not the hash of it.)
+            raise KvmError("duplicate", f"A part of an earlier upload of {name} is on the JetKVM: delete it in the list first, or upload it under another name.", 409)
+        space = await self._call(session, "getStorageSpace")
+        free = number(_dig(space, "bytesFree"), 0, 2**60)
+        if free is not None and carried.size > free:
+            raise KvmError("no_space", f"The JetKVM's own storage has {free:,} bytes free, and the image is {carried.size:,}: delete an image there first.", 507)
+        if still is not None and not still():
+            raise KvmError("stopped", "It was not done: whoever asked for it may no longer do that", 403)
+        started = await self._call(session, "startStorageFileUpload", {"filename": name, "size": carried.size})
+        upload_id = _dig(started, "dataChannel")
+        if not isinstance(upload_id, str) or not UPLOAD_ID.fullmatch(upload_id) or _dig(started, "alreadyUploadedBytes") != 0:
+            left = await self.media_discard(name) if _dig(started, "alreadyUploadedBytes") == 0 else None
+            raise KvmError("bad_response", f"The JetKVM did not open the upload as it was asked. {left or ''}".strip())
+        try:
+            reply = await self._carry(carried, upload_id)
+        except BaseException as ex:
+            if isinstance(ex, (KvmError, UploadCut, httpx.HTTPError)) and not self._closed and ex is not RETIRED:
+                left = await self.media_discard(name)
+                raise self._cut_said(ex, carried, left) from None
+            raise
+        if reply.status_code != 200:
+            left = await self.media_discard(name)
+            if reply.status_code == 401:
+                raise KvmError("action_failed", f"The JetKVM did not take qKVM's session for the upload (somebody signed in to it meanwhile): try again. {left or 'Nothing of it is left on the JetKVM.'}")
+            raise KvmError("action_failed", f"The JetKVM did not take the image (HTTP {reply.status_code}). {left or 'Nothing of it is left on the JetKVM.'}")
+        images, _ = await self._files(session)
+        found = next((one for one in images if one["id"] == name), None)
+        if found is None or found["size"] != carried.size or any(one["id"] == name + PARTIAL for one in images):
+            # (It answers "Upload completed" to a body that ended early, and keeps what came as `.incomplete`.)
+            left = await self.media_discard(name)
+            raise KvmError("action_failed", f"The JetKVM does not list the image whole after its upload. {left or 'Nothing of it is left on the JetKVM.'}")
+        assert carried.sha256 is not None
+        MEDIA_NOTES.carried(self._media_key, name, carried.sha256, carried.size, self._listed.get(name, (None, None))[1])
+        return {**found, "sha256": carried.sha256}
+
+    def _cut_said(self, ex: BaseException, carried: Carried, left: str | None) -> KvmError:
+        rest = left or "Nothing of it is left on the JetKVM."
+        if carried.cut is not None:
+            return KvmError("disconnected", f"{carried.cut}. {rest}", 400)
+        if isinstance(ex, httpx.HTTPError):
+            ex = _transport_error(ex, self.spec.tls)
+        if isinstance(ex, KvmError):
+            return KvmError(ex.code if ex.code in ("timeout", "dropped", "unreachable", "stopped", "another_machine") else "action_failed", f"The upload did not get through to the JetKVM ({ex.message}). {rest}", ex.status)
+        return KvmError("action_failed", f"The upload did not get through to the JetKVM. {rest}")
+
+    async def _carry(self, carried: Carried, upload_id: str) -> httpx.Response:
+        """POST /storage/upload with the image as its body, its length said, on a connection of its own (closed after it), a
+        piece at a time; after the JetKVM that answers at the address was asked which it is, under the session it goes with."""
+        await self._http()  # (how the certificate is checked is settled there)
+        token = await self._login()
+        try:
+            await self._same_jetkvm(token)
+        except _SessionRefused:
+            raise KvmError("action_failed", "The JetKVM did not take qKVM's session for the upload (somebody signed in to it meanwhile): try again.") from None
+        verify = self._tls if self._tls is not None else await system_context()  # (as the connection every look uses: see Device._http)
+        async with httpx.AsyncClient(base_url=self.spec.base_url, verify=verify, timeout=UPLOAD_WAITS, trust_env=False) as client:
+            request = client.build_request(
+                "POST", "/storage/upload", params={"uploadId": upload_id},
+                headers={**self._cookie(token), "Content-Length": str(carried.size), "Content-Type": "application/octet-stream"},
+                content=carried,
+            )  # fmt: skip
+            return await self._send(client, request, MAX_REPLY, UPLOAD_MOST)
+
     # --- status -------------------------------------------------------------
 
     async def _read_status(self, again: bool = True) -> dict[str, Any]:
@@ -2589,11 +2919,12 @@ class JetKvmDevice(Device):
             self._call(session, "getUSBState"),
             self._call(session, "getActiveExtension"),
             self._version(session),
+            self._call(session, "getVirtualMediaState"),  # (what is in its drive, and whether it has one: `media`)
             return_exceptions=True,
         )
         if session.taken or any(isinstance(answer, KvmError) and answer.code == "in_use" for answer in answers):
             return {"state": "busy", "error": IN_USE.as_dict(), "kind": self.kind}  # (its own page took it meanwhile)
-        video, usb, extension, version = answers  # each is what the JetKVM said, or the error asking it ended in
+        video, usb, extension, version, media = answers  # each is what the JetKVM said, or the error asking it ended in
         if video is RETIRED:
             # Cut off as this client was closed (the tile edited or removed, the wall locking itself or stopping): nothing
             # was heard of the JetKVM, and nothing is said of it.
@@ -2614,6 +2945,7 @@ class JetKvmDevice(Device):
             session.wake.set()  # (the connection's loop looks at once, and lets go: the review's R16)
             return {"state": "offline", "error": session.lost.as_dict(), "kind": self.kind}
         self._answered()
+        self._vm_said(media)
         atx: Any = None
         if extension == "atx-power":
             try:
@@ -2641,7 +2973,7 @@ class JetKvmDevice(Device):
             "error": None,
             "kind": self.kind,
             # What this one can be asked beside what every JetKVM can: the power and reset buttons of its ATX extension.
-            "can": can_do(*self.can, "power" if has_atx else None, "reset" if has_atx else None),
+            "can": can_do(*self.can, "power" if has_atx else None, "reset" if has_atx else None, "media" if self._media_offer(has_atx) is not None else None),
             "video": {
                 "signal": bool(ready),
                 "width": number(video.get("width"), 1, 100_000),
@@ -2657,6 +2989,7 @@ class JetKvmDevice(Device):
             "health": {"temp": None, "cpu": None, "mem": None},
             "about": {"model": "JetKVM", "version": version if isinstance(version, str) else None},
             "ports": None,
+            "media": self.media_now(),  # what is in its drive (said to everybody who sees the tile)
         }
 
     def _only_plain(self, twin: str) -> KvmError:

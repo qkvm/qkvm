@@ -88,6 +88,7 @@ def test_an_amt_pc_is_recognised_from_its_address_and_shows_how_it_is(tmp_path: 
         assert server["amt"] == {
             "power": 2, "control": "admin", "kvm": "enabled", "consent": False, "make": "Example Computers", "model": "Office Desk 7",
             "serial": "PC0000000001", "bios": "E7ET42W (1.42)", "plain": True, "listener": True, "session_timeout": 0,
+            "view": "stills",  # (its tile's view: a new tile's, tests/test_amt_views.py)
         }  # fmt: skip
         assert server["no_screen"] is None  # (nothing stands against its screen)
         # Its screen, through its KVM: the first picture asked for opens a session, and the picture comes.

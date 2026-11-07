@@ -1055,6 +1055,14 @@ pre.wrap { white-space: pre-wrap; word-break: break-all; margin: 0 0 14px; }
 .focus-screen.controlling .veil { pointer-events: none; }
 .focus-screen.controlling .veil button { pointer-events: auto; }
 .focus-screen.controlling canvas { touch-action: none; }
+/* The picture fitted into the view (Fit), or at a scale of the machine's own pixels (the bar's size under it): centred while
+   it is smaller than the view (margins of auto, which never cut its edge off), and scrolled while it is larger, by the
+   scroll bars, the wheel, or a drag while nobody holds its keyboard and mouse. */
+.focus-scroll { position: absolute; inset: 0; overflow: hidden; }
+.focus-screen.scaled .focus-scroll { display: flex; overflow: auto; overscroll-behavior: contain; }
+.focus-screen.scaled .focus-scroll canvas { position: static; flex: none; margin: auto; }
+.focus-screen.scaled.pannable:not(.controlling) canvas { cursor: grab; }
+.focus-screen.scaled.panning:not(.controlling) canvas { cursor: grabbing; }
 
 /* --- under the enlarged picture: what the wall saw of this machine (the history) ---------------------------
    A box of its own, the last thing in the enlarged view; the picture above it keeps the room that is left. */
@@ -1111,6 +1119,56 @@ dialog.dialog[open]::backdrop { background: rgba(2, 6, 23, .6); }
 .dialog-body > :last-child { margin-bottom: 0; }
 .dialog-body p { margin-bottom: 12px; line-height: 1.55; }
 .dialog-body h3 { margin: 22px 0 10px; }
+/* The picture that set off a screen alert: as wide as the box, never wider, in the frame every picture has. */
+.alert-picture { display: block; width: 100%; height: auto; margin-bottom: 12px; border: 1px solid var(--line); border-radius: 8px; background: #000; }
+
+/* Virtual media: one box that holds still. It keeps one size whatever it shows (an answer, an error, a long list or
+   none), its controls stand where they stood, and only the list of images scrolls: its first line (what is listed, and
+   Mount at its right), what is in the drive (Unmount at its right) and how to start from it, the list, one line for what
+   is said, and what explains at its foot. */
+dialog.dialog.media { width: min(680px, calc(100vw - 24px)); height: min(760px, calc(100vh - 24px)); }
+dialog.media .dialog-body { display: flex; flex-direction: column; flex: 1; gap: 14px; min-height: 0; overflow: hidden; }
+dialog.media .dialog-body > * { flex: none; margin: 0; }
+.media-head { display: flex; align-items: center; justify-content: space-between; gap: 12px 24px; min-height: 32px; }
+.media-head .section-what { flex-wrap: nowrap; overflow: hidden; }  /* (one line, whatever it says: what is longer is cut) */
+.media-head .section-what strong { flex: none; font-size: 15px; }
+.media-head .muted { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+@media (max-width: 560px) {
+  /* Where room gets short, Upload and Delete keep only their icon (the tooltip names them); Mount keeps its word. */
+  .media-head .media-upload, .media-head .media-delete { width: 32px; padding: 0; gap: 0; font-size: 0; }
+}
+dialog.media .dialog-body > .media-list { flex: 1 1 0; min-height: 80px; overflow-y: auto; }
+.media-list > .check { min-height: 46px; padding-top: 8px; padding-bottom: 8px; }  /* (a list to pick from: more of it in sight) */
+/* What is in the drive: two lines, whatever it says (nothing, or an image with who put it there), so that the lines under it
+   stay where they are; what is longer is cut, and is said whole in its title. */
+.setting > .what > small.media-now {
+  display: -webkit-box;
+  height: 3em;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+}
+.media-said { min-height: 3em; max-height: 3em; overflow-y: auto; line-height: 1.5; color: var(--muted); }
+.media-said.error { color: var(--bad); }
+/* Under way: a spinner before what it says, and the seconds after it (the line keeps its height: nothing moves). */
+.media-said.working { color: var(--text); }
+.media-said.working::before {
+  content: "";
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  margin-right: 8px;
+  vertical-align: -1px;
+  border: 2px solid var(--accent, var(--text));
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: spin .7s linear infinite;
+}
+.media-said.working[data-waited]::after { content: " " attr(data-waited); color: var(--muted); font-variant-numeric: tabular-nums; }
+/* (Its height is kept before the words that fill it come with the answer: four lines, and what is more scrolls in it.) */
+.media-foot { height: 6em; overflow-y: auto; font-size: 12px; line-height: 1.5; }
 
 /* Settings: its sections down the side, in groups, and the one that is chosen beside them. The dialog keeps
    one size whichever is shown, so that nothing jumps when going from one to the next. */
@@ -1432,6 +1490,10 @@ dialog.settings .dialog-body { display: grid; grid-template-columns: 212px minma
     animation-iteration-count: infinite !important;
   }
 }
+/* What is under way says so where motion is kept down as well: its spinner turns, slower (feedback, not decoration). */
+@media (prefers-reduced-motion: reduce) {
+  .media-said.working::before { animation-duration: 1.4s !important; animation-iteration-count: infinite !important; }
+}
 
 /* Console chrome shares the wall's height. Overflow opens over the picture, never reflows it. */
 .focus-bar { position: relative; z-index: 6; display: flex; align-items: center; flex-wrap: nowrap; gap: 10px; padding: 4px 10px; height: var(--console-header-height, 49px); box-sizing: border-box; flex: none; }
@@ -1487,6 +1549,11 @@ dialog.settings .dialog-body { display: grid; grid-template-columns: 212px minma
 .focus-statusbar .control-state, #focus-release-hint { font-size: inherit; white-space: nowrap; }
 .status-details { font-size: 11px; padding: 2px 4px; }
 .focus-statusbar .focus-details-content { top: auto; bottom: calc(100% + 5px); }
+/* The picture's size, in the bar as the wall's own picks are dressed, at the bar's height. */
+.focus-statusbar .pick { flex: none; height: 22px; box-shadow: none; }
+.focus-statusbar .pick select { height: 20px; padding: 0 20px 0 24px; font-size: 11px; }
+.focus-statusbar .pick .icon:first-child { left: 7px; width: 12px; height: 12px; }
+.focus-statusbar .pick .chevron { right: 5px; width: 10px; height: 10px; }
 .screen-keyboard { position: fixed; z-index: 7; display: flex; flex-direction: column; box-sizing: border-box; padding: 0; border: 1px solid var(--line-strong); border-radius: 10px; background: var(--panel); box-shadow: 0 8px 32px #0005; overflow: hidden; }
 .keyboard-titlebar { display: flex; align-items: center; gap: 8px; padding: 6px 10px; cursor: move; touch-action: none; border-bottom: 1px solid var(--line); }
 .keyboard-titlebar strong { flex: 1; }
