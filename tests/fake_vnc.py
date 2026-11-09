@@ -516,7 +516,6 @@ class FakeVnc:
         self._stop: asyncio.Event | None = None
         self._started = threading.Event()
         self._serving = ServerThread("fake VNC server", self._run, self._started.is_set)
-        self._thread = self._serving.thread
         self._connections: set[asyncio.Task[None]] = set()
 
     def start(self) -> FakeVnc:
@@ -527,8 +526,8 @@ class FakeVnc:
         """Ends the server; a server that is stopped already stays so."""
         if self._loop is not None and self._stop is not None and not self._loop.is_closed():
             self._loop.call_soon_threadsafe(self._stop.set)
-        if self._thread.is_alive():
-            self._thread.join(timeout=10)
+        if self._serving.is_alive():
+            self._serving.join(timeout=10)
 
     def drop_everybody(self) -> None:
         """End every connection there is, as a server that restarts does."""

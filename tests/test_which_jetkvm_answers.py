@@ -25,7 +25,7 @@ import pytest
 
 from qkvm import jetkvm, kvm, update, vault
 from tests.fake_jetkvm import FakeJetKvm, JetState
-from tests.settings_file import settings_text, write_settings_text
+from tests.settings_file import settings_text, settings_while_saved, write_settings_text
 from tests.test_jetkvm import other_ways, saved
 from tests.test_wall import PASSWORD, add, snap, wait_until, wall
 
@@ -216,7 +216,7 @@ def test_a_tile_that_knows_no_jetkvm_takes_the_first_it_sees_and_keeps_it(tmp_pa
             assert client.core.store.device(device).machine == ""  # type: ignore[attr-defined]
             wait_until(lambda: status_of(client, device)["state"] == "online", "the JetKVM was not shown", 20)
             wait_until(
-                lambda: json.loads(settings_text(data / "qkvm.json", encoding="utf-8"))["devices"][0].get("machine") == A_MARK,
+                lambda: (saved_now := settings_while_saved(data / "qkvm.json")) is not None and saved_now["devices"][0].get("machine") == A_MARK,
                 "the JetKVM's number was not kept",
                 10,
             )

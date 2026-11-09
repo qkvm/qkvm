@@ -110,6 +110,10 @@ name: Release
 on:
   push:
     tags: ["v*"]
+    # A rehearsal: the short-lived release-X.Y.Z branch, pushed for the checks, runs everything up to the signing (build,
+    # lock, audit, the tries on every target, both images and their scans), so that what only a release runs is seen to
+    # pass before a tag, which cannot be moved, is made. Nothing that signs or publishes runs on it: those wait for a tag.
+    branches: ["release-*"]
   release:
     types: [published]
 
@@ -133,7 +137,7 @@ jobs:
 
   # A release is of a commit on main, and cannot bypass browser, lint/type, platform-matrix and required integration CI.
   tested_commit:
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' && github.ref_type == 'tag'
     runs-on: ubuntu-24.04
     timeout-minutes: 170  # (the tag's own Tests run takes about 90 minutes on Windows, and may queue)
     permissions:
@@ -199,12 +203,20 @@ jobs:
   # in) runs in the next job, on a copy held to that hash; were it to change the artifact itself, sign, which holds
   # what it signs to the same hash, refuses.
   build:
-    if: github.event_name == 'push'
+    if: ${{ !cancelled() && github.event_name == 'push' && (github.ref_type == 'branch' || needs.tested_commit.result == 'success') }}
     needs: tested_commit
     runs-on: ubuntu-24.04
     outputs:
       sums: ${{ steps.sums.outputs.sums }}
     steps:
+      # (A rehearsal, on the release-X.Y.Z branch: its version is the branch's, and the build holds it to the code's.)
+      - name: A rehearsal's version, from its branch
+        if: github.ref_type == 'branch'
+        run: |
+          tag="v${GITHUB_REF_NAME#release-}"
+          version='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          [[ "$tag" =~ $version ]] || { echo "$GITHUB_REF_NAME is no release-X.Y.Z branch: nothing is rehearsed of it." >&2; exit 1; }
+          echo "TAG=$tag" >> "$GITHUB_ENV"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -249,12 +261,20 @@ jobs:
   # jobs that try what walls will run, and the image jobs, install from it. No secret here; what it made is hashed (its
   # list's hash handed on as a job output) before anything runs on this runner that is not pinned.
   libraries:
-    if: github.event_name == 'push'
+    if: ${{ !cancelled() && github.event_name == 'push' && needs.build.result == 'success' }}
     needs: build
     runs-on: ubuntu-24.04
     outputs:
       sums: ${{ steps.lock.outputs.sums }}
     steps:
+      # (A rehearsal, on the release-X.Y.Z branch: its version is the branch's, and the build holds it to the code's.)
+      - name: A rehearsal's version, from its branch
+        if: github.ref_type == 'branch'
+        run: |
+          tag="v${GITHUB_REF_NAME#release-}"
+          version='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          [[ "$tag" =~ $version ]] || { echo "$GITHUB_REF_NAME is no release-X.Y.Z branch: nothing is rehearsed of it." >&2; exit 1; }
+          echo "TAG=$tag" >> "$GITHUB_ENV"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -298,10 +318,18 @@ jobs:
   # pytest, pip-audit, the wheel's dependencies, all from PyPI) can at most change an artifact, never have that
   # signed: sign holds the packages to the build's hash and the image evidence to the image jobs', and refuses.
   packages:
-    if: github.event_name == 'push'
+    if: ${{ !cancelled() && github.event_name == 'push' && needs.build.result == 'success' && needs.libraries.result == 'success' }}
     needs: [build, libraries]
     runs-on: ubuntu-24.04
     steps:
+      # (A rehearsal, on the release-X.Y.Z branch: its version is the branch's, and the build holds it to the code's.)
+      - name: A rehearsal's version, from its branch
+        if: github.ref_type == 'branch'
+        run: |
+          tag="v${GITHUB_REF_NAME#release-}"
+          version='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          [[ "$tag" =~ $version ]] || { echo "$GITHUB_REF_NAME is no release-X.Y.Z branch: nothing is rehearsed of it." >&2; exit 1; }
+          echo "TAG=$tag" >> "$GITHUB_ENV"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -386,7 +414,7 @@ jobs:
   # against them from outside the tree; on Linux the native libraries the wheels bring held to their minimums, as in the
   # image. (A matrix: these jobs hand nothing on.)
   libraries_tested:
-    if: github.event_name == 'push'
+    if: ${{ !cancelled() && github.event_name == 'push' && needs.build.result == 'success' && needs.libraries.result == 'success' }}
     needs: [build, libraries]
     strategy:
       fail-fast: false
@@ -394,11 +422,19 @@ jobs:
         runner: [ubuntu-24.04, ubuntu-24.04-arm, windows-2025]
         python: ["3.11", "3.12", "3.13", "3.14"]
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 90
+    timeout-minutes: 150  # (the whole suite: 79 to 88 minutes on Windows in 0.3.1's rehearsals, and once past 90)
     defaults:
       run:
         shell: bash
     steps:
+      # (A rehearsal, on the release-X.Y.Z branch: its version is the branch's, and the build holds it to the code's.)
+      - name: A rehearsal's version, from its branch
+        if: github.ref_type == 'branch'
+        run: |
+          tag="v${GITHUB_REF_NAME#release-}"
+          version='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          [[ "$tag" =~ $version ]] || { echo "$GITHUB_REF_NAME is no release-X.Y.Z branch: nothing is rehearsed of it." >&2; exit 1; }
+          echo "TAG=$tag" >> "$GITHUB_ENV"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -457,7 +493,7 @@ jobs:
   # other's, and each hands on the hashes of what it made.) Kernel sandbox checks must execute natively, not through
   # syscall emulation.
   images_amd64:
-    if: github.event_name == 'push'
+    if: ${{ !cancelled() && github.event_name == 'push' && needs.build.result == 'success' && needs.libraries.result == 'success' }}
     needs: [build, libraries]
     runs-on: ubuntu-24.04
     outputs:
@@ -503,7 +539,7 @@ jobs:
           overwrite: true
 
   images_arm64:
-    if: github.event_name == 'push'
+    if: ${{ !cancelled() && github.event_name == 'push' && needs.build.result == 'success' && needs.libraries.result == 'success' }}
     needs: [build, libraries]
     runs-on: ubuntu-24.04-arm
     outputs:
@@ -552,7 +588,7 @@ jobs:
   # Nothing is installed or run here but the runner's own tools: its Python (no library beyond Python's own), its
   # openssl, and qkvm/release.py and image-digests.py as they are at the tag. What it signed goes on as an artifact.
   sign:
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' && github.ref_type == 'tag'
     needs: [build, packages, libraries, libraries_tested, images_amd64, images_arm64]
     runs-on: ubuntu-24.04
     environment: release  # the signing key, and nothing else (see the top of this file)
@@ -671,7 +707,7 @@ jobs:
   # checks with, before any draft exists: an openssl that is wrong but agrees with itself would otherwise make a
   # release that no copy installs. No secret here (and so the library may be installed where the runner lacks it).
   signature:
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' && github.ref_type == 'tag'
     needs: sign
     runs-on: ubuntu-24.04
     permissions:
@@ -707,7 +743,7 @@ jobs:
   # Makes the draft release of what was signed and checked, with every file attached, then reads every file back
   # from the draft and checks it against the signature. No key here; nothing is installed.
   draft:
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' && github.ref_type == 'tag'
     needs: [sign, signature, images_amd64, images_arm64]
     runs-on: ubuntu-24.04
     permissions:

@@ -1,5 +1,43 @@
 # Changes
 
+## 0.3.1
+
+Fixes found while 0.3.0 was released and in its reviews. Nothing new is added. Upgrade with `pip install --upgrade qkvm`
+or `docker pull qkvm/qkvm:0.3.1`; from 0.2.1, 0.2.2 and 0.3.0 the app's own update installs it in place. 0.3.1 needs
+the same libraries as 0.3.0.
+
+### Fixed
+
+- **A server's image is let go of under faults too.** Where the threads that read a served image were stopped with
+  work still waiting, or opening its file failed in an unexpected way, a file could stay open and a read's place stay
+  taken until qKVM restarted. (Found by the outside review, with faults made on purpose.)
+- **The Media box says only what is plain.** Where qKVM serves HTTPS already and the address named in *Settings, Server
+  images* is plain HTTP, it says to name the HTTPS address there, and nothing of switching HTTPS on.
+- **A failed edit says what it did not take back.** An edit to another controller that could not be saved ends the
+  image mounted on the tile all the same; it now says so, and to mount it again.
+- **AMI's boards and a wall in Docker:** the README says how a wall in Docker on Linux serves them on port 80
+  (`-p 80:8787`), and why Docker Desktop cannot.
+
+### Releasing
+
+- **A release is rehearsed before its tag.** Pushing a release's branch runs the release workflow up to the signing:
+  the build, the libraries' lock and its audit, the tries on every target, both images and their scans. Signing and
+  publishing stay on the tag. (0.3.0's release found faults only its tag ran, on a tag that could not be moved.)
+- Tests that failed on GitHub's runners for reasons of the runners hold now: a stand-in is started again where Windows
+  had no buffer space for a socket, a slower ARM runner's drawing work is allowed its time, a JetKVM stand-in's first
+  picture comes later than a slow runner's look, two tests that read the settings file while the wall saves it look
+  again where Windows refuses that moment, and a test of the no signal alert waits until the wall holds the tile's
+  picture.
+
+### Known
+
+- The Docker image keeps the five exceptions for Debian's findings accepted for 0.3.0 (SQLite's FTS5 and session
+  extension, zlib's gzip file writing; none reachable from qKVM), until 2026-12-03 or Debian's fixes, whichever comes
+  first.
+- A test of the history file's checkpoint fails now and then on GitHub's slower runners, under reads that never
+  pause: a checkpoint refused is tried again once the file SQLite writes ahead to has doubled, and was refused again
+  there, so that file grew to some four times its share before one got through. The checkpoint is unchanged in 0.3.1.
+
 ## 0.3.0
 
 Recover a machine from the wall: mount an image on it and start it from there, on Proxmox guests, KVMs with the kvmd

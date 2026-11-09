@@ -180,11 +180,15 @@ class Opening:
 
 
 def hand_to_readers(readers: Callable[[], ThreadPoolExecutor], work: Callable[..., Any], *given: Any) -> None:
-    """`work` done in one of the reader threads, waited for by nobody; here at once where they have stopped (qKVM stops)."""
+    """`work` done in one of the reader threads, waited for by nobody; here at once where they have stopped (qKVM stops);
+    and where it was dropped from their queue unstarted (a pool stopped with its queue cancelled), there and then: so that
+    no file stays open and no read's place stays taken (the outside review's third round found eight of each)."""
     try:
-        readers().submit(work, *given)
+        future = readers().submit(work, *given)
     except RuntimeError:
         work(*given)
+        return
+    future.add_done_callback(lambda done: work(*given) if done.cancelled() else None)
 
 
 def scrubbed(text: str, lending: Lending | None = None) -> str:
@@ -401,13 +405,14 @@ class Served:
 
     def __init__(
         self, folder: Callable[[], str], address: Callable[[], str | None],
-        identity: Callable[[str], tuple[str | None, str, str]] | None = None,
+        identity: Callable[[str], tuple[str | None, str, str]] | None = None, https: Callable[[], bool] | None = None,
     ) -> None:
         self._folder = folder
         self._address = address
         # A tile's controller as it is known now (its saved record's pinned certificate, `machine` and `ident`): what a
         # mount is bound to (Lending.identity)
         self._identity = identity
+        self._https = https  # whether the wall itself serves HTTPS (core.https): what the Media box advises depends on it
         # The controller each tile's mount under way is to be bound to, as it was known when that mount was asked: an edit
         # that slips in meanwhile changes the saved record, not this (the outside review's third round)
         self.binding: dict[str, Binding] = {}
@@ -415,6 +420,10 @@ class Served:
         self._epoch: dict[str, int] = {}
         self._of: dict[str, Lending] = {}  # tile id -> its image
         self._by_token: dict[str, Lending] = {}
+
+    def serves_https(self) -> bool:
+        """Whether the wall itself serves HTTPS (its address in Settings, Server images may still name plain HTTP)."""
+        return bool(self._https is not None and self._https())
 
     def base(self) -> str | None:
         """The wall's address as servers reach it (the setting, or else where it listens on the network); None: none."""

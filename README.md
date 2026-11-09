@@ -589,8 +589,11 @@ the image's SHA-256 where qKVM carried it there. The tile says what is in the dr
   an `http://` address without a port in *Settings > Server images*, and forward port 80 of it
   to the port qKVM listens on, in a way that keeps the controller's own address (the image is
   served to that address alone), for instance on Linux:
-  `iptables -t nat -A PREROUTING -p tcp --dport 80 -j REDIRECT --to-ports 8787`. A mount that
-  fails on such a board with an address on another port says so.
+  `iptables -t nat -A PREROUTING -p tcp --dport 80 -j REDIRECT --to-ports 8787`. A wall in Docker
+  on Linux can publish port 80 to its own port as well (`-p 80:8787` beside `-p 8787:8787`), which
+  keeps the controller's address; Docker Desktop (Windows, macOS) hands the reads in from an address
+  of its own, which the image is not served to. A mount that fails on such a board with an address
+  on another port says so.
 - **A mount is bound to the controller it was made on**: the certificate qKVM checked, and the
   numbers the server and its controller give for themselves. A tile changed to another address,
   kind, certificate check or controller, a certificate trusted anew, or a tile removed ends it at

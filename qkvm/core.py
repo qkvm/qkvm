@@ -152,7 +152,7 @@ class Core:
         self.supervised = False  # started by `python -m qkvm`, which can start us again
         self.container = os.environ.get("QKVM_CONTAINER") == "1"  # set in the Docker image
         # The images mounted on the wall's servers, which their controllers read from it (served.py): kept while it runs.
-        self.served = Served(lambda: self.store.server.media_folder, self.media_address, self._tile_identity)
+        self.served = Served(lambda: self.store.server.media_folder, self.media_address, self._tile_identity, lambda: self.https)
         self.updater = Updater(
             data_dir,
             update_repo or os.environ.get("QKVM_UPDATE_REPO") or None,

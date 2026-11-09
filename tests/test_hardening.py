@@ -212,7 +212,6 @@ class LiveWall:
         config = uvicorn.Config(create_app(Core(data)), **{"log_level": "error", "access_log": False, **options})
         self._server = uvicorn.Server(config)
         self._serving = ServerThread("the wall", lambda: self._server.run(sockets=[self._sock]), lambda: self._server.started)
-        self._thread = self._serving.thread
 
     def __enter__(self) -> LiveWall:
         self._serving.start()  # (as every stand-in: a minute on a loaded computer, and why, where its thread ended)
@@ -220,7 +219,7 @@ class LiveWall:
 
     def __exit__(self, *_: object) -> None:
         self._server.should_exit = True
-        self._thread.join(timeout=10)
+        self._serving.join(timeout=10)
 
 
 def test_a_request_sent_only_halfway_holds_up_nobody_else(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

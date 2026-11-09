@@ -39,7 +39,6 @@ class Scripted:
         self._stop: asyncio.Event | None = None
         self._ready = threading.Event()
         self._serving = ServerThread("scripted device", lambda: asyncio.run(self._serve()), self._ready.is_set)
-        self._thread = self._serving.thread
 
     def start(self) -> Scripted:
         self._serving.start()
@@ -48,7 +47,7 @@ class Scripted:
     def stop(self) -> None:
         if self._loop is not None and self._stop is not None:
             self._loop.call_soon_threadsafe(self._stop.set)
-        self._thread.join(timeout=10)
+        self._serving.join(timeout=10)
 
     def asked(self, method: str, path: str) -> list[tuple[float, str, str, str, bytes]]:
         return [one for one in self.seen if one[1] == method and one[2].split("?")[0] == path]

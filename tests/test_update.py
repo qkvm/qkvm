@@ -633,7 +633,7 @@ def test_an_install_whose_request_is_cut_off_by_a_stop_runs_on_and_is_written_do
             time.sleep(0.05)
         live._server.should_exit = True  # (a stop, or the listeners opened again)
         thread.join(30)
-        live._thread.join(30)
+        live._serving.join(30)
     assert live.core.updater.state == "ready" and live.core.updater.installed == "9.9.9"
     live.core.audit.flush()
     assert "update_installed" in (tmp_path / "wall" / "audit.log").read_text(encoding="utf-8")

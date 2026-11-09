@@ -905,7 +905,6 @@ class FakeJetKvm:
         config = uvicorn.Config(self._app, log_level="error", access_log=False, **tls)
         self._server = uvicorn.Server(config)
         self._serving = ServerThread("fake JetKVM", lambda: self._server.run(sockets=[self._sock]), lambda: self._server.started)
-        self._thread = self._serving.thread
 
     def start(self) -> FakeJetKvm:
         self._serving.start()
@@ -947,4 +946,4 @@ class FakeJetKvm:
 
     def stop(self) -> None:
         self._server.should_exit = True
-        self._thread.join(timeout=10)
+        self._serving.join(timeout=10)

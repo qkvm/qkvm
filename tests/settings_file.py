@@ -6,8 +6,11 @@ Legacy fixtures without an external key remain legacy fixtures.
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import re
+import sys
+from typing import Any
 
 from qkvm.vault_storage import MAGIC, StorageCipher, key_path, read_key
 
@@ -19,6 +22,19 @@ def settings_text(path: Path, encoding: str = "utf-8", errors: str | None = None
     if raw.startswith(MAGIC):
         raw = StorageCipher(read_key(key_path(path.parent))).open(raw)
     return raw.decode(encoding, errors or "strict")
+
+
+def settings_while_saved(path: Path) -> Any:
+    """The settings as saved, for a test that waits for the wall to save something: read while the wall may be saving
+    them. The wall replaces the file to save it, and Windows refuses a file that is being replaced to a reader (access
+    denied) for that moment: None then, and the wait looks again. (A tile's machine read so failed once on GitHub's
+    Windows runner, 3.14.)"""
+    try:
+        return json.loads(settings_text(path, encoding="utf-8"))
+    except PermissionError:
+        if sys.platform != "win32":
+            raise
+        return None
 
 
 def write_settings_text(path: Path, text: str, encoding: str = "utf-8", errors: str | None = None) -> int:

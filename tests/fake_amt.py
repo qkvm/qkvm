@@ -805,7 +805,6 @@ class FakeAmt:
         self.url = f"{'https' if tls else 'http'}://127.0.0.1:{self.port}"
         self._server = uvicorn.Server(uvicorn.Config(make_fake_amt(self.state), log_level="error", access_log=False, **tls))
         self._serving = ServerThread("fake Intel AMT machine", lambda: self._server.run(sockets=[self._sock]), lambda: self._server.started)
-        self._thread = self._serving.thread
         self.redirection = FakeRedirection(self.state, redirection, redirection_tls_dir or tls_dir)
 
     @staticmethod
@@ -832,7 +831,7 @@ class FakeAmt:
 
     def stop(self) -> None:
         self._server.should_exit = True
-        self._thread.join(timeout=10)
+        self._serving.join(timeout=10)
         self.redirection.stop()
         if self.beside and amt.REDIRECTION_BESIDE.get(self.port) == self.port + 2 and self.port not in (16992, 16993):
             del amt.REDIRECTION_BESIDE[self.port]

@@ -33,7 +33,7 @@ def test_the_first_thing_a_release_asks_is_whether_its_commit_is_on_main() -> No
 
 def test_nothing_is_built_signed_or_published_before_that_answer() -> None:
     every = jobs(RELEASE)
-    on_the_tag = {name for name, job in every.items() if "if: github.event_name == 'push'" in job}
+    on_the_tag = {name for name, job in every.items() if re.search(r"^    if: .*github\.event_name == 'push'", job, flags=re.M)}
     assert {"tested_commit", "build", "images_amd64", "images_arm64", "sign", "signature", "draft"} <= on_the_tag
     for name in on_the_tag - {"tested_commit"}:
         assert "tested_commit" in waits_for(every, name), name

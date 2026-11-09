@@ -1224,7 +1224,6 @@ class FakeBmc:
         config = uvicorn.Config(make_fake_bmc(self.state), log_level="error", access_log=False, timeout_keep_alive=self.state.keeps_idle, **tls)
         self._server = uvicorn.Server(config)
         self._serving = ServerThread("fake controller", lambda: self._server.run(sockets=[self._sock]), lambda: self._server.started)
-        self._thread = self._serving.thread
 
     def start(self) -> FakeBmc:
         self._serving.start()
@@ -1251,4 +1250,4 @@ class FakeBmc:
 
     def stop(self) -> None:
         self._server.should_exit = True
-        self._thread.join(timeout=10)
+        self._serving.join(timeout=10)

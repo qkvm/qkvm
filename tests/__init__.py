@@ -22,6 +22,13 @@ def local_socket(port: int = 0) -> socket.socket:
     return sock
 
 
+def no_buffer_space(ex: BaseException | None) -> bool:
+    """Whether a stand-in's server ended for want of buffer space for a socket (WSAENOBUFS on Windows, ENOBUFS elsewhere)."""
+    import errno
+
+    return isinstance(ex, OSError) and (getattr(ex, "winerror", None) == 10055 or ex.errno == errno.ENOBUFS)
+
+
 class ServerThread:
     """A stand-in's server, run in a thread of its own, and waited for until it is up.
 
@@ -29,13 +36,27 @@ class ServerThread:
     why, with what ended the thread and the errors its server logged from it. (The web server the
     stand-ins use ends its thread with SystemExit when it cannot start, after logging the reason: an
     `except Exception` sees neither.) A loaded machine is given a minute: ten seconds were once not
-    enough on one core shared with other work.
+    enough on one core shared with other work. A thread that ended for want of buffer space for a socket
+    (Windows' WSAENOBUFS, 10055: after an hour and a half of tests on GitHub's runner, as its event loop
+    made its own pair of sockets) is started again, up to three times, after a pause that grows.
     """
+
+    AGAIN_AFTER = (2.0, 5.0, 10.0)  # seconds before each new start, where a thread ended for want of buffer space
 
     def __init__(self, name: str, serve: Callable[[], object], up: Callable[[], bool]) -> None:
         self._name, self._serve, self._up = name, serve, up
         self._ended_by: BaseException | None = None
         self.thread = threading.Thread(target=self._run, daemon=True)
+
+    def join(self, timeout: float | None = None) -> None:
+        """Waits for the thread that serves now: where one ended for want of buffer space, the one started again. (Each
+        stand-in kept the first thread and waited for it as it stopped, which had ended while the one started again
+        still cleaned up: the outside review of 0.3.1, L031-1.)"""
+        self.thread.join(timeout)
+
+    def is_alive(self) -> bool:
+        """Whether the thread that serves now runs."""
+        return self.thread.is_alive()
 
     def _run(self) -> None:
         try:
@@ -60,10 +81,19 @@ class ServerThread:
         errors = Errors(logging.ERROR)
         logger = logging.getLogger("uvicorn.error")
         logger.addHandler(errors)
+        again = list(self.AGAIN_AFTER)
         try:
             thread.start()
             deadline = time.monotonic() + 60
             while not self._up():
+                if not thread.is_alive() and again and no_buffer_space(self._ended_by):
+                    time.sleep(again.pop(0))
+                    self._ended_by = None
+                    said.clear()
+                    thread = self.thread = threading.Thread(target=self._run, daemon=True)
+                    thread.start()
+                    deadline = time.monotonic() + 60
+                    continue
                 if not thread.is_alive():
                     how = f" with {self._ended_by!r}" if self._ended_by is not None else ""
                     why = f": {'; '.join(said)}" if said else " (and its server logged no error)"

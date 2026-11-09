@@ -14,11 +14,12 @@ from __future__ import annotations
 
 import re
 
-from tests.workflow_text import SECURITY, WORKFLOWS, jobs, steps, uncommented, waits_for
+from tests.workflow_text import SECURITY, WORKFLOWS, jobs, needs, steps, uncommented, waits_for
 
 RELEASE = WORKFLOWS / "release.yml"
 DRAFT_STAGE = {"tested_commit", "build", "libraries", "packages", "libraries_tested", "images_amd64", "images_arm64", "sign", "signature", "draft"}
 PUBLISH_STAGE = {"published", "image", "pypi"}
+TAG_ALONE = {"tested_commit", "sign", "signature", "draft"}  # (never on a rehearsal's branch)
 
 
 def trigger() -> str:
@@ -31,10 +32,13 @@ def test_a_tag_makes_the_draft_and_a_publication_publishes_it() -> None:
     assert re.search(r"^  push:\n    tags: \[\"v\*\"\]\n", on, flags=re.M), on
     assert re.search(r"^  release:\n    types: \[published\]\n", on, flags=re.M), on
     assert set(re.findall(r"^  ([a-z_]+):", on, flags=re.M)) == {"push", "release"}, "nothing else starts a release"
+    assert re.search(r"^    branches: \[\"release-\*\"\]\n", on, flags=re.M), "a rehearsal: the release-X.Y.Z branch, and no other"
     every = jobs(RELEASE)
     assert set(every) == DRAFT_STAGE | PUBLISH_STAGE
     for name in DRAFT_STAGE:
-        assert re.search(r"^    if: github\.event_name == 'push'$", every[name], flags=re.M), name
+        # (Signing and the draft on a tag alone; the rest on a tag, or rehearsed on a release-X.Y.Z branch.)
+        on_push = r"^    if: github\.event_name == 'push' && github\.ref_type == 'tag'$" if name in TAG_ALONE else r"^    if: .*github\.event_name == 'push'"
+        assert re.search(on_push, every[name], flags=re.M), name
         assert not (waits_for(every, name) & PUBLISH_STAGE), name
     for name in PUBLISH_STAGE:
         assert re.search(r"^    if: github\.event_name == 'release'$", every[name], flags=re.M), name
@@ -116,3 +120,38 @@ def test_every_action_is_named_by_its_full_commit() -> None:
     for path in [*WORKFLOWS.glob("*.yml"), SECURITY / "action.yml"]:
         for used in re.findall(r"^\s*(?:- )?uses: *(\S+)", uncommented(path.read_text(encoding="utf-8")), flags=re.M):
             assert used.startswith("./") or re.fullmatch(r"[\w.-]+/[\w./-]+@[0-9a-f]{40}", used), f"{path.name}: {used}"
+
+
+def test_a_rehearsal_tries_everything_a_release_runs_and_signs_and_publishes_nothing() -> None:
+    """The release-X.Y.Z branch, pushed for the checks, runs the release up to the signing (0.3.0's run found faults that
+    only a tag ran, on a tag that could not be moved): nothing on it can sign, make a draft or publish, a tag still builds
+    only once its gate passed, and every job that reads the version takes the branch's."""
+    every = jobs(RELEASE)
+    for name in TAG_ALONE:
+        assert re.search(r"^    if: github\.event_name == 'push' && github\.ref_type == 'tag'$", every[name], flags=re.M), name
+    assert re.search(
+        r"^    if: \$\{\{ !cancelled\(\) && github\.event_name == 'push' && \(github\.ref_type == 'branch' \|\| needs\.tested_commit\.result == 'success'\) \}\}$",
+        every["build"], flags=re.M), "a tag builds only after its gate; a branch has none, and publishes nothing"
+    # (GitHub skips a job where any job before it was skipped, and the gate is skipped on a branch: each rehearsed job
+    # says when it runs, not cancelled and after every job it waits for succeeded. The rehearsal's first run, without
+    # that, ran the build alone.)
+    for name, job in every.items():
+        if name in TAG_ALONE | PUBLISH_STAGE or name == "build":
+            continue
+        condition = re.search(r"^    if: (.*)$", job, flags=re.M)
+        assert condition and condition.group(1).startswith("${{ !cancelled() && github.event_name == 'push' && "), name
+        for need in needs(job):
+            assert f"needs.{need}.result == 'success'" in condition.group(1), (name, need)
+    for name, job in every.items():
+        if re.search(r"^    environment:", job, flags=re.M) or "secrets." in job:
+            assert name in TAG_ALONE | PUBLISH_STAGE, f"{name} holds a secret or an environment and could run on a branch"
+    rehearsal = 'echo "TAG=$tag" >> "$GITHUB_ENV"'
+    shape = r"version='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'"
+    for name, job in every.items():
+        reads_version = "${TAG#v}" in job or '"$TAG"' in job
+        if name in TAG_ALONE | PUBLISH_STAGE or not reads_version:
+            continue
+        first = steps(job)[0]
+        assert "if: github.ref_type == 'branch'" in first and rehearsal in first, name
+        # (Only a release-X.Y.Z branch is rehearsed, its version three numbers, checked before it is written down.)
+        assert 'tag="v${GITHUB_REF_NAME#release-}"' in first and shape in first and first.index(shape) < first.index(rehearsal), name

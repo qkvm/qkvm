@@ -4162,10 +4162,14 @@ class RedfishDevice(Device):
                 "(Settings, Network), or name the address servers reach it at (Settings, Server images)."
             )
         elif base.startswith("http://") and self._https_only(drive):
-            notes.append(
-                f"This server's controller takes an image over HTTPS only, and servers reach qKVM at {base}, over plain HTTP: "
-                "switch HTTPS on (Settings, Network), or name an HTTPS address (Settings, Server images)."
+            # (Where qKVM serves HTTPS already, the address named in Settings, Server images is what is plain: the owner's
+            # trial was told to switch on what was on.)
+            how = (
+                "qKVM serves HTTPS already: name its HTTPS address in Settings, Server images."
+                if served.serves_https()
+                else "switch HTTPS on (Settings, Network), or name an HTTPS address (Settings, Server images)."
             )
+            notes.append(f"This server's controller takes an image over HTTPS only, and servers reach qKVM at {base}, over plain HTTP: {how}")
         if drive is not None and stale(drive, lending.token if lending is not None else None):
             notes.append("The image in its drive was mounted from qKVM before qKVM was restarted, and is not served any more: unmount it, and mount it again.")
         return notes

@@ -18,7 +18,8 @@ case "$(uname -m)" in
   aarch64) scanner_arch=ARM64; checksum=e174dff2a6dba5e3ae41f8d0537a6324405bd08132497340304c6b20e0f16a1f ;;
   *) echo 'Unsupported scanner host architecture' >&2; exit 2 ;;
 esac
-curl --fail --silent --show-error --location --retry 3 \
+# (Tried for some two minutes: GitHub's release page once answered 504 to three tries in seven seconds.)
+curl --fail --silent --show-error --location --retry 8 --retry-delay 15 \
   "https://github.com/aquasecurity/trivy/releases/download/v${version}/trivy_${version}_Linux-${scanner_arch}.tar.gz" \
   -o "$scan_tmp/trivy.tar.gz"
 printf '%s  %s\n' "$checksum" "$scan_tmp/trivy.tar.gz" | sha256sum --check --strict

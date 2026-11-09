@@ -29,7 +29,7 @@ from tests.fake_amt import GUID, AmtState, FakeAmt
 from tests.scripted_device import Scripted
 from tests.test_redfish import status_of
 from tests.test_wall import PASSWORD, add, closed_port, snap, wait_until, wall
-from tests.settings_file import settings_text, write_settings_text
+from tests.settings_file import settings_text, settings_while_saved, write_settings_text
 
 S = 60.0  # for the tests that watch a tile for "minutes": every wait is a sixtieth of what it is
 
@@ -1846,7 +1846,8 @@ def test_a_tile_that_remembers_no_pc_takes_the_first_it_sees_and_keeps_it(tmp_pa
             write_settings_text(tmp_path / name, json.dumps(saved, indent=2), encoding="utf-8")
 
         def kept() -> object:
-            return json.loads(settings_text(tmp_path / "qkvm.json", encoding="utf-8"))["devices"][0].get("machine")
+            saved = settings_while_saved(tmp_path / "qkvm.json")
+            return saved and saved["devices"][0].get("machine")
 
         with wall(tmp_path) as client:
             assert client.core.store.device(device).machine == ""  # type: ignore[attr-defined]

@@ -596,7 +596,9 @@ def test_a_fingerbot_paired_anew_has_its_battery_asked_again_soon_not_an_hour_la
 def test_a_none_said_a_while_ago_is_asked_again_and_a_fingerbot_paired_since_presses(tmp_path: Path, quick: dict[str, float], monkeypatch: pytest.MonkeyPatch) -> None:
     # Nobody watches the picture (a script, a token). Told once that none is paired, the wall refused every press for good,
     # with nothing to say to the script how to change that: also after one was paired. It is asked again after a while.
-    monkeypatch.setattr(kvm, "FINGERBOT_ASK_AGAIN", 1.5, raising=False)
+    # (Five seconds for the steps before the wall asks again: on a loaded Windows runner, 3.11, they took more than the 1.5
+    # this allowed, and the wall asked again where it must not yet.)
+    monkeypatch.setattr(kvm, "FINGERBOT_ASK_AGAIN", 5.0, raising=False)
     fake = FakeKvm(FakeState()).start()
     try:
         with wall(tmp_path) as client:
@@ -610,7 +612,7 @@ def test_a_none_said_a_while_ago_is_asked_again_and_a_fingerbot_paired_since_pre
             assert press(client, device, "fingerbot_power")[1].status_code == 422 and fake.state.ws_streams == ["0"]
             fake.state.fingerbot = True
             assert press(client, device, "fingerbot_power")[1].status_code == 422  # (what it said a moment ago stands)
-            time.sleep(1.6)
+            time.sleep(5.1)
             _, reply = press(client, device, "fingerbot_power")
             assert reply.status_code == 200, reply.text
             assert fake.state.ws_streams == ["0", "0"] and fake.state.presses == [("500", "2")]

@@ -627,7 +627,6 @@ class FakeProxmox:
         config = uvicorn.Config(self._app, interface="asgi3", log_level="error", access_log=False, ssl_certfile=str(cert), ssl_keyfile=str(key), ws_max_size=FRAME)
         self._server = uvicorn.Server(config)
         self._serving = ServerThread("fake Proxmox", lambda: self._server.run(sockets=[self._sock]), lambda: self._server.started)
-        self._thread = self._serving.thread
         self._made: FastAPI | None = None
 
     async def _app(self, scope: Any, receive: Any, send: Any) -> None:
@@ -674,4 +673,4 @@ class FakeProxmox:
         if self._stopping is not None and self._loop is not None and not self._loop.is_closed():
             self._loop.call_soon_threadsafe(self._stopping.set)
         self._server.should_exit = True
-        self._thread.join(timeout=10)
+        self._serving.join(timeout=10)

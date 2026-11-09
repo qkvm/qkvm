@@ -177,7 +177,6 @@ class LiveStandIn(LiveWall):
         self._server = uvicorn.Server(uvicorn.Config(app, **{**cli.SERVER_OPTIONS, "log_level": "error"}))  # (served as the program serves: cli.Line)
         # (Started and waited for as LiveWall starts its own, by the shared starter: LiveWall.__enter__ has used it since a34acefd.)
         self._serving = ServerThread("the wall", lambda: self._server.run(sockets=[self._sock]), lambda: self._server.started)
-        self._thread = self._serving.thread
 
     def __enter__(self) -> LiveStandIn:
         super().__enter__()
@@ -352,7 +351,6 @@ class WallBeforeTheLine(LiveWall):
         self._server = uvicorn.Server(uvicorn.Config(app, **{**cli.SERVER_OPTIONS, "log_level": "error"}))  # (served as the program serves: cli.Line)
         # (Started and waited for as LiveWall starts its own, by the shared starter: LiveWall.__enter__ has used it since a34acefd.)
         self._serving = ServerThread("the wall", lambda: self._server.run(sockets=[self._sock]), lambda: self._server.started)
-        self._thread = self._serving.thread
 
 
 @contextmanager

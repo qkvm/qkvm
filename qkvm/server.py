@@ -3232,7 +3232,9 @@ def create_app(core: Core) -> FastAPI:
             # Another address, kind or check, or another controller (not the same one known better: identity_follows): what
             # was lent to the one before ends, and a mount of it under way hands out nothing (the outside review's fourth round)
             before = (record.cert_pem, record.machine, record.ident)
+            ended = None
             if (record.url, record.kind, record.tls) != (changed.url, changed.kind, changed.tls) or identity_follows(before, (changed.cert_pem, changed.machine, changed.ident)) is None:
+                ended = core.served.of(device_id)
                 core.served.changed(device_id)
             await manager.adopt(client)
             for url_ in (record.url, changed.url):
@@ -3242,7 +3244,13 @@ def create_app(core: Core) -> FastAPI:
             except OSError as ex:
                 store.devices[at] = record
                 await manager.replace(record)
-                return not_saved("The change to this device", ex)
+                refused = not_saved("The change to this device", ex)
+                if ended is None:
+                    return refused
+                # (Ended before the save, for whichever controller it was to be: not given back with the record. The outside
+                # review's fifth round found "nothing was changed" said of it.)
+                return fail(507, "not_saved", f"The change to this device could not be saved ({ex.strerror or ex}), so nothing was changed, "
+                            f"but for {ended.name}, mounted on it from qKVM, which is served no more: mount it again.")
         # (Where the password typed took a machine that gives another number than the one the tile knew, that is said: a person
         # who typed it for a tile that said "it may be another one" is to find what became of it.)
         notes = [not_followed] if not_followed else []
@@ -4093,6 +4101,9 @@ def create_app(core: Core) -> FastAPI:
                 lending.refused.add("changed")
                 log.warning("%s: its mounted image %s was changed, moved or removed in the folder, and is served no more: %s", record.name, lending.name, ex)
             return PlainTextResponse("The image was changed or removed since it was mounted.", status_code=410)
+        except Exception:
+            slot.give_back()  # (an opening that raised what is no OSError kept its read's place: the outside review's fourth round)
+            raise
         first, last, part = wanted
         headers = {"Accept-Ranges": "bytes", "Content-Length": str(last - first + 1)}
         if part:

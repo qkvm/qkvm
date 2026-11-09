@@ -88,7 +88,9 @@ def test_a_screen_that_comes_back_is_given_its_first_picture_and_the_jetkvm_is_n
 
 def test_a_picture_from_before_the_screen_came_back_is_not_passed_off_as_the_screen(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(jetkvm, "FRAME_STALE", 30.0)  # (the picture from before is young: only being from before tells it)
-    jet = FakeJetKvm(JetState(frames_after_signal=12.0)).start()
+    # (Its first picture 20 s after the signal is back: on a slow runner the wall said "online" after the 12 s it was given
+    # before, the new picture had come, and was rightly served.)
+    jet = FakeJetKvm(JetState(frames_after_signal=20.0)).start()
     try:
         with wall(tmp_path) as client:
             device = add(client, jet.url)
@@ -99,7 +101,7 @@ def test_a_picture_from_before_the_screen_came_back_is_not_passed_off_as_the_scr
             wait_until(lambda: said(client, device, "online"), "the screen back was not said")
             reply = client.get(snap(device), params={"age": 0})
             assert reply.status_code == 503 and reply.json()["message"] == "Waiting for the JetKVM's video", reply.headers
-            wait_until(lambda: screen_shown(client, device), "the picture of the screen did not come", timeout=20)
+            wait_until(lambda: screen_shown(client, device), "the picture of the screen did not come", timeout=35)
     finally:
         jet.stop()
 

@@ -1504,6 +1504,17 @@ def test_a_power_command_whose_connection_is_retired_while_it_is_confirmed_is_no
 
 def test_a_power_command_is_done_when_the_server_is_seen_to_have_changed(tmp_path: Path, bmc: FakeBmc, monkeypatch: pytest.MonkeyPatch) -> None:
     bmc.state.power_takes = 0.5  # the real one: nine seconds from "accepted" to on
+    # Which commands are waited for, and for what: off after a forced off, on after an on, and nothing else. (A wait for
+    # "on" after a reset ends at once where the server is on already, as here: the times below did not tell it. The
+    # outside review of 0.3.1, L031-2.)
+    waited_for: list[bool] = []
+    carried_out = redfish.RedfishDevice._carried_out
+
+    async def noted(self: redfish.RedfishDevice, place: str, on: bool, within: float | None = None) -> None:
+        waited_for.append(on)
+        await carried_out(self, place, on, within)
+
+    monkeypatch.setattr(redfish.RedfishDevice, "_carried_out", noted)
     with wall(tmp_path) as client:
         device = add(client, bmc.url)
         act = f"/api/v1/devices/{device}/actions"
@@ -1514,11 +1525,16 @@ def test_a_power_command_is_done_when_the_server_is_seen_to_have_changed(tmp_pat
         assert client.post(act, json={"action": "atx_power"}).status_code == 200
         assert time.monotonic() - began >= 0.5 and bmc.state.power == "On"
         # What cannot be seen at once is not waited for: a system takes its time to shut down, and a reset shows nothing.
-        began = time.monotonic()
-        assert client.post(act, json={"action": "atx_power"}).status_code == 200
-        assert client.post(act, json={"action": "atx_reset"}).status_code == 200
-        assert time.monotonic() - began < 0.5
+        # (Its server takes five seconds to change here: a command waited for would take that long. Each of the two had
+        # less than 0.5 s together, as long as a command waited for took, and inside the image on a loaded runner they
+        # took 0.6 s.)
+        bmc.state.power_takes = 5.0
+        for action in ("atx_power", "atx_reset"):
+            began = time.monotonic()
+            assert client.post(act, json={"action": action}).status_code == 200
+            assert time.monotonic() - began < 2.5, action
         assert bmc.state.actions == ["system ForceOff", "system On", "system GracefulShutdown", "system ForceRestart"]
+        assert waited_for == [False, True]
 
 
 def test_a_server_that_stops_answering_is_offline_and_comes_back(tmp_path: Path) -> None:

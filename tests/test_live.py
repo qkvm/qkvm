@@ -218,7 +218,6 @@ class Wall:
         config = uvicorn.Config(create_app(self.core), **{**cli.SERVER_OPTIONS, "log_level": "error", **(serving or {})})
         self._server = uvicorn.Server(config)
         self._serving = ServerThread("the wall", lambda: self._server.run(sockets=[self._sock]), lambda: self._server.started)
-        self._thread = self._serving.thread
         self.clients: list[httpx.Client] = []
 
     def __enter__(self) -> Wall:
@@ -229,7 +228,7 @@ class Wall:
         for client in self.clients:
             client.close()
         self._server.should_exit = True
-        self._thread.join(timeout=10)
+        self._serving.join(timeout=10)
 
     def browser(self, name: str | None = None, password: str = PASSWORD) -> httpx.Client:
         """A browser signed in: as the first account (made here if there is none), or as `name`."""

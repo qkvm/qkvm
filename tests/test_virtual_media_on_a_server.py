@@ -325,7 +325,14 @@ def test_amis_controller_has_its_remote_media_switched_on_and_reads_the_image_ov
             assert (reply.status_code, reply.json()["code"]) == (409, "action_failed"), reply.text
             assert "takes an image over HTTPS only" in reply.json()["message"] and "Remote media was switched on" in reply.json()["message"]
             assert fake.state.rmedia_switches == 1 and fake.state.media_said == []
-            assert "HTTPS only" in admin.get(media(device)).json()["notes"][0]  # (its drive seen: it says so from now on)
+            said = admin.get(media(device)).json()["notes"][0]
+            assert "HTTPS only" in said and "switch HTTPS on (Settings, Network)" in said  # (its drive seen: it says so from now on)
+            # Where qKVM serves HTTPS itself, only the address named in Settings, Server images is plain: so it says (the
+            # owner's trial was told to switch on what was on).
+            live.core.https_forced = True
+            said = admin.get(media(device)).json()["notes"][0]
+            assert "qKVM serves HTTPS already: name its HTTPS address in Settings, Server images." in said and "switch HTTPS on" not in said
+            live.core.https_forced = False
             media_settings(admin, images, live.url)
             assert admin.get(media(device)).json()["notes"] == []
             reply = mount(admin, device)

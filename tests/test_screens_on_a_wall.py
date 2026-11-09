@@ -115,7 +115,15 @@ def test_no_signal_is_told_after_its_minutes_and_not_at_once(tmp_path: Path, inb
             assert [(d["no_signal_minutes"], d["unchanged_minutes"]) for d in admin.get("/api/v1/wall").json()["devices"]] == [(2, 0), (0, 0)]
             assert admin.put(f"/api/v1/devices/{office}", json={**edit, "no_signal_minutes": 1441}).status_code == 422
             assert admin.put("/api/v1/alerts", json={"enabled": True, "webhook": inbox.url}).status_code == 200
-            shown(admin, office, 0.3)  # (its last picture with a signal, which the alert keeps)
+            # Its last picture with a signal, which the alert keeps: shown until the wall holds one. (A tile's pictures are
+            # noted once a round knows the machine is watched; shown for 0.3 s alone, on a slow Linux runner, 3.11, no round
+            # came in that time and the alert went out with no picture.)
+            def kept() -> bool:
+                shown(admin, office, 0.1)
+                machine = admin.core.screens._machines.get(office)
+                return machine is not None and machine.last_lit is not None
+
+            wait_until(kept, "the wall kept no picture of the tile with a signal", 30)
             admin.get(snap(other))
             # (The round's looks after which it knows what is normal for each, and has kept the last picture with a signal: two
             # were given 0.6 s, and on GitHub's Windows runner, 3.13, the alert twice went out before one was kept.)

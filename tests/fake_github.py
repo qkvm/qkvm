@@ -89,7 +89,6 @@ class FakeGitHub:
         self.url = f"http://127.0.0.1:{self._sock.getsockname()[1]}"
         self._server = uvicorn.Server(uvicorn.Config(self._app(), log_level="error", access_log=False))
         self._serving = ServerThread("fake GitHub", lambda: self._server.run(sockets=[self._sock]), lambda: self._server.started)
-        self._thread = self._serving.thread
 
     def publish(
         self, version: str, wheel: bytes, *, notes: str = "", sums: bool = True, signed_by: str | None = None,
@@ -195,4 +194,4 @@ class FakeGitHub:
 
     def stop(self) -> None:
         self._server.should_exit = True
-        self._thread.join(timeout=10)
+        self._serving.join(timeout=10)

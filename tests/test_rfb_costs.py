@@ -295,8 +295,10 @@ def test_a_server_whose_pictures_cost_much_to_draw_gets_its_share_of_the_drawing
     # share grows with every second the server was served, as the program counts it.)
     assert sum(pool.took) <= 0.2 * went[0] + 0.1 + 0.25, (sum(pool.took), len(pool.took), went[0])
     # (A slice at a time: no single piece of work holds a thread for long. Counted in the thread's own time: by the clock, a
-    # piece on a busy computer took 0.266 s, the thread waiting for a core most of it.)
-    assert max(pool.worked) < 0.25, (max(pool.worked), max(pool.took))
+    # piece on a busy computer took 0.266 s, the thread waiting for a core most of it. On GitHub's ARM runner, slower a
+    # core, a piece took 0.31 s of its thread's own time: what this guards against held a thread a second and more per
+    # kilobyte, and half a second still tells the two apart.)
+    assert max(pool.worked) < 0.5, (max(pool.worked), max(pool.took))
 
 
 def test_a_server_that_costs_little_is_drawn_at_once_while_three_others_cost_the_threads_all_they_have(monkeypatch: pytest.MonkeyPatch) -> None:
