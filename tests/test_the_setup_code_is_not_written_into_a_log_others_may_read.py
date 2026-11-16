@@ -90,10 +90,16 @@ def test_a_wall_whose_starter_has_no_console_says_the_code_was_shown_nowhere(tmp
     if sys.platform == "win32":
         python = str(Path(sys.executable).with_name("pythonw.exe"))
         options = {"creationflags": 0x8, "close_fds": True}  # DETACHED_PROCESS, no handles: as a task at log-on starts it
+        closer: list[str] = []
     else:
+        # No stdout and no stderr, as a starter without a console has. A small Python closes them and then becomes the
+        # starter (exec); a function run in the child before it starts would have this whole test process copied by fork(),
+        # which a machine that counts the memory it promised refuses once the suite has grown the process (GitHub's Ubuntu
+        # 26.04 runners, 2026-11-16: "Cannot allocate memory" on every Python, with the rest of the suite passing).
         python = sys.executable
-        options = {"stdin": subprocess.DEVNULL, "preexec_fn": lambda: (os.close(1), os.close(2))}  # (no stdout, no stderr)
-    command = [python, "-P", "-m", "qkvm", "--data-dir", str(data), "--port", free_port(), "--bind", "local", "--setup-code"]
+        options = {"stdin": subprocess.DEVNULL}
+        closer = ["-P", "-c", "import os, sys; os.close(1); os.close(2); os.execv(sys.executable, [sys.executable, *sys.argv[1:]])"]
+    command = [python, *closer, "-P", "-m", "qkvm", "--data-dir", str(data), "--port", free_port(), "--bind", "local", "--setup-code"]
     wall = subprocess.Popen(command, env=environment, cwd=tmp_path, **options)  # type: ignore[call-overload]
     written = ""
     try:
@@ -109,3 +115,16 @@ def test_a_wall_whose_starter_has_no_console_says_the_code_was_shown_nowhere(tmp
             wall.kill()
     assert not re.search(r"setup code for setting up from another machine: \S", written), written
     assert "the setup code was shown nowhere: qkvm.log can be read by other users of this computer, and qKVM was started without a console" in written, written
+
+
+def test_nothing_has_the_whole_process_copied_to_start_a_program() -> None:
+    # The fault above, wherever else it could come: a function to run in the child before the program starts (what Popen
+    # calls preexec) makes Popen copy the whole process with fork(), the test process grown by the suite or a wall grown by its
+    # day. Every other way of starting shares the memory until the program is loaded, which no machine refuses.
+    word = "preexec" + "_fn"
+    here = Path(__file__).resolve().parent
+    import qkvm
+
+    places = [*here.glob("*.py"), *Path(qkvm.__file__).resolve().parent.rglob("*.py")]
+    assert len(places) > 100
+    assert [path.name for path in places if word in path.read_text(encoding="utf-8")] == []

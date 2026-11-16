@@ -23,6 +23,7 @@
     "cert_mismatch": "error",
     "cert_invalid": "error",
     "plain_only": "error",
+    "https_only": "error",
     "another_machine": "error",
     "unknown_kind": "error",
     "not_set_up": "error",
@@ -32,6 +33,7 @@
     "console_time_up": "error",
     "no_picture": "error",
     "health": "error",
+    "power_led_unwired": "online",
     "internal": "error"
   },
   "refusals": {
@@ -68,6 +70,7 @@
     "initialized": [409],
     "last_admin": [409],
     "locked": [409, 503],
+    "moved": [409],
     "no_password": [409, 502],
     "no_second_step": [409],
     "no_text": [409],
@@ -85,6 +88,7 @@
     "length_required": [411],
     "too_large": [413, 422],
     "another_machine": [422, 502],
+    "https_only": [422, 502],
     "damaged": [422],
     "invalid": [422],
     "name_required": [422],

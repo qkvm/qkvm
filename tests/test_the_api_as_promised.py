@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -22,7 +23,7 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
-from qkvm import jetkvm, kvm, server, update, vault
+from qkvm import alerts, jetkvm, kvm, screens, server, update, vault
 from qkvm.core import Core
 from tests.fake_amt import AmtState, FakeAmt
 from tests.fake_jetkvm import FakeJetKvm, JetState
@@ -31,8 +32,11 @@ from tests.fake_proxmox import SECRET as PVE_SECRET
 from tests.fake_proxmox import TOKEN_ID as PVE_TOKEN_ID
 from tests.fake_proxmox import FakeProxmox, PveState
 from tests.fake_redfish import BmcState, FakeBmc
+from tests.test_alerts import Inbox
 from tests.test_meanwhile import in_background
 from tests.test_redfish import a_screen
+from tests.test_screens_on_a_wall import picture as a_picture
+from tests.test_screens_on_a_wall import shown
 from tests.test_totp import code_for
 from tests.test_users import OTHER, account, browser
 from tests.test_wall import CSRF, PASSWORD, add, closed_port, snap, wait_until, wall
@@ -113,6 +117,9 @@ def test_what_the_table_promises_is_served_and_the_rest_is_the_pages_own(tmp_pat
 # Refusals that any request may answer with, said once in the chapter's table of errors and not in every row.
 GENERIC = {"unauthorized", "not_allowed", "forbidden", "totp_required", "rate_limited", "invalid", "too_large", "length_required", "internal", "locked", "not_saved"}
 Where = tuple[str, str] | str  # a row of the table, as (method, path); or a record described under a "### " heading of the chapter
+# Rows asked by a test of their own, below, and not by the long one: a machine's activity and the picture of its screen
+# alert (promised in 0.3.2, as the Desktop App reads them), which take a screen watch that goes off.
+ASKED_BY_THEIR_OWN: set[Where] = {("GET", "/api/v1/audit"), ("GET", "/api/v1/devices/{}/alert-picture/{}")}
 
 
 class Seen:
@@ -149,16 +156,19 @@ class Seen:
         assert reply.json()["message"], "a refusal without a sentence"
         self.names.setdefault(self.place((method, path)), set()).add(code)
 
-    def all_where_the_readme_describes_them(self) -> None:
+    def all_where_the_readme_describes_them(self, asked: set[Where] | None = None) -> None:
+        """Every name seen is in the README where it describes it; and every request of the table was asked: the ones
+        `asked` names, or (left out) all but those asked by a test of their own (ASKED_BY_THEIR_OWN)."""
         errors = CHAPTER.split("### Errors", 1)[1].split("\n### ", 1)[0]
         assert all(f"`{code}`" in errors for code in GENERIC), [code for code in GENERIC if f"`{code}`" not in errors]
         unsaid = {where: sorted(name for name in names if f"`{name}`" not in self.text(where) and name not in GENERIC) for where, names in self.names.items()}
         assert all(not names for names in unsaid.values()), {where: names for where, names in unsaid.items() if names}
-        # And every request of the table was asked.
-        assert set(self.rows) - set(self.names) == set(), sorted(set(self.rows) - set(self.names))
+        wanted = set(self.rows) - ASKED_BY_THEIR_OWN if asked is None else asked
+        assert wanted <= set(self.rows), sorted(wanted - set(self.rows))  # (each one a row of the table)
+        assert wanted - set(self.names) == set(), sorted(wanted - set(self.names))
 
 
-MEDIA_LISTED = {"images": LIST, "unseen": LIST, "left_out": INT, "notes": LIST, "space": NULL, "mounted": NULL, "offers": DICT, "uploading": NULL}
+MEDIA_LISTED = {"images": LIST, "unseen": LIST, "left_out": INT, "notes": LIST, "space": NULL, "mounted": NULL, "offers": DICT, "uploading": NULL, "listed": STR}
 MEDIA_IMAGE = {"id": STR, "name": STR, "where": STR, "size": INT + NULL, "partial": BOOL, "sha256": NULL}
 MEDIA_OFFERS = {"drives": LIST, "boot": LIST, "restart": BOOL, "upload": BOOL, "where": STR, "writable": LIST, "delete": BOOL, "drops_input": BOOL}
 MEDIA_NOW = {"drive": STR, "image": STR, "name": STR, "where": STR, "read_only": BOOL, "first": BOOL, "by": STR, "at": NUM, "sha256": NULL}
@@ -547,10 +557,17 @@ def test_every_promised_request_answers_as_the_table_says(tmp_path: Path, monkey
         seen.shaped(("GET", media), listed.json()["offers"], MEDIA_OFFERS)
         seen.shaped(("GET", f"{media}/upload"), admin.get(f"{media}/upload").json(), {"uploading": NULL})
         seen.refused("GET", f"{media}/upload", olga.get(f"{media}/upload"), 403, "not_allowed")
+        shown = listed.json()["listed"]
 
-        def upload(who: Any, name: str, body: bytes, machine: str = kvm_name, **more: Any) -> Any:
-            return who.post(f"{media}/upload", params={"name": name, "machine": machine}, content=body, **more)
+        def upload(who: Any, name: str, body: bytes, machine: str = kvm_name, listed: str | None = None, **more: Any) -> Any:
+            return who.post(f"{media}/upload", params={"name": name, "machine": machine, **({"listed": listed} if listed else {})}, content=body, **more)
 
+        # (0.3.2: a change sends the machine its list was made of; one made of another machine is refused, nothing done.)
+        elsewhere = "0" * 32
+        seen.refused("POST", media, admin.post(media, json={"image": "rescue.iso", "machine": kvm_name, "listed": elsewhere}), 409, "moved")
+        seen.refused("POST", f"{media}/unmount", admin.post(f"{media}/unmount", json={"image": "rescue.iso", "machine": kvm_name, "listed": elsewhere}), 409, "moved")
+        seen.refused("POST", f"{media}/delete", admin.post(f"{media}/delete", json={"image": "rescue.iso", "machine": kvm_name, "listed": elsewhere}), 409, "moved")
+        seen.refused("POST", f"{media}/upload", upload(admin, "new.iso", b"x" * 100, listed=elsewhere), 409, "moved")
         seen.refused("POST", f"{media}/upload", upload(olga, "new.iso", b"x" * 100), 403, "not_allowed")
         seen.refused("POST", f"{media}/upload", upload(admin, "new.iso", b"x" * 100, machine="another"), 409, "changed")
         seen.refused("POST", f"{media}/upload", upload(admin, "rescue.iso", b"x" * 100), 409, "duplicate")
@@ -558,11 +575,11 @@ def test_every_promised_request_answers_as_the_table_says(tmp_path: Path, monkey
         comet.state.msd_free = 50
         seen.refused("POST", f"{media}/upload", upload(admin, "new.iso", b"x" * 100), 507, "no_space")
         comet.state.msd_free = 6_000_000_000
-        uploaded = upload(admin, "new.iso", b"x" * 100)
+        uploaded = upload(admin, "new.iso", b"x" * 100, listed=shown)
         assert uploaded.status_code == 200, uploaded.text
         seen.shaped(("POST", f"{media}/upload"), uploaded.json(), {"ok": BOOL, "image": DICT, "sha256": STR})
         seen.shaped(("POST", f"{media}/upload"), uploaded.json()["image"], {**MEDIA_IMAGE, "where": NULL, "sha256": STR})
-        mounted = admin.post(media, json={"image": "new.iso", "machine": kvm_name, "drive": "flash", "writable": True})
+        mounted = admin.post(media, json={"image": "new.iso", "machine": kvm_name, "listed": shown, "drive": "flash", "writable": True})
         assert mounted.status_code == 200, mounted.text
         seen.shaped("How a machine is", mounted.json()["mounted"], {**MEDIA_NOW, "where": NULL, "first": NULL, "sha256": STR})
         seen.refused("POST", media, admin.post(media, json={"image": "rescue.iso", "machine": kvm_name, "drive": "cd", "writable": True}), 422, "invalid")
@@ -643,6 +660,62 @@ def test_every_promised_request_answers_as_the_table_says(tmp_path: Path, monkey
         seen.refused("GET", "/api/v1/status", bare.get("/api/v1/status"), 401, "unauthorized")
 
     seen.all_where_the_readme_describes_them()
+
+
+def test_a_machines_activity_and_the_picture_of_its_alert_answer_as_the_table_says(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # What the Desktop App reads in a machine's Details (0.3.2): what was done to it, by `device` and `limit`, and the
+    # picture a screen alert of it kept, by the stamp its entry names. A screen watch that goes off makes both.
+    monkeypatch.setattr(alerts, "CHECK_EVERY", 0.05)
+    monkeypatch.setattr(screens, "MINUTE", 0.5)  # (a minute is half a second here)
+    seen, inbox = Seen(), Inbox()
+    fake = FakeKvm(FakeState(picture=a_picture(60), picture_type="image/jpeg")).start()
+    try:
+        with wall(tmp_path) as admin:
+            device = add(admin, fake.url, name="Build server", unchanged_minutes=2)
+            other = add(admin, f"http://127.0.0.1:{closed_port()}", force=True, kind="kvmd", name="Another")  # (what is not its own)
+            assert admin.put("/api/v1/alerts", json={"enabled": True, "webhook": inbox.url}).status_code == 200
+            assert admin.post(f"/api/v1/devices/{device}/actions", json={"action": "keys", "keys": "Enter"}).status_code == 200
+            audit = "/api/v1/audit"
+            until = time.monotonic() + 30
+            while not any(entry.get("picture") for entry in admin.get(audit, params={"device": device}).json()["entries"]):
+                assert time.monotonic() < until, "the screen that looked the same was never told"
+                shown(admin, device, 0.3)
+            read = admin.get(audit, params={"device": device, "limit": 100})
+            assert read.status_code == 200, read.text
+            seen.shaped(("GET", audit), read.json(), {"entries": LIST, "more": BOOL, "missing": NULL})
+            entries = read.json()["entries"]
+            assert {entry["device_id"] for entry in entries} == {device} and other not in read.text  # its own, and nothing else
+            assert [entry["time"] for entry in entries] == sorted((entry["time"] for entry in entries), reverse=True)  # newest first
+            assert {"device_added", "action", "alert"} <= {entry["event"] for entry in entries} and read.json()["more"] is False
+            for entry in entries:
+                seen.shaped(("GET", audit), entry, {"time": NUM, "event": STR, "device": STR, "device_id": STR}, exactly=False)
+            pressed = next(entry for entry in entries if entry["event"] == "action")
+            seen.shaped(("GET", audit), pressed, {"user": STR, "action": STR}, exactly=False)
+            assert (pressed["user"], pressed["action"]) == ("admin", "keys")
+            alert = next(entry for entry in entries if entry["event"] == "alert")
+            seen.shaped(("GET", audit), alert, {"state": STR, "was": STR, "watch": STR, "minutes": INT, "picture": STR, "picture_at": NUM}, exactly=False)
+            assert (alert["watch"], alert["minutes"], alert["state"], alert["was"]) == ("unchanged", 2, "unchanged", "online") and "user" not in alert
+            assert re.fullmatch(r"[0-9]{1,16}", alert["picture"])  # (what goes into an address: digits)
+            newest = admin.get(audit, params={"device": device, "limit": 1}).json()
+            assert (newest["entries"], newest["more"]) == (entries[:1], True)
+            account(admin, "olga", "operator")
+            olga = browser(admin, "olga")
+            seen.refused("GET", audit, olga.get(audit, params={"device": device}), 403, "not_allowed")
+            seen.refused("GET", audit, admin.get(audit, params={"device": "x" * 65}), 422, "invalid")
+
+            # The picture, by the stamp the alert's entry names.
+            kept = admin.get(f"/api/v1/devices/{device}/alert-picture/{alert['picture']}")
+            assert kept.status_code == 200 and kept.headers["content-type"] == "image/jpeg" and kept.content == a_picture(60)
+            assert kept.headers["cache-control"] == "no-store"
+            picture = "/api/v1/devices/{}/alert-picture/{}"
+            seen.refused("GET", picture, admin.get(f"/api/v1/devices/{device}/alert-picture/12345"), 404, "no_picture")
+            seen.refused("GET", picture, admin.get(f"/api/v1/devices/{other}/alert-picture/{alert['picture']}"), 404, "no_picture")
+            seen.refused("GET", picture, admin.get(f"/api/v1/devices/nosuch01/alert-picture/{alert['picture']}"), 404, "not_found")
+            seen.refused("GET", picture, olga.get(f"/api/v1/devices/{device}/alert-picture/{alert['picture']}"), 403, "not_allowed")
+    finally:
+        fake.stop()
+        inbox.close()
+    seen.all_where_the_readme_describes_them(ASKED_BY_THEIR_OWN)
 
 
 def test_a_servers_screen_is_in_can_once_its_console_can_be_read(tmp_path: Path) -> None:

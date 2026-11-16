@@ -20,8 +20,8 @@ before there was an index: slower on a long log, and the same answer.
 
 from __future__ import annotations
 
+import collections
 import contextlib
-import dataclasses
 import functools
 import hashlib
 import io
@@ -40,7 +40,7 @@ from pathlib import Path
 from typing import Any, BinaryIO
 
 from ._folders import open_private
-from .store import LONGEST_LINE, AuditLog, entry_of, into_wal, open_shared, sqlite_open
+from .store import LONGEST_LINE, AuditLog, Gate, entry_of, into_wal, open_shared, sqlite_open
 
 log = logging.getLogger("qkvm")
 
@@ -49,7 +49,10 @@ VERSION = 2  # of the tables and of what is taken from an entry; another one is 
 CHUNK = 1_000_000  # bytes of a text file taken in in one transaction, at the most
 TAIL_KEPT = 4096  # bytes of a text file just before where it was read to, of which a hash is kept (see Index._take)
 TICK = 1.0  # seconds between two looks at the text files where nobody said that there is more
-CATCH_UP = 2.0  # seconds a read waits for the index to hold what the text files hold, before it reads them itself
+# Seconds a read waits for the index to hold what the text files hold (or it reads them itself), and for a checkpoint of the
+# index under way to end (or it is told to come back in a moment), the two together; and the first page of a download (the
+# pages after it wait at the gate PAGE_PATIENCE).
+CATCH_UP = 2.0
 READ_PATIENCE = 5.0  # seconds one read of the index may take before it is given up
 WRITE_PATIENCE = 5.0  # seconds a write waits for the file (only a checkpoint of a reader's could hold it)
 OPEN_PATIENCE = 60.0  # seconds the check of the file at its opening may take before it is taken as done
@@ -57,10 +60,16 @@ LOOK_AGAIN = 60.0  # seconds after which the old text files are looked at again,
 REFUSED = (5.0, 15.0, 60.0)  # seconds before the index is tried again after its disk refused it, the third and later every minute
 GONE_AT_ONCE = 5000  # rows deleted in one transaction where a text file is gone
 WAL_MOST = 16_000_000  # bytes the -wal file may take before what is in it is brought into the file and it begins again
-CHECKPOINT_PATIENCE = 2 * READ_PATIENCE  # seconds that waits for the reads under way, longer than any of them may take
+CHECKPOINT_PATIENCE = 2 * READ_PATIENCE  # seconds that waits for the index's own reads under way, longer than any of them may take (none begins meanwhile: Gate)
+# Seconds the checkpoint itself then waits for the file: only a read outside qKVM can hold it by then, which may never let go,
+# and the index's own reads wait at the gate meanwhile. Less than they wait there (CATCH_UP).
+CHECKPOINT_TRY = 1.0
 CHECKPOINT_AGAIN = 60.0  # seconds after one that did not get through before the next is tried
 PAGE = 1000  # entries one page of a download reads at a time
-PAGE_PATIENCE = 15.0  # seconds one page of a download may take where the text files are read (the index behind): under `qkvm stop`'s 25
+# Seconds one page of a download may take where the text files are read (the index behind), and one after the first waits
+# at the index's gate: longer than a checkpoint of the index keeps it shut (CHECKPOINT_PATIENCE), and with READ_PATIENCE
+# under `qkvm stop`'s 25 (Index.pages).
+PAGE_PATIENCE = 15.0
 SAY_EVERY = 60.0  # seconds between two lines in the log about the same trouble
 UNREADABLE_SAID = 30  # rounds in a row a text file could not be opened before the log says so (a moment of it is a file being moved on)
 MOST_WORDS, LONGEST_WORD = 20, 100  # words looked for at once, and characters of each
@@ -102,6 +111,11 @@ _SCHEMA = (
 
 class NotReadable(Exception):
     """A read of the activity log that cannot be answered: it took too long."""
+
+
+class _Busy(NotReadable):
+    """A read of the index that waited at its gate as long as it may (Index._query): a read of the log says so; a page of a
+    download goes on from the text files."""
 
 
 class _Unusable(Exception):
@@ -422,6 +436,7 @@ class Index:
         self._looked = float("-inf")  # the writer's: monotonic time the old text files were last looked at
         self._refused = 0  # the writer's: rounds that its disk refused since one went through
         self._wal_again = 0.0  # the writer's: monotonic time before which the -wal file's size is not looked at again
+        self._gate = Gate()  # the index's own reads pass it, and wait at it while its -wal file is brought into it (_hold_wal)
         self._unreadable = 0  # the writer's: rounds in a row in which a text file could not be opened
         self._said: dict[str, float] = {}  # what trouble the log was last told of, and when
         self.made: float | None = None  # the writer's: seconds the last making from the start took (for whoever tests)
@@ -491,12 +506,14 @@ class Index:
 
     def read(self, asked: Asked, limit: int) -> Found:
         """The newest `limit` entries asked for, newest first. From the index where it holds all the text files do,
-        else from the text files themselves. NotReadable where the index took too long."""
+        else from the text files themselves. NotReadable where the index took too long, or was being brought up to date
+        from its -wal file for longer than the read waits (CATCH_UP, see _query)."""
+        waits_until = time.monotonic() + CATCH_UP
         self.text.flush()  # what was done a moment ago is in what is read
         generation = self.caught_up()
         if generation is not None:
             try:
-                rows = self._query(asked, limit + 1)
+                rows = self._query(asked, limit + 1, waits_until=waits_until)
             except sqlite3.Error:
                 rows = None  # (being made again, or its disk: the text files say the same)
             if rows is not None and generation == self._generation:
@@ -530,43 +547,98 @@ class Index:
 
     def pages(self, asked: Asked) -> Iterator[list[dict[str, Any]]]:
         """Every entry asked for, newest first, PAGE at a time: each page read when it is asked for (in a worker thread),
-        and none of them holds the index between two. Where the index is thrown away meanwhile, the rest comes from the
-        text files, from the moment of the last entry handed over on."""
+        and none of them holds the index between two. A page after the first waits at the index's gate up to PAGE_PATIENCE,
+        longer than a checkpoint of the index keeps it shut (CHECKPOINT_PATIENCE), and so never goes to the text files for
+        one (it did after CATCH_UP: the review of 0.3.2, M1). Where the index is thrown away meanwhile, or the gate stayed
+        shut even so (_Busy), the rest comes from the text files, after the last page handed over (_after): reading them
+        never touches the index, and a download half made and then refused helps nobody. (A single read of the log is
+        answered busy where it waited CATCH_UP: see read.)
+
+        A page after the first takes PAGE_PATIENCE at the gate and READ_PATIENCE for its read at the most, of the index or of
+        the text files, 20 s from when it is asked for, under `qkvm stop`'s 25 (a page being read is waited for: Pager); the
+        first, CATCH_UP and READ_PATIENCE, and PAGE_PATIENCE where it goes to the text files."""
+        asked_at = time.monotonic()
+        waits_until = asked_at + CATCH_UP  # (the first page's: with the wait for the index to catch up)
         self.text.flush()
         generation = self.caught_up()
         below: int | None = None
-        last: float | None = None
+        handed: list[dict[str, Any]] = []  # the last page handed over from the index
         while generation is not None:
             try:
-                rows = self._query(asked, PAGE, below)
-            except sqlite3.Error:
-                rows = None
-            if rows is None or generation != self._generation:
+                rows = self._query(asked, PAGE, below, waits_until)
+            except (sqlite3.Error, _Busy):
+                break
+            if generation != self._generation:
                 break
             entries = [entry for _, line in rows if (entry := _loaded(line)) is not None]
             if entries:
                 yield entries
             if len(rows) < PAGE:
                 return
-            below, last = rows[-1][0], entries[-1]["time"] if entries else last
-        rest = asked if last is None else dataclasses.replace(asked, before=last if asked.before is None else min(last, asked.before))
+            below, handed = rows[-1][0], entries
+            asked_at = time.monotonic()  # (the next page's: from when it is asked for)
+            waits_until = asked_at + PAGE_PATIENCE
+        until = time.monotonic() + PAGE_PATIENCE
+        yield from self._after(asked, handed, min(until, asked_at + PAGE_PATIENCE + READ_PATIENCE) if handed else until)
+
+    def _after(self, asked: Asked, handed: list[dict[str, Any]], until: float) -> Iterator[list[dict[str, Any]]]:
+        """The rest of a download, read from the text files, PAGE at a time: the entries asked for that come after `handed`
+        (the last page handed over from the index; all of them where it is empty), the first page by the monotonic time
+        `until` and each after it within PAGE_PATIENCE of when it is asked for.
+
+        The order of a download is the order of the text files, as the index's is (its ids are given in their order), and
+        not the order of the times the entries say: entries written within one tick of the clock share their time (15.6 ms
+        on Windows before Python 3.13: a burst of them, as several machines removed at once), and an entry can say a time
+        before that of the one written before it (two threads, a clock set back). So where the download was is found in the
+        text files by the entries themselves: what is asked for is passed over up to where it holds the entries of `handed`
+        one after the other, as they were handed over (entries written since the download began, newer than it, are passed
+        over with them), and each entry after that is handed over once, whatever its time says. (Only a page of entries
+        alike to the last character, twice over one after the other, could be taken for it: a thousand entries of one moment
+        and the same words.) (Gone on from the time of
+        the last entry handed over, the entries of that moment not handed over yet were left out, and an entry out of the
+        order of time was left out or handed over twice: the review of 0.3.2, M1.) Where the text files no longer hold
+        `handed` (put back by hand, which is also a reason the index is thrown away), what follows it cannot be told:
+        NotReadable, the download refused rather than made with a part that cannot be placed."""
+        seen: collections.deque[dict[str, Any]] = collections.deque(maxlen=len(handed))
+        found = not handed
         page: list[dict[str, Any]] = []
-        deadline = time.monotonic() + PAGE_PATIENCE
+        deadline = until
         with contextlib.closing(self.text.entries()) as reading:
             for count, entry in enumerate(reading):
                 if count % 1000 == 0 and time.monotonic() > deadline:
                     raise NotReadable(f"The activity log's index is not ready, and reading the log itself took longer than {PAGE_PATIENCE:g} seconds for a page of the download")
-                if rest.wants(Facts.of(entry)):
-                    page.append(entry)
-                    if len(page) >= PAGE:
-                        yield page
-                        page = []
-                        deadline = time.monotonic() + PAGE_PATIENCE  # (the next page's own time: from when it is asked for)
+                if not asked.wants(Facts.of(entry)):
+                    continue
+                if not found:
+                    seen.append(entry)
+                    found = entry == handed[-1] and list(seen) == handed
+                    continue
+                page.append(entry)
+                if len(page) >= PAGE:
+                    yield page
+                    page = []
+                    deadline = time.monotonic() + PAGE_PATIENCE  # (the next page's own time: from when it is asked for)
+        if not found:
+            raise NotReadable("The activity log's files changed while the download was made. Try again.")
         if page:
             yield page
 
-    def _query(self, asked: Asked, limit: int, below: int | None = None) -> list[tuple[int, str]]:
-        """(id, line) of the newest `limit` entries asked for, below the id `below` where it is given."""
+    def _query(self, asked: Asked, limit: int, below: int | None = None, waits_until: float | None = None) -> list[tuple[int, str]]:
+        """(id, line) of the newest `limit` entries asked for, below the id `below` where it is given.
+
+        While the index's -wal file is brought into it (_hold_wal), a read waits for that before it takes hold of the file
+        (store.Gate says why), to the monotonic time `waits_until` at the most (CATCH_UP from now where it is not given), and
+        is then told to come back in a moment: let in, it could hold that off as before, and the reads coming one after the
+        other could hold it off for good. (Those under way when it began are waited for, and end within READ_PATIENCE.)"""
+        if not self._gate.passed(time.monotonic() + CATCH_UP if waits_until is None else waits_until):
+            raise _Busy("The activity log is busy just now. Try again in a moment.")
+        try:
+            return self._query_let_in(asked, limit, below)
+        finally:
+            self._gate.left()  # (its connection closed: a checkpoint waits for it no longer)
+
+    def _query_let_in(self, asked: Asked, limit: int, below: int | None) -> list[tuple[int, str]]:
+        """`_query`, once it is let in at the gate."""
         conn = sqlite_open(self.path, read=True, timeout=2.0)
         deadline = time.monotonic() + READ_PATIENCE
         try:
@@ -1012,8 +1084,13 @@ class Index:
 
     def _hold_wal(self, conn: sqlite3.Connection) -> None:
         """Where the -wal file has grown past WAL_MOST (reads that overlapped kept SQLite from beginning it again), what is
-        in it goes into the file, once the reads under way have ended: they end within READ_PATIENCE. Not again for a
-        minute where that did not get through (something outside qKVM holds a read open)."""
+        in it goes into the file, once the index's own reads under way have ended: they end within READ_PATIENCE, and those
+        asked for meanwhile wait at the gate (store.Gate: reads of its own that kept coming, one beginning before the other
+        ended, kept it from getting through at all). What can be brought in at once is while they end (PASSIVE); the rest,
+        and the -wal file begun again, with a wait for the file of CHECKPOINT_TRY: whatever holds it by then is a read
+        outside qKVM, which may never let go, and the gate is opened again (shut for the whole of SQLite's wait, 10 s, the
+        log's reads were refused meanwhile: the independent review of 0.3.2, M1). Not again for a minute where that did not
+        get through."""
         if time.monotonic() < self._wal_again:
             return
         try:
@@ -1021,15 +1098,20 @@ class Index:
                 return
         except OSError:
             return
-        conn.execute(f"PRAGMA busy_timeout = {int(CHECKPOINT_PATIENCE * 1000)}").fetchall()
-        try:
-            busy = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0]
-        except sqlite3.OperationalError as ex:
-            busy, why = 1, str(ex)
-        else:
-            why = "a read held it"
-        finally:
-            conn.execute(f"PRAGMA busy_timeout = {int(WRITE_PATIENCE * 1000)}").fetchall()
+        with self._gate.shut():
+            try:
+                conn.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchall()
+                if not self._gate.emptied(CHECKPOINT_PATIENCE):
+                    busy, why = 1, f"its own reads under way did not end within {CHECKPOINT_PATIENCE:g} s"
+                else:
+                    conn.execute(f"PRAGMA busy_timeout = {int(CHECKPOINT_TRY * 1000)}").fetchall()
+                    try:
+                        busy = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0]
+                    finally:
+                        conn.execute(f"PRAGMA busy_timeout = {int(WRITE_PATIENCE * 1000)}").fetchall()
+                    why = "a read outside qKVM held it"
+            except sqlite3.OperationalError as ex:
+                busy, why = 1, str(ex)
         if busy:
             self._wal_again = time.monotonic() + CHECKPOINT_AGAIN
             self._say("checkpoint", "the activity log's index could not be brought up to date from its -wal file: %s", why)

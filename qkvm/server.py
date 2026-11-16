@@ -36,7 +36,7 @@ from starlette.requests import ClientDisconnect
 from . import about, activity, alerts, amt, discover, exchange, history, live, metrics, proxmox, qr, screens, totp, vncdevice, webpush
 from ._version import __version__
 from .core import Core, DeviceManager, auth_mark, driver_for, identity, unknown_kind
-from .kvm import FINGERBOT_PRESSES, KEYS, MAX_PROBE, MAX_TEXT, MOST_UPLOAD, POWER_KEY_REFUSED, PRESS_ANSWERED, PRESS_SENT, REJECTED, RETIRED, AlreadySo, Carried, Device, KvmError, MediaOffer, UploadCut, bounded, can_do, fetch_certificate, fingerprint, listens, names_the_power_key, other_way, plain, publicly_trusted, read_json, saved_fingerprint, saved_mark
+from .kvm import FINGERBOT_PRESSES, KEYS, MAX_PROBE, MAX_TEXT, MOST_UPLOAD, POWER_KEY_REFUSED, PRESS_ANSWERED, PRESS_SENT, REJECTED, RETIRED, AlreadySo, Carried, Device, DeviceSpec, KvmError, MediaOffer, UploadCut, bounded, can_do, fetch_certificate, fingerprint, https_instead, listens, names_the_power_key, on_https, other_way, plain, publicly_trusted, read_json, saved_fingerprint, saved_mark
 from .netbind import BindError, lan_ip, normalize, resolve, tailscale_ip
 from .served import SERVED_PATH, MOST_AT_ONCE, Binding, identity_follows, MOST_REFUSED_SAID, Lending, Opening, Slot, address_of, basic_matches, byte_range, hand_to_readers, let_go_and_give_back, read_at, same_address, scrubbed
 from .served import READERS as SERVED_READERS
@@ -442,9 +442,25 @@ class KvmSwitchIn(BaseModel):
     on: bool  # a PC's Intel AMT KVM on (true) or off, on its management engine
 
 
+def media_listed(device_id: str, spec: DeviceSpec) -> str:
+    """The machine a list of its images was made of, as a mark: its tile, the address and the kind it is spoken to as, how its
+    certificate is checked, and what it is known by there (its pinned certificate, the number its machine gives for itself,
+    its identity). GET .../media answers it as `listed`, and a change that sends it back is refused where the tile's machine
+    is no longer so (409 `moved`): a Media box opened for one machine, its tile then edited to another address, sent its
+    mount or its deletion there, wherever an image of that name was (the desktop app's finding 21). Made anew of what is so
+    each time, it cannot stand for another machine after a restart or an edit taken back; nothing in it is secret, and none
+    of it can be read out of it. (Where the machine's number is first learned between a list and its change, that change is
+    refused once, and the box lists again.)"""
+    said = "\0".join((device_id, spec.base_url, spec.kind, spec.tls, spec.cert_pem or "", spec.machine, spec.ident))
+    return hashlib.sha256(said.encode("utf-8", "surrogatepass")).hexdigest()[:32]
+
+
 class MediaIn(BaseModel):
     image: str = Field(min_length=1, max_length=300)  # an image's `id`, as GET .../media listed it
     machine: str = Field(min_length=1, max_length=4 * 60)  # the machine's name, as the confirmation named it
+    # GET .../media's `listed`, as the box that sends this was shown it: refused (409 `moved`) where the tile's machine is no
+    # longer that one. None (a client before 0.3.2, as the Desktop App 0.1.x): not asked, as before. (Also below.)
+    listed: str | None = Field(None, min_length=1, max_length=64)
     drive: Literal["cd", "flash", "disk"] = "cd"  # what it goes in as, of the offer's `drives`
     writable: bool = False  # the machine may change what is on it: only for a drive of the offer's `writable`, and chosen
     boot: Literal["none", "once", "until_unmounted"] = "none"  # start it from the image: not, once (restarted now), until unmounted
@@ -456,11 +472,13 @@ class MediaIn(BaseModel):
 class UnmountIn(BaseModel):
     image: str = Field(min_length=1, max_length=300)  # what is mounted (`image` of `mounted`), as the confirmation named it
     machine: str = Field(min_length=1, max_length=4 * 60)
+    listed: str | None = Field(None, min_length=1, max_length=64)
 
 
 class DeleteIn(BaseModel):
     image: str = Field(min_length=1, max_length=300)  # an image's `id`, as GET .../media listed it, as the confirmation named it
     machine: str = Field(min_length=1, max_length=4 * 60)
+    listed: str | None = Field(None, min_length=1, max_length=64)
 
 
 class AmtViewIn(BaseModel):
@@ -863,24 +881,26 @@ async def detect_kind(url: str, scheme_given: bool, port: int | None = None) -> 
     # No credentials are sent and the answer only picks a driver, so the certificate is not checked here.
     async with httpx.AsyncClient(verify=False, timeout=RECOGNISE, trust_env=False) as client:
 
-        async def said(address: str) -> tuple[bool, Any]:
-            """(whether anything answered there at all, what it said where that was a plain yes in JSON)"""
+        async def said(address: str) -> tuple[bool, Any, str | None]:
+            """(whether anything answered there at all, what it said where that was a plain yes in JSON, the HTTPS address at the
+            same host that a plain one sends everybody on to: kvm.https_instead)"""
             try:
                 reply = await bounded(client, client.build_request("GET", address), MAX_PROBE, RECOGNISE_WITHIN)
             except KvmError as ex:
-                return ex.code != "timeout", None  # too much, or packed oddly: somebody is there all the same
+                return ex.code != "timeout", None, None  # too much, or packed oddly: somebody is there all the same
             except httpx.HTTPError:
-                return False, None
+                return False, None, None
+            sent_on = https_instead(address, reply)
             try:
-                return True, read_json(reply) if reply.status_code == 200 else None
+                return True, read_json(reply) if reply.status_code == 200 else None, sent_on
             except ValueError:
-                return True, None
+                return True, None, sent_on
 
         # Asked together: an address where nothing answers costs one wait, not one for each make.
-        *jets, (root_answers, root) = await asyncio.gather(*(said(f"{c}/device/status") for c in candidates), said(f"{url}/redfish/v1/"))
+        *jets, (root_answers, root, _) = await asyncio.gather(*(said(f"{c}/device/status") for c in candidates), said(f"{url}/redfish/v1/"))
     wanted_tls = url.startswith("https://")  # https:// was typed, or nothing was
-    over_tls = wanted_tls and (root_answers or any(answers for c, (answers, _) in zip(candidates, jets, strict=True) if c.startswith("https://")))
-    for candidate, (_, status) in zip(candidates, jets, strict=True):
+    over_tls = wanted_tls and (root_answers or any(answers for c, (answers, _, _) in zip(candidates, jets, strict=True) if c.startswith("https://")))
+    for candidate, (_, status, _) in zip(candidates, jets, strict=True):
         if isinstance(status, dict) and "isSetup" in status:
             if wanted_tls and not candidate.startswith("https://"):
                 if over_tls:
@@ -909,7 +929,31 @@ async def detect_kind(url: str, scheme_given: bool, port: int | None = None) -> 
     found = await amt.detect(url, scheme_given, port)
     if found is not None:
         return found
+    # Its plain address sends everybody on to HTTPS at the same host (nginx in front of kvmd, once that is its only way in): said,
+    # with that address, before the password typed goes out the plain way to be sent on. Never followed by itself.
+    sent_on = next((to for candidate, (_, _, to) in zip(candidates, jets, strict=True) if candidate == url and to), None)
+    if sent_on is not None:
+        raise on_https(sent_on)
     return "kvmd", url
+
+
+SENT_ON_WITHIN = 3.0  # seconds a KVM at a plain address has to say that it sends everybody on: a web server that does answers at once
+
+
+async def sent_on_to_https(url: str) -> str | None:
+    """Where a KVM's plain address sends everybody on to HTTPS at the same host (kvm.https_instead), asked of its API with no
+    credentials before a kvmd is signed in to, its kind chosen or found by asking (detect_kind sees only its own paths sent
+    on, and a web server may send the API alone): so that a KVM that wants HTTPS is not sent the password the plain way to
+    say so. None for an address that is not plain, and for whatever else answers or nothing: the sign-in after it says that,
+    as before."""
+    if not url.startswith("http://"):
+        return None
+    async with httpx.AsyncClient(timeout=RECOGNISE, trust_env=False) as client:
+        try:
+            reply = await bounded(client, client.build_request("GET", f"{url}/api/auth/check"), MAX_PROBE, SENT_ON_WITHIN)
+        except (httpx.HTTPError, KvmError):
+            return None
+    return https_instead(url, reply)
 
 
 # Characters that are not drawn and are not of the kind that says so of itself ("format"): letters that
@@ -2938,6 +2982,12 @@ def create_app(core: Core) -> FastAPI:
         said = f"This {'says it is' if said_so else 'is'} the same device as {twin.name}, which is on the wall already" + ("" if twin.name == host else f" ({host})")
         return JSONResponse({"code": "same_device", "message": said, "same_as": {"id": twin.id, "name": twin.name, "host": host}}, status_code=409)
 
+    def not_taken_there(ex: KvmError) -> JSONResponse:
+        """A device that could not be added, or saved as edited, at the address typed: as its driver said, and with the address
+        the device itself says to use instead where it says one (`use`: a KVM whose plain address sends everybody on to HTTPS
+        at the same host), for whoever typed it to take. Never taken by itself."""
+        return JSONResponse({"code": ex.code, "message": ex.message, **({"use": ex.use} if ex.use else {})}, status_code=422)
+
     def not_taken(ex: ValueError) -> JSONResponse:
         """What was typed, refused: said as the check says it (capitalize() wrote the rest small, qKVM as qkvm)."""
         said = str(ex)
@@ -3029,11 +3079,28 @@ def create_app(core: Core) -> FastAPI:
             twin = other_way(url) if kind == "jetkvm" and url.startswith("http://") and (body.password or own.secret is not None) else None
             if twin is not None and twin.startswith("https://") and await jetkvm_at(twin):
                 url = twin
+        # Saved without checking, nothing about how it is signed in to changed (its name, its group, its alerts): as any edit so
+        # saved, not asked what its plain address says now. Refused for that in full, a tile whose KVM sends that address on to
+        # HTTPS since could not be renamed while it keeps it (the independent review of 0.3.2, L1). Its own connection goes on
+        # holding its sign-in back there; anything else is asked, saved without checking or not: a password typed, another
+        # user name, address, kind or certificate check is not sent the plain way to a KVM that says it answers on HTTPS.
+        unchecked_as_it_was = (
+            own is not None
+            and body.force
+            and not body.password
+            and (url, kind, body.tls or own.tls, body.username.strip()) == (own.url, own.kind, own.tls, own.username)
+        )
         if kind == "auto":
             try:
                 kind, url = await detect_kind(url, "://" in body.url, typed)
             except KvmError as ex:
-                return fail(422, ex.code, ex.message)
+                return not_taken_there(ex)
+        if kind == "kvmd" and not unchecked_as_it_was and (to := await sent_on_to_https(url)) is not None:
+            # Asked before the password typed or saved goes to its plain address: of a kvmd chosen, or kept in an edit of the same
+            # address, which is not asked what it is; and of one found by asking, where nothing else answered. Asking what it is
+            # sees a plain address that sends its own paths on to HTTPS, and not one that sends its API alone (nginx with only
+            # /api/ on HTTPS), which was sent the password typed the plain way before (the outside review of 0.3.2, its L4).
+            return not_taken_there(on_https(to))
         if any(d.url == url and d is not own for d in store.devices):
             return fail(409, "duplicate", "This device is already on the wall")
         return url, open_url, kind
@@ -3064,7 +3131,7 @@ def create_app(core: Core) -> FastAPI:
         try:
             client, about = await connect(record, body.password, body.force)
         except KvmError as ex:
-            return fail(422, ex.code, ex.message)
+            return not_taken_there(ex)
         if not record.name:
             hostname = str(about.get("hostname") or "")
             # (No longer than a name may be: a device named by an address of ninety characters could not be
@@ -3212,7 +3279,7 @@ def create_app(core: Core) -> FastAPI:
             except KvmError as ex:
                 if body.force and carried:
                     return fail(422, "password_needed", f"This device could not be checked at its new address ({ex.message}). Type its password to save it there all the same.")
-                return fail(422, ex.code, ex.message)
+                return not_taken_there(ex)
         async with one_change:
             # The KVM was talked to without holding up other changes. What was checked before that is checked again.
             refusal = still_allowed(request)
@@ -3722,6 +3789,18 @@ def create_app(core: Core) -> FastAPI:
             return fail(409, "changed", f"The confirmation named {machine}, and this machine is called {record.name} now. Nothing was {what}: look at it again.")
         return None
 
+    def media_moved(listed: str | None, device_id: str, device: Device, record: DeviceRecord, what: str) -> JSONResponse | None:
+        """The change was chosen from a list of this tile's machine as it is now (`listed`, media_listed of the driver that will
+        do it): otherwise nothing is done, and it is said why (the desktop app's finding 21). A change that names no list (a
+        client before 0.3.2) is not asked this, as before."""
+        if listed is None or listed == media_listed(device_id, device.spec):
+            return None
+        return fail(
+            409, "moved",
+            f"{record.name} is not the machine its images were listed for any more: its address, or what qKVM knows of the machine "
+            f"there, was changed since. Nothing was {what}: list its images again.",
+        )  # fmt: skip
+
     def media_failed(event: str, ex: KvmError, detail: dict[str, Any], request: Request, record: DeviceRecord, mounted: str = "") -> JSONResponse:
         """A refusal of the device's, written down and said; `mounted`: the image is mounted, and what failed came after it
         (what was not done, for the sentence: "started from it", "restarted")."""
@@ -3774,7 +3853,11 @@ def create_app(core: Core) -> FastAPI:
             listed = await device.media_images()
         except KvmError as ex:
             return fail(ex.status, ex.code, ex.message)
-        said = {**listed, "mounted": device.media_now(), "offers": (device.media_offer() or offer).as_dict(), "uploading": uploading(device_id)}
+        # (The machine as this list was made of it, once it has answered: what it was known by as it did.)
+        said = {
+            **listed, "mounted": device.media_now(), "offers": (device.media_offer() or offer).as_dict(), "uploading": uploading(device_id),
+            "listed": media_listed(device_id, device.spec),
+        }  # fmt: skip
         return still_shown(request, device_id) or JSONResponse(said)
 
     @app.get("/api/v1/devices/{device_id}/media/upload")
@@ -3792,7 +3875,7 @@ def create_app(core: Core) -> FastAPI:
         if isinstance(found, JSONResponse):
             return found
         device, record, offer = found
-        if refused := media_named(body.machine, record, "mounted"):
+        if refused := media_moved(body.listed, device_id, device, record, "mounted") or media_named(body.machine, record, "mounted"):
             return refused
         restart = body.restart or body.boot == "once"
         if body.drive not in offer.drives:
@@ -3871,7 +3954,7 @@ def create_app(core: Core) -> FastAPI:
         if isinstance(found, JSONResponse):
             return found
         device, record, offer = found
-        if refused := media_named(body.machine, record, "taken out"):
+        if refused := media_moved(body.listed, device_id, device, record, "taken out") or media_named(body.machine, record, "taken out"):
             return refused
         if refused := media_held(request, device_id, record, "", restart=False, drops=offer.drops_input):
             return refused
@@ -3900,6 +3983,8 @@ def create_app(core: Core) -> FastAPI:
         if isinstance(found, JSONResponse):
             return found
         device, record, offer = found
+        if refused := media_moved(body.listed, device_id, device, record, "deleted"):
+            return refused
         if not offer.delete:
             return fail(422, "invalid", f"{record.name} has no images of its own that qKVM deletes")
         if refused := media_named(body.machine, record, "deleted"):
@@ -3951,12 +4036,15 @@ def create_app(core: Core) -> FastAPI:
     async def media_upload(
         device_id: str, request: Request,
         name: Annotated[str, Query(min_length=1, max_length=300)], machine: Annotated[str, Query(min_length=1, max_length=4 * 60)],
+        listed: Annotated[str | None, Query(min_length=1, max_length=64)] = None,  # (as MediaIn's)
     ) -> Response:  # fmt: skip
         """Carry the image in the body into the device's own storage, as `name`: streamed through as it comes, kept nowhere."""
         found = media_target(request, device_id)
         if isinstance(found, JSONResponse):
             return found
         device, record, offer = found
+        if refused := media_moved(listed, device_id, device, record, "uploaded"):
+            return refused
         if not offer.upload:
             return fail(422, "invalid", f"Images are not carried through qKVM to {record.name}")
         if refused := media_named(machine, record, "uploaded"):
@@ -3973,7 +4061,7 @@ def create_app(core: Core) -> FastAPI:
         detail: dict[str, Any] = {"device": record.name, "device_id": device_id, "image": name, "size": size}
         try:
             try:
-                listed = await device.media_upload(name, carried, by=user.name, still=still_theirs)
+                put_there = await device.media_upload(name, carried, by=user.name, still=still_theirs)
             except KvmError as ex:
                 message = ex.message
                 if ex is RETIRED and (other := manager.devices.get(device_id)) is not None and other is not device:
@@ -4000,7 +4088,7 @@ def create_app(core: Core) -> FastAPI:
         finally:
             uploads.pop(device_id, None)
         audit.write("media_uploaded", client_ip(request), sha256=carried.sha256, **detail)
-        return JSONResponse({"ok": True, "image": listed, "sha256": carried.sha256})
+        return JSONResponse({"ok": True, "image": put_there, "sha256": carried.sha256})
 
     # --- an image mounted on a server, as its controller reads it (served.py, 0.3.0 A4) ------------------------------
     # Public: the controller has no session here. By the address made for that one mount, to the controller's own address

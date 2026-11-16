@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import errno
 import ipaddress
@@ -1092,6 +1093,66 @@ def read_only_uri(path: Path) -> str:
     if uri.startswith("file://") and not uri.startswith("file:///"):
         uri = "file:////" + uri[len("file://") :]
     return f"{uri}?mode=rw"
+
+
+class Gate:
+    """What a store's own reads pass before they take hold of its database: shut while its writer brings the -wal file into
+    the file (a checkpoint, TRUNCATE), for the history (history.py) and the activity log's index (activity.py) alike.
+
+    SQLite's checkpoint waits for the place in the file's index that a read under way holds; a read that begins as that one
+    ends can take the same place, and the next ones share it, so that reads that keep coming, one beginning before the other
+    ends, keep it from getting through however short each is (the history's -wal file at four times its share on GitHub's
+    runners, 0.3.1). With no read of the store's own beginning meanwhile, those under way end within their patience, and
+    it gets through. A read waits at the gate only so long, and is then told to come back (the store says how); the gate
+    is opened again whatever happens in the checkpoint.
+
+    The reads let in are counted until they have let go of the file (`left`), and the writer waits for those (`emptied`)
+    rather than SQLite: what SQLite then still waits for is held outside qKVM (a database browser, a monitoring script,
+    Litestream, which keeps a read open by design), waits at no such gate, and cannot be waited out. The checkpoint is
+    given a moment for it, and the gate opened again: shut for the whole of SQLite's wait, the wall's own reads were told to
+    come back for most of every minute where such a read stayed open, and the file was held all the same (the
+    independent review of 0.3.2, M1).
+    """
+
+    def __init__(self) -> None:
+        self._turn = threading.Condition()
+        self._shut = False
+        self._in = 0  # reads let in that have not let go of the file yet
+
+    @contextlib.contextmanager
+    def shut(self) -> Iterator[None]:
+        """Shut while what is in it runs (the writer's checkpoint), and opened again however that ends."""
+        with self._turn:
+            self._shut = True
+        try:
+            yield
+        finally:
+            with self._turn:
+                self._shut = False
+                self._turn.notify_all()
+
+    def passed(self, until: float) -> bool:
+        """Wait (a worker thread) until the gate is open, to the monotonic time `until` at the most. False where it is shut then.
+        True: the read is let in, and counted as under way until it says `left`, once it has let go of the file (whatever
+        came of it: a read that never says so is waited for by every checkpoint, to its patience)."""
+        with self._turn:
+            if not self._turn.wait_for(lambda: not self._shut, max(0.0, until - time.monotonic())):
+                return False
+            self._in += 1
+            return True
+
+    def left(self) -> None:
+        """A read let in (`passed`) has let go of the file."""
+        with self._turn:
+            self._in -= 1
+            if self._in <= 0:
+                self._turn.notify_all()
+
+    def emptied(self, within: float) -> bool:
+        """Wait (the writer, with the gate shut) until the reads let in have all left, `within` seconds at the most. False
+        where some are still under way then."""
+        with self._turn:
+            return self._turn.wait_for(lambda: self._in <= 0, within)
 
 
 # Taken around every opening and closing of a database (sqlite_open, _Private.close): a database's -wal and -shm, which SQLite

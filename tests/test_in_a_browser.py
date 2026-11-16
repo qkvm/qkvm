@@ -511,7 +511,10 @@ def test_a_kvm_is_added_from_the_wall(tmp_path: Path, browser: Browser, fakes: l
         form.locator("input[type=password]").fill(DEVICE_PASSWORD)
         form.locator('input[placeholder="None"]').fill("Rack 1")
         form.get_by_role("button", name="Check and add").click()
-        expect(form.locator("ul.results li.ok")).to_contain_text("over plain HTTP")  # said, where the password crosses unencrypted
+        # What it is, and that the password crosses unencrypted, said where it does: in brackets, as the Desktop App says it,
+        # with no dash and no dot between (the owner's rule for every word published).
+        named = fakes[0].url.split("//", 1)[1]  # (named by its address, where nothing else was given it)
+        expect(form.locator("ul.results li.ok")).to_have_text(f"{named} added (RM10 V0.98.3 release7, over plain HTTP)")
         expect(page.locator("#wall article")).to_have_count(1)
         # The try with the wrong password is no longer true of that address, and its line went: one line per address.
         expect(form.locator("ul.results li")).to_have_count(1)
@@ -1337,6 +1340,48 @@ def test_what_is_no_kvm_is_not_added_anyway_and_a_tile_that_signs_nobody_in_is_s
             assert len(elsewhere.asked("POST", "/api/auth/login")) <= 2  # (asked once more at most, for the address that was tried)
     finally:
         elsewhere.stop()
+
+
+def test_a_tile_whose_kvm_answers_on_https_since_is_still_renamed_without_checking(tmp_path: Path, browser: Browser) -> None:
+    # (The independent review of 0.3.2, L1.) A KVM whose plain address sends everybody on to HTTPS since its tile was made:
+    # an edit of the tile says so, and offers that address. Where nothing about how it is signed in to was changed, it offers
+    # "Save without checking" as well, as for a device that signs nobody in (which this one is, to the wall); the box had
+    # nothing else, and the tile could not be given another name or group at the address it has.
+    secure = FakeKvm(FakeState(), tls_dir=tmp_path / "tls").start()
+    plain = FakeKvm(FakeState()).start()
+    try:
+        with a_wall(tmp_path / "wall", ("Comet", plain)) as (live, admin), looking(browser, live) as page:
+            sign_in(page, live)
+            expect(tile(page, "Comet")).to_have_attribute("data-state", "online")
+            plain.state.https_at = secure.url
+            expect(tile(page, "Comet")).to_have_attribute("data-state", "error", timeout=20_000)
+            page.get_by_role("button", name="Actions for Comet").click()
+            top(page).get_by_role("button", name="Edit...").click()
+            form = top(page)
+            form.locator("input[type=text]").first.fill("Comet (old rack)")
+            form.get_by_role("button", name="Save", exact=True).click()
+            expect(form.locator("p.error")).to_contain_text(f"This KVM answers on HTTPS: its plain address sends everybody to {secure.url}")
+            expect(form.get_by_role("button", name=f"Use {secure.url}")).to_be_visible()
+            anyway = form.get_by_role("button", name="Save without checking")
+            expect(anyway).to_be_visible()
+            # Not with a password typed: that is never sent the plain way to a KVM that says it answers on HTTPS.
+            password = form.locator("input[type=password]")
+            password.fill(DEVICE_PASSWORD)
+            expect(anyway).to_be_hidden()
+            form.get_by_role("button", name="Save", exact=True).click()
+            expect(form.locator("p.error")).to_contain_text("This KVM answers on HTTPS")
+            expect(anyway).to_be_hidden()
+            password.fill("")
+            form.get_by_role("button", name="Save", exact=True).click()
+            expect(anyway).to_be_visible()
+            anyway.click()
+            told(page, "Comet (old rack) saved")
+            saved = admin.get("/api/v1/wall").json()["devices"][0]
+            assert (saved["name"], saved["url"]) == ("Comet (old rack)", plain.url)
+            assert secure.state.logins == 0
+    finally:
+        plain.stop()
+        secure.stop()
 
 
 def test_the_computer_on_screen_is_switched_from_the_tile_of_a_kvm_with_several_ports(tmp_path: Path, browser: Browser) -> None:

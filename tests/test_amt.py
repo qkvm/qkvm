@@ -2,7 +2,7 @@
 (phase 1), and the redirection port for the screen, keys and the pointer through its KVM (phase 2).
 
 Everything here runs against the stand-in in fake_amt.py, which was built from Intel's class reference and, for the
-redirection port, from what a real engine (AMT 16) was seen to send. What was tried on that real machine is in the
+redirection port, from what a real engine was seen to send. What was tried on that real machine is in the
 README; the tests that need it (test_real_amt.py) skip without it.
 """
 
@@ -74,20 +74,20 @@ def test_an_amt_pc_is_recognised_from_its_address_and_shows_how_it_is(tmp_path: 
         added = reply.json()
         assert added["device"]["kind"] == "amt" and added["device"]["picture"] is False
         assert added["device"]["name"] == "desk-7"  # what the engine says the PC is called
-        assert added["about"] == {"model": "Example Computers Office Desk 7", "version": "12.0.90", "hostname": "desk-7"}
+        assert added["about"] == {"model": "Example Computers Office Desk 7", "version": "99.2.10", "hostname": "desk-7"}
         device = added["device"]["id"]
         status = status_of(client, device, state="online")
         assert status["kind"] == "amt" and status["picture"] is False and status["screen"] is True and status["console"] is False
         assert status["atx"] == {"enabled": True, "power": True, "hdd": None}
         # What a client may ask of it: the power buttons, and through its KVM the screen, keys and text, and the live line.
         assert status["can"] == ["screen", "keys", "text", "power", "reset", "power_state", "live", "control", "bios_setup"]
-        assert status["about"] == {"model": "Example Computers Office Desk 7", "version": "12.0.90"}
+        assert status["about"] == {"model": "Example Computers Office Desk 7", "version": "99.2.10"}
         server = status["server"]
-        assert (server["power"], server["health"], server["processor"], server["processors"], server["memory_gib"]) == ("On", None, "Intel Core i5, 3.4 GHz", 1, 16)
+        assert (server["power"], server["health"], server["processor"], server["processors"], server["memory_gib"]) == ("On", None, "Intel Core i3, 2.9 GHz", 1, 12)
         assert (server["temperatures"], server["fans"], server["unwell"], server["locator"]) == ([], [], [], None)
         assert server["amt"] == {
             "power": 2, "control": "admin", "kvm": "enabled", "consent": False, "make": "Example Computers", "model": "Office Desk 7",
-            "serial": "PC0000000001", "bios": "E7ET42W (1.42)", "plain": True, "listener": True, "session_timeout": 0,
+            "serial": "PC0000000001", "bios": "XB0Z07A (0.07)", "plain": True, "listener": True, "session_timeout": 0,
             "view": "stills",  # (its tile's view: a new tile's, tests/test_amt_views.py)
         }  # fmt: skip
         assert server["no_screen"] is None  # (nothing stands against its screen)
@@ -297,10 +297,10 @@ def test_a_pc_whose_chassis_says_nothing_is_named_after_its_board(tmp_path: Path
     with wall(tmp_path) as client:
         reply = client.post("/api/v1/devices", json={"url": pc.url, "password": "secret"})
         assert reply.status_code == 201, reply.text
-        assert reply.json()["about"] == {"model": "Example Boards EB-Q370", "version": "12.0.90", "hostname": None}
+        assert reply.json()["about"] == {"model": "Example Boards EB-X100", "version": "99.2.10", "hostname": None}
         assert reply.json()["device"]["name"] == "127.0.0.1:" + pc.url.rsplit(":", 1)[1]  # it has no name to go by
         status = status_of(client, reply.json()["device"]["id"], state="online")
-        assert (status["server"]["processor"], status["server"]["processors"], status["server"]["memory_gib"]) == ("Example Processor X, 3.4 GHz", 2, 8.5)
+        assert (status["server"]["processor"], status["server"]["processors"], status["server"]["memory_gib"]) == ("Example Processor X, 2.9 GHz", 2, 8.5)
 
 
 def test_an_export_takes_an_amt_pc_along_and_an_import_brings_it_back(tmp_path: Path, pc: FakeAmt) -> None:
@@ -505,7 +505,7 @@ def sixtieth(monkeypatch: pytest.MonkeyPatch) -> None:
 # eight seconds a look is given (0.13 s) was shorter than a busy computer took for one: the tile said "offline" of an
 # engine that answers everything but its sign-in (once, in a whole run beside other tracks).
 A = 20.0
-CHALLENGE =(401, {"WWW-Authenticate": 'Digest realm="Digest:0123456789ABCDEF", nonce="6c2a6f1b", qop="auth"', "Server": "Intel(R) Active Management Technology 12.0.90"}, b"")
+CHALLENGE =(401, {"WWW-Authenticate": 'Digest realm="Digest:0123456789ABCDEF", nonce="6c2a6f1b", qop="auth"', "Server": "Intel(R) Active Management Technology 99.2.10"}, b"")
 WATCHED = 375 / S
 LATE, NEVER = 12 / A, 60 / A  # (later than anything else is waited for, sooner than a sign-in is; and never: see A)
 HOW: dict[str, tuple[Any, int]] = {
@@ -641,7 +641,7 @@ def test_a_detail_answered_wrongly_leaves_the_rest_of_the_tile_standing(tmp_path
         assert status["server"]["processor"] is None and status["server"]["processors"] is None
         assert status["about"]["version"] is None and status["about"]["model"] == "Example Computers Office Desk 7"
         assert status["server"]["amt"]["consent"] is False  # what the KVM settings said; the opt-in service was not heard
-        assert status["server"]["memory_gib"] == 16
+        assert status["server"]["memory_gib"] == 12
 
 
 def test_a_listing_that_never_ends_is_not_followed_for_ever(pc: FakeAmt) -> None:
@@ -1909,7 +1909,7 @@ def test_a_digest_challenge_without_qop_is_not_answered(tmp_path: Path) -> None:
                 if length:
                     await reader.readexactly(length)
                 writer.write(
-                    b"HTTP/1.1 401 Unauthorized\r\nServer: Intel(R) Active Management Technology 16.1.25\r\n"
+                    b"HTTP/1.1 401 Unauthorized\r\nServer: Intel(R) Active Management Technology 99.2.10\r\n"
                     b'WWW-Authenticate: Digest realm="Digest:00000000000000000000000000000000", nonce="fixednonce"\r\nContent-Length: 0\r\n\r\n'
                 )
                 await writer.drain()

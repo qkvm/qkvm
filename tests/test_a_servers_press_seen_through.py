@@ -222,6 +222,47 @@ def test_a_command_whose_read_before_it_gets_no_answer_is_not_sent_and_says_so(b
     assert bmc_fast.state.actions == [] and not any(request.startswith("POST") for request in bmc_fast.state.requests)
 
 
+@pytest.mark.parametrize("action", ["reboot", "atx_reset"])
+def test_a_press_that_found_no_connection_on_a_pinned_certificate_is_not_sent_and_says_so(tmp_path: Path, action: str) -> None:
+    # (Found re-reading the desktop's follow-up 4, 0.3.2.) With its certificate pinned and shown by no other tile, a tile's
+    # commands go through the HTTP library's own connections, and where none could be had from them in time (PoolTimeout),
+    # nothing went out. That was said as no answer in time: of a reset, "it may have been done", and of a restart of the
+    # controller, which may never answer as it goes down, "done". Nothing was sent, and that is what is said.
+    bmc = FakeBmc(BmcState(), tls_dir=tmp_path / "tls").start()
+
+    async def run() -> kvm.KvmError | None:
+        spec = kvm.DeviceSpec(
+            id="ab12", name="server", base_url=bmc.url, username="admin", password="secret", kind="redfish", tls="pinned", cert_pem=await kvm.fetch_certificate(bmc.url)
+        )
+        device = redfish.RedfishDevice(spec)
+        try:
+            await device.identify()
+            assert device._pinned_alone()  # (the road under test: not a line of the tile's own)
+            sending = device._send
+
+            async def no_connection_to_be_had(client: httpx.AsyncClient, request: httpx.Request, *args: object, **kwargs: object) -> httpx.Response:
+                if request.method == "POST" and "/Actions/" in request.url.path:
+                    raise httpx.PoolTimeout("no connection to be had in time", request=request)
+                return await sending(client, request, *args, **kwargs)  # type: ignore[arg-type]
+
+            device._send = no_connection_to_be_had  # type: ignore[method-assign]
+            try:
+                await device.act(action)
+            except kvm.KvmError as ex:
+                return ex
+            return None
+        finally:
+            await device.close()
+
+    try:
+        refused = asyncio.run(run())
+        assert refused is not None, f"{action} was said to be done, and nothing was sent"
+        assert refused.code == "action_failed" and refused.message.startswith("Nothing was sent") and redfish.never_sent(refused), refused.message
+        assert bmc.state.actions == [] and not any(request.startswith("POST") and "/Actions/" in request for request in bmc.state.requests)
+    finally:
+        bmc.stop()
+
+
 @pytest.fixture
 def bmc_fast(monkeypatch: pytest.MonkeyPatch) -> Iterator[FakeBmc]:
     monkeypatch.setattr(redfish.RedfishDevice, "WAITS", httpx.Timeout(0.5, connect=2.0, pool=2.0))

@@ -22,7 +22,7 @@ from playwright.sync_api import Browser, Locator, Page, expect
 from qkvm import kvm
 from qkvm.kvm import MEDIA_NOTES
 from tests.fake_kvm import FakeKvm, FakeState
-from tests.test_in_a_browser import a_wall, browser, looking, sign_in, tile, told, top, until  # noqa: F401  (fixtures, by name)
+from tests.test_in_a_browser import DEVICE_PASSWORD, a_wall, browser, looking, sign_in, tile, told, top, until  # noqa: F401  (fixtures, by name)
 from tests.test_virtual_media_in_a_browser import where_everything_stands
 
 DEBIAN = "debian-13.iso"
@@ -241,6 +241,96 @@ def test_an_image_larger_than_a_cd_rom_drive_reads_is_said_so_at_its_mount(tmp_p
         expect(top(page).locator("h2")).to_have_text("Mount debian-13.iso")
         expect(top(page)).not_to_contain_text("2.36 GB")
     assert comet.state.msd_drive["connected"] is False
+
+
+def test_a_box_whose_tile_was_moved_to_another_kvm_meanwhile_changes_nothing_there_and_closes(tmp_path: Path, browser: Browser, comet: FakeKvm) -> None:  # noqa: F811
+    # (The desktop app's finding 21: the box stays open across an edit of its tile. Opened for this KVM, its tile edited to
+    # another's address meanwhile, it sent its mount there, where an image of the same name was. It sends the machine it
+    # listed with every change now; the wall refuses one listed for another machine, and the box closes.)
+    other = FakeKvm(FakeState(msd=True, msd_images={name: {"complete": True, "removable": True, "size": 700_000_000, "mod_ts": 1.0, "sha256": ""} for name in (DEBIAN, "only-there.iso")})).start()
+    try:
+        with a_wall(tmp_path / "wall") as (live, admin), looking(browser, live) as page:
+            added = admin.post("/api/v1/devices", json={"url": comet.url, "password": DEVICE_PASSWORD, "name": "comet"})
+            assert added.status_code == 201, added.text
+            device = added.json()["device"]["id"]
+            sign_in(page, live)
+            expect(tile(page, "comet")).to_have_attribute("data-state", "online", timeout=30_000)
+            box = open_the_box(page)
+            debian = box.get_by_role("radio", name=re.compile(r"^debian-13\.iso"))
+            expect(debian).to_be_visible(timeout=20_000)
+            debian.check()
+            # Meanwhile, from somewhere else, its tile is edited to the other KVM's address, by its name as it was.
+            edited = admin.put(f"/api/v1/devices/{device}", json={"name": "comet", "url": other.url, "password": DEVICE_PASSWORD})
+            assert edited.status_code == 200, edited.text
+
+            def at_the_other() -> bool:
+                admin.get("/api/v1/status")  # (a look at it, which finds what its drive offers)
+                listed = admin.get(f"/api/v1/devices/{device}/media")
+                return listed.status_code == 200 and any(image["id"] == "only-there.iso" for image in listed.json()["images"])
+
+            until(page, at_the_other, "the tile never spoke to the other KVM")
+            box.get_by_role("button", name="Mount", exact=True).click()
+            question = top(page)
+            expect(question.locator("h2")).to_have_text("Mount debian-13.iso")
+            question.get_by_role("button", name="Mount", exact=True).click()
+            told(page, "comet is not the machine its images were listed for any more")
+            expect(page.locator("dialog[open]")).to_have_count(0)
+            assert other.state.msd_drive["connected"] is False and other.state.msd_calls == [], other.state.msd_calls
+            assert comet.state.msd_calls == []
+            # Opened again, the box lists the machine the tile is at now, and what is chosen from that is done there.
+            box = open_the_box(page)
+            expect(box.get_by_role("radio", name=re.compile(r"^only-there\.iso"))).to_be_visible(timeout=20_000)
+            box.get_by_role("radio", name=re.compile(r"^debian-13\.iso")).check()
+            box.get_by_role("button", name="Mount", exact=True).click()
+            top(page).get_by_role("button", name="Mount", exact=True).click()
+            told(page, "comet: Mount debian-13.iso done")
+            assert other.state.msd_drive["image"] == DEBIAN and other.state.msd_drive["connected"] is True
+            assert comet.state.msd_calls == []
+    finally:
+        other.stop()
+
+
+def test_an_upload_from_a_box_whose_tile_was_moved_to_another_kvm_meanwhile_sends_nothing_and_closes(tmp_path: Path, browser: Browser, comet: FakeKvm) -> None:  # noqa: F811
+    # (The independent review of 0.3.2, L4.) The wall refuses an upload listed for another machine (409 `moved`) before it
+    # reads a byte of it, and closes the connection under a browser still sending: its answer can be lost, and the box then
+    # said that qKVM did not answer and that it may have been done, and stayed open, where nothing was. The box asks for its
+    # list again before a byte goes; where the tile is at another machine by now, it says so and closes, as for the other
+    # three changes, and nothing is sent.
+    other = FakeKvm(FakeState(msd=True, msd_images={DEBIAN: {"complete": True, "removable": True, "size": 700_000_000, "mod_ts": 1.0, "sha256": ""}})).start()
+    upload_path, _ = an_image(tmp_path, "rescue.iso", 2_000_000)
+    try:
+        with a_wall(tmp_path / "wall") as (live, admin), looking(browser, live) as page:
+            added = admin.post("/api/v1/devices", json={"url": comet.url, "password": DEVICE_PASSWORD, "name": "comet"})
+            assert added.status_code == 201, added.text
+            device = added.json()["device"]["id"]
+            sign_in(page, live)
+            expect(tile(page, "comet")).to_have_attribute("data-state", "online", timeout=30_000)
+            sent: list[str] = []
+            page.on("request", lambda request: sent.append(request.url) if "/media/upload" in request.url and request.method == "POST" else None)
+            box = open_the_box(page)
+            expect(box.get_by_role("radio", name=re.compile(r"^rescue-00\.iso"))).to_be_visible(timeout=20_000)
+            # Meanwhile, from somewhere else, its tile is edited to the other KVM's address, by its name as it was.
+            edited = admin.put(f"/api/v1/devices/{device}", json={"name": "comet", "url": other.url, "password": DEVICE_PASSWORD})
+            assert edited.status_code == 200, edited.text
+
+            def at_the_other() -> bool:
+                admin.get("/api/v1/status")  # (a look at it, which finds what its drive offers)
+                listed = admin.get(f"/api/v1/devices/{device}/media")
+                return listed.status_code == 200 and not any(image["id"] == "rescue-00.iso" for image in listed.json()["images"])
+
+            until(page, at_the_other, "the tile never spoke to the other KVM")
+            with page.expect_file_chooser() as chooser:
+                box.get_by_role("button", name="Upload...").click()
+            chooser.value.set_files(str(upload_path))
+            question = top(page)
+            expect(question.locator("h2")).to_have_text("Upload rescue.iso")
+            question.get_by_role("button", name="Upload", exact=True).click()
+            told(page, "comet is not the machine its images were listed for any more")
+            expect(page.locator("dialog[open]")).to_have_count(0)
+            assert sent == [], sent
+            assert other.state.msd_writes == [] and comet.state.msd_writes == []
+    finally:
+        other.stop()
 
 
 def test_what_is_under_way_in_the_box_spins_and_counts_its_seconds(tmp_path: Path, browser: Browser, comet: FakeKvm) -> None:  # noqa: F811

@@ -136,10 +136,10 @@ def test_a_servers_readings_are_collected_by_sensor() -> None:
     record = type("Record", (), {"id": "ab12", "name": "db-01", "kind": "redfish", "group": ""})()
     status = {
         "state": "online", "last_seen_ago": 3, "health": {"temp": None},
-        "server": {"health": "Warning", "temperatures": [{"name": "CPU0_TEMP", "celsius": 61, "ok": True}, {"name": "odd", "celsius": None, "ok": True}]},
+        "server": {"health": "Warning", "temperatures": [{"name": "TEMP_CPU_A", "celsius": 61, "ok": True}, {"name": "odd", "celsius": None, "ok": True}]},
     }  # fmt: skip
     said = samples(metrics.render(started=1.0, unlocked=True, sessions=0, devices=[(record, status)], update_available=True))
     labels = 'id="ab12",device="db-01",kind="redfish",group=""'
-    assert said[f'qkvm_device_temperature_celsius{{{labels},sensor="CPU0_TEMP"}}'] == 61
+    assert said[f'qkvm_device_temperature_celsius{{{labels},sensor="TEMP_CPU_A"}}'] == 61
     assert said[f"qkvm_server_healthy{{{labels}}}"] == 0 and said["qkvm_update_available"] == 1
     assert not any('sensor="odd"' in name for name in said)  # a sensor without a reading is not a reading of nought

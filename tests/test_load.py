@@ -710,8 +710,10 @@ def test_services_on_the_internet_are_checked_against_the_list_the_admin_names(
     assert narrowed.cert_store_stats()["x509_ca"] == 1
 
 
-def test_raising_the_allowance_for_open_files_never_fails() -> None:
+def test_raising_the_allowance_for_open_files_never_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli, "files_allowed", None)  # (what it leaves allowed is kept there: not for the tests after this one)
     cli.raise_file_limit()  # whatever the system says: more if it may, as before if it may not
+    assert cli.idle_kept_most() >= 1
 
 
 def test_a_log_line_does_not_wait_for_whatever_it_is_written_to(tmp_path: Path) -> None:

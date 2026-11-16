@@ -38,7 +38,7 @@ from tests import ServerThread, local_socket
 from tests.fake_kvm import make_device_certificate
 from tests.fake_vnc import Behind
 
-PROCESSOR = "Intel Xeon Silver 4410Y"
+PROCESSOR = "Example Silver 9100Y"  # made up: the model of no real processor
 UNSET = object()
 WAY_IN: object = UNSET  # set by a test: what the controller answers, word for word, as the way into its console
 # What the computer, the chassis and the controller are called, by layout.
@@ -95,7 +95,7 @@ class BmcState:
     more_fans: int = 0  # so many fans more than the three, each fitted and well (openbmc layout)
     last_fan_unwell: bool = False  # ...but the last of them says it is not well
     fan_takes: float = 0.0  # seconds each fan takes to answer (openbmc layout)
-    fan_failing: str = ""  # the fan (its resource's name, "fan_CPU0_FAN") whose every read is answered 503 (openbmc layout)
+    fan_failing: str = ""  # the fan (its resource's name, "fan_FAN_CPU_A") whose every read is answered 503 (openbmc layout)
     # At one of its moments it answers an error with HTTP 200, as some controllers do, instead of 503: as a
     # record ({"error": {"message": ...}}, the standard's shape) or as a text ({"error": "..."}). None: 503.
     errors_in_200: str | None = None
@@ -183,6 +183,9 @@ class BmcState:
     begins_with_nothing: bool = False
     seats: int = 2  # how many may have the console open at once
     monitor_goes_dark: bool = False  # set to switch the server's own monitor off while a console is open
+    # The two words for that as the pass to the console says them, in place of what monitor_goes_dark makes them: a word
+    # left out of this is not said at all.
+    console_words: dict[str, Any] | None = None
     web_sessions: dict[str, str] = field(default_factory=dict)  # the web page's sessions: cookie -> the token to send with every request
     web_logins: int = 0
     web_signed_out: int = 0
@@ -409,7 +412,7 @@ def make_fake_bmc(state: BmcState) -> FastAPI:
         return JSONResponse(headers={"ETag": shown_mark()}, content={
             **light, "@odata.etag": shown_mark(),
             "Id": name, "Model": state.model, "Manufacturer": state.manufacturer, "HostName": state.hostname,
-            "PowerState": state.power, "BiosVersion": "F12", "SerialNumber": "SN0000000000", "UUID": state.uuid,
+            "PowerState": state.power, "BiosVersion": "X07", "SerialNumber": "SN0000000000", "UUID": state.uuid,
             "Status": {"Health": "OK", "HealthRollup": state.health, "State": "Enabled"},
             "ProcessorSummary": {"Count": 2, "Model": PROCESSOR},
             "MemorySummary": {"TotalSystemMemoryGiB": 256},
@@ -787,8 +790,8 @@ def make_fake_bmc(state: BmcState) -> FastAPI:
     def temperatures() -> list[tuple[str, Any, dict[str, Any]]]:
         """(name, reading, status) of every temperature, in whichever shape it is then said."""
         return [
-            ("CPU0_TEMP", state.cpu_temperature, {"Health": state.temperature_health, "State": "Enabled"}),
-            ("CPU1_TEMP", 55, fine), ("DIMM_A_TEMP", 45, fine), ("M2_TEMP", None, {"State": "Absent"}),
+            ("TEMP_CPU_A", state.cpu_temperature, {"Health": state.temperature_health, "State": "Enabled"}),
+            ("TEMP_CPU_B", 55, fine), ("TEMP_MEM_A", 45, fine), ("TEMP_SSD_A", None, {"State": "Absent"}),
         ]  # fmt: skip
 
     @app.get(v1 + "/Chassis/{name}/Thermal")
@@ -801,18 +804,18 @@ def make_fake_bmc(state: BmcState) -> FastAPI:
                 for sensor, reading, status in temperatures()
             ],
             "Fans": [
-                {"Name": "CPU0_FAN", "Reading": 1650, "ReadingUnits": "RPM", "Status": fine},
-                {"Name": "CPU1_FAN", "Reading": 450, "ReadingUnits": "RPM", "Status": {"Health": "Warning", "State": "Enabled"}},
-                {"Name": "SYS_FAN5", "Reading": None, "ReadingUnits": "RPM", "Status": {"State": "Absent"}},
+                {"Name": "FAN_CPU_A", "Reading": 1650, "ReadingUnits": "RPM", "Status": fine},
+                {"Name": "FAN_CPU_B", "Reading": 450, "ReadingUnits": "RPM", "Status": {"Health": "Warning", "State": "Enabled"}},
+                {"Name": "FAN_REAR_5", "Reading": None, "ReadingUnits": "RPM", "Status": {"State": "Absent"}},
             ],
         })  # fmt: skip
 
     # --- the newer shape of the same sensors (OpenBMC has only this one) ---------------------------------
     # A fan says its speed as a share of its most (Reading), as revolutions (SpeedRPM), or both.
     FANS = {
-        "fan_CPU0_FAN": {"Name": "CPU0_FAN", "SpeedPercent": {"SpeedRPM": 1650}, "Status": fine},
-        "fan_CPU1_FAN": {"Name": "CPU1_FAN", "SpeedPercent": {"Reading": 18}, "Status": {"Health": "Warning", "State": "Enabled"}},
-        "fan_SYS_FAN5": {"Name": "SYS_FAN5", "SpeedPercent": {"SpeedRPM": None}, "Status": {"State": "Absent"}},
+        "fan_FAN_CPU_A": {"Name": "FAN_CPU_A", "SpeedPercent": {"SpeedRPM": 1650}, "Status": fine},
+        "fan_FAN_CPU_B": {"Name": "FAN_CPU_B", "SpeedPercent": {"Reading": 18}, "Status": {"Health": "Warning", "State": "Enabled"}},
+        "fan_FAN_REAR_5": {"Name": "FAN_REAR_5", "SpeedPercent": {"SpeedRPM": None}, "Status": {"State": "Absent"}},
     }
 
     @app.get(v1 + "/Chassis/{name}/ThermalSubsystem")
@@ -1032,10 +1035,15 @@ def make_fake_bmc(state: BmcState) -> FastAPI:
         made = secrets.token_hex(16)
         state.console_passes.add(made)
         dark = 1 if state.monitor_goes_dark else 0
-        return JSONResponse({
+        said: dict[str, Any] = {
             "client_ip": "127.0.0.1", "token": made, "session": secrets.token_hex(8), "server_ip": "127.0.0.1",
             "kvm_service_status": 1, "automatic_off": dark, "local_monitor_off": dark, "power_save_mode": 0,
-        })  # fmt: skip
+        }  # fmt: skip
+        if state.console_words is not None:
+            for word in ("automatic_off", "local_monitor_off"):
+                said.pop(word)
+            said.update(state.console_words)
+        return JSONResponse(said)
 
     def pieces(frame: Any) -> list[bytes]:
         """A frame as the console sends it: its facts with the first piece, and its data cut up."""

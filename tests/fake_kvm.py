@@ -45,6 +45,9 @@ class FakeState:
     colour: tuple[int, int, int] = (32, 74, 135)
     signal: bool = True
     ws_moved: str = ""  # set: the websocket answers with a redirect to this address
+    # Set: its web server sends every request on to this address with 301, the path after it (nginx in front of kvmd, once
+    # HTTPS is its only way in: the owner's Comet Pro on a new GLKVM firmware, 2026-11-15, at its plain address)
+    https_at: str = ""
     picture: bytes = b""  # set: sent as the picture, whatever it is
     login_status: int = 200  # another number: signing in fails with it, whatever the password
     width: int = 1920  # what the connected computer outputs
@@ -158,6 +161,7 @@ class FakeState:
     # A multi-port KVM (Comet X): one colour per input, None for an input with nothing plugged in.
     ports: list[tuple[int, int, int] | None] = field(default_factory=list)
     active_port: int = 0
+    switch_fails: int = 0  # so many of the next answers of its switch are a 502, its web server's while kvmd restarts behind it
     keyboard_online: bool = True  # what it says of the keyboard it is to the computer (a cable that is out: False)
     # Whether its mouse is absolute (stock kvmd's default) or relative (a real Comet was set to "usb_rel": `mouse.absolute`
     # false in its /api/hid). kvmd drops a move of the other kind: counted in `pointer_dropped` (every event is in `hid`
@@ -193,6 +197,13 @@ class FakeState:
     server_host: object = "pikvm"  # its name in /api/info (meta.server.host: the machine's own, as the page shows it)
     jiggler: bool = False  # whether keep-awake is on (a stock one says so in /api/hid)
     jiggler_enabled: bool = True  # False: keep-awake is switched off in its settings, and switching it on answers yes and does nothing
+    # GLKVM's firmware of late (a Comet Pro, 2026-11-15) gives its jiggler settings of its own, and says them in /api/hid:
+    # {"enabled": true, "active": ..., "config": {"enabled": ..., "interval": {...}, "schedule": {...}}, "state": {"active":
+    # ..., "blocked_reason": "disabled"}} where they switch it off. Switching it on through the API is then refused (502
+    # action_failed at the wall, in the real one's words of nothing: what it answers here is made up, an error of its own).
+    # False: the older shape, no jiggler at all in /api/hid, and switched as it is asked.
+    jiggler_settings: bool = False
+    jiggler_settings_on: bool = True  # (with `jiggler_settings`: whether its own settings let it run)
     # Its mass storage drive (kvmd's MSD) and its own image storage (0.3.0), as GL.iNet's kvmd tree (4.16) and stock kvmd's
     # source have them: GET /api/msd, set_params (only while the drive is disconnected; a CD-ROM drive read-only, `rw=1` no
     # CD-ROM drive on GL.iNet's), set_connected, write (its length from Content-Length, 507 where it is more than is free, an
@@ -313,6 +324,8 @@ def make_fake_kvm(state: FakeState) -> FastAPI:
     async def auth(request: Request, call_next: Any) -> Any:
         state.requests += 1
         state.asked.append(f"{request.method} {request.url.path}")
+        if state.https_at:
+            return PlainTextResponse("301 Moved Permanently", status_code=301, headers={"Location": state.https_at + request.url.path})
         await pause(state.stall, lambda: state.stall > 0)
         await pause(state.slow.get(request.url.path, 0), lambda: request.url.path in state.slow)
         if state.stock:
@@ -425,6 +438,14 @@ def make_fake_kvm(state: FakeState) -> FastAPI:
             return ok({"busy": False, "connected": None, "enabled": True, "online": True, "jiggler": jiggler, "keyboard": keyboard, "mouse": mouse})
         output = "usb" if state.mouse_absolute else "usb_rel"
         mouse = {"online": state.keyboard_online, "absolute": state.mouse_absolute, "outputs": {"active": output, "available": ["usb", "usb_rel", "usb_hybrid", "usb_touch"]}}
+        if state.jiggler_settings:
+            config = {
+                "enabled": state.jiggler_settings_on, "interval": {"seconds": 60, "random": False},
+                "schedule": {"enabled": False, "start": "09:00", "end": "18:00", "days": [1, 2, 3, 4, 5]},
+            }  # fmt: skip
+            running = state.jiggler and state.jiggler_settings_on
+            jiggler = {"enabled": True, "active": running, "config": config, "state": {"active": running, "blocked_reason": None if state.jiggler_settings_on else "disabled"}}
+            return ok({"keyboard": {"online": state.keyboard_online}, "mouse": mouse, "jiggler": jiggler})
         return ok({"keyboard": {"online": state.keyboard_online}, "mouse": mouse})
 
     answering_atx = [0]
@@ -486,7 +507,7 @@ def make_fake_kvm(state: FakeState) -> FastAPI:
         if state.version_fails > 0:  # one of its moments
             state.version_fails -= 1
             return error("ServerError", 500)
-        return ok({"model": state.model, "version": "V1.10.1 release2"})
+        return ok({"model": state.model, "version": "V0.98.3 release7"})  # (in the shape GL.iNet's firmware says it; made up)
 
     @app.get("/api/system/get_hostname")
     async def hostname() -> Any:
@@ -511,6 +532,8 @@ def make_fake_kvm(state: FakeState) -> FastAPI:
     @app.post("/api/hid/set_params")
     async def hid_params(jiggler: str = "") -> Any:
         state.actions.append(f"jiggler {jiggler}")
+        if state.jiggler_settings and not state.jiggler_settings_on and jiggler in ("1", "true"):
+            return error("JigglerDisabledError", 400, "Jiggler is disabled")  # (made up: see `jiggler_settings`)
         if state.jiggler_enabled:  # (kvmd: where it is not enabled, it is not switched, and nothing is said of that)
             state.jiggler = jiggler in ("1", "true")
         return ok()
@@ -587,6 +610,9 @@ def make_fake_kvm(state: FakeState) -> FastAPI:
     @app.get("/api/switch")
     async def switch() -> Any:
         # Shaped like kvmd/apps/kvmd/switch/state.py in GL.iNet's published firmware source.
+        if state.switch_fails > 0:
+            state.switch_fails -= 1
+            return PlainTextResponse("502 Bad Gateway", status_code=502)
         if not state.ports and state.stock:
             # Stock kvmd answers for a switch it has not got: with one of no ports, none of them on screen.
             return ok({

@@ -88,20 +88,33 @@ def test_a_screen_that_comes_back_is_given_its_first_picture_and_the_jetkvm_is_n
 
 def test_a_picture_from_before_the_screen_came_back_is_not_passed_off_as_the_screen(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(jetkvm, "FRAME_STALE", 30.0)  # (the picture from before is young: only being from before tells it)
-    # (Its first picture 20 s after the signal is back: on a slow runner the wall said "online" after the 12 s it was given
-    # before, the new picture had come, and was rightly served.)
-    jet = FakeJetKvm(JetState(frames_after_signal=20.0)).start()
+    # The stand-in sends its first picture of the screen 60 s after the signal is back, unless the test asks for it sooner
+    # (below), and the wall waits 120 s for it. On a slow runner the wall said "online" after the 12 s the stand-in was given
+    # at first, and the picture was asked for after the 20 s it was given next, the same 20 s as the wall's own wait
+    # (PICTURE_AFTER_SIGNAL): the new picture had come, or the wall had rightly connected again for one, and either was rightly
+    # served. With the wall's wait well above the stand-in's, the wall never connects again here; and a runner has a minute.
+    stand_in, patience = 60.0, 120.0
+    monkeypatch.setattr(jetkvm, "PICTURE_AFTER_SIGNAL", patience)
+    jet = FakeJetKvm(JetState(frames_after_signal=stand_in)).start()
     try:
         with wall(tmp_path) as client:
             device = add(client, jet.url)
             picture(client, device)
             jet.say_signal(False)  # a moment without signal (a screen that changes its mode, a short sleep)...
             wait_until(lambda: said(client, device, "no_signal"), "the screen asleep was not said")
+            back = time.monotonic()
             jet.say_signal(True)  # ...and back, the last picture well within FRAME_STALE: it is from before all the same
             wait_until(lambda: said(client, device, "online"), "the screen back was not said")
+            online = time.monotonic() - back
             reply = client.get(snap(device), params={"age": 0})
-            assert reply.status_code == 503 and reply.json()["message"] == "Waiting for the JetKVM's video", reply.headers
-            wait_until(lambda: screen_shown(client, device), "the picture of the screen did not come", timeout=35)
+            asked = time.monotonic() - back
+            timings = (
+                f"'online' was said {online:.1f} s after the screen came back and the picture asked for at {asked:.1f} s; "
+                f"the stand-in's first picture of it comes at {stand_in:g} s, and the wall waits {patience:g} s for one"
+            )
+            assert reply.status_code == 503 and reply.json()["message"] == "Waiting for the JetKVM's video", f"{timings}: {reply.headers}"
+            jet.state.frames_from = time.monotonic()  # (the first picture of the screen, now)
+            wait_until(lambda: screen_shown(client, device), "the picture of the screen did not come", timeout=20)
     finally:
         jet.stop()
 

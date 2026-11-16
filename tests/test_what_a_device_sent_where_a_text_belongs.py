@@ -260,10 +260,10 @@ def with_screen() -> Iterator[FakeBmc]:
 def test_the_pass_to_a_controllers_console(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, with_screen: FakeBmc, part: str) -> None:
     # (What it says beside the pass itself: who it takes the wall for, where it is, whether the server's own
     # monitor goes dark. None of these, as something that is no text, is an error of the program.)
-    dark = part.endswith("beside a yes")
-    if dark:
-        # Two words say that the monitor goes dark, and the second is looked at only where the first says
-        # yes. A second word that cannot be read is not a plain no (redfish.said_yes): the console is left alone.
+    dark = part.endswith("beside a yes") or part in ("automatic_off", "local_monitor_off")
+    if part.endswith("beside a yes"):
+        # Two words say that the monitor goes dark. A word that cannot be read is not a plain no (redfish.said_yes),
+        # beside a yes or beside a no: the console is opened only where both are a plain no, and is left alone here.
         with_screen.state.monitor_goes_dark, part = True, "local_monitor_off"
 
     def changed(path: str, said: Any) -> None:

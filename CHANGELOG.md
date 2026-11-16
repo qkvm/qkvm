@@ -1,5 +1,91 @@
 # Changes
 
+## 0.3.2
+
+Fixes found in 0.3.1's reviews, by the Desktop App, and on real devices. Upgrade with `pip install --upgrade qkvm` or
+`docker pull qkvm/qkvm:0.3.2`; from 0.2.1, 0.2.2, 0.3.0 and 0.3.1 the app's own update installs it in place. 0.3.2
+needs the same libraries as 0.3.1.
+
+### Fixed
+
+- **A media change goes only to the machine the tile was at when its list was made.** The Media box stays open across an
+  edit of its tile: a box opened for one KVM whose tile was then pointed at another sent its mount, unmount, deletion or
+  upload there. A list now carries a mark of its machine (`listed`), a change sends it back, and where the tile's
+  machine has moved since, the change is refused (409 `moved`) with nothing asked of either. Before an upload the page
+  asks for the list again, so that a box whose tile has moved sends nothing and closes. A client that sends no mark is
+  served as before.
+- **A server's console is opened only where its controller says the monitor stays on.** Where the controller's console
+  pass does not say both of its monitor-off words, or says either some other way than a plain no, the console is left
+  alone and the tile says why (where one of the two is a plain no and the other is not, that only one of them is off). A
+  word said as nothing (an empty text) is a word not said. (One that said neither, or said one as nothing, had its
+  console opened, and the server's own monitor could go dark.)
+- **Sign-in pacing keeps every wait that stands.** Past 2048 remembered sign-ins the oldest was let go of whatever it
+  held, and a password a device had just refused could be offered to it again at once. Only waits that have run out
+  make room now.
+- **The history and the activity log are not held up by their own reads.** Reads that kept coming, one beginning before
+  the other ended, kept the database's checkpoint from getting through, and the file SQLite writes ahead to grew to
+  several times its share. qKVM's own reads now wait while a checkpoint runs (3 s for the history, 2 s for the activity
+  log, then "try again in a moment"). A download of the activity log waits longer, 15 s for each page after the first,
+  so that a checkpoint never sends it to the text files. Where it goes there all the same (the index made again
+  meanwhile), it goes on from where it was in them, each entry once: it went on from the time of the last entry it had,
+  and entries of that same moment were left out, and one out of the order of time left out or sent twice. A program
+  outside qKVM that keeps a read of the files open (a database browser, a backup tool) still holds the checkpoint off,
+  and the file grows until it lets go; the wall's own reads wait out each such try, which takes about a second and a
+  half.
+- **A connection is kept 130 s between requests.** The web server let an idle connection go after 5 s: a request sent on
+  it at that moment was lost, and a proxy in front answered it 502, a power button's too. A proxy in front of qKVM
+  should let an idle connection to it go sooner than 130 s; the README names the defaults that do. At most 1000 are kept
+  at once (a quarter of the open files allowed, where that is fewer), the one kept longest let go first, so that
+  requests nobody has to sign in for cannot hold open connections without end; a busy wall uses a few hundred. A request
+  whose head came with the one before it has 20 s to be finished, as every request has; it had the whole 130 s. Where a
+  later web server library lacks what the 20 s limit of such a request reads, a connection is kept 5 s between requests,
+  as before; where it lacks only what the count of kept connections reads, they are kept 130 s without that count. The
+  log says which, once.
+- **Two requests the Desktop App reads are promised in v1:** a machine's activity (`GET /api/v1/audit` with `device`
+  and `limit`) and the picture of a screen alert (`GET /api/v1/devices/{id}/alert-picture/{stamp}`), with their
+  answers and refusals in the README's table. A test holds every request the Desktop App makes to that table.
+- **The Add KVM line has no dash:** `<name> added (<model>, over plain HTTP)`, as the Desktop App says it. A test
+  keeps dashes out of everything the page and the server say.
+- **A server's command that found no free connection says "Nothing was sent".** With its certificate pinned, where
+  none of the connections came free in time, a reset said "it may have been done" and a controller's restart "done".
+- From real devices:
+  - **A KVM whose plain address sends everybody on to HTTPS is said so.** Added as http://, it said only "Login failed
+    (HTTP 301)". It is refused with `https_only` and its HTTPS address, which the page offers; it is never followed by
+    itself. A plain address taken for a PiKVM-style KVM is asked the same before the password goes out, and a tile whose
+    KVM has begun to do so can still be renamed or regrouped with Save without checking.
+  - **Why a KVM's power is unknown is said.** Where its board says the power light is off while the screen shows a
+    picture, the tile says "Power unknown" and its Details say the power-LED wires are probably not connected
+    (`power_led_unwired`, in the status's `atx.note`, which is there only then). On a KVM with several inputs the board
+    may be another computer's than the one on screen: the tile says "Power unknown" alone, also after an edit of the
+    tile.
+  - **A jiggler switched off in the KVM's own settings is refused in those words**, and nothing is sent; it was 502
+    `action_failed`. (A new GL.iNet firmware gives the jiggler settings of its own.)
+- **The README says what a real PiKVM V4 did.** It said that no real PiKVM had been tried. One was: its
+  picture, the live line with its H.264, keys, typed text and the pointer, keep-awake, and virtual media, each as it
+  should be; its power light is the second of the three above. GL.iNet Comets on a new firmware were tried too, and
+  gave the other two.
+- **No model of the test hardware in anything published.** The stand-ins in the tests, and the demo the website
+  shows, had processor models, firmware versions, sensor names and more of the machines qKVM was tried on. They are
+  made up now, the website's pictures were taken again, and a test refuses a real processor's model.
+
+### Releasing
+
+- **The Docker image is on a newer base**, `python:3.13-slim` of 2026-11-05 (the same Python 3.13.18), with Debian's
+  fixes for zlib: its two exceptions are gone.
+- Three tests that were tighter than the code hold to what it promises: typing for an account suspended meanwhile, a
+  JetKVM's picture from before its screen came back, and the history's test of reads that overlap (0.3.1's known
+  one), which passes now that the checkpoint gets through.
+
+### Known
+
+- The Docker image keeps the three exceptions for SQLite's findings (its FTS5 search and secure delete, its session
+  extension; none reachable from qKVM), which Debian calls minor and has not fixed for trixie, until 2026-12-17 or
+  Debian's fixes, whichever comes first.
+- On the PiKVM V4, its power and reset buttons were not pressed, and its power light could not be read on the test
+  machine's board; a computer was not started from an image there.
+- A power button, keys and typed text go to the machine the tile is at when they arrive; they are not yet tied to the
+  one their confirmation named, as media changes are now.
+
 ## 0.3.1
 
 Fixes found while 0.3.0 was released and in its reviews. Nothing new is added. Upgrade with `pip install --upgrade qkvm`

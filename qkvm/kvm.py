@@ -52,6 +52,9 @@ ACTIONS: dict[str, tuple[str, dict[str, str]]] = {
     "jiggler_on": ("/api/hid/set_params", {"jiggler": "1"}),  # the KVM nudges the mouse to keep the computer awake
     "jiggler_off": ("/api/hid/set_params", {"jiggler": "0"}),
 }
+# A KVM whose jiggler has settings of its own (GLKVM of late: a Comet Pro, 2026-11-15) says where they switch it off, and
+# refuses it being switched on: the wall says so, and sends nothing.
+JIGGLER_OFF_THERE = "The jiggler is switched off in the KVM's own settings: switch it on there first"
 # What a tile can do, by word: the whole vocabulary, in the order a list of them is written in. A driver
 # says which hold for every device of its kind (`Device.can`), and its look at the device adds what that
 # one has (`can` in its status: a power board, several inputs, a light): what a client may ask of the
@@ -557,9 +560,18 @@ class Rejected:
     name; each new one began to count at nothing, and the first of those is to be had by any account that
     may sign in, as often as it likes. What is kept is a digest of the address, the user name and the
     password, in memory: never the password, and nothing of it is written anywhere.
+
+    Past the most, room is made only of what protects nothing any more: a mark whose wait has run out, the oldest of those
+    first (`_make_room`). A wait that stands is never let go of to make room: dropped, it was a password offered again
+    before its time, its count of noes in a row begun again at nothing (the desktop app's finding 11; the desktop's own
+    pacing, 818877ef). Where every mark still stands, all of them are kept, more than the most for as long as they stand,
+    and a device new to it is let in as ever, with nothing standing against it: refusing its sign-in for want of room
+    would lock it out for nothing it did. What can be kept so is bounded by what went out: every mark stands for a
+    sign-in that went to a device (or for what it came to) within the longest wait, an hour (LOGIN_BACKOFFS,
+    UNANSWERED_MOST, jetkvm.LOGIN_WAIT_MOST), and a new one comes only of a new address, user or password.
     """
 
-    MOST = 2048  # of them; the oldest go first (somebody adding devices with one wrong password after another)
+    MOST = 2048  # of them, where more have run out (somebody adding devices with one wrong password after another)
 
     def __init__(self) -> None:
         # (noes in a row, sign-ins in a row that nothing answered, when it may be offered again)
@@ -584,9 +596,22 @@ class Rejected:
         now = time.monotonic()
         standing = self._known.pop(what, (0, 0, 0.0))[2]
         self._known[what] = (times, unanswered, max(now + wait, standing))  # (the newest last)
-        while len(self._known) > self.MOST:
-            del self._known[next(iter(self._known))]
+        if len(self._known) > self.MOST:
+            self._make_room(now, what)
         return max(wait, standing - now)
+
+    def _make_room(self, now: float, kept: str) -> None:
+        """Marks whose wait has run out let go of, the oldest first, until no more are kept than the most: never one whose
+        wait stands, nor `kept`, noted just now. Where too few have run out, more than the most are kept (see the class)."""
+        over = len(self._known) - self.MOST
+        gone = []
+        for what, (_, _, until) in self._known.items():  # (the oldest first)
+            if until <= now and what != kept:
+                gone.append(what)
+                if len(gone) >= over:
+                    break
+        for what in gone:
+            del self._known[what]
 
     def said_no(self, what: str) -> float:
         """One more no in a row: how long it is not offered again."""
@@ -675,6 +700,33 @@ class Rejected:
 REJECTED = Rejected()
 
 
+REDIRECTS = (301, 302, 303, 307, 308)
+
+
+def https_instead(url: str, resp: httpx.Response) -> str | None:
+    """Where a device's plain address sends everybody, where that is HTTPS at the same host: a PiKVM's or a Comet's web server
+    once HTTPS is its only way in (the owner's Comet Pro on a new GLKVM firmware, 2026-11-15, answered its plain address with
+    301). The scheme, host and port it names, and nothing else of it. None for anything else: no redirect, an address that
+    is not plain HTTP, one that sends elsewhere (another host, plain HTTP, nowhere that can be read)."""
+    if resp.status_code not in REDIRECTS or not url.startswith("http://"):
+        return None
+    try:
+        there, here = urlsplit(resp.headers.get("location", "").strip()), urlsplit(url)
+        port = there.port
+    except ValueError:  # (a port that is no number, a bracket that does not close)
+        return None
+    if there.scheme.lower() != "https" or not there.hostname or there.hostname != here.hostname:
+        return None
+    host = f"[{there.hostname}]" if ":" in there.hostname else there.hostname
+    return f"https://{host}" + (f":{port}" if port not in (None, 443) else "")
+
+
+def on_https(to: str) -> KvmError:
+    """A KVM whose plain address sends everybody on to HTTPS at `to`: never followed by itself (the saved password would go
+    wherever a redirect says), and the address offered to whoever adds or edits it (`use`)."""
+    return KvmError("https_only", f"This KVM answers on HTTPS: its plain address sends everybody to {to}. To use it there, type {to}", 502, use=to)
+
+
 def not_signing_in(why: str) -> KvmError:
     """What stands against a device that is there and does not sign this program in, for another reason than the password."""
     return KvmError("no_sign_in", f"The device does not sign qKVM in ({why}). It is asked again shortly.", 503)
@@ -695,11 +747,14 @@ def sign_in_waits() -> httpx.Timeout:
 
 
 class KvmError(Exception):
-    def __init__(self, code: str, message: str, status: int = 502) -> None:
+    def __init__(self, code: str, message: str, status: int = 502, use: str | None = None) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
         self.status = status
+        # An address the device itself says to use instead (`https_only`: its plain one sends everybody there): offered to
+        # whoever adds or edits it, never followed by qKVM itself.
+        self.use = use
 
     def as_dict(self) -> dict[str, str]:
         return {"code": self.code, "message": self.message}
@@ -1345,6 +1400,13 @@ def flag(value: Any) -> bool | None:
 # "leds": {"power": false} on a running PC). Stock kvmd has no word, and its light is the one in `leds`. A computer
 # asleep is on: the power is there, and a short press wakes it (as a PC with Intel AMT is said to be).
 POWER_WORDS = {"on": True, "sleep": True, "off": False}
+# A board that says the computer is off (its power light, or GLKVM's word read from it) while the computer sends a picture:
+# the light is not wired to the board (the owner's stock PiKVM V4, 2026-11-15). The status says so beside the board's word,
+# but on a KVM with several inputs, whose board may be another computer's than the one on screen.
+POWER_LED_UNWIRED = {
+    "code": "power_led_unwired",
+    "message": "The KVM's board says the power light is off while the screen shows a picture: its power-LED wires are probably not connected.",
+}
 
 
 def power_said(atx: Any) -> bool | None:
@@ -2010,8 +2072,12 @@ class KvmDevice(Device):
         # such thing (stock kvmd), None while that is not known (not asked yet, or answered with an error of the moment).
         self._glinet: bool | None = None
         self._jiggler_off = False  # the KVM said at the last look that keep-awake is switched off in its own settings
+        self._jiggler_blocked = False  # ...said so in the way of GLKVM of late, whose jiggler has settings of its own: see JIGGLER_OFF_THERE
         self._single_port_at: float | None = None  # when the device last said it has no port switch
         self._port_seen: int | None = None  # which computer was on screen at the last look (a multi-port KVM)
+        # Whether the KVM has shown several inputs, at any look of this client or of the one of the same KVM it took over from
+        # (takes_over): its power board may be another computer's than the one on screen (see the board's `note`).
+        self._shown_several = False
         self._usb_unsure = False  # another one is since, and the device has not found its keyboard there yet
         # Whether the KVM's mouse is absolute, as it said at the last look (/api/hid, `mouse.absolute`; None: not said). kvmd
         # drops a move of the other kind: relative steps while its mouse is absolute (stock kvmd, W7), and places while it is
@@ -2062,11 +2128,22 @@ class KvmDevice(Device):
         # Which family the KVM is, as the client before found it (the same device at the same address), where this one
         # has not asked yet: until it has, its session would go into the address of a stock kvmd's event line.
         if isinstance(retired, KvmDevice) and self._glinet is None:
-            self._glinet, self._jiggler_off = retired._glinet, retired._jiggler_off
+            self._glinet, self._jiggler_off, self._jiggler_blocked = retired._glinet, retired._jiggler_off, retired._jiggler_blocked
         # One request to the Fingerbot at a time, across an edit too: a press of the client before may still be holding the
         # button (a tile renamed during a hold had the new client ask the battery while the arm was down).
         if isinstance(retired, KvmDevice):
             self._fingerbot_turn = retired._fingerbot_turn
+        # That it has shown several inputs, where this one talks to the KVM the one before it saw: the same check and certificate
+        # (and what else it is known by). A certificate taken anew may be another KVM's, of one input. Not which input was on
+        # screen (_port_seen): this one has not seen that, and a change of it is what makes a keyboard unsure (_usb_unsure).
+        # Without it an edit of the tile (its group) brought the wires' note back while the switch did not answer (the
+        # reviews of 0.3.2), at the new client's own look before it took over too: that look's note goes as well.
+        mark = ("tls", "cert_pem", "machine", "ident")
+        if isinstance(retired, KvmDevice) and retired._shown_several and all(getattr(self.spec, f) == getattr(retired.spec, f) for f in mark):
+            self._shown_several = True
+            atx = (self._status or {}).get("atx")
+            if self._status is not None and isinstance(atx, dict) and "note" in atx:
+                self._status = {**self._status, "atx": {key: value for key, value in atx.items() if key != "note"}}
         # (Whether a Fingerbot is paired, which the KVM says only when a line is opened, and its battery, which it says only when
         # it is asked, are in PACED, found by every client of the KVM: see `_fingerbot`, `_battery`.)
 
@@ -2156,6 +2233,12 @@ class KvmDevice(Device):
             self._answered()
             # We send the token ourselves; don't let the cookie jar send a stale one too.
             client.cookies.clear()
+            if (to := https_instead(self.spec.base_url, resp)) is not None:
+                # Its plain address sends everybody on to HTTPS at the same host. Not followed: said, with that address, and held
+                # back as a sign-in that was neither yes nor no, so that the password does not go out the plain way at every look.
+                self._neither_yes_nor_no(offered, KvmError("bad_response", f"Login failed (HTTP {resp.status_code})"), NO_SAID)
+                self._login_error = on_https(to)
+                raise self._login_error
             if resp.status_code in (401, 403):
                 # Every tile refresh ends up here, so back off rather than hammer the
                 # device with a password it has already rejected: longer each time.
@@ -2229,6 +2312,10 @@ class KvmDevice(Device):
                     REQUEST_OUT.set(False)
                 raise failed(_transport_error(ex, self.spec.tls)) from ex
             self._answered()
+            if (to := https_instead(self.spec.base_url, resp)) is not None:
+                # Its plain address sends everybody on to HTTPS since it was signed in to (HTTPS made its only way in): said,
+                # with that address, and not followed. The tile says so ("error": it is there), and an edit offers it.
+                raise on_https(to)
             if resp.status_code not in (401, 403):
                 return resp
             if relogged:
@@ -2652,6 +2739,9 @@ class KvmDevice(Device):
         if action == "jiggler_on" and self._jiggler_off:
             # (Sent all the same, kvmd answers yes and leaves it off: "done" would be said of nothing done.)
             raise KvmError("invalid", "Keep-awake is switched off in this KVM's own settings", 422)
+        if action == "jiggler_on" and self._jiggler_blocked:
+            # (Sent all the same, GLKVM refuses it, and the wall said only that the action failed.)
+            raise KvmError("invalid", JIGGLER_OFF_THERE, 422)
         if action == "port":
             if not 0 <= port < len(_dig(self._status, "ports", "list") or []):
                 raise KvmError("invalid", "This KVM has no such port", 422)
@@ -3433,7 +3523,7 @@ class KvmDevice(Device):
                 ex = await self._gone_meanwhile("/api/auth/check") or ex
             if ex.code in ("auth_failed", "no_password"):
                 state = "auth"
-            elif ex.code == "no_sign_in":
+            elif ex.code in ("no_sign_in", "https_only"):
                 state = "error"  # it is there, and something is wrong with it: not "offline", which an alert would report as gone
             elif ex.code in ("cert_mismatch", "cert_invalid"):
                 state = "error"
@@ -3490,12 +3580,16 @@ class KvmDevice(Device):
         elif self._usb_unsure:
             keyboard = mouse = None
         has_ports = isinstance(ports, dict)
+        self._shown_several = self._shown_several or has_ports
         if self._glinet is False:
             about = _stock_about(info)  # (stock kvmd says what it is in /api/info, which is read anyway)
         if isinstance(hid, dict):
             # Stock kvmd says whether keep-awake is enabled in its settings. Where it is not, switching it on is answered
             # with a yes, and nothing is switched. (Only a plain false says so: anything else is no answer.)
             self._jiggler_off = flag(_dig(hid, "jiggler", "enabled")) is False
+            # GLKVM of late gives its jiggler settings of its own, and says why it does not run: "disabled" where they switch it
+            # off (`enabled` stays true). An answer without them (the older shape, stock kvmd) says nothing of that.
+            self._jiggler_blocked = _dig(hid, "jiggler", "state", "blocked_reason") == "disabled"
             self._mouse_absolute = flag(_dig(hid, "mouse", "absolute"))
         glinet = self._glinet is not False  # (as `act` has it: refused only where the KVM said it has no such thing)
         fingerbot = self._fingerbot is True and glinet  # (as the KVM said last on a line to its events: see _heard_on_the_line)
@@ -3523,6 +3617,15 @@ class KvmDevice(Device):
                 "enabled": has_atx,
                 "power": power,
                 "hdd": flag(_dig(atx, "leds", "hdd")) if board else None,
+                # A board that says off beside a picture is no witness of the power (the page says neither on nor off then):
+                # why, in the wall's words. Only where there is something to say: else the board is as it was before 0.3.2
+                # (`enabled`, `power`, `hdd`), for whoever reads it as one (the Desktop App, a client of 0.3.1's). Not on a KVM
+                # with several inputs: its board may be wired to another computer than the one on screen, and the wires may be
+                # as they should (the review of 0.3.2). The page says "Power unknown" there all the same, without a why. Nor on one
+                # that has shown several (_shown_several, this look's among them, and an edited tile's before the edit) and whose
+                # switch did not answer this look: one answer of it that was not a yes (a 502 while kvmd restarts) has it taken
+                # for a KVM of one input for ABOUT_TTL (_read_ports).
+                **({"note": dict(POWER_LED_UNWIRED)} if power is False and signal is True and not self._shown_several else {}),
             },
             # A Fingerbot paired with the KVM, which presses the power button (`fingerbot` in `can`): its battery in percent
             # (null until it was asked, or where it was no number), and whether that is low. Null without one. It says

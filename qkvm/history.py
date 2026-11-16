@@ -32,7 +32,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .store import into_wal, sqlite_open
+from .store import Gate, into_wal, sqlite_open
 
 log = logging.getLogger("qkvm")
 
@@ -52,13 +52,17 @@ TRIM_EVERY = 600.0  # seconds between two trims by age and size
 TRIM_PATIENCE = 30.0  # seconds one trim by size may go on deleting; what is still over the size allowed goes at the next
 SLICES = 20  # steps of time a long cut is made in, every device to each in turn (see _delete_before)
 SAY_EVERY = 60.0  # seconds between two lines in the log about the same trouble
-READ_WAIT = 3.0  # seconds a read waits for the file to be opened
+READ_WAIT = 3.0  # seconds a read waits, at the most, for the file to be opened and for a checkpoint under way to end
 READ_PATIENCE = 5.0  # seconds a read may take before it is given up
 WRITE_PATIENCE = 5.0  # seconds a write waits for the file (only a checkpoint of another connection could hold it)
-# Seconds a checkpoint waits for the reads under way to end: longer than any read may take, so that it gets through
-# however the reads come. (It waited the writer's five seconds, as long as a read may take, and reads of four or
+# Seconds a checkpoint waits for the wall's own reads under way to end. None begins while it runs (see read): those it
+# waits for began before, and end within READ_PATIENCE; this is three times that and more, for a read that is slow to be
+# given its turn on a busy computer. (It waited the writer's five seconds, as long as a read may take, and reads of four or
 # five seconds one after the other kept it from ever getting through.)
 CHECKPOINT_PATIENCE = 2 * (READ_WAIT + READ_PATIENCE)
+# Seconds the checkpoint itself then waits for the file: only a read outside qKVM can hold it by then, which may never let
+# go (a database browser, Litestream), and the wall's own reads wait at the gate meanwhile. Less than they wait (READ_WAIT).
+CHECKPOINT_TRY = 1.0
 CHECKPOINT_AGAIN = 60.0  # seconds after a checkpoint that did not get through before one is tried again for the -wal's size
 WAL_MOST = 8_000_000  # bytes the -wal file may take before it is brought into the file: this, or a tenth of the size allowed where that is less
 OPEN_PATIENCE = 120.0  # seconds the check of a file at a start may take before it is taken as not done
@@ -183,6 +187,7 @@ class History:
         self._starting = threading.Lock()
         self._stopping = False
         self._ready = threading.Event()  # the file is open and can be read
+        self._gate = Gate()  # the wall's own reads pass it, and wait at it while a checkpoint runs (see read)
         self._conn: sqlite3.Connection | None = None
         self.dropped = 0  # rows that found the queue full, or a file that could not be written, since the start
         self._said: dict[str, float] = {}  # what trouble the log was last told of, and when
@@ -684,10 +689,17 @@ class History:
     def _checkpoint(self) -> bool:
         """What is in the -wal file goes into the file itself, and the -wal file is emptied: a copy of the one file is then whole.
 
-        Waits for the reads under way to end (CHECKPOINT_PATIENCE, which is longer than any read may take). False where
-        it did not get through. Then it is tried again after CHECKPOINT_AGAIN, or once the -wal file has grown to twice
-        what it was, whichever comes first, so that one refusal does not let it grow for a minute unchecked; and at the
-        next look where another connection's checkpoint of the file turned it away, which SQLite says with the row
+        The wall's own reads wait for it at the gate (store.Gate, which says why; see read): reads that kept coming, one
+        beginning before the other ended, kept it from getting through at all (refused after its whole wait on GitHub's
+        runners, where the -wal file grew to four times its share). What can be brought in at once is (PASSIVE: SQLite
+        waits for nothing in it), while those under way end; they are waited for (CHECKPOINT_PATIENCE, which is longer than
+        any read may take), and then the rest is brought in and the -wal file begun again, with a wait for the file of
+        CHECKPOINT_TRY: whatever holds it by then is a read outside qKVM, which waits for nothing of this and may never let
+        go. The gate is opened again however that ends: it stayed shut for SQLite's whole wait, and the wall's reads were
+        told to come back for most of every minute where such a read stayed open (the independent review of 0.3.2, M1).
+        False where it did not get through. Then it is tried again after CHECKPOINT_AGAIN, or once the -wal file has grown
+        to twice what it was, whichever comes first, so that one refusal does not let it grow for a minute unchecked; and
+        at the next look where another connection's checkpoint of the file turned it away, which SQLite says with the row
         (1, -1, -1), at once. (Not by the time it took: an error that keeps coming, a full disk, comes at once as well, and
         was tried at every batch.)
         """
@@ -695,17 +707,22 @@ class History:
         if conn is None:
             return False
         began = time.monotonic()
-        try:
-            conn.execute(f"PRAGMA busy_timeout = {int(CHECKPOINT_PATIENCE * 1000)}").fetchall()
+        with self._gate.shut():
             try:
-                busy, wal_frames, done_frames = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
-            finally:
-                conn.execute(f"PRAGMA busy_timeout = {int(WRITE_PATIENCE * 1000)}").fetchall()
-        except sqlite3.OperationalError as ex:
-            busy, wal_frames, done_frames = 1, None, None
-            why = f"{ex} (code {getattr(ex, 'sqlite_errorcode', None)})"
-        else:
-            why = f"it says {(busy, wal_frames, done_frames)}: the file is held by a read or a checkpoint of another connection"
+                conn.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchall()
+                if not self._gate.emptied(CHECKPOINT_PATIENCE):
+                    busy, wal_frames, done_frames = 1, None, None
+                    why = f"the wall's own reads under way did not end within {CHECKPOINT_PATIENCE:g} s"
+                else:
+                    conn.execute(f"PRAGMA busy_timeout = {int(CHECKPOINT_TRY * 1000)}").fetchall()
+                    try:
+                        busy, wal_frames, done_frames = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+                    finally:
+                        conn.execute(f"PRAGMA busy_timeout = {int(WRITE_PATIENCE * 1000)}").fetchall()
+                    why = f"it says {(busy, wal_frames, done_frames)}: the file is held by a read outside qKVM or a checkpoint of another connection"
+            except sqlite3.OperationalError as ex:
+                busy, wal_frames, done_frames = 1, None, None
+                why = f"{ex} (code {getattr(ex, 'sqlite_errorcode', None)})"
         took = time.monotonic() - began
         if busy:
             try:
@@ -977,13 +994,28 @@ class History:
 
         `limit`: rows at the most (a cut page says `more`). `every`: samples averaged over spans of that many seconds.
         NotReadable where the file cannot be read just now.
+
+        While a checkpoint runs, a read waits for it to end before it takes hold of the file (see _checkpoint): READ_WAIT
+        at the most, with the wait for the file to be opened, and then it is told to come back in a moment. Let in after
+        that, it could hold the checkpoint off as before, and the wall's reads coming one after the other could hold it
+        off for good. (Those under way when it began are waited for, and end within READ_PATIENCE.)
         """
         if what not in WHAT:
             raise ValueError(f"not something the history is asked for: {what!r}")
         now = time.time() if now is None else now
         limit = max(1, min(MOST_ROWS, limit))
+        waits_until = time.monotonic() + READ_WAIT
         if not self._ready.wait(READ_WAIT):
             raise NotReadable("The history is not open just now. Try again in a moment.")
+        if not self._gate.passed(waits_until):
+            raise NotReadable("The history is busy just now. Try again in a moment.")
+        try:
+            return self._read_let_in(device_id, what, since, until, limit, every, now)
+        finally:
+            self._gate.left()  # (its connection closed: a checkpoint waits for it no longer)
+
+    def _read_let_in(self, device_id: str, what: str, since: float, until: float, limit: int, every: int, now: float) -> dict[str, Any]:
+        """`read`, once it is let in at the gate."""
         try:
             conn = sqlite_open(self.path, read=True, timeout=2.0)  # (a data folder on a share too: store.read_only_uri)
         except sqlite3.Error as ex:

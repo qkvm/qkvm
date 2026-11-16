@@ -1,7 +1,7 @@
 """A PC's screen through Intel AMT's own KVM: the redirection port's handshake, RFB in RGB565, the pace a wall needs,
 the settings that decide whether a session may be opened at all, and what an engine on that port can make of it.
 
-Against the stand-in (fake_amt.py), whose redirection port answers as a real engine (AMT 16) was seen to answer, byte
+Against the stand-in (fake_amt.py), whose redirection port answers as a real engine was seen to answer, byte
 for byte where it was seen; the README says what was tried on that real machine, and test_real_amt.py tries it again
 where one is named in the environment.
 """
@@ -663,7 +663,7 @@ def test_start_into_bios_setup_arms_it_and_resets_or_powers_on(pc: FakeAmt) -> N
 
 
 def test_the_boot_put_carries_every_property_the_engine_reported(pc: FakeAmt, monkeypatch: pytest.MonkeyPatch) -> None:
-    # A real AMT 16 engine refused a Put of AMT_BootSettingData that left out EnforceSecureBoot, PlatformErase, SecureErase
+    # A real engine refused a Put of AMT_BootSettingData that left out EnforceSecureBoot, PlatformErase, SecureErase
     # and UefiBootNumberOfParams (a first version of mine sent a smaller set): the stand-in refuses it now as well, and the
     # driver sends every property the engine reported. With the smaller set, nothing is armed and nothing pressed.
     full = amt.BOOT_PUT_PROPERTIES
@@ -1664,7 +1664,7 @@ def test_what_is_held_down_is_let_go_of_also_when_the_screen_may_no_longer_be_ha
 
 
 def test_the_power_is_cut_also_while_a_session_is_open(pc: FakeAmt) -> None:
-    # A real engine (AMT 16) neither offers cutting the power (8) or cycling it (5) while a KVM session is open, nor does it
+    # A real engine neither offers cutting the power (8) or cycling it (5) while a KVM session is open, nor does it
     # (it answered 2): "Hold power button" while a live view held a session was refused, "does not offer off". The wall's own
     # session is closed for it, and the power is cut.
     async def run() -> None:

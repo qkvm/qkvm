@@ -19,7 +19,7 @@ import sqlite3
 import sys
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -486,6 +486,462 @@ def test_a_read_of_the_text_files_takes_no_longer_than_a_read_of_the_index(tmp_p
     monkeypatch.setattr(activity, "PAGE_PATIENCE", -1.0)
     with wall(tmp_path) as admin:
         assert admin.get("/api/v1/audit/export", params={"q": "no-such-word"}).status_code == 503
+
+
+def held_open(monkeypatch: pytest.MonkeyPatch, hold: Callable[[str], object]) -> dict[str, list[float]]:
+    """The index's own reads (Index.read, through Index._query) made to take their time by a hook, in place of a log long
+    enough for that: before its query each takes hold of the file (a read under way, as SQLite counts one) and keeps it
+    until `hold(the reading thread's name)` returns. The moments they took that hold are kept by that name."""
+    took_hold: dict[str, list[float]] = {}
+    opening = activity.sqlite_open
+
+    class Holding(sqlite3.Connection):
+        def execute(self, sql: str, *given: Any) -> sqlite3.Cursor:  # type: ignore[override]
+            if sql.startswith("SELECT id, line FROM entries"):
+                super().execute("BEGIN")
+                super().execute("SELECT COUNT(*) FROM entries").fetchall()  # (from here on it holds what it began with)
+                name = threading.current_thread().name
+                took_hold.setdefault(name, []).append(time.monotonic())
+                hold(name)
+            return super().execute(sql, *given)
+
+    def holding(path: Path, *, read: bool = False, **how: Any) -> sqlite3.Connection:
+        if not read:
+            return opening(path, **how)  # (the writer's)
+        return sqlite3.connect(store.read_only_uri(path), uri=True, factory=Holding, **how)
+
+    monkeypatch.setattr(activity, "sqlite_open", holding)
+    return took_hold
+
+
+def entry_into(conn: sqlite3.Connection, number: int) -> None:
+    with conn:
+        line = json.dumps({"time": 1_700_000_000.0 + number, "event": "login", "ip": "", "user": "olga"})
+        conn.execute("INSERT INTO entries (id, t, kind, who, device, device_id, said, line) VALUES (?, ?, 'signin', 'olga', NULL, NULL, 'olga', ?)", (number, 1_700_000_000.0 + number, line))
+
+
+def index_with_a_checkpoint(
+    index: activity.Index, between: Callable[[], object]
+) -> tuple[threading.Thread, threading.Event, threading.Event, list[bool], threading.Event]:
+    """The index's writer, on a thread of its own as it has one (its connection is used on that thread alone): the file
+    opened, an entry, `between()` (a read that takes hold of the file), an entry after it, and the -wal file brought into
+    the file (WAL_MOST 0: whatever it holds), whether that got through going into the list. Returns (the thread, set as the
+    checkpoint begins: a hook on its statement and not a guess, set once it has ended, the outcome, to be set by the test
+    once it is done with the file: it is then closed)."""
+    begun, ended, done = threading.Event(), threading.Event(), threading.Event()
+    outcome: list[bool] = []
+
+    def write() -> None:
+        assert index._open()
+        conn = index._conn
+        assert conn is not None
+        try:
+            entry_into(conn, 1)
+            between()
+            entry_into(conn, 2)  # (after what it holds)
+            conn.set_trace_callback(lambda sql: begun.set() if "wal_checkpoint" in sql else None)
+            index._hold_wal(conn)
+            conn.set_trace_callback(None)
+            outcome.append(index._wal_again == 0.0)  # (set where it did not get through: not tried again for a minute)
+            ended.set()
+            done.wait(60)
+        finally:
+            index._close()
+
+    return threading.Thread(target=write, daemon=True), begun, ended, outcome, done
+
+
+def an_index_whose_reads_go_to_it(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> activity.Index:
+    """An index, its writer not started, whose reads go to it (it holds all there is: the wait for its rounds is none here)."""
+    monkeypatch.setattr(activity, "WAL_MOST", 0)  # (whatever is in the -wal file is brought into the file at the writer's next look)
+    index = activity.Index(tmp_path / activity.FILE, AuditLog(tmp_path / "audit.log"))
+    monkeypatch.setattr(index, "caught_up", lambda within=activity.CATCH_UP: index._generation)
+    return index
+
+
+def test_a_read_asked_for_while_the_index_is_brought_up_to_date_waits_for_it_and_that_gets_through(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # As the history's (tests/test_history.py): the index's -wal file is brought into the file (a checkpoint, TRUNCATE) once
+    # the reads under way have ended, and that waits for every read that begins before it is through as well: one that
+    # began while it waited held it up as long again, and reads that kept coming, one beginning before the other ended,
+    # could keep it from getting through at all, its -wal file growing past WAL_MOST until they paused. The index's own
+    # reads wait while it runs. Here a read under way holds it up; another is asked for meanwhile, and would hold the
+    # file longer than the checkpoint waits.
+    monkeypatch.setattr(activity, "CHECKPOINT_PATIENCE", 3.0)
+    index = an_index_whose_reads_go_to_it(tmp_path, monkeypatch)
+    release = {"first": threading.Event(), "second": threading.Event()}
+    took_hold = held_open(monkeypatch, lambda name: release[name].wait(30))
+    answers: dict[str, Any] = {}
+
+    def read() -> None:
+        try:
+            answers[threading.current_thread().name] = index.read(activity.Asked(), 10)
+        except Exception as ex:  # (said below)
+            answers[threading.current_thread().name] = ex
+
+    first = threading.Thread(target=read, name="first", daemon=True)
+    second = threading.Thread(target=read, name="second", daemon=True)
+
+    def first_holds() -> None:
+        first.start()
+        wait_until(lambda: "first" in took_hold, "the first read never took hold of the file")
+
+    writer, begun, ended, outcome, done = index_with_a_checkpoint(index, first_holds)
+    try:
+        writer.start()
+        assert begun.wait(10), "the checkpoint never began"
+        second.start()
+        time.sleep(0.5)  # (time enough for a read that does not wait to take hold of the file)
+        held_at_once = "second" in took_hold
+        release["first"].set()
+        assert ended.wait(activity.CHECKPOINT_PATIENCE + 10), "the checkpoint never ended"
+        wal = (tmp_path / (activity.FILE + "-wal")).stat().st_size
+    finally:
+        release["first"].set()
+        release["second"].set()
+        first.join(10)
+        second.join(10)
+        done.set()
+        writer.join(10)
+    assert not held_at_once, "a read asked for while the checkpoint ran took hold of the file at once"
+    assert outcome == [True], "the checkpoint did not get through"
+    assert wal == 0, f"the -wal file holds {wal} bytes after the checkpoint"
+    assert all(isinstance(answers.get(name), activity.Found) and answers[name].by == "index" for name in ("first", "second")), answers
+
+
+def test_a_read_of_the_index_waits_for_its_checkpoint_only_so_long_and_a_read_outside_qkvm_still_holds_the_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # The index's own reads wait while its checkpoint runs, though not for ever: CATCH_UP at the most (their wait for the
+    # index to catch up is part of it), and then they are told to come back in a moment. A read outside qKVM waits at no
+    # such gate: it holds the -wal file all the same, and the checkpoint is refused, as before.
+    monkeypatch.setattr(activity, "CHECKPOINT_PATIENCE", 5.0)
+    monkeypatch.setattr(activity, "CATCH_UP", 0.5)
+    index = an_index_whose_reads_go_to_it(tmp_path, monkeypatch)
+    outside = sqlite3.connect(tmp_path / activity.FILE, check_same_thread=False)
+    took_hold = held_open(monkeypatch, lambda name: None)
+
+    def outside_holds() -> None:
+        outside.execute("BEGIN")
+        outside.execute("SELECT COUNT(*) FROM entries").fetchall()  # (a read that holds what it began with, and stays so)
+
+    writer, begun, ended, outcome, done = index_with_a_checkpoint(index, outside_holds)
+    try:
+        writer.start()
+        assert begun.wait(10), "the checkpoint never began"
+        began = time.monotonic()
+        with pytest.raises(activity.NotReadable, match="Try again in a moment"):
+            index.read(activity.Asked(), 10)
+        waited = time.monotonic() - began
+        assert ended.wait(activity.CHECKPOINT_PATIENCE + 10), "the checkpoint never ended"
+        outside.rollback()
+        answered = index.read(activity.Asked(), 10)  # (and once it is over, a read is answered at once)
+    finally:
+        outside.close()
+        done.set()
+        writer.join(10)
+    assert 0.45 <= waited < activity.CHECKPOINT_PATIENCE, f"the read waited {waited:.2f} s"
+    assert sum(len(moments) for moments in took_hold.values()) == 1  # (the one answered: the one refused never took hold of the file)
+    assert outcome == [False], "the read outside qKVM did not hold the checkpoint off"
+    assert answered.by == "index" and len(answered.entries) == 2
+
+
+def test_a_read_outside_qkvm_costs_the_indexs_own_reads_a_second_or_so_at_a_checkpoint(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # As the history's (tests/test_history.py): a program outside qKVM that keeps a read of the index open keeps its checkpoint
+    # from getting through, and the gate stayed shut for the whole of the checkpoint's wait all the same (10 s, once a minute
+    # while the -wal file is past its share): the activity log's reads, and the Desktop App's view of a machine's activity,
+    # were answered 503 meanwhile (the independent review of 0.3.2, M1). The gate is shut now only until the index's own reads
+    # under way have ended, and the checkpoint waits for the file a second at the most. With the times as they are.
+    index = an_index_whose_reads_go_to_it(tmp_path, monkeypatch)
+    outside = sqlite3.connect(tmp_path / activity.FILE, check_same_thread=False)
+
+    def outside_holds() -> None:
+        outside.execute("BEGIN")
+        outside.execute("SELECT COUNT(*) FROM entries").fetchall()  # (a read that holds what it began with, and stays so)
+
+    writer, begun, ended, outcome, done = index_with_a_checkpoint(index, outside_holds)
+    stop = threading.Event()
+    reads: list[tuple[float, str]] = []  # (seconds it took, "index" or what it was told)
+
+    def reading() -> None:
+        while not stop.is_set():
+            began = time.monotonic()
+            try:
+                how = index.read(activity.Asked(), 10).by
+            except activity.NotReadable as ex:
+                how = str(ex)
+            reads.append((time.monotonic() - began, how))
+            stop.wait(0.05)
+
+    reader = threading.Thread(target=reading, daemon=True)
+    try:
+        writer.start()
+        assert begun.wait(10), "the checkpoint never began"
+        began = time.monotonic()
+        reader.start()
+        assert ended.wait(activity.CHECKPOINT_PATIENCE + 10), "the checkpoint never ended"
+        took = time.monotonic() - began
+        stop.wait(0.5)  # (and some reads after it)
+    finally:
+        stop.set()
+        reader.join(10)
+        outside.rollback()
+        outside.close()
+        done.set()
+        writer.join(10)
+    assert outcome == [False], "the read outside qKVM did not hold the checkpoint off"
+    other = sorted({how for _, how in reads if how != "index"})
+    longest = max(seconds for seconds, _ in reads)
+    assert reads and not other, f"{len(reads)} reads, not from the index: {other} (the checkpoint took {took:.1f} s)"
+    # (A second, with room for a busy computer, as for the history's: tests/test_history.py, A_TRY_COSTS.)
+    assert took <= 2.5 and longest <= 2.5, f"the checkpoint took {took:.1f} s, and a read {longest:.1f} s"
+
+
+def test_a_read_of_the_indexs_own_longer_than_its_checkpoints_own_wait_is_waited_for_and_it_gets_through(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # As the history's: the checkpoint's own wait for the file is a second (CHECKPOINT_TRY), and a read of the index's own
+    # under way that takes longer than that is waited for before it; the checkpoint gets through then.
+    index = an_index_whose_reads_go_to_it(tmp_path, monkeypatch)
+    took_hold = held_open(monkeypatch, lambda name: time.sleep(activity.CHECKPOINT_TRY + 1.5))
+    answers: dict[str, Any] = {}
+    first = threading.Thread(target=lambda: answers.update(first=index.read(activity.Asked(), 10)), name="first", daemon=True)
+
+    def first_holds() -> None:
+        first.start()
+        wait_until(lambda: "first" in took_hold, "the read never took hold of the file")
+
+    writer, _, ended, outcome, done = index_with_a_checkpoint(index, first_holds)
+    try:
+        writer.start()
+        assert ended.wait(activity.CHECKPOINT_PATIENCE + 10), "the checkpoint never ended"
+        wal = (tmp_path / (activity.FILE + "-wal")).stat().st_size
+    finally:
+        first.join(10)
+        done.set()
+        writer.join(10)
+    assert outcome == [True], "the checkpoint did not get through"
+    assert wal == 0, f"the -wal file holds {wal} bytes after the checkpoint"
+    assert isinstance(answers.get("first"), activity.Found) and answers["first"].by == "index", answers
+
+
+def reads_of_the_text_files(index: activity.Index, monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """How many times the text files are read from here on (AuditLog.entries), one item a reading."""
+    readings: list[int] = []
+    reading = index.text.entries
+
+    def counted() -> Iterator[dict[str, Any]]:
+        readings.append(1)
+        return reading()
+
+    monkeypatch.setattr(index.text, "entries", counted)
+    return readings
+
+
+def test_a_page_of_a_download_waits_at_the_gate_longer_than_a_checkpoint_of_the_index_keeps_it_shut(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # A page after the first waited at the index's gate as a single read does, CATCH_UP (2 s), and went on from the text
+    # files where the gate stayed shut longer: an ordinary checkpoint of the index (CHECKPOINT_PATIENCE, 10 s, where another
+    # read is under way) sent a download to the text files, whose way from the last time handed over lost and doubled lines
+    # (the review of 0.3.2, M1). It waits PAGE_PATIENCE now, longer than a checkpoint keeps the gate shut, and a page with
+    # its read of the index (READ_PATIENCE) is still over before `qkvm stop` stops waiting. The first page keeps its CATCH_UP,
+    # and a single read its 2 s and 503 (the tests above).
+    assert activity.PAGE_PATIENCE > activity.CHECKPOINT_PATIENCE
+    assert activity.PAGE_PATIENCE + activity.READ_PATIENCE < cli.ASK_PATIENCE
+    monkeypatch.setattr(activity, "PAGE", 40)
+    monkeypatch.setattr(activity, "CATCH_UP", 0.2)
+    entries = [{"time": 1_700_000_000.0 + number, "event": "login", "ip": "", "user": f"user{number}"} for number in range(200)]
+    written(tmp_path, entries, files=3)
+    index = activity.Index(tmp_path / activity.FILE, AuditLog(tmp_path / "audit.log"))
+    index.start()
+    shut, opening = threading.Event(), threading.Event()
+
+    def checkpoint() -> None:  # (the writer's checkpoint, as long as the test says: the gate shut meanwhile)
+        with index._gate.shut():
+            shut.set()
+            opening.wait(30)
+
+    try:
+        caught_up(index)
+        readings = reads_of_the_text_files(index, monkeypatch)
+        pages = index.pages(activity.Asked())
+        handed = list(next(pages))
+        holder = threading.Thread(target=checkpoint, daemon=True)
+        holder.start()
+        assert shut.wait(10)
+        threading.Timer(1.0, opening.set).start()  # (five times as long as CATCH_UP, as made here)
+        began = time.monotonic()
+        handed += next(pages)
+        waited = time.monotonic() - began
+        handed += [entry for page in pages for entry in page]
+    finally:
+        opening.set()
+        index.stop()
+    assert not readings, "a page that waited at the gate went on from the text files"
+    assert waited >= 0.9, f"the page waited {waited:.2f} s"
+    assert handed == list(reversed(entries))
+
+
+BASE = 1_700_000_000.0
+# The times of 200 entries, as written one after the other (the newest last), for a download of 40 entries a page: its first
+# page from the index is the entries 199 down to 160, and the rest comes from the text files.
+TIMES: dict[str, list[float]] = {
+    "every one its own moment": [BASE + number for number in range(200)],
+    # A burst within one tick of the clock (15.6 ms on Windows before Python 3.13: 200,000 calls gave 12 moments there).
+    "150 to 170 one moment": [BASE + (150 if 150 <= number <= 170 else number) for number in range(200)],
+    "every one the same moment": [BASE] * 200,
+    # Two threads: the one that took its time first wrote its line second.
+    "159 and 160 out of order": [BASE + {159: 160, 160: 159}.get(number, number) for number in range(200)],
+    # Handed over on the first page, and older than the last one handed there.
+    "161 before 160": [BASE + (150.5 if number == 161 else number) for number in range(200)],
+    # The clock set back after entry 164: the newest 35 older than all the rest.
+    "the clock set back": [BASE + number - (1000 if number >= 165 else 0) for number in range(200)],
+}
+
+
+@pytest.mark.parametrize("way", ["the gate shut", "the index thrown away"])
+@pytest.mark.parametrize("times", list(TIMES))
+def test_a_download_finished_from_the_text_files_hands_every_entry_over_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, times: str, way: str) -> None:
+    # Where a page of a download cannot come from the index (it was thrown away meanwhile, or its gate stayed shut longer than
+    # a page waits), the rest comes from the text files. It went on from the time of the last entry handed over, older than
+    # that: entries of that moment not handed over yet were left out, and an entry whose time was out of order was left out
+    # or handed over twice (the review of 0.3.2, M1; a file that looked whole, its length what was made). It goes on from
+    # where the last page handed over is in the text files now, by the entries themselves, whatever their times say: the
+    # order of the download is the order of the files, as the index's is. Entries written meanwhile (one timed before most:
+    # a clock set back) are newer than the download, and not in it.
+    monkeypatch.setattr(activity, "PAGE", 40)
+    monkeypatch.setattr(activity, "CATCH_UP", 0.2)
+    monkeypatch.setattr(activity, "PAGE_PATIENCE", 0.3)  # (the gate's wait, made short: it is shut for as long as the test runs)
+    entries = [{"time": at, "event": "login", "ip": "", "user": f"user{number}"} for number, at in enumerate(TIMES[times])]
+    written(tmp_path, entries, files=3)
+    index = activity.Index(tmp_path / activity.FILE, AuditLog(tmp_path / "audit.log"))
+    index.start()
+    try:
+        caught_up(index)
+        readings = reads_of_the_text_files(index, monkeypatch)
+        pages = index.pages(activity.Asked())
+        handed = list(next(pages))  # (the first page from the index, as it comes)
+        with open(tmp_path / "audit.log", "ab") as newest:  # (written meanwhile)
+            newest.write(b"".join((json.dumps({"time": BASE + 10.5, "event": "login", "ip": "", "user": f"late{number}"}) + "\n").encode() for number in range(3)))
+        if way == "the gate shut":
+            with index._gate.shut():  # (the index brought up to date for longer than the next page waits)
+                handed += next(pages)
+        else:
+            index._forget_all()  # (as where it is removed, to be made again: what it holds is no longer believed)
+            handed += next(pages)
+        handed += [entry for page in pages for entry in page]
+    finally:
+        index.stop()
+    assert readings, "the download never went to the text files"
+    users = [entry["user"] for entry in handed]
+    expected = [entry["user"] for entry in reversed(entries)]
+    left_out = [user for user in expected if user not in users]
+    twice = sorted({user for user in users if users.count(user) > 1})
+    assert handed == list(reversed(entries)), f"{len(handed)} handed over of {len(entries)}: left out {left_out}, twice {twice}"
+
+
+def test_a_download_finished_from_the_text_files_hands_over_what_is_asked_for_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # The same, of a download that asks for some entries (the sign-ins): the entries passed over in the text files on the way
+    # to where the download was are those asked for, as the pages of the index were.
+    monkeypatch.setattr(activity, "PAGE", 40)
+    monkeypatch.setattr(activity, "CATCH_UP", 0.2)
+    entries = [
+        {"time": BASE + (110 if 105 <= number <= 135 else number), "event": ("login", "action")[number % 2], "ip": "", "user": f"user{number}"}
+        for number in range(200)
+    ]  # (the first page is the sign-ins 198 down to 120: the boundary within the moment of 105 to 135)
+    written(tmp_path, entries, files=3)
+    index = activity.Index(tmp_path / activity.FILE, AuditLog(tmp_path / "audit.log"))
+    index.start()
+    try:
+        caught_up(index)
+        asked = activity.Asked.of(kind="signin")
+        pages = index.pages(asked)
+        handed = list(next(pages))
+        index._forget_all()
+        handed += [entry for page in pages for entry in page]
+    finally:
+        index.stop()
+    assert handed == [entry for entry in reversed(entries) if entry["event"] == "login"]
+
+
+def test_a_download_whose_last_page_is_no_longer_in_the_text_files_is_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Where the text files no longer hold the last page handed over (put back by hand, which is also why the index was
+    # thrown away), where the download was cannot be found in them, and what follows it cannot be told: the download is
+    # refused (503, made whole or not at all), not finished with a part that cannot be placed.
+    monkeypatch.setattr(activity, "PAGE", 40)
+    monkeypatch.setattr(activity, "CATCH_UP", 0.2)
+    written(tmp_path, [{"time": BASE + number, "event": "login", "ip": "", "user": f"user{number}"} for number in range(200)], files=3)
+    index = activity.Index(tmp_path / activity.FILE, AuditLog(tmp_path / "audit.log"))
+    index.start()
+    try:
+        caught_up(index)
+        pages = index.pages(activity.Asked())
+        assert len(next(pages)) == 40
+        index.stop()  # (its writer stopped, so that it does not take in what is written next)
+        written(tmp_path, [{"time": BASE + number, "event": "login", "ip": "", "user": f"other{number}"} for number in range(200)], files=3)
+        index._forget_all()
+        with pytest.raises(activity.NotReadable, match="changed while"):
+            next(pages)
+    finally:
+        index.stop()
+
+
+def test_reads_of_the_index_that_overlap_do_not_keep_its_wal_file_growing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # The index's own reads, two readers that read again at once, each read held open 0.2 s by a hook, the second beginning
+    # halfway through the first's, while the index takes in 12 MB of a busy wall's log, a megabyte at a time, and brings its
+    # -wal file into the file whenever it is past WAL_MOST (made 1 MB here). Every checkpoint is to get through. (Before
+    # the gate, one was refused after its whole wait in one run of two on Windows, and the -wal file reached 15.8 MB.)
+    monkeypatch.setattr(activity, "WAL_MOST", 1_000_000)
+    written_lines(tmp_path, busy_lines(12, 1_790_000_000.0))
+    index = activity.Index(tmp_path / activity.FILE, AuditLog(tmp_path / "audit.log"))
+    monkeypatch.setattr(index, "caught_up", lambda within=activity.CATCH_UP: index._generation)  # (its reads go to it while it is made)
+    stop = threading.Event()
+    took_hold = held_open(monkeypatch, lambda name: stop.wait(0.2))
+    hold_wal = activity.Index._hold_wal
+    checkpoints: list[tuple[bool, float]] = []  # (got through, seconds) of each that was tried
+    wal = tmp_path / (activity.FILE + "-wal")
+    largest, left = [0], [0]  # (bytes of the -wal file as a transaction ends, and as the look after it ends)
+
+    def counted(self: activity.Index, conn: sqlite3.Connection) -> None:
+        size = wal.stat().st_size if wal.exists() else 0
+        largest[0] = max(largest[0], size)
+        tried = size > activity.WAL_MOST and time.monotonic() >= self._wal_again
+        began, before = time.monotonic(), self._wal_again
+        hold_wal(self, conn)
+        if tried:
+            checkpoints.append((self._wal_again == before, time.monotonic() - began))
+        left[0] = max(left[0], wal.stat().st_size if wal.exists() else 0)
+
+    monkeypatch.setattr(activity.Index, "_hold_wal", counted)
+    refused: list[str] = []
+
+    def reader(offset: float) -> None:
+        stop.wait(offset)
+        while not stop.is_set():
+            try:
+                index.read(activity.Asked(), 10)
+            except activity.NotReadable as ex:
+                refused.append(str(ex))
+
+    index.start()
+    readers = [threading.Thread(target=reader, args=(n * 0.1,), name=f"reader {n}", daemon=True) for n in range(2)]
+    try:
+        wait_until(lambda: wal.exists(), "the index was never made", timeout=30)
+        for each in readers:
+            each.start()
+        wait_until(lambda: index._through > float("-inf"), "the index never took in all there was", timeout=300)
+    finally:
+        stop.set()
+        for each in readers:
+            each.join(5)
+        index.stop()
+    reads = sum(len(moments) for moments in took_hold.values())
+    turned_away = [f"{took:.1f} s" for through, took in checkpoints if not through]
+    said = (
+        f"{len(checkpoints)} checkpoints, refused after {turned_away}; {reads} reads, {len(refused)} told to come back; "
+        f"the -wal file at most {largest[0] / 1e6:.1f} MB, {left[0] / 1e6:.1f} MB after a look"
+    )
+    print(chr(10) + said)
+    assert reads >= 20, f"the reads and the writer did not meet: {said}"
+    assert not turned_away, f"a checkpoint was refused under the index's own reads: {said}"
+    assert len(checkpoints) >= 5, f"the reads and the writer did not meet: {said}"
+    # Held to WAL_MOST: past it only by what one transaction writes (a megabyte of the text files, which with the entries'
+    # indexes put up to 3 MB into the -wal file here), and brought back under it by the look after that transaction.
+    assert left[0] <= activity.WAL_MOST, f"the -wal file was left past its limit: {said}"
 
 
 def test_the_index_leaves_the_room_the_record_needs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

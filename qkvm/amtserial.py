@@ -3,7 +3,7 @@
 The engine carries it on its redirection port, as it carries the KVM: the same handshake and Digest sign-in (amt.signed_in),
 asked for "SOL " where the KVM asks for "KVMR"; then a start message with the session's settings, the text the PC writes in
 messages of their own, and a ping the console sends and the engine answers. The message codes are Intel's, as the published
-sources of MeshCommander and amtterm name them (read to learn them, not copied), and what a real engine (AMT 16) answered:
+sources of MeshCommander and amtterm name them (read to learn them, not copied), and what a real engine answered:
 the start of the session, its settings' answer of 23 bytes, a pong to every ping, nothing else while the PC wrote nothing.
 
 Read only: nothing is ever sent to the PC. What comes is kept in a bounded buffer (the last MOST_KEPT bytes, a terminal's

@@ -109,6 +109,12 @@ def test_what_is_kept_of_a_rejected_password_is_not_the_password_and_does_not_gr
     assert len(marks) == 10
     for number in range(known.MOST + 50):  # somebody adding devices with one wrong password after another
         known.said_no(known.what("login", dataclasses.replace(spec, password=f"guess {number}")))
+    # Each is kept while its wait stands (test_a_hold_is_never_let_go_of_to_make_room.py), an hour at the most; once they
+    # have run out, the next one noted makes room of them, down to the most.
+    assert len(known._known) == known.MOST + 51
+    for what, (times, unanswered, _) in list(known._known.items()):
+        known._known[what] = (times, unanswered, 0.0)
+    known.said_no(known.what("login", dataclasses.replace(spec, password="one guess more")))
     assert len(known._known) == known.MOST
     # Typed again by a person, it is forgotten on both roads; and a login that is let in is forgotten too.
     again = known.what("web", spec)

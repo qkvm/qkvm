@@ -713,15 +713,47 @@ def said_yes(value: Any) -> bool:
 
     Asked of the two words for "the server's own monitor goes dark while a console is open". A real board
     says 0 or 1. Said some other way (true, 1.0, "on"), or as something that cannot be read at all, it is
-    not taken for a no: the console is the thing to leave alone when in doubt. Not said at all is a no.
+    not taken for a no: the console is the thing to leave alone when in doubt. Not said at all (None), or
+    said as nothing (an empty text, or blanks), is no plain no either (the owner's rule of 2026-11-05): see
+    `monitor_goes_dark`. (The empty text was taken for a no, and the console opened: the review of 0.3.2.)
     """
-    if value is None or value is False:
+    if not_said(value):
+        return True
+    if value is False:
         return False
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         return value != 0
     if isinstance(value, str):
-        return value.strip().lower() not in ("", "0", "false", "off", "no", "disabled")
+        return value.strip().lower() not in ("0", "false", "off", "no", "disabled")
     return True
+
+
+def not_said(value: Any) -> bool:
+    """Whether a controller's word is not said at all: left out (None), or said as nothing (a text of blanks or of none)."""
+    return value is None or (isinstance(value, str) and not value.strip())
+
+
+def monitor_goes_dark(given: dict[str, Any]) -> str | None:
+    """Why a controller's console is left alone, by the two words it hands out with the pass to it (`automatic_off`,
+    `local_monitor_off`); None where it may be opened: only where both are said, and both are a plain no (`said_yes`).
+
+    Where either is not said at all, the console is left alone too (the owner's rule of 2026-11-05, the desktop app's
+    finding 10): a controller that does not say may switch the server's own monitor off all the same, and whoever stands
+    at the server would see it go dark. It was taken for a no, and the console opened. A word said as nothing (an empty
+    text, or blanks) is not said either, and is said so.
+
+    Where one of the two is a plain no and the other is not, the console is left alone as well, and said so in a sentence of
+    its own: that the controller "is set to switch the server's own monitor off" may be untrue then (the rule before the
+    owner's, from their real boards, took the monitor to go dark only where both were 1: the independent review of 0.3.2)."""
+    words = (given.get("automatic_off"), given.get("local_monitor_off"))
+    if any(not_said(word) for word in words):
+        return "The controller does not say whether it switches the server's own monitor off while its console is open, so qKVM leaves the console alone"
+    yes = [said_yes(word) for word in words]
+    if all(yes):
+        return "The controller is set to switch the server's own monitor off while its console is open, so qKVM leaves the console alone"
+    if any(yes):
+        return "Of the controller's two settings that switch the server's own monitor off while its console is open, only one is off, so qKVM leaves the console alone"
+    return None
 
 
 def link(value: Any) -> str | None:
@@ -1611,6 +1643,12 @@ class RedfishDevice(Device):
                         continue
                     raise failed(_transport_error(ex, self.spec.tls)) from ex
                 except httpx.HTTPError as ex:
+                    if command and method != "GET" and isinstance(ex, httpx.PoolTimeout):
+                        # None of the HTTP library's connections came free in time: the command never went, and says so, as
+                        # one stopped before its line does (not "it may have been done", nor, of a controller's restart,
+                        # "done"). Found re-reading the desktop's follow-up 4 (0.3.2). (One that could not be made at all is
+                        # "unreachable" already, which says the same.)
+                        raise self._not_done(NothingSent("action_failed", "Nothing was sent: no connection to the controller came free in time"), refused=relogged) from ex
                     raise failed(_transport_error(ex, self.spec.tls)) from ex
             self._answered()
             if reply.status_code == 401 and denied_is_an_answer:
@@ -2910,9 +2948,9 @@ class RedfishDevice(Device):
             console_pass, own, session = given.get("token"), as_text(given.get("client_ip")), as_text(given.get("session"))
             if not (isinstance(console_pass, str) and CONSOLE_PASS.fullmatch(console_pass)):
                 raise KvmError("no_picture", f"The controller gave no pass for its console (HTTP {asked.status_code})", 404)
-            if said_yes(given.get("automatic_off")) and said_yes(given.get("local_monitor_off")):
+            if (dark := monitor_goes_dark(given)) is not None:
                 # Whoever stands at the server would see that. It is not "only looking" any more.
-                raise KvmError("no_picture", "The controller is set to switch the server's own monitor off while its console is open, so qKVM leaves the console alone", 404)
+                raise KvmError("no_picture", dark, 404)
             if self._complete_first is None:
                 # The firmware says what it can do. Whether a console may reconnect decides how it wants to be greeted.
                 try:
@@ -3300,7 +3338,8 @@ class RedfishDevice(Device):
         self._power = on
         processors = [t["celsius"] for t in temperatures if "cpu" in t["name"].lower()]
         health = plain(_dig(system, "Status", "HealthRollup") or _dig(system, "Status", "Health"), 20)
-        # One board calls its processor "Intel Xeon E-2336 CPU      , 2900 Mhz, 6 Core(s), ...".
+        # One board calls its processor by its model, a run of spaces, and after a comma what else it knows of it (in
+        # that shape, made up: "Example E-9100 CPU      , 3100 Mhz, 8 Core(s), ...").
         processor = (named(_dig(system, "ProcessorSummary", "Model")) or "").split(",")[0].strip() or None
         unwell = [sensor["name"] for sensor in (*temperatures, *fans) if not sensor["ok"] and sensor["name"]]
         if health == "Critical":

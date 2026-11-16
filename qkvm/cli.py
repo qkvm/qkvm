@@ -22,8 +22,11 @@ import stat
 import sys
 import threading
 import time
+import weakref
+from collections import OrderedDict
+from operator import attrgetter
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, ClassVar
 from urllib.parse import urlsplit
 
 import uvicorn
@@ -44,6 +47,10 @@ from .store import AuditLog, InstanceLock, ServerSettings, Store, StoreError, ho
 from .tlscert import NotOurs
 from .update import UpdateError, check_startup_requirements
 from .vault_storage import MAGIC, MigrationRequired
+
+if TYPE_CHECKING:
+    # (In an annotation only: the web server keeps it to itself, and a later version may keep it elsewhere. See Http.)
+    from uvicorn.server import ServerState
 
 log = logging.getLogger("qkvm")
 MAX_CRASHES = 5  # restarts allowed within CRASH_WINDOW before giving up
@@ -150,14 +157,31 @@ def outdated_headline(outdated: dict[str, str]) -> str:
     return f"qkvm: these libraries are below the required minimum versions - update them with: pip install --upgrade {which}"
 
 
-def raise_file_limit() -> None:
-    """Allow as many open connections as the system will give.
+# The open files allowed, as raise_file_limit left them: None where there is no such allowance (Windows, or none set), or
+# where it was not asked (a web server started some other way than by `qkvm`, as the tests start one).
+files_allowed: int | None = None
+
+
+def raise_file_limit() -> int | None:
+    """Allow as many open connections as the system will give. The number allowed then, also kept in files_allowed (None:
+    there is no such allowance), a quarter of which the connections kept between requests are held to (idle_kept_most).
 
     Every KVM on the wall takes several, and so does every browser looking at it. The usual
     starting allowance on Linux and macOS (1024, 256) is used up by a wall of a hundred KVMs.
     """
+    global files_allowed
+    files_allowed = _more_files()
+    if idle_kept_most() < IDLE_KEPT_MOST:
+        log.warning(
+            "open files allowed: %d, and no more: connections kept between requests are held to %d at once, a quarter of them, not %d",
+            files_allowed, idle_kept_most(), IDLE_KEPT_MOST,
+        )  # fmt: skip
+    return files_allowed
+
+
+def _more_files() -> int | None:
     if sys.platform == "win32":  # Windows has no such allowance
-        return
+        return None
     import resource
 
     soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
@@ -165,18 +189,65 @@ def raise_file_limit() -> None:
         if hard != resource.RLIM_INFINITY:
             wanted = min(wanted, hard)
         if soft == resource.RLIM_INFINITY or soft >= wanted:
-            return  # enough as it is
+            break  # enough as it is
         try:
             resource.setrlimit(resource.RLIMIT_NOFILE, (wanted, hard))
         except (ValueError, OSError):
             continue
         log.info("open files allowed: %d (was %d)", wanted, soft)
-        return
+        break
+    soft = resource.getrlimit(resource.RLIMIT_NOFILE)[0]  # (as it stands now, whatever was asked)
+    return None if soft == resource.RLIM_INFINITY else soft
+
+
+def idle_kept_most() -> int:
+    """How many connections are kept between requests at once, at the most (Http): IDLE_KEPT_MOST, or a quarter of the open
+    files allowed (files_allowed) where that is fewer. Where the allowance could not be raised (a hard limit of 1024), a
+    thousand of them took all but a few of the files a hundred KVMs and their browsers need, kept so by some eight requests a
+    second that nobody signs in for (the independent review of 0.3.2): three quarters are left for those now."""
+    if files_allowed is None:
+        return IDLE_KEPT_MOST
+    return max(1, min(IDLE_KEPT_MOST, files_allowed // 4))
 
 
 HEADERS_WITHIN = 20.0  # seconds a connection has to say what it wants: a request's first line and its headers
 STALLED_AFTER = 20.0  # seconds an answer may wait for its caller to take some more of it
 TAKEN_AT_LEAST = 4096  # bytes of a waiting answer that have to be taken in that time for the wait to go on
+# Connections kept between requests (answered, and waiting for their next request: timeout_keep_alive) at once, at the most;
+# past it, the one kept longest is let go (Http). One cheap request that nobody has to sign in for keeps a connection, an open
+# file, for 130 s: without a number, some 500 requests a second used up a file limit of 65,536 (the review of 0.3.2). A large
+# wall never comes near it: a browser keeps six connections to one address at the most, and a proxy in front as many as had
+# requests under way through it at once (Traefik keeps 200 idle ones to an address at the most as it comes, cloudflared
+# 100), so that a hundred people watching one wall, through one proxy or not, keep a few hundred. And it is a small part of
+# the open files raise_file_limit asks for; where the system allows fewer than four times as many, a quarter of those
+# (idle_kept_most).
+IDLE_KEPT_MOST = 1000
+# What the number of them uses of the web server's own HTTP, of a connection of it (and its server_state, which they are
+# counted by: see lacks): nothing the web server promises, and pyproject.toml gives it no upper bound.
+KEPT_USES = ("timeout_keep_alive_task", "_unset_keepalive_if_required", "timeout_keep_alive_handler", "conn.trailing_data")
+# What of those the time for a request sent with the beginning of the next uses (HEADERS_WITHIN from the end of the answer
+# before it), the number kept or not: whether the connection is kept for its next request, and what of that request is here.
+AHEAD_USES = ("timeout_keep_alive_task", "conn.trailing_data")
+# Seconds a connection is kept for its next request where the web server has not got AHEAD_USES: the web server's own as it
+# comes (timeout_keep_alive's default), in place of SERVER_OPTIONS's. A request begun with the one before it is let go then
+# too, a long way within HEADERS_WITHIN, where nothing tells it apart from a connection that waits for its next.
+KEPT_SHORT = 5.0
+
+
+def lacks(connection: H11Protocol) -> list[str]:
+    """What the number of connections kept between requests (Http) uses of the web server that this connection of it has not
+    got: none of it, with the web server it was tried with (tests/test_hardening.py)."""
+    missing = []
+    for name in KEPT_USES:
+        try:
+            attrgetter(name)(connection)
+        except AttributeError:
+            missing.append(name)
+    try:
+        weakref.WeakKeyDictionary({connection.server_state: None})  # (as Http._KEPT keeps them: by it, weakly)
+    except (AttributeError, TypeError):
+        missing.append("server_state")
+    return missing
 
 
 class Http(H11Protocol):
@@ -187,23 +258,60 @@ class Http(H11Protocol):
     then takes nothing of the answer is kept for as long as it likes: an answer is not given up on, and a
     connection is not closed, while there is something left to send. Anybody who can reach the port could
     hold as many as the system gives out, and leave none for a browser, or for qKVM to reach a device with.
+
+    And a number: a connection kept between requests (answered, waiting for its next one, timeout_keep_alive) is
+    held by whoever asked once, for as long as that. Those are held to idle_kept_most() at once, the one kept
+    longest let go first, as the keep-alive's end lets it go. A connection on which a request or an answer is
+    under way is not one of them, nor is a WebSocket (the live line: not this protocol from its upgrade on).
+    That number uses what the web server keeps to itself (KEPT_USES): where a later version has not got it, no
+    number is kept (every connection is kept for the whole keep-alive), and the log says so once.
+
+    A request sent with the beginning of the next has HEADERS_WITHIN for the rest of that one from the end of its
+    answer, whether the number is kept or not (it had none where the number was not: the reviews of 0.3.2). That
+    uses less of the web server (AHEAD_USES). Where a later version has not got that either, every connection
+    is kept KEPT_SHORT for its next request, the web server's own time as it comes, and the log says so instead.
     """
 
     _asking: asyncio.TimerHandle | None = None  # runs while a request is awaited or arriving
     _handing_over: asyncio.TimerHandle | None = None  # runs while an answer waits to be taken
     _still_to_take = 0  # how much of it was waiting when that clock was started
+    # The connections each web server keeps between requests (by its ServerState, which all of its connections share),
+    # the one kept longest first; and this connection's web server's (None: not counted).
+    _KEPT: ClassVar[weakref.WeakKeyDictionary[ServerState, OrderedDict[Http, None]]] = weakref.WeakKeyDictionary()
+    _kept: OrderedDict[Http, None] | None = None
+    # Whether the web server has what that number uses (lacks): found out at its first connection. (It raised otherwise, at
+    # every connection or every answer for some of it: "Exception in ASGI application", and the connection closed.)
+    _counting: ClassVar[bool | None] = None
+    # Whether it has what the time for a request begun with the one before it uses (AHEAD_USES): found out with _counting.
+    _ahead_timed: ClassVar[bool] = True
+    _resting: asyncio.TimerHandle | None = None  # where it has not: runs while the connection is kept for its next request
 
     def connection_made(self, transport: asyncio.Transport) -> None:  # type: ignore[override]
         super().connection_made(transport)
+        if Http._counting is None:
+            missing = lacks(self)
+            Http._ahead_timed = not any(name in AHEAD_USES for name in missing)
+            Http._counting = not missing
+            if missing and not Http._ahead_timed:
+                log.warning(
+                    "connections are kept %g s between requests, as uvicorn keeps them as it comes, not for the whole keep-alive, "
+                    "and are not held to %d at once: uvicorn %s has not got %s, which the time for a request begun with the one "
+                    "before it and that number use",
+                    KEPT_SHORT, idle_kept_most(), uvicorn.__version__, ", ".join(missing),
+                )  # fmt: skip
+            elif missing:
+                log.warning(
+                    "connections kept between requests are not held to %d at once: uvicorn %s has not got %s, which that uses",
+                    idle_kept_most(), uvicorn.__version__, ", ".join(missing),
+                )  # fmt: skip
+        if Http._counting:
+            self._kept = Http._KEPT.setdefault(self.server_state, OrderedDict())
         self._expect_a_request()
 
     def data_received(self, data: bytes) -> None:
+        self._in_use()  # (the beginning of its next request, or of a WebSocket's)
         super().data_received(data)
-        if self.transport.get_protocol() is not self:
-            # The request was for the live line, and the connection is the WebSocket's now (`Line`, which keeps time of
-            # its own). Left running, these clocks closed every line twenty seconds after it opened.
-            self._stop_the_clock()
-            self._taken()
+        if self._handed_over():
             return
         if self.cycle is not None and not self.cycle.response_complete:
             self._stop_the_clock()  # a whole request is here and being answered (its body has a clock of its own)
@@ -213,6 +321,7 @@ class Http(H11Protocol):
             self._expect_a_request()
 
     def connection_lost(self, exc: Exception | None) -> None:
+        self._in_use()
         self._stop_the_clock()
         self._taken()
         super().connection_lost(exc)
@@ -227,11 +336,78 @@ class Http(H11Protocol):
 
     def on_response_complete(self) -> None:
         super().on_response_complete()
+        if self._handed_over():
+            return  # (a WebSocket asked for with the request answered: taken up as that answer ended)
         # An answer may be finished and its end still here, with a caller that takes nothing. A connection
         # is closed only once everything was sent, so this one would not be: not after the pause the web
         # server allows between two requests, and not when the answer said it was the last.
         if self.transport.get_write_buffer_size():
             self._wait_for_the_taker()
+        self._kept_now()
+
+    def _kept_now(self) -> None:
+        """An answer is over: where the connection is kept for its next request (timeout_keep_alive), it is one of those kept,
+        the newest; where they are more than idle_kept_most() then, the one kept longest is let go."""
+        if self.transport.is_closing():
+            return  # (closed after its answer)
+        if not Http._ahead_timed:
+            # Nothing here tells a connection with a request begun with the one before it from one that waits for its next:
+            # both are kept KEPT_SHORT from this answer's end, and no number of them is kept.
+            self._rest()
+            return
+        if self.timeout_keep_alive_task is None:
+            return  # (its next request, sent before the answer was over, is here and answered)
+        if self.conn.trailing_data[0]:
+            # The beginning of its next request came with the one before it: in use, and given the time a request has to say
+            # what it wants, from here, the number kept or not. (It had none, and stayed the whole keep-alive, 130 s since
+            # 0.3.2, outside the number too; and where the number was not kept, until the reviews of 0.3.2.)
+            self._expect_a_request()
+            return
+        if self._kept is None:
+            return  # (no number is kept: the web server has not got what it uses)
+        kept, most = self._kept, idle_kept_most()
+        kept[self] = None
+        while len(kept) > most:
+            longest, _ = kept.popitem(last=False)
+            # As the keep-alive's end lets it go (close: what is left of its last answer is sent first). Nothing of a request
+            # had come on it since (data_received takes it out of those kept).
+            longest._unset_keepalive_if_required()
+            longest.timeout_keep_alive_handler()
+
+    def _ours(self) -> bool:
+        """Whether the connection is still this HTTP's: not the WebSocket's that a request on it was for (`Line`)."""
+        return self.transport.get_protocol() is self
+
+    def _handed_over(self) -> bool:
+        """Where the connection became a WebSocket's (a request for the live line, taken up as its bytes came or as the
+        answer before it ended): every clock of this HTTP's stopped, and True. `Line` keeps time of its own; left running,
+        these closed the line: twenty seconds after it opened (HEADERS_WITHIN), and, where the web server has not got
+        AHEAD_USES, KEPT_SHORT after it opened where it was asked for with the request before it (the second round of the
+        reviews of 0.3.2)."""
+        if self._ours():
+            return False
+        self._in_use()
+        self._stop_the_clock()
+        self._taken()
+        return True
+
+    def _in_use(self) -> None:
+        if self._kept is not None:
+            self._kept.pop(self, None)
+        if self._resting is not None:
+            self._resting.cancel()
+            self._resting = None
+
+    def _rest(self) -> None:
+        """Kept KEPT_SHORT for its next request, from now (the end of an answer): where the web server has not got AHEAD_USES.
+        Its first byte ends it (data_received), and that request has HEADERS_WITHIN for the rest from there."""
+        if self._resting is not None:
+            self._resting.cancel()
+        self._resting = self.loop.call_later(KEPT_SHORT, self._rested)
+
+    def _rested(self) -> None:
+        self._resting = None
+        self._close_unless_answering()
 
     def _wait_for_the_taker(self) -> None:
         if self._handing_over is None:
@@ -245,6 +421,8 @@ class Http(H11Protocol):
 
     def _taken_anything(self) -> None:
         self._handing_over = None
+        if not self._ours():
+            return  # (what waits is the WebSocket's now, which has a clock of its own for it: `Line`)
         left = self.transport.get_write_buffer_size()
         if not left:
             return
@@ -265,8 +443,12 @@ class Http(H11Protocol):
 
     def _waited_long_enough(self) -> None:
         self._asking = None
+        self._close_unless_answering()
+
+    def _close_unless_answering(self) -> None:
+        # (Never a connection that became a WebSocket's: the last answer on it is complete, and was not what it waited for.)
         answering = self.cycle is not None and not self.cycle.response_complete
-        if not answering and not self.transport.is_closing():
+        if not answering and not self.transport.is_closing() and self._ours():
             self.transport.close()
 
 
@@ -433,6 +615,13 @@ SERVER_OPTIONS: dict[str, Any] = {
     "log_level": "warning",
     "access_log": False,  # tiles poll for a frame every second; an access log would be nothing but noise
     "server_header": False,
+    # Seconds a connection is kept after an answer for its next request. As it comes, five: a client that sent a request
+    # on a pooled connection at the moment it was let go lost it (the desktop's joint test against 0.3.0). Longer than
+    # the proxies in common use keep an idle one to the server behind them by default (nginx and AWS's load balancers a
+    # minute, Traefik and cloudflared a minute and a half, Caddy two), so that the one in front lets go first; not for
+    # ever, every connection kept being an open file (raise_file_limit), and IDLE_KEPT_MOST of them at once at the most
+    # (Http). One that asks for nothing goes after HEADERS_WITHIN (Http), and a stop closes the idle ones at once.
+    "timeout_keep_alive": 130,
     "timeout_graceful_shutdown": 3,
     # Who is calling, and whether over HTTPS, is worked out in one place (security.client_ip, is_secure)
     # from the proxies named with --trusted-proxy. Left on, the web server would rewrite both by itself,

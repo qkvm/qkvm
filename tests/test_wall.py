@@ -330,7 +330,7 @@ def test_add_edit_remove_device(tmp_path: Path, fake: FakeKvm) -> None:
         created = client.post("/api/v1/devices", json={"url": fake.url + "/#/", "password": kvm_password})
         assert created.status_code == 201
         device = created.json()["device"]
-        assert created.json()["about"] == {"model": "RM10", "version": "V1.10.1 release2", "hostname": "rack-kvm"}
+        assert created.json()["about"] == {"model": "RM10", "version": "V0.98.3 release7", "hostname": "rack-kvm"}
         assert device["name"] == "rack-kvm"
         assert device["url"] == fake.url
         assert device["has_password"] is True
@@ -456,7 +456,7 @@ def test_status_reports_video_and_model(tmp_path: Path, fake: FakeKvm) -> None:
     assert status["state"] == "no_signal"
     assert status["video"] == {"signal": False, "width": 1920, "height": 1080, "fps": 60}
     assert status["health"]["temp"] == 42.5
-    assert status["about"] == {"model": "RM10", "version": "V1.10.1 release2"}
+    assert status["about"] == {"model": "RM10", "version": "V0.98.3 release7"}
     assert frame.headers["x-kvm-signal"] == "0"
 
 

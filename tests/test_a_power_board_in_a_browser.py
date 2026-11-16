@@ -56,6 +56,58 @@ def test_a_computer_its_kvms_board_says_is_off_is_off_or_asleep_on_its_tile(tmp_
         fake.stop()
 
 
+UNWIRED = "The KVM's board says the power light is off while the screen shows a picture: its power-LED wires are probably not connected."
+
+
+def test_a_power_light_that_says_off_beside_a_picture_says_why_on_the_tile_and_in_its_details(tmp_path: Path, browser: Browser) -> None:  # noqa: F811
+    # (The owner's stock PiKVM V4, 2026-11-15: its board's light said off beside a running computer's picture. The tile said
+    # neither "Power on" nor "Power off", by design, and nothing of why.)
+    fake = FakeKvm(FakeState(atx=True, computer_on=False, signal=True)).start()
+    try:
+        with a_wall(tmp_path, ("Demo PC", fake)) as (live, _), looking(browser, live) as page:
+            sign_in(page, live)
+            shown = tile(page, "Demo PC")
+            expect(shown).to_have_attribute("data-state", "online")
+            meta = shown.locator(".meta")
+            expect(meta).to_contain_text("Power unknown")  # (its footer has one short line: the why is its title, whole)
+            expect(meta).to_have_attribute("title", UNWIRED)
+            expect(meta).not_to_contain_text("Power off")
+            # Enlarged, its Details say it whole.
+            shown.focus()
+            page.keyboard.press("Enter")
+            page.locator("#focus-details > summary").click()
+            expect(page.locator("#focus-status-meta")).to_contain_text(UNWIRED)
+            # Lit again, it is the computer's power, and nothing more is said of the wires.
+            page.keyboard.press("Escape")
+            fake.state.computer_on = True
+            expect(meta).to_contain_text("Power on")
+            expect(meta).not_to_have_attribute("title", UNWIRED)
+    finally:
+        fake.stop()
+
+
+def test_a_power_light_that_says_off_beside_a_picture_on_a_kvm_with_several_inputs_is_power_unknown_without_a_why(tmp_path: Path, browser: Browser) -> None:  # noqa: F811
+    # On a KVM that switches between computers the board may be wired to another computer than the one on screen: the note
+    # of the wires would be wrong there (the review of 0.3.2), and is not given. "Power unknown" stays, alone.
+    fake = FakeKvm(FakeState(atx=True, computer_on=False, signal=True, ports=[(32, 74, 135), (135, 74, 32)])).start()
+    try:
+        with a_wall(tmp_path, ("Demo PC", fake)) as (live, _), looking(browser, live) as page:
+            sign_in(page, live)
+            shown = tile(page, "Demo PC")
+            expect(shown).to_have_attribute("data-state", "online")
+            meta = shown.locator(".meta")
+            expect(meta).to_contain_text("Power unknown")
+            expect(meta).not_to_contain_text("Power off")
+            page.wait_for_timeout(1000)  # (looked at again meanwhile: STATUS_TTL)
+            expect(meta).not_to_have_attribute("title", UNWIRED)
+            shown.focus()
+            page.keyboard.press("Enter")
+            page.locator("#focus-details > summary").click()
+            expect(page.locator("#focus-status-meta")).not_to_contain_text("power-LED")
+    finally:
+        fake.stop()
+
+
 def test_a_power_button_whose_answer_is_no_answer_of_the_walls_own_is_not_offered_again(tmp_path: Path, browser: Browser) -> None:  # noqa: F811
     # qKVM stopped while a board held the long press: the web server cut the request off with a bare 500, which the
     # page took for a refusal and offered under "Retry failed", which would press the button again. So it did with

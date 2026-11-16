@@ -38,6 +38,7 @@ from tests.fake_amt import AmtState, FakeAmt
 from tests.fake_jetkvm import FakeJetKvm, JetState, no_long_handshake
 from tests.fake_kvm import MADE_UP_PPS, MADE_UP_SPS, FakeKvm, FakeState, made_up_film, pictures_of
 from tests.fake_redfish import BmcState, FakeBmc
+from tests.test_hardening import asked_on, let_go
 from tests.test_wall import CSRF, PASSWORD, closed_port, wait_until
 
 HEAD = struct.Struct("<BBHIq")
@@ -324,6 +325,32 @@ def test_a_pass_opens_one_line_once_and_the_pictures_come_numbered(tmp_path: Pat
             turned.closed()
         viewer.close()
         wait_until(lambda: pikvm.state.media_clients == 0, "the line to the KVM was not closed after the last viewer left")
+
+
+def test_a_live_line_is_never_let_go_for_the_number_of_connections_kept_between_requests(tmp_path: Path, pikvm: FakeKvm, monkeypatch: pytest.MonkeyPatch) -> None:
+    # The connections kept between requests are held to cli.IDLE_KEPT_MOST at once, the one kept longest let go first
+    # (tests/test_hardening.py). A live line is a WebSocket, on which no request comes: it is never one of those, however
+    # long it has been open and however many are kept after it, and holds the machine's keyboard and mouse as before.
+    monkeypatch.setattr(cli, "IDLE_KEPT_MOST", 2)
+    with Wall(tmp_path) as wall:
+        admin = wall.browser()
+        device = wall.add(admin, pikvm.url)
+        viewer = wall.line(admin, device)
+        last = viewer.picture()
+        kept = [socket.create_connection(("127.0.0.1", wall.port), timeout=10) for _ in range(5)]
+        try:
+            for connection in kept:
+                assert asked_on(connection, "/healthz") == 200
+            assert let_go(kept[0]) and let_go(kept[2]), "more were kept at once than may be"
+            for _ in range(10):
+                came = viewer.picture()
+                assert came.counter > last.counter, "the line stopped"
+                last = came
+            assert pikvm.state.media_clients == 1
+        finally:
+            for connection in kept:
+                connection.close()
+        viewer.close()
 
 
 def test_a_pass_runs_out_and_a_line_that_says_no_hello_is_closed(tmp_path: Path, pikvm: FakeKvm, monkeypatch: pytest.MonkeyPatch) -> None:

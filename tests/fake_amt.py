@@ -32,7 +32,7 @@ from tests import ServerThread, local_socket
 from tests.fake_kvm import make_device_certificate
 from tests.fake_vnc import FakeVnc, PixelFormat, VncState
 
-SERVER = "Intel(R) Active Management Technology 12.0.90"  # what every answer of an engine says of itself
+SERVER = "Intel(R) Active Management Technology 99.2.10"  # what every answer of an engine says of itself (its version made up)
 GUID = "3C4A5B6C7D8E4F60A1B2C3D4E5F60718"  # the number this PC gives for itself (CIM_ComputerSystemPackage.PlatformGUID)
 
 
@@ -49,14 +49,16 @@ class AmtState:
     model: object = "Office Desk 7"
     serial: object = "PC0000000001"
     board_make: object = "Example Boards"
-    board_model: object = "EB-Q370"
-    bios: object = "E7ET42W (1.42)"
-    family: int = 205  # the SMBIOS processor family: 205 is Intel Core i5
+    # (The board, its firmware, processor and memory are made up, each in the shape an engine says it: together they are no
+    # real machine.)
+    board_model: object = "EB-X100"
+    bios: object = "XB0Z07A (0.07)"
+    family: int = 206  # the SMBIOS processor family: 206 is Intel Core i3
     other_family: object = None  # what the processor is where `family` is 1 ("Other")
-    clock: int = 3400  # MHz
+    clock: int = 2900  # MHz
     processors: int = 1
-    memory: list[int] = field(default_factory=lambda: [8 * 2**30, 8 * 2**30])  # bytes a module each
-    version: object = "12.0.90"  # the AMT firmware (CIM_SoftwareIdentity "AMT")
+    memory: list[int] = field(default_factory=lambda: [4 * 2**30, 8 * 2**30])  # bytes a module each
+    version: object = "99.2.10"  # the AMT firmware (CIM_SoftwareIdentity "AMT")
     hostname: object = "desk-7"
     guid: object = GUID
     realm: str = ""  # its Digest realm ("": REALM, as every stand-in has unless told otherwise; a real engine has one of its own)
@@ -106,7 +108,7 @@ class AmtState:
     redirection_rejections: int = 0
     kvm_sessions: int = 0  # sessions that got as far as RFB
     redirection_open: int = 0  # connections to the redirection port open right now
-    # KVM sessions open right now (in RFB). While one is, a real engine (AMT 16) did not list 8 (off) and 5 (cycle) among the
+    # KVM sessions open right now (in RFB). While one is, a real engine did not list 8 (off) and 5 (cycle) among the
     # states it offers, and answered a request for either with 2; a test may count another viewer's in here too.
     kvm_open: int = 0
     session_ended_at: float = float("-inf")  # when the last KVM or serial session ended
@@ -154,7 +156,7 @@ class AmtState:
 
 
 REALM = "Digest:" + "A3F7C2E1" * 4
-# What a Put of AMT_BootSettingData must carry: the properties Intel's SDK marks put-required, and the four a real AMT 16
+# What a Put of AMT_BootSettingData must carry: the properties Intel's SDK marks put-required, and the four a real
 # engine refused a Put without as well ("the supplied SOAP violates the corresponding XML schema definition").
 BOOT_PUT_REQUIRED = (
     "UseSOL", "UseSafeMode", "ReflashBIOS", "BIOSSetup", "BIOSPause", "LockPowerButton", "LockResetButton", "LockKeyboard",
@@ -477,7 +479,7 @@ def make_fake_amt(state: AmtState) -> FastAPI:
             if given is None:
                 return fault(relates_to, "SchemaValidationError", "The supplied SOAP violates the corresponding XML schema definition.")
             said = {amt.local(child.tag): (child.text or "") for child in given}
-            # The keys must come along (InstanceID is the one key here); and, as a real engine (AMT 16) refused a Put that left
+            # The keys must come along (InstanceID is the one key here); and, as a real engine refused a Put that left
             # any of them out, every put-required property this instance has.
             if said.get("InstanceID") != "Intel(r) AMT:BootSettingData 0" or any(key not in said for key in BOOT_PUT_REQUIRED):
                 return fault(relates_to, "SchemaValidationError", "The supplied SOAP violates the corresponding XML schema definition.")
@@ -551,7 +553,7 @@ class FakeRedirection(FakeVnc):
     """The engine's redirection port: Intel's handshake (start, which sign-ins, Digest, "the KVM may begin"), then the
     KVM as RFB, which the VNC stand-in speaks with the manners of a real engine's (see `amt_screen`).
 
-    Built from what a real engine (AMT 16) was seen to send, byte for byte, and from MeshCommander's published source
+    Built from what a real engine was seen to send, byte for byte, and from MeshCommander's published source
     for what it was not seen to send (the answer to a wrong password is not known: here it is "not so", 1, and the
     connection ends). It can be told to answer otherwise (`AmtState.redirect_odd`).
     """
@@ -763,7 +765,7 @@ class FakeRedirection(FakeVnc):
 
 
 def amt_screen() -> VncState:
-    """What the KVM of a real engine (AMT 16) was seen to be, in RFB: it greets as "RFB 004.000" and speaks 3.8, offers
+    """What the KVM of a real engine was seen to be, in RFB: it greets as "RFB 004.000" and speaks 3.8, offers
     None and a type of its own (128), says its screen is RGB565, hangs up at any other number of bits a pixel, rings the
     bell before its first answer, answers the first request with the screen's size alone, sends Raw, and drops the keys
     that come within moments of the handshake (0.05 and 0.15 s after it were lost there, 0.3 s and later were not)."""

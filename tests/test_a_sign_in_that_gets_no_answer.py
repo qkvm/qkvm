@@ -1336,8 +1336,9 @@ def test_the_page_lets_a_tile_be_saved_in_spite_of_a_device_that_signs_nobody_in
     # no button for it. It has one where nothing about how the device is signed in to was changed. Not where
     # a device is added, and not for another address: whatever is at an address that is no KVM answers its
     # sign-in that way, and once added was sent the password every five minutes for good. (Both are seen in
-    # a browser, in test_in_a_browser.py; this holds the two lines.)
+    # a browser, in test_in_a_browser.py; this holds the two lines.) The same for a KVM that says it answers on
+    # HTTPS (`https_only`), which the wall saves unchecked only so (the independent review of 0.3.2, L1).
     script = (Path(kvm.__file__).parent / "static" / "app.js").read_text(encoding="utf-8")
     assert "const CANNOT_BE_REACHED = ['unreachable', 'timeout', 'dropped'];" in script and "CANNOT_BE_CHECKED" not in script
     assert "if (CANNOT_BE_REACHED.includes(ex.code)) {" in script
-    assert "saveAnyway.hidden = !(CANNOT_BE_REACHED.includes(ex.code) || (ex.code === 'no_sign_in' && asItWas));" in script
+    assert "saveAnyway.hidden = !(CANNOT_BE_REACHED.includes(ex.code) || (['no_sign_in', 'https_only'].includes(ex.code) && asItWas));" in script

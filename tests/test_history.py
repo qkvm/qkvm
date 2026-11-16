@@ -14,7 +14,7 @@ import os
 import sqlite3
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -65,7 +65,7 @@ ONLINE: dict[str, Any] = {
     "state": "online", "error": None, "last_seen_ago": 0,
     "atx": {"enabled": True, "power": True, "hdd": None},
     "health": {"temp": 42.5, "cpu": 17, "mem": 39.5},
-    "server": {"temperatures": [{"name": "CPU0_TEMP", "celsius": 61, "ok": True}], "fans": [{"name": "CPU0_FAN", "reading": 1650, "unit": "RPM", "ok": True}]},
+    "server": {"temperatures": [{"name": "TEMP_CPU_A", "celsius": 61, "ok": True}], "fans": [{"name": "FAN_CPU_A", "reading": 1650, "unit": "RPM", "ok": True}]},
 }  # fmt: skip
 OFFLINE: dict[str, Any] = {"state": "offline", "error": {"code": "unreachable", "message": "Nothing answers"}, "last_seen_ago": 12}
 
@@ -75,7 +75,7 @@ def with_power(status: dict[str, Any], on: bool | None) -> dict[str, Any]:
 
 
 def with_temperature(status: dict[str, Any], celsius: float) -> dict[str, Any]:
-    return {**status, "server": {**status["server"], "temperatures": [{"name": "CPU0_TEMP", "celsius": celsius, "ok": True}]}}
+    return {**status, "server": {**status["server"], "temperatures": [{"name": "TEMP_CPU_A", "celsius": celsius, "ok": True}]}}
 
 
 # How long a test waits for a trim it asked for to end: what one trim may hold the writer for (its time, TRIM_PATIENCE,
@@ -154,20 +154,20 @@ def test_samples_are_taken_at_a_slow_pace_or_when_a_reading_moves(kept: History)
     by_sensor: dict[str, list[float]] = {}
     for row in samples:
         by_sensor.setdefault(row["sensor"], []).append(row["t"] - t0)
-    assert by_sensor == {"CPU0_FAN": [0, 60, 120, 180, 240], "CPU0_TEMP": [0, 60, 120, 180, 240, 290], "device": [0, 60, 120, 180, 240]}
+    assert by_sensor == {"FAN_CPU_A": [0, 60, 120, 180, 240], "TEMP_CPU_A": [0, 60, 120, 180, 240, 290], "device": [0, 60, 120, 180, 240]}
     assert {row["unit"] for row in samples} == {"C", "RPM"}
     # ...and averaged over spans, one series per sensor, for a graph that is to stay small.
     spans = kept.read("dev", "samples", t0, t0 + 400, every=200)
-    assert [series["sensor"] for series in spans["series"]] == ["CPU0_FAN", "CPU0_TEMP", "device"] and spans["more"] is False
-    cpu = next(series for series in spans["series"] if series["sensor"] == "CPU0_TEMP")
+    assert [series["sensor"] for series in spans["series"]] == ["FAN_CPU_A", "TEMP_CPU_A", "device"] and spans["more"] is False
+    cpu = next(series for series in spans["series"] if series["sensor"] == "TEMP_CPU_A")
     assert cpu["unit"] == "C" and [[t - t0, value, low, high] for t, value, low, high in cpu["points"]] == [[0, 61, 61, 61], [200, 62.5, 61, 64]]
     # A page that is cut loses whole sensors at its end, never the newest spans of every sensor: the graph says "last 24 h".
     # Nor of the last sensor it holds: one whose series does not fit whole is left out, and not handed over with its oldest
-    # span and without its newest. (The page held CPU0_TEMP's first span only, and the graph drew it as the whole day.)
+    # span and without its newest. (The page held TEMP_CPU_A's first span only, and the graph drew it as the whole day.)
     cut = kept.read("dev", "samples", t0, t0 + 400, every=200, limit=3)
-    assert [(series["sensor"], len(series["points"])) for series in cut["series"]] == [("CPU0_FAN", 2)] and cut["more"] is True
+    assert [(series["sensor"], len(series["points"])) for series in cut["series"]] == [("FAN_CPU_A", 2)] and cut["more"] is True
     # Cut where one series ends and the next begins, the last is whole and stays.
-    for limit, whole in ((2, [("CPU0_FAN", 2)]), (4, [("CPU0_FAN", 2), ("CPU0_TEMP", 2)])):
+    for limit, whole in ((2, [("FAN_CPU_A", 2)]), (4, [("FAN_CPU_A", 2), ("TEMP_CPU_A", 2)])):
         page = kept.read("dev", "samples", t0, t0 + 400, every=200, limit=limit)
         assert [(series["sensor"], len(series["points"])) for series in page["series"]] == whole and page["more"] is True
     # One sensor that does not fit by itself: nothing of it, and `more` says to narrow the window.
@@ -483,58 +483,353 @@ def many_sensors(look: int, names: str = "s") -> dict[str, Any]:
     return {"state": "online", "server": {"temperatures": [{"name": f"{names}{n}", "celsius": 40.0 + look % 2} for n in range(history.MOST_SENSORS)], "fans": []}}
 
 
-def test_reads_that_overlap_do_not_keep_the_wal_file_growing_past_its_share(tmp_path: Path) -> None:
+def held_open(monkeypatch: pytest.MonkeyPatch, hold: Callable[[str], object]) -> dict[str, list[float]]:
+    """The wall's own reads (History.read) made to take their time by a hook, in place of a history long enough for that:
+    each holds what it began with (a read under way, as SQLite counts one) until `hold(device)` returns, and the moments at
+    which reads of each device took that hold are kept in what this returns."""
+    summary = History._summary
+    took_hold: dict[str, list[float]] = {}
+
+    def holding(conn: sqlite3.Connection, device_id: str, since: float, until: float, now: float) -> dict[str, Any]:
+        conn.execute("BEGIN")
+        conn.execute("SELECT COUNT(*) FROM states").fetchall()  # (from here on it holds what it began with)
+        took_hold.setdefault(device_id, []).append(time.monotonic())
+        try:
+            hold(device_id)
+            return summary(conn, device_id, since, until, now)
+        finally:
+            conn.rollback()
+
+    monkeypatch.setattr(History, "_summary", staticmethod(holding))
+    return took_hold
+
+
+def test_reads_that_overlap_do_not_keep_the_wal_file_growing_past_its_share(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     # SQLite brings the -wal file into the file by itself, but begins it again from the start only when no read is under
-    # way that began before. Reads that overlap, one beginning before the other ends (three of the route's, staggered),
-    # kept it growing for as long as they came: 98 MB in two and a half minutes beside a file of 2 MB, with a cap of
-    # 10 MB, and the checkpoint every ten minutes, which waited five seconds, did not get through reads of five.
+    # way that began before. Reads that overlap, one beginning before the other ends, kept it growing for as long as they
+    # came: 98 MB in two and a half minutes beside a file of 2 MB, with a cap of 10 MB. And the checkpoint that waits for
+    # the reads under way did not get through them either while they kept coming: it waits for the place in the file's
+    # index that a read under way holds, a read that begins as that one ends takes the same place, and the next ones share
+    # it (two readers of 0.2 s held a checkpoint off for its whole wait, half the time on Windows, now and then on Linux).
+    # On GitHub's runners a checkpoint was refused after its 16 s, and again where the -wal file had doubled: four times
+    # its share. The wall's own reads (History.read) wait while a checkpoint runs: these are those, two readers that
+    # read again at once, each read held open 0.2 s by a hook, the second beginning halfway through the first's.
     kept = History(tmp_path / history.FILE, limits=lambda: (365, 10))  # (the -wal file's share: a tenth, 1 MB)
+    stop = threading.Event()
+    took_hold = held_open(monkeypatch, lambda device: stop.wait(0.2))
+    checkpoint = History._checkpoint
+    checkpoints: list[tuple[bool, float]] = []  # (got through, seconds): every one, where the log says a refusal once a minute
+
+    def counted(self: History) -> bool:
+        began = time.monotonic()
+        through = checkpoint(self)
+        checkpoints.append((through, time.monotonic() - began))
+        return through
+
+    monkeypatch.setattr(History, "_checkpoint", counted)
     kept.start()
     kept.observe("w", ONLINE)
     kept.flush()
     share = 10 * 1_000_000 // 10
-    stop = threading.Event()
+    refused: list[str] = []
 
     def reader(offset: float) -> None:
         stop.wait(offset)
         while not stop.is_set():
-            conn = sqlite3.connect(f"{(tmp_path / history.FILE).resolve().as_uri()}?mode=ro", uri=True)
-            conn.execute("BEGIN")
-            conn.execute("SELECT COUNT(*) FROM states").fetchall()  # (a read under way: it holds what it began with)
-            stop.wait(0.2)
-            conn.rollback()
-            conn.close()
+            try:
+                kept.read("w", "summary", 0, 1e11)
+            except history.NotReadable as ex:
+                refused.append(str(ex))
 
-    readers = [threading.Thread(target=reader, args=(n * 0.07,), daemon=True) for n in range(3)]
+    readers = [threading.Thread(target=reader, args=(n * 0.1,), daemon=True) for n in range(2)]
     for each in readers:
         each.start()
     wal = tmp_path / (history.FILE + "-wal")
     largest = 0
     t0 = time.time() - 2000 * 60
-    with heard() as said:  # (what the log says meanwhile: where a checkpoint was turned away, how)
-        try:
-            for look in range(2000):  # (sixty-four readings a minute, of two thousand minutes: some 128,000 rows)
-                kept.observe("w", many_sensors(look), now=t0 + look * 60)
-                if look % 20 == 0:
-                    time.sleep(0.01)  # (the writer takes what came meanwhile: transactions as a wall writes them)
-                    largest = max(largest, wal.stat().st_size)
-                    while kept._waiting.qsize() > history.QUEUE_SIZE // 2:  # (no faster than it writes: nothing is to be dropped)
-                        time.sleep(0.01)
-                        largest = max(largest, wal.stat().st_size)
-            deadline = time.monotonic() + 60
-            while kept._waiting.unfinished_tasks and time.monotonic() < deadline:
+    try:
+        for look in range(2000):  # (sixty-four readings a minute, of two thousand minutes: some 128,000 rows)
+            kept.observe("w", many_sensors(look), now=t0 + look * 60)
+            if look % 20 == 0:
+                time.sleep(0.01)  # (the writer takes what came meanwhile: transactions as a wall writes them)
                 largest = max(largest, wal.stat().st_size)
-                time.sleep(0.01)
-        finally:
-            stop.set()
-            for each in readers:
-                each.join(5)
+                while kept._waiting.qsize() > history.QUEUE_SIZE // 2:  # (no faster than it writes: nothing is to be dropped)
+                    time.sleep(0.01)
+                    largest = max(largest, wal.stat().st_size)
+        deadline = time.monotonic() + 60
+        while kept._waiting.unfinished_tasks and time.monotonic() < deadline:
+            largest = max(largest, wal.stat().st_size)
+            time.sleep(0.01)
+    finally:
+        stop.set()
+        for each in readers:
+            each.join(5)
     assert kept._waiting.unfinished_tasks == 0 and kept.dropped == 0
-    # Held to its share, give or take what one transaction writes (500 rows at the most): never what all of them wrote. (Or
-    # twice that: a checkpoint turned away, as one was once in a whole run of the tests on a busy PC, is tried again once
-    # the -wal file has doubled. See the test below.)
-    assert largest <= 2 * (share + 500_000), f"the -wal file grew to {largest / 1e6:.1f} MB; the log said {said}"
+    reads = len(took_hold.get("w", []))
+    assert reads >= 20 and len(checkpoints) >= 5, f"{reads} reads, {len(checkpoints)} checkpoints: the reads and the writer did not meet"
+    turned_away = [f"{took:.1f} s" for through, took in checkpoints if not through]
+    said = f"{len(checkpoints)} checkpoints, refused after {turned_away}; {reads} reads, {len(refused)} told to come back"
+    assert not turned_away, f"a checkpoint was refused under the wall's own reads: {said}"
+    # Held to its share, give or take what one transaction writes (500 rows at the most, some 50 kB): never what all of them
+    # wrote, and no longer twice that (a checkpoint turned away, tried again once the -wal file had doubled).
+    assert largest <= share + 500_000, f"the -wal file grew to {largest / 1e6:.1f} MB: {said}"
     kept.stop()
+
+
+def writer_with_a_checkpoint(kept: History, between: Callable[[], object]) -> tuple[threading.Thread, threading.Event, threading.Event, list[bool], threading.Event]:
+    """The writer's part, on a thread of its own as the writer has it (its connection is used on that thread alone): the
+    file opened, a row, `between()` (a read that takes hold of the file), a row after it, and a checkpoint, whose outcome
+    goes into the list. Returns (the thread, set as the checkpoint begins: a hook on its statement and not a guess, set
+    once it has ended, the outcome, to be set by the test once it is done with the file: it is then closed)."""
+    begun, ended, done = threading.Event(), threading.Event(), threading.Event()
+    outcome: list[bool] = []
+
+    def write() -> None:
+        kept._open()
+        conn = kept._conn
+        assert conn is not None
+        try:
+            with conn:
+                conn.execute("INSERT INTO states (device, t, state, code) VALUES ('w', 1, 'online', '')")
+            between()
+            with conn:
+                conn.execute("INSERT INTO states (device, t, state, code) VALUES ('w', 2, 'offline', '')")  # (after what it holds)
+            conn.set_trace_callback(lambda sql: begun.set() if "wal_checkpoint" in sql else None)
+            outcome.append(kept._checkpoint())
+            conn.set_trace_callback(None)
+            ended.set()
+            done.wait(60)
+        finally:
+            kept._close()
+
+    return threading.Thread(target=write, daemon=True), begun, ended, outcome, done
+
+
+def test_a_read_asked_for_while_a_checkpoint_runs_waits_for_it_and_the_checkpoint_gets_through(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # A checkpoint (TRUNCATE) waits for the reads under way, and also for every read that begins before it is through: one
+    # that began while it waited held it up as long again. The wall's own reads wait while it runs. Here a read under way
+    # holds it up; another is asked for meanwhile, and would hold the file longer than the checkpoint waits.
+    monkeypatch.setattr(history, "CHECKPOINT_PATIENCE", 3.0)
+    kept = History(tmp_path / history.FILE, limits=lambda: (365, 10))
+    release = {"first": threading.Event(), "second": threading.Event()}
+    took_hold = held_open(monkeypatch, lambda device: release[device].wait(30))
+    answers: dict[str, Any] = {}
+
+    def read(device: str) -> None:
+        try:
+            answers[device] = kept.read(device, "summary", 0, 1e11)
+        except Exception as ex:  # (said below)
+            answers[device] = ex
+
+    first = threading.Thread(target=read, args=("first",), daemon=True)
+    second = threading.Thread(target=read, args=("second",), daemon=True)
+
+    def first_holds() -> None:
+        first.start()
+        wait_until(lambda: "first" in took_hold, "the first read never took hold of the file")
+
+    writer, begun, ended, outcome, done = writer_with_a_checkpoint(kept, first_holds)
+    try:
+        writer.start()
+        assert begun.wait(10), "the checkpoint never began"
+        second.start()
+        time.sleep(0.5)  # (time enough for a read that does not wait to take hold of the file)
+        held_at_once = "second" in took_hold
+        release["first"].set()
+        assert ended.wait(history.CHECKPOINT_PATIENCE + 10), "the checkpoint never ended"
+        wal = (tmp_path / (history.FILE + "-wal")).stat().st_size
+    finally:
+        release["first"].set()
+        release["second"].set()
+        first.join(10)
+        second.join(10)
+        done.set()
+        writer.join(10)
+    assert not held_at_once, "a read asked for while the checkpoint ran took hold of the file at once"
+    assert outcome == [True], f"the checkpoint did not get through: {outcome}"
+    assert wal == 0, f"the -wal file holds {wal} bytes after the checkpoint"
+    assert all(isinstance(answers.get(device), dict) for device in ("first", "second")), answers  # both were answered
+
+
+def test_a_read_waits_for_a_checkpoint_only_so_long_and_a_read_outside_qkvm_still_holds_the_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # The wall's own reads wait while a checkpoint runs, though not for ever: READ_WAIT at the most (the wait for the file to
+    # be open is part of it), and then they are told to come back in a moment. A read outside qKVM (a database browser that
+    # keeps one open; a program that reads it again and again, one read beginning before the other ends) waits at no such
+    # gate: it holds the -wal file all the same, and the checkpoint is refused, as before.
+    monkeypatch.setattr(history, "CHECKPOINT_PATIENCE", 5.0)
+    monkeypatch.setattr(history, "READ_WAIT", 0.5)
+    kept = History(tmp_path / history.FILE, limits=lambda: (365, 10))
+    outside = sqlite3.connect(tmp_path / history.FILE, check_same_thread=False)
+    took_hold = held_open(monkeypatch, lambda device: None)
+
+    def outside_holds() -> None:
+        outside.execute("BEGIN")
+        outside.execute("SELECT COUNT(*) FROM states").fetchall()  # (a read that holds what it began with, and stays so)
+
+    writer, begun, ended, outcome, done = writer_with_a_checkpoint(kept, outside_holds)
+    try:
+        writer.start()
+        assert begun.wait(10), "the checkpoint never began"
+        began = time.monotonic()
+        with pytest.raises(history.NotReadable, match="Try again in a moment"):
+            kept.read("w", "summary", 0, 1e11)
+        waited = time.monotonic() - began
+        assert ended.wait(history.CHECKPOINT_PATIENCE + 10), "the checkpoint never ended"
+        outside.rollback()
+        answered = kept.read("w", "summary", 0, 1e11)  # (and once it is over, a read is answered at once)
+    finally:
+        outside.close()
+        done.set()
+        writer.join(10)
+    assert 0.45 <= waited < history.CHECKPOINT_PATIENCE, f"the read waited {waited:.2f} s"
+    assert len(took_hold.get("w", [])) == 1  # (the one answered: the one refused never took hold of the file)
+    assert outcome == [False], "the read outside qKVM did not hold the checkpoint off"
+    assert answered["changes"] == 2
+
+
+# What one try of a checkpoint that a read outside qKVM holds off may cost the wall's own reads, in seconds: the checkpoint's
+# own wait for the file (CHECKPOINT_TRY, a second), with room for a busy computer. Less than a read waits at the gate
+# (READ_WAIT), so that none of them is told to come back for it.
+A_TRY_COSTS = 2.5
+
+
+def reads_meanwhile(kept: History, stop: threading.Event) -> tuple[threading.Thread, list[tuple[float, str]]]:
+    """A thread that reads the history again and again until `stop`, each read as the page asks for one, and what came of
+    each: (seconds it took, "answered" or what it was told)."""
+    reads: list[tuple[float, str]] = []
+
+    def reading() -> None:
+        while not stop.is_set():
+            began = time.monotonic()
+            try:
+                kept.read("w", "summary", 0, 1e11)
+                how = "answered"
+            except history.NotReadable as ex:
+                how = str(ex)
+            reads.append((time.monotonic() - began, how))
+            stop.wait(0.05)
+
+    return threading.Thread(target=reading, daemon=True), reads
+
+
+def test_a_read_outside_qkvm_costs_the_walls_own_reads_a_second_or_so_at_a_checkpoint(tmp_path: Path) -> None:
+    # A program outside qKVM that keeps a read of the file open (a database browser, a monitoring script, Litestream, which
+    # keeps one open by design) keeps the checkpoint from getting through, whatever qKVM does. The gate stayed shut for the
+    # whole of the checkpoint's wait all the same (16 s), and the wall's own reads were told to come back meanwhile: in the
+    # review's probe 48 s of 56, where 0.3.1 answered them (the independent review of 0.3.2, M1). The gate is shut now only
+    # until the wall's own reads under way have ended; then the checkpoint waits for the file a second at the most, and the
+    # gate is opened again whatever came of it. With the times as they are.
+    kept = History(tmp_path / history.FILE, limits=lambda: (365, 10))
+    outside = sqlite3.connect(tmp_path / history.FILE, check_same_thread=False)
+
+    def outside_holds() -> None:
+        outside.execute("BEGIN")
+        outside.execute("SELECT COUNT(*) FROM states").fetchall()  # (a read that holds what it began with, and stays so)
+
+    writer, begun, ended, outcome, done = writer_with_a_checkpoint(kept, outside_holds)
+    stop = threading.Event()
+    reader, reads = reads_meanwhile(kept, stop)
+    try:
+        writer.start()
+        assert begun.wait(10), "the checkpoint never began"
+        began = time.monotonic()
+        reader.start()
+        assert ended.wait(history.CHECKPOINT_PATIENCE + 10), "the checkpoint never ended"
+        took = time.monotonic() - began
+        stop.wait(0.5)  # (and some reads after it)
+    finally:
+        stop.set()
+        reader.join(10)
+        outside.rollback()
+        outside.close()
+        done.set()
+        writer.join(10)
+    assert outcome == [False], "the read outside qKVM did not hold the checkpoint off"
+    refused = sorted({how for _, how in reads if how != "answered"})
+    longest = max(seconds for seconds, _ in reads)
+    assert reads and not refused, f"{len(reads)} reads, refused: {refused} (the checkpoint took {took:.1f} s)"
+    assert took <= A_TRY_COSTS and longest <= A_TRY_COSTS, f"the checkpoint took {took:.1f} s, and a read {longest:.1f} s"
+
+
+def test_a_read_of_the_walls_own_longer_than_the_checkpoints_own_wait_is_waited_for_and_it_gets_through(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # What the gate is for stands: the checkpoint's own wait for the file is a second now (CHECKPOINT_TRY), and a read of the
+    # wall's own under way that takes longer than that, within its time, is waited for before it (the gate counts it, and
+    # not SQLite); the checkpoint gets through then, and the -wal file is emptied.
+    kept = History(tmp_path / history.FILE, limits=lambda: (365, 10))
+    took_hold = held_open(monkeypatch, lambda device: time.sleep(history.CHECKPOINT_TRY + 1.5))
+    answers: dict[str, Any] = {}
+    first = threading.Thread(target=lambda: answers.update(first=kept.read("first", "summary", 0, 1e11)), daemon=True)
+
+    def first_holds() -> None:
+        first.start()
+        wait_until(lambda: "first" in took_hold, "the read never took hold of the file")
+
+    writer, _, ended, outcome, done = writer_with_a_checkpoint(kept, first_holds)
+    try:
+        writer.start()
+        assert ended.wait(history.CHECKPOINT_PATIENCE + 10), "the checkpoint never ended"
+        wal = (tmp_path / (history.FILE + "-wal")).stat().st_size
+    finally:
+        first.join(10)
+        done.set()
+        writer.join(10)
+    assert outcome == [True], "the checkpoint did not get through"
+    assert wal == 0, f"the -wal file holds {wal} bytes after the checkpoint"
+    assert isinstance(answers.get("first"), dict), answers
+
+
+def test_a_trim_where_a_read_outside_qkvm_holds_the_file_costs_the_walls_own_reads_a_second_or_so_a_try(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # The same at a trim, which tries the checkpoint twice (before it deletes anything, and at its end): each try shut the
+    # gate for its whole wait, some 32 s of reads told to come back at every trim (the review's probe).
+    kept = History(tmp_path / history.FILE, limits=lambda: (365, 10))  # (the -wal file's share: 1 MB)
+    checkpoint = History._checkpoint
+    tries: list[tuple[bool, float]] = []  # (got through, seconds) of each try
+
+    def counted(self: History) -> bool:
+        began = time.monotonic()
+        through = checkpoint(self)
+        tries.append((through, time.monotonic() - began))
+        return through
+
+    kept.start()
+    kept.observe("w", ONLINE)
+    kept.flush()
+    outside = sqlite3.connect(tmp_path / history.FILE, check_same_thread=False)
+    outside.execute("BEGIN")
+    outside.execute("SELECT COUNT(*) FROM states").fetchall()  # (a read under way, and it stays so)
+    wal = tmp_path / (history.FILE + "-wal")
+    t0 = time.time() - 1000 * 60
+    look = 0
+    # (Past a quarter of its share, where a trim tries the checkpoint before it deletes anything; short of the share, where
+    # the writer tries it by itself after its rows.)
+    while wal.stat().st_size <= 400_000 and look < 1000:
+        kept.observe("w", many_sensors(look), now=t0 + look * 60)
+        look += 1
+        if look % 20 == 0:
+            wait_until(lambda: kept._waiting.unfinished_tasks == 0, "the writer never caught up", 30)
+    wait_until(lambda: kept._waiting.unfinished_tasks == 0, "the writer never caught up", 30)
+    assert 250_000 < wal.stat().st_size < 1_000_000, wal.stat().st_size
+    monkeypatch.setattr(History, "_checkpoint", counted)
+    stop = threading.Event()
+    reader, reads = reads_meanwhile(kept, stop)
+    try:
+        reader.start()
+        kept.trim()
+        wait_until(lambda: kept._waiting.unfinished_tasks == 0, "the trim never ended", trim_ends_within())
+        stop.wait(0.5)
+        at_the_trim = list(tries)  # (and not the one at the stop below, which gets through: the read outside has ended)
+    finally:
+        stop.set()
+        reader.join(10)
+        outside.rollback()
+        outside.close()
+    kept.stop()
+    refused = sorted({how for _, how in reads if how != "answered"})
+    longest = max(seconds for seconds, _ in reads)
+    said = f"tries {[(through, round(took, 1)) for through, took in at_the_trim]}; {len(reads)} reads, the longest {longest:.1f} s, refused: {refused}"
+    assert len(at_the_trim) >= 2 and not any(through for through, _ in at_the_trim), said
+    assert reads and not refused, said
+    assert all(took <= A_TRY_COSTS for _, took in at_the_trim) and longest <= A_TRY_COSTS, said
 
 
 def test_a_checkpoint_turned_away_is_tried_again_once_the_wal_file_has_doubled(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1434,9 +1729,9 @@ def test_a_servers_sensors_and_its_power_are_kept(tmp_path: Path) -> None:
             one = add(admin, bmc.url, username="admin", password=bmc.state.password, kind="auto")
             seen(admin, one)
             summary = admin.get(hist(one)).json()
-            assert set(summary["sensors"]) >= {"CPU0_TEMP", "CPU1_TEMP", "CPU0_FAN", "device"} and summary["power"] == "on"
+            assert set(summary["sensors"]) >= {"TEMP_CPU_A", "TEMP_CPU_B", "FAN_CPU_A", "device"} and summary["power"] == "on"
             fans = [row for row in admin.get(hist(one, what="samples")).json()["rows"] if row["unit"] == "RPM"]
-            assert {row["sensor"] for row in fans} == {"CPU0_FAN", "CPU1_FAN"}
+            assert {row["sensor"] for row in fans} == {"FAN_CPU_A", "FAN_CPU_B"}
             # Switched off from the wall: the press, and then the state its controller shows, are both events.
             assert admin.post(f"/api/v1/devices/{one}/actions", json={"action": "power_off"}).status_code == 200
             seen(admin, one, "no_signal")

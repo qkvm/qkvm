@@ -110,8 +110,11 @@ def test_a_power_button_where_the_kinds_it_offers_are_no_list(tmp_path: Path, mo
 
 # --- the two words for "the server's own monitor goes dark while a console is open" ----------------------------
 
-YES: list[Any] = [1, "1", True, 1.0, "true", "on", "On", "enabled", 2, ["x"], {"a": 1}]
-NO: list[Any] = [0, "0", False, 0.0, "false", "off", "", "no", " 0 ", None]
+# (Not said at all, or said as nothing, is no plain no either: the owner's rule of 2026-11-05, the desktop app's finding 10.
+# The empty text was kept among the noes here on purpose, and the console was opened for it: a word said as nothing says
+# nothing, and when in doubt the console is left alone (the review of 0.3.2). So are blanks.)
+YES: list[Any] = [1, "1", True, 1.0, "true", "on", "On", "enabled", 2, ["x"], {"a": 1}, None, "", "  ", "\t"]
+NO: list[Any] = [0, "0", False, 0.0, "false", "off", "no", " 0 ", "Disabled"]
 
 
 def test_which_words_are_a_plain_no() -> None:
@@ -126,18 +129,33 @@ def with_screen() -> Iterator[FakeBmc]:
     server.stop()
 
 
+SET_TO = "The controller is set to switch the server's own monitor off while its console is open, so qKVM leaves the console alone"
+NOT_SAID = "The controller does not say whether it switches the server's own monitor off while its console is open, so qKVM leaves the console alone"
+# One of the two a plain no, and the other not: that it "is set to switch the server's own monitor off" may be untrue (the
+# owner's real boards were taken to darken their monitor where both were 1: the independent review of 0.3.2). Said as it is.
+ONE_OFF = "Of the controller's two settings that switch the server's own monitor off while its console is open, only one is off, so qKVM leaves the console alone"
+
+
 @pytest.mark.parametrize(
-    ("first", "second", "dark"),
+    ("first", "second", "why"),
     [
-        (1, 1, True), ("1", "1", True),
+        (1, 1, SET_TO), ("1", "1", SET_TO),
         # Said some other way than a real board was seen to say it. It was taken for "no", and the console
         # was opened: whoever stood at the server saw its monitor go dark. Not a plain no is not a no.
-        (True, True, True), (1.0, 1.0, True), ("true", "on", True), (1, ["unreadable"], True), ({"a": 1}, 1, True),
-        (0, 0, False), (1, 0, False), (0, 1, False), ("0", "false", False), (False, 1, False), (1, "", False), ("off", "on", False),
-        (1, "missing", False), ("missing", "missing", False),
+        (True, True, SET_TO), (1.0, 1.0, SET_TO), ("true", "on", SET_TO), (1, ["unreadable"], SET_TO), ({"a": 1}, 1, SET_TO),
+        # Opened only where both are a plain no (the owner's rule of 2026-11-05): one of the two that is not was enough
+        # to open it, as long as the other one was. Left alone, with a sentence of its own: only one of them is off.
+        (1, 0, ONE_OFF), (0, 1, ONE_OFF), (False, 1, ONE_OFF), ("off", "on", ONE_OFF), (0, ["unreadable"], ONE_OFF), ({"a": 1}, "0", ONE_OFF),
+        # Not said at all, or said as nothing: it was taken for a no, and the console was opened (the desktop app's
+        # finding 10; the empty text until the review of 0.3.2). It is left alone, and the tile says that the controller
+        # does not say.
+        (1, "missing", NOT_SAID), ("missing", "missing", NOT_SAID), (0, "missing", NOT_SAID), ("missing", 0, NOT_SAID),
+        (None, 0, NOT_SAID), (0, None, NOT_SAID), (None, None, NOT_SAID),
+        (1, "", NOT_SAID), ("", 0, NOT_SAID), (0, "  ", NOT_SAID), ("", "", NOT_SAID),
+        (0, 0, None), ("0", "false", None), (False, "off", None), (0.0, " no ", None),
     ],
 )  # fmt: skip
-def test_the_console_is_left_alone_unless_the_monitor_stays_on(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, with_screen: FakeBmc, first: Any, second: Any, dark: bool) -> None:
+def test_the_console_is_opened_only_where_both_words_say_a_plain_no(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, with_screen: FakeBmc, first: Any, second: Any, why: str | None) -> None:
     def changed(path: str, said: Any) -> None:
         if path == "/api/kvm/token":
             for name, word in (("automatic_off", first), ("local_monitor_off", second)):
@@ -149,9 +167,9 @@ def test_the_console_is_left_alone_unless_the_monitor_stays_on(tmp_path: Path, m
     answering(monkeypatch, changed)
     with wall(tmp_path) as admin:
         device = add(admin, with_screen.url)
-        if dark:
+        if why is not None:
             wait_until(lambda: admin.get(snap(device)).status_code == 404, "it was never said that there is no picture")
-            assert "monitor" in admin.get(snap(device)).json()["message"]
+            assert admin.get(snap(device)).json()["message"] == why
             assert with_screen.state.heard == []  # the console was never opened
         else:
             assert picture_of(admin, device)[:2] == bytes([0xFF, 0xD8])

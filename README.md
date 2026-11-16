@@ -193,6 +193,14 @@ The first visit walks you through four steps:
   container the search sees the container's network, not yours, unless it is started with
   `--network host` (Linux), and no Tailscale peers (the image has no `tailscale` command):
   type the addresses there.
+- **A KVM that answers on HTTPS only.** A Comet or a PiKVM whose plain address sends everybody on to
+  HTTPS at the same host (its web server answers `http://` with a redirect) is said so when it
+  is added or edited at its `http://` address, before its password goes out, and the HTTPS
+  address is offered (*Use https://...*): nothing follows a redirect by itself, and never to
+  another host. Its tile says the same where that is changed on the KVM later; edit its address
+  to the HTTPS one, and type its password there. Until then the tile can still be given another
+  name or group at its `http://` address, with *Save without checking*, where nothing about how
+  it is signed in to was changed.
 - **One device, one tile.** A KVM is known by the certificate it made for itself, and a
   server or a JetKVM by its own number, so the wall notices when what you are adding is on
   it already under another address. It then asks: use the new address for the tile that is
@@ -213,6 +221,8 @@ The first visit walks you through four steps:
   - *Your actions*: key combinations and text you saved under Settings > Actions.
   - *Power*: Keep awake / Allow sleep (the KVM nudges the mouse); press power, hold power and
     press reset when the KVM has an ATX power board; Wake-on-LAN for the targets saved on it.
+    Keep awake is not offered where a stock PiKVM's own settings switch it off; where a Comet's
+    own jiggler settings do (its firmware of late), it says so, and nothing is sent.
     On a KVM with the kvmd interface (a Comet, a PiKVM) a press is done when the board has let go
     of the button (half a second; six and a half for holding it). Where the board says whether the
     computer is on, a press that must change that (a short one on a computer that is off, holding
@@ -222,7 +232,11 @@ The first visit walks you through four steps:
     it takes: the tile shows when it is off, as it does after a reset that the power stays on
     through. The tile says *Power on* or *Power off* by the board; with no picture and the board
     saying off, that the computer is off or asleep (a computer asleep may put its power light
-    out, and the board then says off: a real one did). While somebody watches such a KVM's picture,
+    out, and the board then says off: a real one did). Where the board says off beside a picture,
+    it says *Power unknown*, and why (its footer's tooltip, and the enlarged view's *Details*):
+    the board's power-LED wires are probably not connected. On a KVM with several inputs it says
+    *Power unknown* alone: its board may be wired to another computer than the one on screen.
+    While somebody watches such a KVM's picture,
     the wall holds the KVM's line for events anyway (it keeps the picture coming), and hears the
     board there, as the KVM's own page does, instead of asking it: a Comet's board answers one
     question at a time and tells whoever asks meanwhile that there is none, which took the buttons
@@ -497,8 +511,11 @@ firmware tool. *Actions > Media...* is an admin's, in person: whoever mounts an 
 machine and starts it from that is root on it (see [Accounts](#accounts)). The box lists the
 images, says what is in the drive and who put it there from qKVM, and mounts, unmounts, uploads
 and deletes. Each of those asks first, naming the machine and the image; the request carries
-both, and nothing is done where the machine is called otherwise by then, or the image is no
-longer listed. Each is in the activity log with the account, the machine and the image, and with
+both, and the machine the box listed, and nothing is done where the machine is called otherwise
+by then, the image is no longer listed, or the tile's machine is no longer the one listed (its
+tile edited to another address, or another machine, while the box was open: the box then
+closes, and opened again lists the machine the tile is at now; an upload asks for the list
+again first, and sends nothing of the image then). Each is in the activity log with the account, the machine and the image, and with
 the image's SHA-256 where qKVM carried it there. The tile says what is in the drive
 (`CD: debian-13.iso`, `Flash: ...`), to everybody who sees it.
 
@@ -820,7 +837,8 @@ on the wall, and again when it is over ("back to normal").
   machine when that leaves the wall. For "no signal" it is the last picture with a signal the
   wall had, and none where nobody looked at the machine. The alert's line in the activity log
   has *Picture*, for an admin (in *Settings > Activity*, and under *Done to it* beside the
-  machine's history). It is never sent with an alert.
+  machine's history; for a program, `GET /api/v1/devices/{id}/alert-picture/{stamp}` in
+  [The API](#the-api)). It is never sent with an alert.
 - As every alert: nothing goes off while alerts are paused (what is so when the pause ends is
   told then), nor for a machine whose alerts are off. A watch is told whatever kinds are
   ticked in *Settings > Alerts*, since it was asked for on the machine itself; its "back to
@@ -1019,12 +1037,12 @@ with the statuses it comes with; the ones the requests below answer:
 | 401 | `unauthorized` (sign in first; in the middle of things: the session ended, sign in again and do not loop), `bad_password`, `bad_code`, `code_required`, `bad_key`, `bad_recovery` | the session |
 | 403 | `forbidden` (the header), `not_allowed` (the role, or a token), `totp_required` (set the second step up first), `suspended`, `stopped` (whoever asked lost the right while it was under way) | |
 | 404 | `not_found` (also: a machine this account was not given), `no_picture`, `no_console`, `no_live` (no live picture of this machine), `no_virtual_media` (no `media` in its `can`) | |
-| 409 | `busy` (something else is being done to that machine), `changed`, `duplicate` (an image of that name is there already), `no_text`, `in_use`, `console_held`, `enabled`, `not_enabled`, `not_started`, `not_initialized`, `no_second_step`, `no_password` (the account has no password here: it is signed in by the identity proxy), `same_host` (a device's page on a host name qKVM is looked at under), `unknown_kind` (a tile of a kind of machine this version does not know, kept from a later version: nothing is sent to it; it can be removed) | the state of things |
+| 409 | `busy` (something else is being done to that machine), `changed`, `moved` (a change of a machine's virtual media picked from a list of another machine: its tile was edited to another address, or another machine, since), `duplicate` (an image of that name is there already), `no_text`, `in_use`, `console_held`, `enabled`, `not_enabled`, `not_started`, `not_initialized`, `no_second_step`, `no_password` (the account has no password here: it is signed in by the identity proxy), `same_host` (a device's page on a host name qKVM is looked at under), `unknown_kind` (a tile of a kind of machine this version does not know, kept from a later version: nothing is sent to it; it can be removed) | the state of things |
 | 411, 413 | `length_required` (a body sent without its length), `too_large` (a body over 64 KiB, a file over what a file may be, an image over 16 GB) | the request |
 | 422 | `invalid`, `name_required`; for a file: `not_a_file`, `damaged`, `newer`, `passphrase_needed`, `wrong_passphrase`, `too_large` | the request |
 | 429 | `rate_limited`, with `Retry-After` in seconds, which is meant; `busy` (too many passwords being checked at once: try again shortly) | |
 | 500, 501 | `internal` (the details are in the wall's log); `missing_driver` (a JetKVM, where the Python that runs qKVM lacks the aiortc package qKVM is installed with) | the wall's |
-| 502 | the device's: `unreachable`, `dropped`, `auth_failed`, `no_password`, `not_set_up`, `cert_mismatch`, `cert_invalid`, `plain_only`, `another_machine` (another machine answers at the address than the one the tile was added for, a PC with Intel AMT by its PlatformGUID, a JetKVM by its own number (which it says once signed in), a server by its UUID and its controller's, or has its guest's number on its Proxmox, by the guest's SMBIOS UUID: nothing was sent; 422 from an edit), `bad_response`, `action_failed`, `console_time_up` | the device |
+| 502 | the device's: `unreachable`, `dropped`, `auth_failed`, `no_password`, `not_set_up`, `cert_mismatch`, `cert_invalid`, `plain_only`, `https_only` (a KVM whose plain address sends everybody on to HTTPS at the same host, which is said and not followed; 422 from an add or an edit), `another_machine` (another machine answers at the address than the one the tile was added for, a PC with Intel AMT by its PlatformGUID, a JetKVM by its own number (which it says once signed in), a server by its UUID and its controller's, or has its guest's number on its Proxmox, by the guest's SMBIOS UUID: nothing was sent; 422 from an edit), `bad_response`, `action_failed`, `console_time_up` | the device |
 | 503 | `no_stream` (not yet: ask again), `no_sign_in` (the device answers, and does not sign qKVM in), `locked` (qKVM cannot open the saved passwords just now), `busy` (no memory to check a password with) | |
 | 504 | `timeout`: no answer from the device | |
 | 507 | `not_saved`: the change could not be written down (a full disk), and was taken back | the wall's disk |
@@ -1059,7 +1077,7 @@ wherever something is written down; `locked`; and the device's own wherever a de
 | `GET /api/v1/about` | viewer | | `version`, `licence`; to an admin also what it runs on |
 | `GET /api/v1/wall` | viewer | | `interval` (seconds between two pictures of a tile, as set for this wall), `live` (the form of the live line this qKVM speaks, as a number: 2; a program that speaks another form asks for no live picture, see [Live view and control](#live-view-and-control)), `devices` (the machines this account may see, each as below). Never waits for a device |
 | `GET /api/v1/status` | viewer | | by device `id`, how each is (below), from what is known: it waits for no device, except up to a second and a half for one's very first look |
-| `GET /api/v1/devices/{id}/history?what=summary&since=&until=&limit=&every=` | viewer | | what the wall saw of the machine, kept beside the settings (the chapter [History](#history)). `what`: "summary" (default), "states", "samples" or "events"; `since` and `until` in seconds since 1970 (left out: the last week, for samples the last day); `limit` 1 to 5000 (1000 left out); `every` 0 to 86400: samples averaged over spans of that many seconds. A summary: `since`, `until`, `first_seen`, `last_seen` (seconds since 1970, or null), `state` and `power` ("on", "off", or null) as last seen, `watched`, `online`, `answering` (seconds of the window), `share`, `answering_share` (online, and answering, over watched; null where nothing was seen), `changes`, `events` (how many in the window), `sensors` (the names of its readings of the last day). The rest: `since`, `until`, `rows` (oldest first; a state `t`, `state`, `code`; an event `t`, `kind` ("pressed": a power button pressed from the wall, "power": a change of power state seen), `what`, `ok` (null: nobody heard how it went), `note`; a sample `t`, `sensor`, `unit`, `value`), `more` (the page was cut: narrow the window), and for samples `every`; with `every` given, `series` in place of `rows`, one per sensor: `sensor`, `unit`, `points` of `[t, average, min, max]` (a sensor whose series does not fit whole is left out). 404 `not_found`; 503 `busy` (three reads at once are answered, from everybody together, and one at a time of each account or token, whose next waits its turn for eight seconds at the most and, after a read, as long again as that read took; `Retry-After` says when); 503 `history_unavailable` (the file is being opened or replaced, or the read took too long) |
+| `GET /api/v1/devices/{id}/history?what=summary&since=&until=&limit=&every=` | viewer | | what the wall saw of the machine, kept beside the settings (the chapter [History](#history)). `what`: "summary" (default), "states", "samples" or "events"; `since` and `until` in seconds since 1970 (left out: the last week, for samples the last day); `limit` 1 to 5000 (1000 left out); `every` 0 to 86400: samples averaged over spans of that many seconds. A summary: `since`, `until`, `first_seen`, `last_seen` (seconds since 1970, or null), `state` and `power` ("on", "off", or null) as last seen, `watched`, `online`, `answering` (seconds of the window), `share`, `answering_share` (online, and answering, over watched; null where nothing was seen), `changes`, `events` (how many in the window), `sensors` (the names of its readings of the last day). The rest: `since`, `until`, `rows` (oldest first; a state `t`, `state`, `code`; an event `t`, `kind` ("pressed": a power button pressed from the wall, "power": a change of power state seen), `what`, `ok` (null: nobody heard how it went), `note`; a sample `t`, `sensor`, `unit`, `value`), `more` (the page was cut: narrow the window), and for samples `every`; with `every` given, `series` in place of `rows`, one per sensor: `sensor`, `unit`, `points` of `[t, average, min, max]` (a sensor whose series does not fit whole is left out). 404 `not_found`; 503 `busy` (three reads at once are answered, from everybody together, and one at a time of each account or token, whose next waits its turn for eight seconds at the most and, after a read, as long again as that read took; `Retry-After` says when); 503 `history_unavailable` (the file is being opened or replaced, or brought up to date for longer than three seconds, or the read took too long) |
 | `GET /api/v1/devices/{id}/snapshot?w=640&age=1` | viewer | | the screen as `image/jpeg` or `image/png`, with `X-KVM-Signal` 1 or 0 (0: a placeholder, the computer shows nothing) and `Cache-Control: no-store`. A still kept between sessions (a PC with Intel AMT whose tile is only shown) carries `X-KVM-Still: 1` and `X-KVM-Age: <seconds>`, how old the still is. `w`: the width wanted, 1 to 16384 (the source's own is never exceeded); `age`: how old, in seconds, the frame may be (0 to 3600; viewers asking within that window share one frame). 404 `not_found`; 404 `no_picture` (a server whose controller gives none); 503 `no_stream` (not yet: ask again); 409 `in_use` (a JetKVM whose one viewer is somebody else); the device's |
 | `POST /api/v1/devices/{id}/live` | viewer | `{}` | `v` (the form of the live line this qKVM speaks: 2), `ticket` (a pass for one live line to this machine, good for half a minute and for one use: 16 to 200 letters, digits, `-` or `_`; it is in no log, and is not to be kept). A viewer, a wall screen and a token may ask, and may watch; taking keyboard and mouse over the line takes an operator or an admin, by cookie or by token. 404 `not_found`; 404 `no_live` (a server whose console is not read: `live` is not in its `can`); 429 `busy` (this account, token or wall screen has 32 live lines open, the passes it has not used counted with them; or the wall 256 passes out: `Retry-After`); 503 `locked` |
 | a WebSocket at `/api/v1/devices/{id}/live` (`GET`, upgraded) | by the pass | the first message, text: `{"t": "hello", "v": 2, "ticket": "...", "video": ["h264", "jpeg"], "max_w": 1920, "max_fps": 30}` | the live line: the machine's picture down, keyboard and mouse up, with the messages [Live view and control](#live-view-and-control) lists. It carries no cookie, and is asked for from the address the pass was given to. A line whose first message is not a pass this qKVM gave for this machine is told `{"t": "bye", "code": "no_pass", "message": ...}` and closed; one from a page of another host, or for a host this wall does not answer to, is refused 403 before anything is read |
@@ -1068,12 +1086,12 @@ wherever something is written down; `locked`; and the device's own wherever a de
 | `POST /api/v1/devices/{id}/actions` | operator | `action`*, and what that one needs (the table below); `batch` (any id of letters, digits and "-", up to forty: ties several requests together as one act in the activity log) | `ok`, `note` (null; or "already on", "already off" for a server that was so; or "pressed, but the computer is still off", "held, but the computer is still on", "pressed; its board has not said since", "pressed; not seen: its connection ended" (the tile was edited or removed, or the wall locked itself; and "held; ..." of the same) for a KVM's power button whose change its board did not show: it was pressed). 404 `not_found` (also: the saved action is gone); 409 `busy` (with `by`, the name of whoever has the machine's keyboard and mouse over a live line, where that is why: an account's, or a token's with "(token)"; to an admin in person the message adds that they can take them over in the live view: an action never takes over by itself); 409 `conflict` (it waited for the last holder of the keyboard to be let go of, and meanwhile the tile was changed or taken off the wall: nothing was sent); 409 `changed` (the saved action was edited since it was listed); 409 `no_text`; 403 `not_allowed` (a token and a saved text); 403 `stopped`; 422 `invalid` (also: an action this machine cannot do); 502 `action_failed` (the device refused); 504 `timeout` and 502 `dropped` (it may have been done); the device's. Every action is written to the activity log with the account |
 | `PUT /api/v1/devices/{id}/view` | operator, a person | `view`*: "health", "stills" or "live" | which of its three views a PC with Intel AMT is in (see [Intel AMT](#intel-amt)): `ok`, `amt_view` (as it is now). In effect at once; each change is written to the activity log (`amt_view_changed`, with `view` and `was`), and one that changes nothing is not. 403 `not_allowed` (a token: it changes no setting of a tile); 404 `not_found`; 422 `invalid` (no PC with Intel AMT); 507 `not_saved` |
 | `POST /api/v1/devices/{id}/console` | operator, a person | `{}` | `url`: a way into a server's own console, signed in, good for one use, for the browser of whoever asked; it is in no log, and is not to be kept. 403 `not_allowed` (a token); 404 `not_found`; 404 `no_console` (no such way in from this device); 409 `same_host` (the browser reaches the device by a host name qKVM is looked at under, the one this request came by or one in `allowed_hosts`: it would hand the device its sign-in to qKVM, and nothing is asked of the device); the device's |
-| `GET /api/v1/devices/{id}/media` | admin, a person | | what can be mounted on the machine, asked of it now: `images` (each `id`, the only thing a mount names, `name`, `where` (for a virtual machine on Proxmox, the storage; null on a KVM's own and a server's), `size` in bytes or null, `partial` (an upload of it was cut off: only to delete; a JetKVM's keeps its name with `.incomplete`), `sha256` (where qKVM carried it there and it is still that image, else null)), `unseen` (a sentence for each place whose images could not be listed, in the device's words: a storage the token may not read), `left_out` (how many entries were no image qKVM passes on to the device), `notes` (sentences of what stands against a change now: a KVM's File Sharing on, its drive offline or busy), `space` (a KVM's own storage: `free` and `size` in bytes; null elsewhere), `mounted` (what is in its drive now, as the status's `media` below, or null), `uploading` (an upload to it under way, as `GET .../media/upload` says it, or null) and `offers`, by what the last look at the machine found: `drives` (what an image goes in as: "cd", read-only; "flash", a kvmd KVM's USB flash drive; "disk", a JetKVM's, read-only), `writable` (of `drives`: those an image may be mounted writable in, where that is chosen), `boot` (how it can be told to start from it: "once", "until_unmounted"; none on a KVM), `restart` (it can be restarted from here: a KVM with a power board too), `upload` (images are carried through qKVM to it), `delete` (images can be deleted from it), `drops_input` (a mount or an unmount drops its keyboard and mouse for a moment), `where` ("proxmox": the images are on the storages of its node; "device": on the KVM's own storage; "qkvm": a server's, in the folder qKVM serves them from); and for a server `served_from` (the wall's address as its controller reaches it, or null where there is none). 403 `not_allowed` (a token); 404 `not_found`; 404 `no_virtual_media`; 502 `another_machine`; the device's |
-| `POST /api/v1/devices/{id}/media` | admin, a person | `image`* (an `id` as listed), `machine`* (the machine's name, as the confirmation named it), `drive` (of the offer's `drives`; "cd", the default), `writable` (true: the machine may change what is on it; only for a drive of the offer's `writable`; false, the default), `boot` ("none", the default: its boot order is left as it is; "once": it is restarted now to start from the image, and its boot order is as before for every start after; "until_unmounted": it starts from the image from its next start until it is unmounted), `restart` (true: restart it now, with "until_unmounted"; "once" always restarts; on a machine that cannot be told to start from it, a KVM, with `boot` "none": its reset button, its power button where it is off, for its boot menu to find the drive). A restart of a virtual machine stops it at once and starts it again | the image is put in its drive, read-only: `ok`, `note` (null, or a sentence: a CD-ROM drive added where there was none, which a running guest has from its next start; how it starts), `mounted`. 409 `changed` (the machine is called otherwise now, the image is no longer listed, or its settings were changed on the device meanwhile: nothing was done); 409 `busy` (as for an action; with a restart also while somebody has its keyboard and mouse over a live line, with `by`); 409 `changed` also where another image is in a KVM's drive (unmount it first), or the image is not there whole; 409 `busy` where another image is in a server's drive; 409 `action_failed` (no CD-ROM drive and no place for one, a boot order the wall does not read; a KVM's File Sharing on, its drive offline; a KVM that did not mount it as asked, which has it taken out again; no address servers reach the wall at, a server's controller that takes HTTPS alone while the wall is reached over plain HTTP, another tool's boot override); 502 `action_failed` (a server's controller did not mount it: in its words); 422 `invalid` (a drive it has not got, writable where that is not offered, a way of starting it cannot do, a restart with `boot` "none" where it can be told to start from it, a restart where it has no power board); 504 `timeout` and 502 `dropped` (it may have been done); 502 `another_machine`; the device's. A refusal after the image was put in says so: `"mounted": true`. Every mount, and every start or restart from it, is in the activity log with the account, the machine, the image, the drive, and its SHA-256 where qKVM carried it there |
-| `POST /api/v1/devices/{id}/media/unmount` | admin, a person | `image`* (`image` of `mounted`, as the confirmation named it), `machine`* | the drive is emptied, and the boot order put back where it was set to start from the image from here: `ok`, `note` ("nothing was mounted"; or what is left of the boot order), `mounted` (null). 409 `changed` (another image is in the drive now, or the machine is called otherwise: nothing was taken out); 409 `busy`; 502 `another_machine`; the device's. In the activity log as a mount is |
-| `POST /api/v1/devices/{id}/media/upload?name=...&machine=...` | admin, a person | the image itself as the body, its length said (`Content-Length`, 16 GB at the most); `name`* (what it is called on the device), `machine`* (as the confirmation named it) | the image carried into the device's own storage (an offer with `upload`), streamed as it comes and hashed on its way, kept nowhere on the wall: `ok`, `image` (as `GET .../media` lists it: `id`, `name`, `where`, `size`, `partial`, `sha256`), `sha256`. 409 `changed` (the machine is called otherwise); 409 `duplicate` (an image of that name is there); 409 `busy` (another upload to it under way, its drive busy); 411 `length_required`; 413 `too_large` (over 16 GB, refused before a byte is read); 422 `invalid` (a name of characters qKVM does not hand on, an empty body, a machine without uploads); 507 `no_space`; 400 `disconnected` (cut off, gone quiet for a minute) and 403 `stopped` (the account may no longer); the device's. What a refused or cut-off upload wrote is removed from the device, where it allows that; the answer says where it could not be. In the activity log with the account, the machine, the image, its size and its SHA-256 (one that failed: how much of it came) |
+| `GET /api/v1/devices/{id}/media` | admin, a person | | what can be mounted on the machine, asked of it now: `images` (each `id`, the only thing a mount names, `name`, `where` (for a virtual machine on Proxmox, the storage; null on a KVM's own and a server's), `size` in bytes or null, `partial` (an upload of it was cut off: only to delete; a JetKVM's keeps its name with `.incomplete`), `sha256` (where qKVM carried it there and it is still that image, else null)), `unseen` (a sentence for each place whose images could not be listed, in the device's words: a storage the token may not read), `left_out` (how many entries were no image qKVM passes on to the device), `notes` (sentences of what stands against a change now: a KVM's File Sharing on, its drive offline or busy), `space` (a KVM's own storage: `free` and `size` in bytes; null elsewhere), `mounted` (what is in its drive now, as the status's `media` below, or null), `uploading` (an upload to it under way, as `GET .../media/upload` says it, or null), `listed` (the machine this list was made of: a mark of the address it is spoken to at and of what it is known by there, which a change sends back) and `offers`, by what the last look at the machine found: `drives` (what an image goes in as: "cd", read-only; "flash", a kvmd KVM's USB flash drive; "disk", a JetKVM's, read-only), `writable` (of `drives`: those an image may be mounted writable in, where that is chosen), `boot` (how it can be told to start from it: "once", "until_unmounted"; none on a KVM), `restart` (it can be restarted from here: a KVM with a power board too), `upload` (images are carried through qKVM to it), `delete` (images can be deleted from it), `drops_input` (a mount or an unmount drops its keyboard and mouse for a moment), `where` ("proxmox": the images are on the storages of its node; "device": on the KVM's own storage; "qkvm": a server's, in the folder qKVM serves them from); and for a server `served_from` (the wall's address as its controller reaches it, or null where there is none). 403 `not_allowed` (a token); 404 `not_found`; 404 `no_virtual_media`; 502 `another_machine`; the device's |
+| `POST /api/v1/devices/{id}/media` | admin, a person | `image`* (an `id` as listed), `machine`* (the machine's name, as the confirmation named it), `listed` (`listed` of the `GET .../media` the image was picked from: the change is refused where the tile's machine is no longer that one, its tile edited to another address or another machine meanwhile; left out, as by a client before 0.3.2, it is not asked), `drive` (of the offer's `drives`; "cd", the default), `writable` (true: the machine may change what is on it; only for a drive of the offer's `writable`; false, the default), `boot` ("none", the default: its boot order is left as it is; "once": it is restarted now to start from the image, and its boot order is as before for every start after; "until_unmounted": it starts from the image from its next start until it is unmounted), `restart` (true: restart it now, with "until_unmounted"; "once" always restarts; on a machine that cannot be told to start from it, a KVM, with `boot` "none": its reset button, its power button where it is off, for its boot menu to find the drive). A restart of a virtual machine stops it at once and starts it again | the image is put in its drive, read-only: `ok`, `note` (null, or a sentence: a CD-ROM drive added where there was none, which a running guest has from its next start; how it starts), `mounted`. 409 `moved` (the tile's machine is not the one `listed` names any more: nothing was done, and nothing was asked of either machine); 409 `changed` (the machine is called otherwise now, the image is no longer listed, or its settings were changed on the device meanwhile: nothing was done); 409 `busy` (as for an action; with a restart also while somebody has its keyboard and mouse over a live line, with `by`); 409 `changed` also where another image is in a KVM's drive (unmount it first), or the image is not there whole; 409 `busy` where another image is in a server's drive; 409 `action_failed` (no CD-ROM drive and no place for one, a boot order the wall does not read; a KVM's File Sharing on, its drive offline; a KVM that did not mount it as asked, which has it taken out again; no address servers reach the wall at, a server's controller that takes HTTPS alone while the wall is reached over plain HTTP, another tool's boot override); 502 `action_failed` (a server's controller did not mount it: in its words); 422 `invalid` (a drive it has not got, writable where that is not offered, a way of starting it cannot do, a restart with `boot` "none" where it can be told to start from it, a restart where it has no power board); 504 `timeout` and 502 `dropped` (it may have been done); 502 `another_machine`; the device's. A refusal after the image was put in says so: `"mounted": true`. Every mount, and every start or restart from it, is in the activity log with the account, the machine, the image, the drive, and its SHA-256 where qKVM carried it there |
+| `POST /api/v1/devices/{id}/media/unmount` | admin, a person | `image`* (`image` of `mounted`, as the confirmation named it), `machine`*, `listed` (as for a mount) | the drive is emptied, and the boot order put back where it was set to start from the image from here: `ok`, `note` ("nothing was mounted"; or what is left of the boot order), `mounted` (null). 409 `moved` (as for a mount); 409 `changed` (another image is in the drive now, or the machine is called otherwise: nothing was taken out); 409 `busy`; 502 `another_machine`; the device's. In the activity log as a mount is |
+| `POST /api/v1/devices/{id}/media/upload?name=...&machine=...&listed=...` | admin, a person | the image itself as the body, its length said (`Content-Length`, 16 GB at the most); `name`* (what it is called on the device), `machine`* (as the confirmation named it), `listed` (as for a mount) | the image carried into the device's own storage (an offer with `upload`), streamed as it comes and hashed on its way, kept nowhere on the wall: `ok`, `image` (as `GET .../media` lists it: `id`, `name`, `where`, `size`, `partial`, `sha256`), `sha256`. 409 `moved` (as for a mount, before a byte is read); 409 `changed` (the machine is called otherwise); 409 `duplicate` (an image of that name is there); 409 `busy` (another upload to it under way, its drive busy); 411 `length_required`; 413 `too_large` (over 16 GB, refused before a byte is read); 422 `invalid` (a name of characters qKVM does not hand on, an empty body, a machine without uploads); 507 `no_space`; 400 `disconnected` (cut off, gone quiet for a minute) and 403 `stopped` (the account may no longer); the device's. What a refused or cut-off upload wrote is removed from the device, where it allows that; the answer says where it could not be. In the activity log with the account, the machine, the image, its size and its SHA-256 (one that failed: how much of it came) |
 | `GET /api/v1/devices/{id}/media/upload` | admin, a person | | the upload under way to the machine: `uploading` (`name`, `size`, `sent` (bytes carried to the device so far), `by`, `at`), or null. Nothing is asked of the device for it |
-| `POST /api/v1/devices/{id}/media/delete` | admin, a person | `image`* (an `id` as listed), `machine`* | the image deleted from the device's own storage (an offer with `delete`): `ok`, `note` (null; "it was not on the KVM any more"). 409 `busy` (it is mounted, or being uploaded); 409 `changed`; 422 `invalid`; the device's. In the activity log as a mount is |
+| `POST /api/v1/devices/{id}/media/delete` | admin, a person | `image`* (an `id` as listed), `machine`*, `listed` (as for a mount) | the image deleted from the device's own storage (an offer with `delete`): `ok`, `note` (null; "it was not on the KVM any more"). 409 `moved` (as for a mount); 409 `busy` (it is mounted, or being uploaded); 409 `changed`; 422 `invalid`; the device's. In the activity log as a mount is |
 | `PUT /api/v1/wall/order` | admin | `ids`* (device ids, first to last; the rest keep their order after them) | `ok`, `ids` (the whole order, as it is now, for every browser). 507 `not_saved` |
 | `POST /api/v1/devices/remove` | admin | `ids`* (1 to 5000 device ids, within the 64 KiB a body may have; one given twice is one machine) | takes every one of them off the wall, or none: `ok`, `removed` (their ids, in the wall's order). Each one's saved password and history go with it, and each gets a line of its own in the activity log (`device_removed`), as one removed on its own does. An action on its way to one of them is answered as one cut off by an edit of the tile (it may have been done), and a live line to one is told `gone`, the keys it held let go of first. 404 `not_found` with `unknown` (the ids that are not on the wall: nothing was removed); 507 `not_saved` (nothing was removed, and nothing on them was cut off) |
 | `GET /api/v1/tokens` | admin | | `tokens`: each `id`, `name`, `kind` ("api" or "display"), `role`, `devices` (ids, or null for all), `groups`, `created`, `expires` (null: never), `used` (null: not yet). Never the token itself |
@@ -1082,6 +1100,8 @@ wherever something is written down; `locked`; and the device's own wherever a de
 | `POST /api/v1/export` | admin, a person | `password`* (the account's own, again), `parts`* (of "devices", "actions", "alerts", "wall"), `passphrase` (10 characters or more: an encrypted file with the passwords in it; empty: a plain file without them) | the file as `application/json` with a `Content-Disposition` name (`qkvm-<date>.qkvm` or `.json`), and the header `X-QKVM-Not-Opened`: how many saved passwords or texts are not in it because they do not open any more. 401 `bad_password`; 422 `invalid`, `too_large` (more in the wall than a file holds); 503 `locked` |
 | `POST /api/v1/import/read` | admin, a person | `file`* (its text), `passphrase` (of an encrypted one) | what the file holds, changing nothing: `encrypted`, `secrets` (a plain file with passwords in it), `made` (seconds since 1970, 0 where it does not say), `program` (the version that wrote it), `devices` (null where the file has no such part; else each `name`, `host`, `kind`, `group`, `password` (whether one is in the file), `tls`, `open_url`, `new` (this wall would take it), `same_as` (the name of the tile here that is the same device, or empty)), `actions` (null, or each `name`, `kind`, `keys`, `text` (of the new ones; what a button will type is read before it is taken), `enter`, `danger`, `new`), `alerts` (null, or `enabled`, `address` (the file names one), `host` (of that address), `format`, `kinds`), `wall` (null, or `interval`, `update_check`), `left_out` (a sentence for each entry that did not pass). 422 `not_a_file`, `damaged`, `newer`, `passphrase_needed`, `wrong_passphrase`, `too_large` |
 | `POST /api/v1/import` | admin, a person | `file`*, `passphrase`, `take` (which parts, of the four; left out: the file is read and nothing is taken) | what was taken: `devices`, `actions` (how many were added), `alerts`, `wall` (whether they were replaced), `left_out`. 422 `not_a_file`, `damaged`, `newer`, `passphrase_needed`, `wrong_passphrase`, `too_large`; 503 `locked`; 507 `not_saved` |
+| `GET /api/v1/audit?device=&limit=` | admin | | what the activity log says of one machine (the chapter [Activity log](#activity-log)): `device`* (its `id`; entries written before 0.2.0 named it only, and are found by the name it has now), `limit` (1 to 500, 100 left out; a number beyond either end is taken as that end). `entries` (newest first, at most `limit` of them), `more` (there are older ones than the last), `missing` (null; or `count`, `since` and `why`: entries the wall could not write, and so the log is not whole). Each entry: `time` (seconds since 1970), `event` (a word for what happened: `device_added`, `action`, `action_failed`, `alert`, `live_opened` and the rest; one not met is one added since), `user` (who did it: an account's name, or a token's followed by " (token)"; left out where the wall did it by itself, as an alert), `device` and `device_id` (the machine by its name at the time, and by its id: since 0.2.0); where its event has them, `action` (the action's name, as `POST .../actions` takes it), `error` and `note` (sentences: why it failed, and what else is to be known), `state` and `was` (an alert: the state the machine went into and the one it came from); and an alert of a [watched screen](#watching-a-screen) `watch` (`no_signal` or `unchanged`), `minutes`, `back` (true: it is over) and, where its picture was kept, `picture` (the stamp to ask for it by, below: digits) and `picture_at` (when the wall had that picture, in seconds since 1970). Whatever else an entry holds is as its event writes it. 503 `activity_unavailable` (the log could not be read in time: ask again in a moment); 503 `busy` (read in turns, as the history is: `Retry-After` says when). Without `device` (the whole log), with the log's other parameters, and its download, it is the page's own |
+| `GET /api/v1/devices/{id}/alert-picture/{stamp}` | admin | | the picture a screen alert of the machine kept, by the `picture` of the alert's entry (above): `image/jpeg` or `image/png`, with `Cache-Control: no-store`. Only the last alert's picture of each machine is kept, for 30 days, and it goes when the machine leaves the wall. 404 `not_found`; 404 `no_picture` (no longer kept, or never of this machine) |
 
 ### A machine, as the wall lists it
 
@@ -1144,7 +1164,7 @@ guessed at.
 | `last_seen_ago` | seconds since the device last answered; null: never |
 | `video` | `signal` (true or false), `width`, `height`, `fps` |
 | `usb` | `keyboard`, `mouse`: whether the computer sees them |
-| `atx` | `enabled` (a power board, or a server), `power` (the computer is on; asleep counts as on; null where the board does not say, at this look), `hdd` |
+| `atx` | `enabled` (a power board, or a server), `power` (the computer is on; asleep counts as on; null where the board does not say, at this look), `hdd`; and on a KVM with the kvmd interface, only where the board is no witness of the power, `note`: `code` and `message` (left out otherwise, as before 0.3.2). `power_led_unwired`: the board says the power light is off while the screen shows a picture, so its power-LED wires are probably not connected (the page says neither *Power on* nor *Power off* then, and why); never on a KVM with several inputs, whose board may be another computer's |
 | `fingerbot` | a KVM's: null, or, where a Fingerbot is paired with it, `battery` (percent; null until it was asked, which is once an hour) and `low` (below 25). Nothing of the computer's power comes from a Fingerbot |
 | `health` | `temp` (the KVM's own, or a server's hottest processor, in degrees Celsius), `cpu`, `mem` (percent) |
 | `about` | `model`, `version`, as the device says them |
@@ -1254,18 +1274,21 @@ machine: while an action is on its way, a second one for the same machine is ref
 ### The page's own
 
 These are under `/api/v1/` as well, take an admin (but for the first-run setup, which takes
-nobody), and change with the page: `setup`; `devices` (adding, changing and removing one),
-`devices/{id}/certificate`, `devices/{id}/trust`, `devices/{id}/alert-picture/{stamp}` (the picture
-a screen alert kept, by the `picture` of its line in the activity log), `devices/{id}/kvm` (switching a PC's Intel AMT
+nobody), and change with the page: `setup`; `devices` (adding, changing and removing one; a KVM
+whose plain address sends everybody on to HTTPS at the same host is refused 422 `https_only`, with
+`use`, that address, which the page offers and nothing takes by itself; but for an edit with
+`force` that leaves its address, kind, certificate check, user name and password as they are,
+saved as any other),
+`devices/{id}/certificate`, `devices/{id}/trust`, `devices/{id}/kvm` (switching a PC's Intel AMT
 KVM on or off on its engine, `{"on": true}`; 409 `busy` with `by` as for an action), `discover`; `proxmox` (`proxmox/guests`, `{"url",
 "username", "password"}`: the virtual machines an API token may see on a Proxmox, to pick from when
 adding them, and `named`, the one an address names by its ID); `actions` (saving one);
 `users`; `security`; `recovery`; `settings` (and `settings/media`, `{"folder", "address"}`: the folder of
 images for servers and the wall's address as their controllers reach it); `alerts`; `push` (the browsers told the alerts by Web
 Push, which takes any account, for its own: `push`, `push/key`, `push/{id}`, `push/{id}/test`, as
-[On a phone](#on-a-phone) says); `audit` (the activity log, and `audit/export`
-to download it: `q`, `kind`, `before`, `since`, `until`, `user`, `device`, `limit`, as the chapter
-[Activity log](#activity-log) says); `metrics` (the token for
+[On a phone](#on-a-phone) says); `audit` (the activity log beyond one machine's, which is promised
+above: `q`, `kind`, `before`, `since`, `until` and `user`, the whole log without `device`, and
+`audit/export` to download it, as the chapter [Activity log](#activity-log) says); `metrics` (the token for
 `/metrics`); `update`. A program written against them is written against this version. Their
 codes are in `words.json` all the same.
 
@@ -1374,12 +1397,20 @@ without one has none).
   time for all the machines; what is left over goes at the next round). The `-wal` file holds
   what was written since the file was last brought up to date, and is held to a tenth of the
   size allowed (8 MB at the most): whenever it grows past that, what it holds goes into the
-  file, once the reads under way have ended. The file is kept to the rest.
+  file, once qKVM's own reads under way have ended. A read asked for meanwhile waits until that
+  is done (three seconds at the most, and is then told to try again in a moment): reads that
+  kept coming, one beginning before the other ended, kept it from ever being done. The file is
+  kept to the rest.
   (So between two rounds the two grow by what ten minutes bring, and while a round gives the
   room back, what it moves passes through the `-wal` file, a share at a time.)
-  (A program outside qKVM that keeps a read of the file open, a database browser, keeps the
-  `-wal` file growing until it lets go, and a round stops trimming as soon as it meets that,
-  which would only grow it more; the log says so.) Both limits can be set with
+  (A program outside qKVM that keeps a read of the file open, a database browser, a
+  monitoring script, Litestream, or that reads it again and again, one read beginning before
+  the other ends, keeps the `-wal` file growing until it lets go: qKVM's own reads wait while
+  the file is brought up to date, those of another program cannot be made to. qKVM then waits
+  for it a second each time it tries (a minute after the last try, or sooner where the `-wal`
+  file has doubled, and twice at each round), and its own reads wait that second with it and
+  are answered. A round stops trimming as soon as it meets that, which would only grow it
+  more; the log says so.) Both limits can be set with
   [offline server settings](#advanced-server-settings): `history_days` (1 to 3650) and `history_mb` (10 to 100000); nothing, or 0, means
   the default. (A server with forty readings writes about 2 MB a day at the default pace; a
   KVM a few hundred kB. One machine puts 128 readings a minute in the history at the most: a
@@ -1461,9 +1492,21 @@ Who signed in, changed what, and did what to which machine: *Settings > Activity
   says so.
   Nothing waits for it: the text files are written whatever it does, the wall answers as fast,
   and where it is behind (being made, its disk refusing) the page reads the files themselves,
-  slower, with the same answers, for 5 s at the most (a page of a download, 15 s): a question
-  that takes longer there is answered 503 `activity_unavailable`, to be asked again in a moment
-  or narrowed down. It leaves the record its room: where the disk has less free than two text
+  slower, with the same answers, for 5 s at the most (a page of a download, 15 s, and 20 s at
+  the most with its wait for the index, below): a question that takes longer there is answered
+  503 `activity_unavailable`, to be asked again in a moment or narrowed down. Whenever its
+  `-wal` file has grown past 16 MB, what that holds goes into the index once qKVM's own reads
+  under way have ended, and a read asked for meanwhile waits until that is done (two seconds at
+  the most, with its wait for the index to catch up; then 503 `activity_unavailable`, to be
+  asked again in a moment), as the history's reads do: reads that kept coming, one beginning
+  before the other ended, kept it from ever being done. A program outside qKVM that reads the
+  index that way, or keeps a read of it open, still can; qKVM then waits for it a second at
+  each try (once a minute), and the log's reads wait that second with it and are answered. A
+  download waits so too, its first page two seconds as a read does and each page
+  after it up to 15 s, and only then, or where the index is made again meanwhile, goes on from
+  the files: after the last entry the index gave it (from the newest where it gave none), each
+  entry once (refused with 503 `activity_unavailable` where the files no longer hold the last
+  page it was given). It leaves the record its room: where the disk has less free than two text
   files and 32 MB more, it waits (the log of qKVM says so), and the page reads the files.
   Where two of the files begin with the same line (a copy made by hand), it steps aside until
   one of them goes, and is made again then. The newest file's last line counts once it has
@@ -1519,9 +1562,10 @@ Who signed in, changed what, and did what to which machine: *Settings > Activity
   `limit` (1 to 500, 100 left out) answers `entries` (newest first, as written), `more`, and
   `missing` (entries that could not be written, or null). `GET /api/v1/audit/export` takes the
   same but `before` and `limit`, and `format` (`csv` or `jsonl`), and answers the file with its
-  `Content-Length`, or 503 `activity_unavailable` or `busy`, 507 `not_saved`. These are the page's own
-  requests (see [The API](#the-api)): they change with it. `qkvm status` says how large the
-  files and the index are.
+  `Content-Length`, or 503 `activity_unavailable` or `busy`, 507 `not_saved`. Of these, what is
+  said of one machine (`GET /api/v1/audit` with `device` and `limit`, which the Desktop App reads) is
+  promised in [The API](#the-api), with the picture of a screen alert; the rest is the page's own,
+  and changes with it. `qkvm status` says how large the files and the index are.
 
 ## JetKVM
 
@@ -1737,9 +1781,12 @@ screen is in the console that the controller's own web page opens, and qKVM take
   holds is shown, and nothing is typed into it. When somebody has the console first, the controller asks them whether a newcomer
   may look; the wall does not leave that question on their screen. It leaves the moment it is
   told to wait, shows how the server is, says why, and looks again ten minutes later.
-- A controller that is set to switch the server's own monitor off while a console is open is
-  left alone, and the enlarged tile says why there is no picture. Ten minutes later it is asked
-  again, in case the setting was changed.
+- A console is opened only where the controller says that the server's own monitor stays on
+  while it is open: both of the two words it hands out with the console's pass
+  (`automatic_off`, `local_monitor_off`) are said, and both are a plain no. A controller that
+  says anything else (both on, or only one of the two off) or does not say is left alone, and
+  the enlarged tile says which of these it is, and that there is no picture for it.
+  Ten minutes later it is asked again, in case the setting was changed.
 - A controller ends a console session in which no key was pressed for a while (half an hour,
   on the boards this was tried with), and a wall that only looks presses none. It opens the console again at
   once, and the tile keeps its picture for the moment that takes.
@@ -1923,8 +1970,8 @@ A business PC with Intel vPro Enterprise has a management engine beside its proc
 it, as Intel's own tools do, and reads its screen through the engine's own KVM. **This is
 experimental**: it was built from Intel's published class reference and MeshCommander's
 published source (read to learn the redirection handshake, not copied), tried against a
-stand-in, and tried on one real machine, a business PC with Intel AMT 16 set up by hand in
-admin control mode without user consent (see [Limits](#limits) for what exactly). Add a PC like
+stand-in, and tried on one real machine, a business PC with a recent Intel AMT, set up by hand
+in admin control mode without user consent (see [Limits](#limits) for what exactly). Add a PC like
 a KVM: type its address, with the engine's user name (`admin`, as it comes) and password, and
 qKVM recognises it. *Find KVMs on my network* finds such PCs as well.
 
@@ -2499,6 +2546,15 @@ HTTP request of their own, with a session; that door is not built.
   also means that any program on that computer can say it is passing on whichever address
   it likes. Once a proxy is named, only what was named is believed: name `127.0.0.1` too if
   one of your proxies runs on the same computer.
+- **A proxy that keeps its connections to qKVM open between requests** has to let an idle one
+  go sooner than qKVM does, which is 130 seconds after its last answer: otherwise it can send
+  a request on a connection at the moment qKVM closes it, and lose that request (a press of a
+  power button among them). The defaults of nginx (`keepalive_timeout` in an `upstream` block,
+  60 seconds), Traefik (`idleConnTimeout`, 90), cloudflared (`keepAliveTimeout`, 90) and Caddy
+  (`keepalive`, two minutes) all do; a value set above 130 seconds does not. (qKVM keeps 1000
+  idle connections at once at the most, from everybody together, or a quarter of the open
+  files the system allows it where that is fewer, and past that closes the one kept longest
+  sooner; a busy wall keeps a few hundred.)
 - **First-run setup takes a password and nothing else**, so a new qKVM belongs to whoever
   opens it first: choose the password right after starting it. Started with `--setup-code`,
   qKVM asks whoever sets it up from another machine for a code printed in its terminal (or
@@ -2533,11 +2589,14 @@ HTTP request of their own, with a session; that door is not built.
   runs under a strict Content-Security-Policy, and requests for unknown host names are rejected.
 - **Nobody holds a connection for nothing.** One that has not sent a whole request within 20
   seconds is closed, a request's body gets the same, one that asks and then takes nothing of
-  the answer for 20 seconds is dropped. The one thing in qKVM that is spoken to over a
-  websocket, the live view's line, shows a pass within ten seconds or is closed, and is hung up
-  on when it answers no ping, takes nothing off the line, or floods it (see
-  [Live view and control](#live-view-and-control)). Wrong passwords are checked two at a time at
-  most, so that guessing cannot use up the computer's memory.
+  the answer for 20 seconds is dropped, and one that was answered is kept for its next request
+  for 130 seconds (longer than a proxy in front keeps one, see above) and then closed, 1000 of
+  those at once at the most, or a quarter of the open files the system allows qKVM where that
+  is fewer (past that, the one kept longest is closed first). The one
+  thing in qKVM that is spoken to over a websocket, the live view's line, shows a pass within
+  ten seconds or is closed, and is hung up on when it answers no ping, takes nothing off the
+  line, or floods it (see [Live view and control](#live-view-and-control)). Wrong passwords
+  are checked two at a time at most, so that guessing cannot use up the computer's memory.
 - **A KVM is not trusted either.** What a device sends is read only up to a limit, only JPEG
   and PNG data of a sane size is passed on to a browser as a picture, and what a device says
   about itself (name, model, numbers) is reduced to plain short text or a number before it is
@@ -2550,7 +2609,8 @@ HTTP request of their own, with a session; that door is not built.
   taken-over JetKVM could make that library hold or compute has not been measured.
 - **Virtual media is root on a machine**, and is kept so: an admin's right, in person, never a
   token's; a confirmation that names the machine and the image, which the request carries and
-  is held to; every mount, unmount and start from an image in the activity log; images
+  is held to, with the machine the list was made of (a tile edited to another machine since
+  is refused); every mount, unmount and start from an image in the activity log; images
   read-only; and a device is only ever handed what qKVM itself listed or made, never an
   address somebody typed (a device that fetches an address is a way into the network it stands
   in). On Proxmox nothing is fetched at all: the image is one on its storages. An image carried
@@ -3114,7 +3174,7 @@ or from published source, and tried on a stand-in laid out like it.
 | GL.iNet Comet (GL-RM1, GL-RM10), GLKVM firmware | Used daily on real devices: picture, status, actions. ATX board, heard on the KVM's line for events, and keyboard and mouse in the live view: tried on a real device (see below). A Fingerbot paired with it: tried on a real Comet with a Fingerbot on a desk, pressing nothing (see below) |
 | GL.iNet Comet X (four ports) | Real device: picture, status, port switching |
 | JetKVM | Real device: picture, status, sharing with its own page, restart, keys, typed text, saved actions, keep-awake, the live view with keyboard and mouse, over its `hidrpc` channel and over JSON-RPC; a key and a mouse button held as its own page takes the viewer and as a connection ends; the ATX extension's short press and its lights (see below); virtual media (see below); its long press and reset, Wake-on-LAN, a password, HTTPS, a firmware without `hidrpc` and typed text in a layout other than US only against a stand-in |
-| Stock PiKVM, and other KVMs with PiKVM's `kvmd` interface | kvmd's own test environment, kvmd 4.226 with ustreamer 6.67 (a video loopback and the GPIO mockup in place of a Pi's capture and pins): sign-in, the tile, its picture, the status, keys, typed text, keep-awake, the power and reset buttons and the power light, the network search, the live line with its pictures and with kvmd-media's H.264, keyboard and mouse over it, the history: see below. No real PiKVM yet |
+| Stock PiKVM, and other KVMs with PiKVM's `kvmd` interface | kvmd's own test environment, kvmd 4.226 with ustreamer 6.67 (a video loopback and the GPIO mockup in place of a Pi's capture and pins): sign-in, the tile, its picture, the status, keys, typed text, keep-awake, the power and reset buttons and the power light, the network search, the live line with its pictures and with kvmd-media's H.264, keyboard and mouse over it, the history: see below. A real PiKVM V4: the tile, its picture, the status, the network search, the live line with its H.264, keys, typed text and the pointer, keep-awake, and virtual media; its power and reset buttons were not pressed, and its power light could not be read on the test machine's board (see below) |
 | Servers through Redfish, AMI MegaRAC controllers | Real boards of two makers: see below |
 | Servers through Redfish, Dell iDRAC9 | Dell's own capture of an iDRAC9 (firmware 7.20.10.05, from `dell/iDRAC-Redfish-Scripting`), served by DMTF's Redfish-Mockup-Server 1.3.0: sign-in and out, status, temperatures and fans, the locator light, the power actions it offers; no real iDRAC yet |
 | Servers through Redfish, HPE iLO 5 | HPE's own `ilo-redfish-emulator` v1.1.0 (an iLO 5 on a DL360 Gen10 Plus): the same, and the power actions carried out; no real iLO yet |
@@ -3125,7 +3185,7 @@ or from published source, and tried on a stand-in laid out like it.
 | XCP-ng, Citrix Hypervisor, VMware ESXi, Hyper-V | Not supported |
 | Servers through Redfish, the standard itself | DMTF's own example (DSP2043 `public-rackmount1`, in Redfish-Mockup-Server 1.3.0), and sushy-tools 2.2.0, whose stand-in server really goes on and off a few seconds after it is told: on, shut down, power cut and reset, each seen to happen |
 | Servers through Redfish, other controllers (Supermicro, Lenovo XCC and the rest) | Expected to work where they follow the standard; not tried, and no emulator or capture of theirs is published |
-| Business PCs with Intel AMT (vPro Enterprise) | Experimental. One real machine (AMT 16, admin control mode, no consent): its state, power state, what it is and how it was set up; its KVM switched on and off from the wall; its screen on the tile, enlarged and live, and the still every five minutes of a tile only shown; keys, typed text and the pointer, and nothing held after keyboard and mouse were given back with a key down; every power button. Against a stand-in only: client control mode and consent, the plain port, the network search: see below |
+| Business PCs with Intel AMT (vPro Enterprise) | Experimental. One real machine (a recent Intel AMT, admin control mode, no consent): its state, power state, what it is and how it was set up; its KVM switched on and off from the wall; its screen on the tile, enlarged and live, and the still every five minutes of a tile only shown; keys, typed text and the pointer, and nothing held after keyboard and mouse were given back with a key down; every power button. Against a stand-in only: client control mode and consent, the plain port, the network search: see below |
 | VNC servers (QEMU and libvirt guests, TigerVNC, TightVNC, RealVNC, x11vnc, a controller's own VNC server) | Built from RFC 6143 and tried against a stand-in; the reader against TigerVNC's `Xvnc` and QEMU's own server by the test written for GitHub, passed on Linux and on GitHub; a libvirt guest's console as a tile (above). TightVNC, RealVNC, x11vnc and a controller's own VNC server not tried |
 | Sipeed NanoKVM, IPMI without Redfish | Not supported |
 
@@ -3143,7 +3203,7 @@ or from published source, and tried on a stand-in laid out like it.
   `wait=1` was answered with an error and pressed nothing); and told whoever asked while it
   answered somebody else that there was no board. What the wall does with each is said under
   *Using it*. One PC is one: another computer's power light may be wired otherwise, and a stock
-  PiKVM's board was not tried.
+  PiKVM's board was tried only so far as is said below.
 - The same Comet's board was then heard on its line for events, as the wall now hears it: the
   Comet read its board for that line about every second and a quarter and said it there when it
   had changed (once, and nothing more for as long as nothing changed), "on" four and a half seconds
@@ -3176,7 +3236,7 @@ or from published source, and tried on a stand-in laid out like it.
   the stream on, sixty pictures a second at 2560 by 1440 with a key frame each second, and the
   page drew them.
 - JetKVM support was built from the device's published source and tried on real hardware
-  (firmware 0.5.9), with a Windows PC behind it. The picture, the status, sharing the picture
+  (on a recent firmware), with a Windows PC behind it. The picture, the status, sharing the picture
   with the device's own page (the tile said *In use elsewhere* one to four seconds after that
   page was opened, and *Show here* had the picture back on the tile a second and a half after
   the click; the page that lost it said so and did not take it back by itself) and restarting
@@ -3247,7 +3307,15 @@ or from published source, and tried on a stand-in laid out like it.
   itself and no Wake-on-LAN, which are not offered on its tile. Not supported: a kvmd with
   its sign-in switched off (it hands out no session), and moving the pointer by relative steps
   over the live line while the KVM's mouse is absolute, its default (kvmd drops such steps;
-  the same on a Comet). Not tried: a real PiKVM, its HDMI capture and USB, and its WebRTC.
+  the same on a Comet).
+- A real PiKVM V4 was then tried, through a wall of qKVM, with a Windows PC behind it: the
+  tile, its picture and status, the network search, the live line with its H.264, keys, typed
+  text and the pointer over the live line, keep-awake switched on and off, and virtual media (an
+  image uploaded, its SHA-256 the same as the file's, mounted as a CD-ROM drive, unmounted and
+  deleted), each as it should be. Its ATX board's power and reset buttons were not pressed, and
+  its power light could not be read on the test machine's board: it said off while the computer
+  ran, which the tile now says (the power unknown, its wires probably not connected). Not tried:
+  starting the computer from an image, and its WebRTC.
 - Servers were built from what the controllers of an ASRock Rack and a Gigabyte board (both
   AMI MegaRAC) report about themselves, and tried on real boards of both makers. Signing in
   and out, the status with its temperatures and fans, and reading which power actions the
@@ -3284,7 +3352,7 @@ or from published source, and tried on a stand-in laid out like it.
   from reading Intel's and MeshCommander's open tools (read to learn the calls and the
   redirection handshake, not copied), tried against a stand-in built from the same reference
   and from what a real engine was seen to send, and tried on one real machine: a business PC
-  with Intel AMT 16, set up by hand in admin control mode with user consent off, with a GL.iNet
+  with a recent Intel AMT, set up by hand in admin control mode with user consent off, with a GL.iNet
   Comet showing the same screen beside it to compare with. There, qKVM recognised it from its
   address and read its state, power state, what it is (as its BIOS says it), its control mode
   and consent setting; switched its KVM on (the access point, then the redirection listener),
@@ -3359,8 +3427,8 @@ or from published source, and tried on a stand-in laid out like it.
 - Typing and mouse control happen over the [live line](#live-view-and-control), which the
   page's enlarged view and the qKVM desktop program speak. The line was tried against the
   stand-in devices in the tests, against kvmd's own test environment, on a real JetKVM, on
-  a real Comet, on a real PC with Intel AMT and on a real Proxmox (all above): what a real PiKVM
-  makes of its keys and its mouse over it is unseen. A JetKVM's picture on the line
+  a real Comet, on a real PiKVM, on a real PC with Intel AMT and on a real Proxmox (all
+  above). A JetKVM's picture on the line
   is JPEG made of decoded frames (the WebRTC library qKVM uses hands out decoded frames and
   nothing else through what it documents). A server's console takes keyboard and mouse
   where it is AMI's: typed keys were tried on a real board (an older Gigabyte); the pointer
@@ -3397,7 +3465,10 @@ or from published source, and tried on a stand-in laid out like it.
   Comet, a PiKVM) was tried against kvmd's own test environment (its drive's code, without a USB
   port behind it): an upload, a CD-ROM drive and a USB flash drive, both read-only, unmounted,
   deleted. kvmd lists an image some two seconds after its write is answered, and a deleted one as
-  long: qKVM waits for its listing (up to ten seconds), which it did not before that trial.
+  long: qKVM waits for its listing (up to ten seconds), which it did not before that trial. On a
+  real PiKVM V4 an image was uploaded, mounted as a CD-ROM drive, unmounted and deleted (see
+  above); a computer was not started from it. An image under 600 KB is refused as a CD-ROM drive
+  there as well, in words, before the KVM is asked.
 - *Alerts in a browser* (Web Push) were tried with Chrome on Windows 11, through Google's push
   service: turned on in *Settings > Alerts*, and a test alert shown by the page's worker. Safari,
   Firefox, Edge and the browsers of phones were not tried; on an iPhone the wall's certificate has

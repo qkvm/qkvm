@@ -111,13 +111,20 @@ def test_typing_stops_when_the_account_that_typed_is_suspended(tmp_path: Path, m
             olga = browser(admin, "olga")
             text = "rm -rf /srv/everything ; " * 40  # 1000 characters
             typing, answers = in_background(lambda: olga.post(f"/api/v1/devices/{device}/actions", json={"action": "text", "text": text}))
-            wait_until(lambda: len(jet.state.typed) >= 20, "nothing was typed", timeout=30)
+            # Suspended just after the wall asked (at key 25): the most keys the design lets go after a suspension, every time
+            # and not by the luck of the moment. (The test allowed fewer than 20, and a slow runner suspended her at key 27:
+            # the wall asked again at key 50 and stopped there, as it is made to.)
+            wait_until(lambda: len(jet.state.typed) >= jetkvm.ASK_EVERY + 1, "nothing was typed", timeout=30)
             suspended = admin.put(f"/api/v1/users/{who}", json={"name": "olga", "role": "operator", "suspended": True})
             assert suspended.status_code == 200
             at_that_moment = len(jet.state.typed)
             typing.join(120)
             print(f"\nkeys down when she was suspended: {at_that_moment}; when the wall stopped typing: {len(jet.state.typed)} of {len(text)}; answer {answers[0].status_code}")
-            assert len(jet.state.typed) < at_that_moment + 20, "the wall went on typing for an account that was suspended"
+            # It asks every 25 keys at the most, whatever the setting is made (a looser one fails here), so that no more than
+            # 26 keys go after a suspension: those to the next ask, and one that was on its way as she was suspended.
+            assert jetkvm.ASK_EVERY <= 25, f"the wall asks only every {jetkvm.ASK_EVERY} keys"
+            after = len(jet.state.typed) - at_that_moment
+            assert after <= 26, f"the wall went on typing for an account that was suspended: {after} keys after key {at_that_moment}"
     finally:
         jet.stop()
 

@@ -77,14 +77,14 @@ def test_a_server_is_recognised_from_its_address_and_shows_how_it_is(tmp_path: P
         assert status["about"] == {"model": "SRV-2200", "version": "1.42.0"}
         server = status["server"]
         assert (server["power"], server["health"], server["processors"], server["memory_gib"]) == ("On", "OK", 2, 256)
-        assert server["processor"] == "Intel Xeon Silver 4410Y"
+        assert server["processor"] == "Example Silver 9100Y"
         assert server["temperatures"] == [
-            {"name": "CPU0_TEMP", "celsius": 61, "ok": True}, {"name": "CPU1_TEMP", "celsius": 55, "ok": True}, {"name": "DIMM_A_TEMP", "celsius": 45, "ok": True},
+            {"name": "TEMP_CPU_A", "celsius": 61, "ok": True}, {"name": "TEMP_CPU_B", "celsius": 55, "ok": True}, {"name": "TEMP_MEM_A", "celsius": 45, "ok": True},
         ]  # fmt: skip
-        assert server["unwell"] == ["CPU1_FAN"]  # what the controller is not happy with, by name
+        assert server["unwell"] == ["FAN_CPU_B"]  # what the controller is not happy with, by name
         assert server["fans"] == [  # the one that is not fitted is not listed
-            {"name": "CPU0_FAN", "reading": 1650, "unit": "RPM", "ok": True},
-            {"name": "CPU1_FAN", "reading": 450, "unit": "RPM", "ok": False},
+            {"name": "FAN_CPU_A", "reading": 1650, "unit": "RPM", "ok": True},
+            {"name": "FAN_CPU_B", "reading": 450, "unit": "RPM", "ok": False},
         ]
         # This controller has no console qKVM reads. That is found out by asking once, without the password,
         # and from then on the tile is told plainly that there is no picture, rather than left to guess.
@@ -1111,7 +1111,7 @@ def test_what_a_controller_says_about_itself_is_not_taken_at_face_value(tmp_path
         status = status_of(client, device, state="online")
         assert status["about"]["model"].startswith("Rack Maker <script>") and len(status["about"]["model"]) <= 60  # one short line
         assert status["about"]["version"] is None
-        assert status["health"]["temp"] == 55 and {"name": "CPU1_TEMP", "celsius": 55, "ok": True} in status["server"]["temperatures"]
+        assert status["health"]["temp"] == 55 and {"name": "TEMP_CPU_B", "celsius": 55, "ok": True} in status["server"]["temperatures"]
     assert named("", "Default string", " n/a ", "SRV-1100") == "SRV-1100"
 
 
@@ -1124,13 +1124,14 @@ def test_the_page_is_told_that_a_server_has_no_picture(tmp_path: Path, bmc: Fake
 
 def test_a_board_that_says_too_much_about_its_processor_is_cut_short(tmp_path: Path, bmc: FakeBmc, monkeypatch: pytest.MonkeyPatch) -> None:
     # The shape of what one real board answered: a name, a run of spaces, and what else it knows about the processor.
-    said = "Intel Xeon E-2336 CPU              , 2900 Mhz, 6 Core(s), 12 Logical Processor(s)"
+    # (Its processor made up, and what it knows of it too.)
+    said = "Example E-9100 CPU              , 3100 Mhz, 8 Core(s), 16 Logical Processor(s)"
     monkeypatch.setattr(fake_redfish, "PROCESSOR", said)
     bmc.state.model, bmc.state.manufacturer = "", "To Be Filled By O.E.M."
     with wall(tmp_path) as client:
         device = add(client, bmc.url)
         status = status_of(client, device, state="online")
-        assert status["server"]["processor"] == "Intel Xeon E-2336 CPU"
+        assert status["server"]["processor"] == "Example E-9100 CPU"
         assert status["about"]["model"] is None  # nobody filled it in, and nothing is made up in its place
 
 
@@ -1142,8 +1143,8 @@ def test_a_critical_fault_is_a_problem_and_a_warning_is_not(tmp_path: Path, bmc:
         bmc.state.health = bmc.state.temperature_health = "Critical"
         status = status_of(client, device, state="error")
         # It says where to look: the alert that goes out carries this line.
-        assert status["error"] == {"code": "health", "message": "The server reports a critical fault (CPU0_TEMP, CPU1_FAN)"}
-        assert status["server"]["unwell"] == ["CPU0_TEMP", "CPU1_FAN"] and status["server"]["temperatures"][0]["ok"] is False
+        assert status["error"] == {"code": "health", "message": "The server reports a critical fault (TEMP_CPU_A, FAN_CPU_B)"}
+        assert status["server"]["unwell"] == ["TEMP_CPU_A", "FAN_CPU_B"] and status["server"]["temperatures"][0]["ok"] is False
         assert status["server"]["power"] == "On" and status["atx"]["power"] is True  # still told how it is, and still switchable
         assert client.post(f"/api/v1/devices/{device}/actions", json={"action": "atx_reset"}).status_code == 200
 

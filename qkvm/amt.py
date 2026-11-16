@@ -103,12 +103,12 @@ RETRY_LOOK = 4.0
 # where it can be seen whether it was carried out (on, off), it is looked for, this long and this often.
 CONFIRM_WITHIN = 25.0
 CONFIRM_EVERY = 2.0
-# A real engine (AMT 16) neither offered nor carried out these while a KVM session, or a serial console, was open (it answered 2):
+# A real engine neither offered nor carried out these while a KVM session, or a serial console, was open (it answered 2):
 # the power cut off and the power cycled. With the wall's own session closed for them, it listed them again about a second later.
 OFFER_WAIT = 5.0
 OFFER_EVERY = 0.5
 # Seconds after a PC was seen to start (switched on, reset, cycled) during which a redirection port that does not answer is the
-# engine being busy, and said so: a real one (AMT 16) answered no new KVM session in time until 27 to 37 s after power on,
+# engine being busy, and said so: a real one answered no new KVM session in time until 27 to 37 s after power on,
 # and its WS-Management questions timed out now and then meanwhile. (A session open before the start went on through it.)
 STARTING = 90.0
 # Times a command, or a read it is decided by, asks which PC answers before it goes (see AmtDevice._request and
@@ -601,7 +601,7 @@ BOOT_SETTINGS = AMT + "AMT_BootSettingData"
 BOOT_SERVICE = CIM + "CIM_BootService"
 BOOT_CONFIG = CIM + "CIM_BootConfigSetting"
 BOOT_CONFIG_INSTANCE = "Intel(r) AMT: Boot Configuration 0"  # the one boot configuration, by its InstanceID (SDK)
-# The properties a Put of AMT_BootSettingData carries. A real AMT 16 board refused a Put that left any of these out ("the
+# The properties a Put of AMT_BootSettingData carries. A real engine refused a Put that left any of these out ("the
 # supplied SOAP violates the corresponding XML schema definition"), so every one of these the engine reported goes along.
 # Every one but BIOSSetup is sent at its OWN safe value, not echoed as the engine gave it: so that starting into the setup
 # carries out nothing another tool left armed without a role (an erase, a BIOS reset, a boot source, a password bypass).
@@ -2178,7 +2178,7 @@ class AmtDevice(Device):
         async with self._quiet:  # (no look between the question which PC answers and the command: see _quiet)
             state, wanted = await self._decide_and_command(action, still)
         if state is None:
-            # A real engine (AMT 16) neither offers nor carries out cutting the power, or cycling it, while a KVM session is open
+            # A real engine neither offers nor carries out cutting the power, or cycling it, while a KVM session is open
             # (it answered 2, and did nothing). The wall's own session is closed for it, and none is opened until it is answered
             # and, for a power cut, the PC is seen off (one opened at once showed a black screen for the seconds that took).
             async with self._screen.no_session("Its power is being switched"):

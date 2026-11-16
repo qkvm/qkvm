@@ -995,9 +995,11 @@ function addDevicesForm(onAdded) {
       }, ADD_PATIENCE);
       const model = [about.model, about.version].filter(Boolean).join(' ');
       row.className = 'ok';
-      // Said where it is so: what is typed and seen there, and the device's password, are not encrypted on the way.
-      const how = String(device.url || '').startsWith('http://') ? ' · over plain HTTP' : '';
-      text.textContent = `${device.name} added${model ? ` (${model})` : ''}${how}`;
+      // Said where it is so: what is typed and seen there, and the device's password, are not encrypted on the way. In
+      // brackets with what it is, as the Desktop App says it: "name added (model, over plain HTTP)".
+      const plain = String(device.url || '').startsWith('http://') ? 'over plain HTTP' : '';
+      const more = [model, plain].filter(Boolean).join(', ');
+      text.textContent = `${device.name} added${more ? ` (${more})` : ''}`;
       onAdded();
       return true;
     } catch (ex) {
@@ -1010,6 +1012,15 @@ function addDevicesForm(onAdded) {
         row.append(
           h('button', { type: 'button', onclick: () => moveTo(twin, url, row) }, 'Use this address instead'),
           h('button', { type: 'button', onclick: () => add(url, row, force, true) }, 'Keep both'));
+        return true;
+      }
+      const instead = ex.code === 'https_only' && ex.data?.use;
+      if (instead) {
+        // A KVM whose plain address sends everybody on to HTTPS at the same host: nothing was added, and the address it
+        // names is offered. Never taken by itself: where a redirect points is not for qKVM to send a password to unasked.
+        row.className = 'ask';
+        text.textContent = `${url}: ${ex.message}.`;
+        row.append(h('button', { type: 'button', onclick: () => add(instead, row, force, keepBoth) }, `Use ${instead}`));
         return true;
       }
       row.className = 'bad';
@@ -1159,10 +1170,14 @@ function editDeviceDialog(device, onDone) {
     const error = h('p', { class: 'error', hidden: true });
     const save = h('button', { type: 'submit', class: 'primary' }, 'Save');
     const saveAnyway = h('button', { type: 'button', hidden: true }, 'Save without checking');
+    // A KVM whose plain address sends everybody on to HTTPS at the same host: that address offered, put in the box when it is
+    // taken, and saved only as any other address is (its password typed, as nothing knows it there by itself).
+    const useInstead = h('button', { type: 'button', hidden: true });
 
     const send = async force => {
       error.hidden = true;
       saveAnyway.hidden = true;  // offered again only for what is refused now
+      useInstead.hidden = true;
       try {
         await api('PUT', `api/v1/devices/${device.id}`, {
           name: name.value, url: url.value, username: username.value, password: password.value,
@@ -1174,10 +1189,17 @@ function editDeviceDialog(device, onDone) {
       } catch (ex) {
         error.textContent = ex.message;
         error.hidden = false;
-        // Also where it is there and signs nobody in just now, as long as nothing about how it is signed in to
-        // was changed: a tile in that state can still be given another name or group.
+        // Also where it is there and signs nobody in just now, or says it answers on HTTPS (its plain address sends everybody
+        // there), as long as nothing about how it is signed in to was changed: a tile in that state can still be given another
+        // name or group. (The wall saves such a KVM unchecked only so: the independent review of 0.3.2, L1.)
         const asItWas = url.value.trim() === device.url && username.value === device.username && !password.value;
-        saveAnyway.hidden = !(CANNOT_BE_REACHED.includes(ex.code) || (ex.code === 'no_sign_in' && asItWas));
+        saveAnyway.hidden = !(CANNOT_BE_REACHED.includes(ex.code) || (['no_sign_in', 'https_only'].includes(ex.code) && asItWas));
+        const instead = ex.code === 'https_only' && ex.data?.use;
+        if (instead) {
+          useInstead.textContent = `Use ${instead}`;
+          useInstead.dataset.use = instead;
+          useInstead.hidden = false;
+        }
         return;
       }
       close();
@@ -1185,9 +1207,16 @@ function editDeviceDialog(device, onDone) {
       onDone();
     };
     saveAnyway.addEventListener('click', () => busy(saveAnyway, () => send(true)));
+    useInstead.addEventListener('click', () => {
+      url.value = useInstead.dataset.use;
+      useInstead.hidden = true;
+      error.hidden = true;
+      password.focus();
+    });
     // It is offered for what was refused, as it was sent. Left on show, it saved unchecked whatever was
     // typed after: another address and a password for it, which then went there every five minutes.
     for (const box of [url, username, password, tls]) box.addEventListener('input', () => { saveAnyway.hidden = true; });
+    url.addEventListener('input', () => { useInstead.hidden = true; });  // (offered for the address it was refused at)
 
     body.append(h('form', { onsubmit: event => { event.preventDefault(); busy(save, () => send(false)); } },
       field('Name', name),
@@ -1212,6 +1241,7 @@ function editDeviceDialog(device, onDone) {
         showsCertificate(device) && h('button', { type: 'button', onclick: () => certificateDialog(device, () => { close(); onDone(); }) }, 'Review certificate'),
         h('button', { type: 'button', onclick: close }, 'Cancel'),
         saveAnyway,
+        useInstead,
         save),
     ));
   });
@@ -4668,6 +4698,9 @@ function machineText(status) {
     // "Power off" under a running machine is worse than saying nothing.
     if (status.atx.power) parts.push('Power on');
     else if (status.atx.power === false && !status.video.signal) parts.push('Power off');
+    // Off beside a picture: no witness. Why, where the wall can say (the wall's words, powerNote); on a KVM with several
+    // inputs it cannot, its board perhaps another computer's than the one on screen.
+    else if (status.atx.power === false && (status.atx.note || status.ports)) parts.push('Power unknown');
   }
   // A Fingerbot paired with the KVM, and its battery where that is low.
   if (status.fingerbot) parts.push(status.fingerbot.low ? `Fingerbot battery low (${status.fingerbot.battery}%)` : 'Fingerbot');
@@ -4675,6 +4708,13 @@ function machineText(status) {
   if (status.usb?.keyboard === false && !switchedOff(status)) parts.push('USB not connected');
   if (status.health?.temp != null) parts.push(`${Math.round(status.health.temp)}°C`);
   return parts.join(' · ');
+}
+
+// Why a KVM's power board is no witness of the computer's power, in the wall's words (`atx.note`: a light that says off beside
+// a picture is probably not wired). Whole in the enlarged view's Details; the title of a tile's footer, whose one line says
+// "Power unknown".
+function powerNote(status) {
+  return status?.picture !== false ? status?.atx?.note?.message || '' : '';
 }
 
 // --- servers: seen through their management controller, which has no picture to give ---------------
@@ -4832,7 +4872,8 @@ async function switchKvmOff(device, close) {
 // Unmount at its right; then what the image goes in as, how the machine is to start, the list, and one line for what is
 // said (an upload's progress too). A control that cannot be used is shown disabled, never taken away, so that nothing comes
 // to stand where another one stood. Each mount, unmount, upload and deletion asks first, naming the machine and the image,
-// and sends both: the server does nothing where either is not what was named.
+// and sends both, with the machine the box listed (`listed`): the server does nothing where either is not what was named,
+// nor where the tile's machine is no longer the one listed (its tile edited to another address meanwhile: the box closes).
 
 // A mount that restarts the machine waits for it to stop and to start again, each as long as a power button's.
 const MEDIA_LOOK_AGAIN = 5000;  // ms: a look at the box's machine that got no answer is asked again once, this much later
@@ -5039,6 +5080,7 @@ function mediaDialog(id) {
         const seconds = Math.floor((Date.now() - began) / 1000);
         if (seconds >= 1) said.dataset.waited = `${seconds} s`;
       }, 500);
+      let moved = false;
       try {
         const done = await send();
         toast(`${device.name}: ${what} done${done.note ? `. ${done.note}` : ''}`, 'ok');
@@ -5048,6 +5090,12 @@ function mediaDialog(id) {
         // did), as for Start into BIOS setup; "no answer" where nothing came back, or something went wrong inside it.
         const answered = (ex.data?.message && ex.code !== 'internal') || !unanswered(ex);
         tell(answered ? ex.message : `No answer to "${what}": it may have been done. Look at ${device.name} before trying again.`, true);
+        // The tile's machine is not the one this box listed any more (its tile was edited meanwhile): nothing was done, and
+        // the box, made for that one, closes. Opened again, it lists the machine the tile is at now.
+        if (ex.code === 'moved') {
+          toast(ex.message, 'error');
+          moved = true;
+        }
       } finally {
         clearInterval(counting);
         said.classList.remove('working');
@@ -5056,6 +5104,10 @@ function mediaDialog(id) {
         body.inert = false;
       }
       lookAgainSoon();
+      if (moved) {
+        dialog.close();
+        return;
+      }
       const message = said.textContent;
       const bad = said.classList.contains('error');
       if (dialog.open) await load();
@@ -5064,7 +5116,7 @@ function mediaDialog(id) {
     };
     // An upload: the file as this browser reads it, carried through qKVM to the device as it comes. Its progress is the
     // server's count of what went through, asked every second; closing the box stops it, and what came of it is taken off.
-    const send = async chosen => {
+    const send = async (chosen, listed) => {
       const controller = new AbortController();
       carrying = controller;
       const shownProgress = async () => {
@@ -5077,7 +5129,17 @@ function mediaDialog(id) {
       };
       const progress = setInterval(shownProgress, MEDIA_PROGRESS_EVERY);
       try {
-        const query = `name=${encodeURIComponent(chosen.name)}&machine=${encodeURIComponent(device.name)}`;
+        // The machine this box listed, asked again before a byte goes. The wall refuses an upload listed for another one (409
+        // `moved`) before it reads it, and closes the connection under a browser still sending, which may then see it reset
+        // and not the answer: the box said that it may have been done, and stayed open, where nothing was (the independent
+        // review of 0.3.2, L4). Where the tile is at another machine by now, that is said and the box closes, as for the
+        // other changes, and nothing is sent. (Where that look gets no answer, the upload goes: the wall still refuses it.)
+        const relisted = await api('GET', `api/v1/devices/${encodeURIComponent(device.id)}/media`).catch(() => null);
+        if (controller.signal.aborted) throw new ApiError('The upload was stopped: the box was closed', 'disconnected', 0);
+        if (relisted?.listed && listed && relisted.listed !== listed) {
+          throw new ApiError(`${device.name} is not the machine its images were listed for any more: its address, or what qKVM knows of the machine there, was changed since. Nothing was uploaded: list its images again.`, 'moved', 409);
+        }
+        const query = `name=${encodeURIComponent(chosen.name)}&machine=${encodeURIComponent(device.name)}&listed=${encodeURIComponent(listed)}`;
         let reply;
         try {
           reply = await fetch(`api/v1/devices/${encodeURIComponent(device.id)}/media/upload?${query}`, {
@@ -5127,6 +5189,7 @@ function mediaDialog(id) {
         tell(refused, true);
         return;
       }
+      const { listed } = shown;  // (the machine the box listed, as it was when it was asked to upload to it)
       const yes = await confirmBox({
         title: `Upload ${chosen.name}`,
         message: `${chosen.name} (${bytesText(chosen.size)}) is carried through qKVM to the KVM's own storage of ${device.name} as this browser reads it, and kept nowhere on the way. Keep this box open until it is done: closing it stops the upload, and what came of it is taken off the KVM.`,
@@ -5134,23 +5197,24 @@ function mediaDialog(id) {
         danger: false,
       });
       if (!yes) return;
-      await carry(`Upload ${chosen.name}`, `Uploading ${chosen.name}...`, () => send(chosen));
+      await carry(`Upload ${chosen.name}`, `Uploading ${chosen.name}...`, () => send(chosen, listed));
     });
     remove.addEventListener('click', async () => {
       const image = pickedImage();
       if (!image) return;
+      const { listed } = shown;  // (the machine the list was made of, as it was when the image was picked from it)
       const yes = await confirmBox({
         title: `Delete ${image.name}`,
         message: `${image.name} is deleted from the KVM's own storage of ${device.name}. It cannot be brought back from here.`,
         action: 'Delete',
       });
       if (!yes) return;
-      await carry(`Delete ${image.name}`, 'Deleting...', () => api('POST', `api/v1/devices/${encodeURIComponent(device.id)}/media/delete`, { image: image.id, machine: device.name }, MEDIA_PATIENCE));
+      await carry(`Delete ${image.name}`, 'Deleting...', () => api('POST', `api/v1/devices/${encodeURIComponent(device.id)}/media/delete`, { image: image.id, machine: device.name, listed }, MEDIA_PATIENCE));
     });
     mount.addEventListener('click', async () => {
       const image = pickedImage();
       if (!image) return;
-      const offers = shown.offers;
+      const { offers, listed } = shown;
       const [drive, rw] = as.value.split('_');
       const writable = rw === 'rw';
       const boot = how.value;
@@ -5183,11 +5247,12 @@ function mediaDialog(id) {
       });
       if (!yes) return;
       await carry(`Mount ${image.name}`, again ? 'Mounting and restarting: as long as it takes to stop and to start...' : 'Mounting...',
-        () => api('POST', `api/v1/devices/${encodeURIComponent(device.id)}/media`, { image: image.id, machine: device.name, drive, writable, boot, restart: again }, MEDIA_PATIENCE));
+        () => api('POST', `api/v1/devices/${encodeURIComponent(device.id)}/media`, { image: image.id, machine: device.name, listed, drive, writable, boot, restart: again }, MEDIA_PATIENCE));
     });
     unmount.addEventListener('click', async () => {
       const mounted = shown?.mounted;
       if (!mounted) return;
+      const { listed } = shown;
       const drops = shown.offers.drops_input ? ' Its keyboard and mouse may drop for a moment.' : '';
       const yes = await confirmBox({
         title: `Unmount ${mounted.name}`,
@@ -5196,7 +5261,7 @@ function mediaDialog(id) {
       });
       if (!yes) return;
       await carry(`Unmount ${mounted.name}`, 'Unmounting...',
-        () => api('POST', `api/v1/devices/${encodeURIComponent(device.id)}/media/unmount`, { image: mounted.image, machine: device.name }, MEDIA_PATIENCE));
+        () => api('POST', `api/v1/devices/${encodeURIComponent(device.id)}/media/unmount`, { image: mounted.image, machine: device.name, listed }, MEDIA_PATIENCE));
     });
     body.append(
       h('div', { class: 'media-head' },
@@ -5496,7 +5561,11 @@ function render(tile) {
   tile.el.classList.toggle('has-panel', Boolean(tile.device.picture === false && !screen && state !== 'connecting' && fillPanel(tile.panel, tile.status)));
   tile.el.classList.toggle('pictured', screen);
   if (state !== 'online') fillVeil(tile.veil, state, veilContent(tile.device, tile.status, tile.view, state, message));
-  $('.meta', tile.el).textContent = [metaText(tile.status), viewNote(tile, tile.view, screen)].filter(Boolean).join(' · ');
+  const meta = $('.meta', tile.el);
+  meta.textContent = [metaText(tile.status), viewNote(tile, tile.view, screen)].filter(Boolean).join(' · ');
+  const why = powerNote(tile.status);
+  if (why) meta.title = why;
+  else meta.removeAttribute('title');
   fillPorts(tile.ports, tile);
   if (state !== tile.state) {
     tile.state = state;
@@ -7019,7 +7088,7 @@ function renderLive() {
   const alert = $('#focus-live-alert');
   alert.hidden = false;
   alert.textContent = (focus.endedBy || picture?.failed) ? [text, title].filter(Boolean).join(' · ') : '';
-  $('#focus-status-meta').textContent = [$('#focus-state').textContent, $('#focus-meta').textContent].filter(Boolean).join(' · ');
+  $('#focus-status-meta').textContent = [$('#focus-state').textContent, $('#focus-meta').textContent, powerNote(tile?.status)].filter(Boolean).join(' · ');
   alert.title = alert.textContent;
   Object.assign(line.dataset, {
     codec: picture?.codec || '', width: picture?.size.w || 0, height: picture?.size.h || 0, fps: focus.fps || 0,

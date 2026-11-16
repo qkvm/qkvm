@@ -771,12 +771,17 @@ def test_a_slice_of_drawing_is_the_work_its_thread_did_not_the_time_it_waited_fo
     began = time.perf_counter()
     drawing.start()
     started.wait(5)
+    holding = time.perf_counter()
     stall()  # (Python's lock held here, the drawing thread waiting for it)
+    held = time.perf_counter() - holding
     drawing.join(10)
     went = time.perf_counter() - began
     (done, took, worked) = out[0]
-    # (The stall is in the clock, what the shares are charged, and not in the work, what LONG_STEP counts.)
-    assert done and went >= 0.5 and took - worked >= 0.4, (done, round(went, 3), round(took, 3), round(worked, 3))
+    # (The stall is in the clock, what the shares are charged, and not in the work, what LONG_STEP counts.) What the stall
+    # held is measured: it is made from a count of a builtin's loop, timed before, and a busy machine can make it a third
+    # of its 0.6 s (GitHub's Windows runner, 2026-11-16: 0.58 s by the clock, 0.34 s of work). The thread's own time is
+    # counted at each tick of the system's clock, 15.6 ms on Windows: a tenth of a second allows for a few.
+    assert done and held >= 0.15 and took - worked >= held - 0.1, (done, round(went, 3), round(held, 3), round(took, 3), round(worked, 3))
 
 
 def test_a_picture_that_came_while_nobody_looked_is_never_decoded_in_the_drawing_threads(monkeypatch: pytest.MonkeyPatch) -> None:

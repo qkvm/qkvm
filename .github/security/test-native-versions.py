@@ -27,8 +27,8 @@ MINIMUMS = json.loads((HERE / "native-minimums.json").read_text(encoding="utf-8"
 DOCKERFILE = HERE.parent.parent / "Dockerfile"
 
 # The base image the Dockerfile builds on, by digest, and the CPython in it: python:3.13-slim as Docker Hub served it on
-# 2026-11-01 (docker buildx imagetools inspect, read only), PYTHON_VERSION 3.13.18 in its config on amd64 and arm64.
-BASE_IMAGE = ("python:3.13-slim", "sha256:2d44738ebf4ce5f63b9d9ea871e9c7cfdc0426f7b0c97cac915fd88ded1d86bb", "3.13.18")
+# 2026-11-16 (docker buildx imagetools inspect, read only), PYTHON_VERSION 3.13.18 in its config on amd64 and arm64.
+BASE_IMAGE = ("python:3.13-slim", "sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90", "3.13.18")
 
 # What the image of 0.2.0 said of itself on both architectures (python -P - < native-versions.py, 2026-10-26), but for
 # CPython: the base image's since 0.2.1 (BASE_IMAGE below), which the image takes as it is.

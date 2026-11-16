@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import gzip
+import json
+import logging
 import os
 import socket
+import subprocess
+import sys
 import threading
 import time
 from collections.abc import AsyncIterator, Iterator
@@ -631,6 +635,427 @@ def test_a_connection_that_asks_for_nothing_is_not_kept_for_ever(tmp_path: Path,
         assert browser.get("/api/ws", headers=upgrade).status_code == 403
 
 
+def asked_on(connection: socket.socket, path: str) -> int:
+    """GET `path` on a connection that is kept between requests; the answer's status, its body read to the end. 0: closed."""
+    head = b""
+    try:
+        connection.sendall(f"GET {path} HTTP/1.1|Host: 127.0.0.1||".replace("|", chr(13) + chr(10)).encode())
+        while b"\r\n\r\n" not in head:
+            more = connection.recv(4096)
+            if not more:
+                return 0
+            head += more
+    except ConnectionError:  # (closed by the other end, as Windows says it)
+        return 0
+    head, body = head.split(b"\r\n\r\n", 1)
+    length = next(int(line.split(b":", 1)[1]) for line in head.split(b"\r\n") if line.lower().startswith(b"content-length:"))
+    while len(body) < length:
+        more = connection.recv(4096)
+        assert more, "closed in the middle of an answer"
+        body += more
+    return int(head.split(b" ", 2)[1])
+
+
+def test_a_connection_kept_between_requests_is_kept_longer_than_a_proxy_in_front_keeps_one(tmp_path: Path) -> None:
+    # The web server let a connection go five seconds after its last answer, as it comes: a client that sent a request
+    # on a pooled connection at that very moment lost it (the desktop's joint test against 0.3.0). A browser may send it
+    # again by itself, a press of a power button too; a program or a proxy in front does not. qKVM keeps one longer than
+    # the proxies in common use keep one by default (a minute for nginx and AWS's load balancers, a minute and a half for
+    # Traefik and cloudflared, two minutes for Caddy), so that the one in front lets go first, and not for ever: every
+    # connection kept is an open file (cli.raise_file_limit), and a client that opens a new one for every request and
+    # leaves the old ones open has as many as it asked in that time. One that asks for nothing goes after HEADERS_WITHIN
+    # as before (the test above).
+    from qkvm import cli
+
+    with LiveWall(tmp_path, **cli.SERVER_OPTIONS) as live:
+        pooled = socket.create_connection(("127.0.0.1", live.port))
+        pooled.settimeout(10)
+        try:
+            assert asked_on(pooled, "/healthz") == 200
+            time.sleep(6)  # (longer than the web server's own five seconds)
+            assert asked_on(pooled, "/healthz") == 200, "the connection was let go between two requests six seconds apart"
+        finally:
+            pooled.close()
+    kept = cli.SERVER_OPTIONS["timeout_keep_alive"]
+    assert 120 < kept <= 180, f"an idle connection is kept {kept} s"
+
+
+def let_go(connection: socket.socket, within: float = 5.0) -> bool:
+    """Whether qKVM closes this connection (it has sent nothing on it since its last answer) within the time."""
+    was = connection.gettimeout()
+    connection.settimeout(within)
+    try:
+        return connection.recv(100) == b""
+    except TimeoutError:
+        return False
+    except ConnectionError:  # (closed by the other end, as Windows may say it)
+        return True
+    finally:
+        connection.settimeout(was)
+
+
+def test_connections_kept_between_requests_are_held_to_a_number_and_the_one_kept_longest_goes_first(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Since 0.3.2 a connection is kept 130 s after its answer (the test above), and one cheap request nobody has to sign in
+    # for (/healthz, the page) bought that long an open file, with nothing to say how many (the review of 0.3.2): a file
+    # limit of 65,536 was used up by some 500 requests a second, where it took some 3,300 new connections a second before.
+    # Those kept between requests are held to cli.IDLE_KEPT_MOST at once (made 3 here), the one kept longest let go first, as
+    # the keep-alive's end would let it go. One whose next request has begun is in use, and never let go for it.
+    from qkvm import cli
+
+    most = cli.IDLE_KEPT_MOST
+    monkeypatch.setattr(cli, "IDLE_KEPT_MOST", 3)
+    with LiveWall(tmp_path, **cli.SERVER_OPTIONS) as live:
+        busy, *kept = connections = [socket.create_connection(("127.0.0.1", live.port)) for _ in range(6)]
+        for connection in connections:
+            connection.settimeout(10)
+        try:
+            assert asked_on(busy, "/healthz") == 200  # (the first kept; then its next request begun, the head halfway)
+            busy.sendall("GET /healthz HTTP/1.1|Host: 127.0.0.1|".replace("|", chr(13) + chr(10)).encode())
+            for connection in kept:  # (five kept, one after the other)
+                assert asked_on(connection, "/healthz") == 200
+            assert let_go(kept[0]) and let_go(kept[1]), "five were kept at once where three may be"
+            assert not let_go(kept[2], 0.3) and not let_go(busy, 0.3), "more were let go than the three kept longest, or one in use"
+            busy.sendall(b"\r\n")  # (the rest of its request: answered, and kept from then on, the newest)
+            assert answer_on(busy) == 200, "the request under way was cut off"
+            assert let_go(kept[2]), "the one kept longest stayed where one more was kept"
+            for connection in (kept[3], kept[4], busy):
+                assert asked_on(connection, "/healthz") == 200, "one of the three newest was let go"
+        finally:
+            for connection in connections:
+                connection.close()
+    assert 600 <= most <= 2000  # (a hundred browsers of six connections each, a proxy's few hundred: why, at IDLE_KEPT_MOST)
+
+
+class Allowance:
+    """The system's allowance for open files as the standard library's `resource` says it, for raise_file_limit: what it
+    allows (soft) and how far it may be raised (hard), and the most a raise is let up to (None: up to hard)."""
+
+    RLIM_INFINITY = -1
+    RLIMIT_NOFILE = 7
+
+    def __init__(self, soft: int, hard: int, most: int | None = None) -> None:
+        self.limits, self.most = (soft, hard), most
+
+    def getrlimit(self, which: int) -> tuple[int, int]:
+        assert which == self.RLIMIT_NOFILE
+        return self.limits
+
+    def setrlimit(self, which: int, limits: tuple[int, int]) -> None:
+        assert which == self.RLIMIT_NOFILE and limits[1] == self.limits[1]
+        if (self.most is not None and limits[0] > self.most) or (self.limits[1] != self.RLIM_INFINITY and limits[0] > self.limits[1]):
+            raise ValueError("not allowed")
+        self.limits = limits
+
+
+def allowed(monkeypatch: pytest.MonkeyPatch, allowance: Allowance | None) -> int | None:
+    """What raise_file_limit leaves allowed on a system that says `allowance` (None: Windows, which has none)."""
+    from qkvm import cli
+
+    with monkeypatch.context() as system:
+        system.setattr(sys, "platform", "win32" if allowance is None else "linux")
+        if allowance is not None:
+            system.setitem(sys.modules, "resource", allowance)
+        return cli.raise_file_limit()
+
+
+INF = Allowance.RLIM_INFINITY
+
+
+@pytest.mark.parametrize(
+    ("soft", "hard", "most", "files", "kept"),
+    [
+        (1024, 1024, None, 1024, 256),  # a hard limit of 1024: nothing to raise it to (the review of 0.3.2)
+        (1024, 1024 * 1024, 1024, 1024, 256),  # a raise refused, whatever the hard limit says
+        (1024, 3000, None, 3000, 750),
+        (1024, 524288, None, 65536, 1000),  # (systemd's, raised)
+        (256, 10240, None, 10240, 1000),  # (macOS's)
+        (1048576, 1048576, None, 1048576, 1000),  # (Docker's: enough as it is)
+        (INF, INF, None, None, 1000),
+        (8, 8, None, 8, 2),
+    ],
+)  # fmt: skip
+def test_where_the_system_allows_few_open_files_fewer_connections_are_kept_between_requests(
+    monkeypatch: pytest.MonkeyPatch, soft: int, hard: int, most: int | None, files: int | None, kept: int
+) -> None:
+    # Up to cli.IDLE_KEPT_MOST (1000) connections are kept between requests at once, each an open file. Where the allowance
+    # for open files could not be raised (a hard limit of 1024), that number of them took all but a few, which a hundred KVMs
+    # and the browsers watching them need, and some eight requests a second that nobody signs in for kept it so (the
+    # independent review of 0.3.2). They are held to a quarter of what is allowed once raise_file_limit has asked for more,
+    # where that is fewer; and to IDLE_KEPT_MOST on Windows, which has no such allowance.
+    from qkvm import cli
+
+    monkeypatch.setattr(cli, "files_allowed", None, raising=False)
+    assert allowed(monkeypatch, Allowance(soft, hard, most)) == files
+    assert cli.files_allowed == files and cli.idle_kept_most() == kept
+    assert allowed(monkeypatch, None) is None and cli.idle_kept_most() == cli.IDLE_KEPT_MOST == 1000
+
+
+def test_the_connections_kept_between_requests_are_held_to_a_quarter_of_the_open_files_allowed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # (The test above, at the web server: twelve open files allowed, three kept at once, the one kept longest let go first.)
+    from qkvm import cli
+
+    monkeypatch.setattr(cli, "files_allowed", None, raising=False)
+    assert allowed(monkeypatch, Allowance(12, 12)) == 12
+    with LiveWall(tmp_path, **cli.SERVER_OPTIONS) as live:
+        kept = [socket.create_connection(("127.0.0.1", live.port), timeout=10) for _ in range(5)]
+        try:
+            for connection in kept:
+                assert asked_on(connection, "/healthz") == 200
+            assert let_go(kept[0]) and let_go(kept[1]), "five were kept at once where twelve open files are allowed"
+            assert not any(let_go(connection, 0.3) for connection in kept[2:]), "more were let go than the two kept longest"
+        finally:
+            for connection in kept:
+                connection.close()
+
+
+def test_a_proxys_connections_under_the_number_are_kept_and_used_again(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # A proxy in front keeps its connections to qKVM and sends request after request on them, each within the 120 s it keeps
+    # one idle (the test above it). As many as the number, none is let go, however often each is used and however long it
+    # waits between two (within the keep-alive): the number counts connections, not time.
+    from qkvm import cli
+
+    monkeypatch.setattr(cli, "IDLE_KEPT_MOST", 4)
+    with LiveWall(tmp_path, **cli.SERVER_OPTIONS) as live:
+        pool = [socket.create_connection(("127.0.0.1", live.port), timeout=10) for _ in range(4)]
+        try:
+            for turn in range(3):
+                for connection in reversed(pool) if turn % 2 else pool:
+                    assert asked_on(connection, "/healthz") == 200, f"a connection of the pool was let go (turn {turn})"
+                time.sleep(1.5 if turn == 0 else 0.2)
+            assert not any(let_go(connection, 0.3) for connection in pool)
+        finally:
+            for connection in pool:
+                connection.close()
+
+
+def answer_on(connection: socket.socket) -> int:
+    """The status of the next answer on a connection whose request was sent, its body read to the end. 0: closed."""
+    head = b""
+    while b"\r\n\r\n" not in head:
+        try:
+            more = connection.recv(4096)
+        except ConnectionError:
+            return 0
+        if not more:
+            return 0
+        head += more
+    head, body = head.split(b"\r\n\r\n", 1)
+    length = next(int(line.split(b":", 1)[1]) for line in head.split(b"\r\n") if line.lower().startswith(b"content-length:"))
+    while len(body) < length:
+        more = connection.recv(65536)
+        assert more, "closed in the middle of an answer"
+        body += more
+    return int(head.split(b" ", 2)[1])
+
+
+def test_an_answer_under_way_is_never_let_go_for_the_number_of_connections_kept(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The same with an answer on its way, half of it sent and the rest to come (a web server of the program's options and an
+    # app that holds its answer, so that it is under way for as long as the test says, whatever a system's buffers take).
+    # And a request sent with the beginning of the next one: kept for that one as before 0.3.2 it was not, its head had no
+    # HEADERS_WITHIN and could stay the whole keep-alive, past the number as well. It has HEADERS_WITHIN from its answer's end.
+    from qkvm import cli
+
+    monkeypatch.setattr(cli, "IDLE_KEPT_MOST", 3)
+    monkeypatch.setattr(cli, "HEADERS_WITHIN", 1.0)
+    go_on = threading.Event()
+
+    async def app(scope: Any, receive: Any, send: Any) -> None:
+        if scope["type"] != "http":
+            return
+        held = scope["path"] == "/held"
+        await send({"type": "http.response.start", "status": 200, "headers": [(b"content-length", b"200000" if held else b"2")]})
+        if held:
+            await send({"type": "http.response.body", "body": b"x" * 100_000, "more_body": True})
+            await asyncio.to_thread(go_on.wait, 20)
+            await send({"type": "http.response.body", "body": b"y" * 100_000})
+        else:
+            await send({"type": "http.response.body", "body": b"ok"})
+
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    server = uvicorn.Server(uvicorn.Config(app, **{**cli.SERVER_OPTIONS, "log_level": "error"}))
+    serving = ServerThread("the web server", lambda: server.run(sockets=[sock]), lambda: server.started)
+    serving.start()
+    connections: list[socket.socket] = []
+
+    def connected() -> socket.socket:  # (each just before it asks: a connection that asks nothing goes after HEADERS_WITHIN)
+        connection = socket.create_connection(("127.0.0.1", port), timeout=10)
+        connections.append(connection)
+        return connection
+
+    try:
+        under_way = connected()
+        assert asked_on(under_way, "/") == 200  # (kept first, the longest of all; then asked for the long answer)
+        under_way.sendall("GET /held HTTP/1.1|Host: 127.0.0.1||".replace("|", chr(13) + chr(10)).encode())
+        ahead = connected()
+        ahead.sendall("GET / HTTP/1.1|Host: 127.0.0.1||GET / HTTP/1.1|Host: 127".replace("|", chr(13) + chr(10)).encode())
+        assert answer_on(ahead) == 200
+        kept: list[socket.socket] = []
+        for _ in range(4):  # (four kept, one after the other)
+            kept.append(connected())
+            assert asked_on(kept[-1], "/") == 200
+        assert let_go(kept[0]), "four were kept at once where three may be"
+        assert let_go(ahead, 5), "a request's head begun with the one before it was waited for past HEADERS_WITHIN"
+        go_on.set()
+        assert answer_on(under_way) == 200, "the answer under way was cut off"
+        assert asked_on(under_way, "/") == 200, "the connection whose answer was under way was let go"
+    finally:
+        go_on.set()
+        for connection in connections:
+            connection.close()
+        server.should_exit = True
+        serving.join(timeout=10)
+
+
+@pytest.mark.parametrize("counting", [True, False], ids=["with the number", "where the number is not kept"])
+def test_a_request_begun_with_the_one_before_it_has_its_own_time_whatever_else_goes_on(monkeypatch: pytest.MonkeyPatch, counting: bool) -> None:
+    # The test above shows it among others: past the number, the eviction of the one kept longest closed that connection all
+    # the same, and it passed with the time for it taken out (the third review of 0.3.2, by a mutation). Here it is the one
+    # connection there is. And where the number is not kept (a later web server's ServerState is no weak key, as
+    # tests/later_web_server.py makes it), it was given no such time at all: it stayed for the whole keep-alive, 130 s (the
+    # second and third reviews of 0.3.2). Whether the number is kept, its time is its own.
+    from qkvm import cli
+
+    monkeypatch.setattr(cli, "HEADERS_WITHIN", 0.4)
+    monkeypatch.setattr(cli.Http, "_counting", None)  # (found out anew at the first connection of this web server)
+    monkeypatch.setattr(cli.Http, "_ahead_timed", True, raising=False)
+    if not counting:
+        monkeypatch.setattr(uvicorn.server.ServerState, "__hash__", None)
+
+    async def app(scope: Any, receive: Any, send: Any) -> None:
+        if scope["type"] == "http":
+            await send({"type": "http.response.start", "status": 200, "headers": [(b"content-length", b"2")]})
+            await send({"type": "http.response.body", "body": b"ok"})
+
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    server = uvicorn.Server(uvicorn.Config(app, **{**cli.SERVER_OPTIONS, "lifespan": "off", "log_level": "error"}))
+    serving = ServerThread("the web server", lambda: server.run(sockets=[sock]), lambda: server.started)
+    serving.start()
+    try:
+        with socket.create_connection(("127.0.0.1", sock.getsockname()[1]), timeout=10) as ahead:
+            ahead.sendall("GET / HTTP/1.1|Host: 127.0.0.1||GET / HTTP/1.1|Host: 127".replace("|", chr(13) + chr(10)).encode())
+            assert answer_on(ahead) == 200
+            began = time.monotonic()
+            assert let_go(ahead, 3.0), "a request's head begun with the one before it was waited for past HEADERS_WITHIN"
+            assert time.monotonic() - began < 2.5
+        assert cli.Http._counting is counting
+    finally:
+        server.should_exit = True
+        serving.join(timeout=10)
+
+
+@pytest.mark.parametrize("ahead_timed", [True, False], ids=["as the web server comes", "a later one without what the time ahead uses"])
+def test_a_websocket_asked_for_with_the_request_before_it_keeps_its_line_past_that_answer(monkeypatch: pytest.MonkeyPatch, ahead_timed: bool) -> None:
+    # A WebSocket asked for with the request before it, both sent at once, is taken up by the web server as that answer
+    # ends (on_response_complete), not as its bytes come (data_received, which stops Http's clocks where the connection
+    # became the WebSocket's). Where the web server has not got AHEAD_USES, the answer's end then started Http's own clock
+    # for the next request (KEPT_SHORT) on a connection that was the WebSocket's by then, and it closed the live line
+    # KEPT_SHORT after it opened (the second round of the reviews of 0.3.2: 0.37 s with KEPT_SHORT 0.35 s; 5 s as it comes).
+    # Whichever web server, the line stays past every clock of Http's, and answers.
+    from qkvm import cli
+
+    monkeypatch.setattr(cli, "KEPT_SHORT", 0.3)
+    monkeypatch.setattr(cli, "HEADERS_WITHIN", 0.4)
+    # (As the web server installed is found to be at its first connection; or as one that has not got AHEAD_USES, nor
+    # what the number of connections kept uses, is: test_a_later_web_server_without_what_..., which has no WebSocket.)
+    monkeypatch.setattr(cli.Http, "_counting", None if ahead_timed else False)
+    monkeypatch.setattr(cli.Http, "_ahead_timed", ahead_timed, raising=False)
+
+    async def app(scope: Any, receive: Any, send: Any) -> None:
+        if scope["type"] == "http":
+            await send({"type": "http.response.start", "status": 200, "headers": [(b"content-length", b"2")]})
+            await send({"type": "http.response.body", "body": b"ok"})
+        elif scope["type"] == "websocket":
+            assert (await receive())["type"] == "websocket.connect"
+            await send({"type": "websocket.accept"})
+            while (said := await receive())["type"] == "websocket.receive":
+                await send({"type": "websocket.send", "text": said["text"]})
+
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    server = uvicorn.Server(uvicorn.Config(app, **{**cli.SERVER_OPTIONS, "lifespan": "off", "log_level": "error"}))
+    serving = ServerThread("the web server", lambda: server.run(sockets=[sock]), lambda: server.started)
+    serving.start()
+    try:
+        with socket.create_connection(("127.0.0.1", sock.getsockname()[1]), timeout=10) as line:
+            line.sendall(
+                "GET / HTTP/1.1|Host: 127.0.0.1||GET /line HTTP/1.1|Host: 127.0.0.1|Upgrade: websocket|Connection: Upgrade|"
+                "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==|Sec-WebSocket-Version: 13||".replace("|", chr(13) + chr(10)).encode()
+            )  # fmt: skip
+            came = b""
+            while b" 101 " not in came or not came.endswith(b"\r\n\r\n"):
+                more = line.recv(4096)
+                assert more, came
+                came += more
+            assert came.startswith(b"HTTP/1.1 200 "), came
+            assert cli.Http._ahead_timed is ahead_timed
+            assert not let_go(line, 1.2), "the live line was closed by a clock of the HTTP it was asked for over"
+            line.sendall(bytes([0x81, 0x84, 0, 0, 0, 0]) + b"ping")  # (a text frame, masked as a browser sends it)
+            assert line.recv(4096) == bytes([0x81, 0x04]) + b"ping", "the live line does not answer"
+    finally:
+        server.should_exit = True
+        serving.join(timeout=10)
+
+
+@pytest.mark.parametrize("what",["as_it_is", "moved", "_unset_keepalive_if_required", "timeout_keep_alive_handler", "timeout_keep_alive_task", "server_state", "conn", "unhashable"])
+def test_a_later_web_server_without_what_the_number_of_connections_kept_uses_is_run_as_before_the_number(what: str) -> None:
+    # The number (the tests above) uses what the web server keeps to itself, which any later version may rename or move, and
+    # pyproject.toml gives it no upper bound. Where one of those is not there, qKVM is run as it was before the number
+    # (every connection kept its whole keep-alive), says so once in its log, and that is all. It raised: at every answer or
+    # every connection for some of them ("Exception in ASGI application", and the connection closed), at the first one let
+    # go for the others; and qKVM did not start where ServerState was not in uvicorn.server (the review of 0.3.2's fixes).
+    # A web server of the program's options, in a process of its own made into such a later one: tests/later_web_server.py.
+    # And a request sent with the beginning of the next has HEADERS_WITHIN (made 1 s there) whether the number is kept or not:
+    # it was given none where the number was not (the second and third reviews of 0.3.2), and stayed the whole keep-alive.
+    # Where what tells it apart is not there either (cli.AHEAD_USES), every connection is kept cli.KEPT_SHORT (made 1 s
+    # there) for its next request, the web server's own time as it comes, which lets that one go too; and the log says so.
+    from qkvm import cli
+
+    app_folder = Path(__file__).resolve().parent.parent
+    done = subprocess.run(
+        [sys.executable, "-m", "tests.later_web_server", what],
+        cwd=app_folder, env={**os.environ, "PYTHONPATH": str(app_folder)}, capture_output=True, text=True, timeout=120,
+    )  # fmt: skip
+    assert done.returncode == 0, done.stderr[-3000:]
+    came = json.loads(done.stdout.splitlines()[-1])
+    assert not [line for line in came["logged"] if line[1] >= logging.ERROR], came["logged"]
+    assert came["first"] == [200] * 4, came
+    said = [line[2] for line in came["logged"] if line[0] == "qkvm"]
+    if what in ("as_it_is", "moved"):
+        assert came["let_go"] == [True, True, False, False] and came["again"] == [None, None, 200, 200], came
+        assert not said, said
+    else:
+        assert came["let_go"] == [False] * 4 and came["again"] == [200] * 4, came
+        assert len(said) == 1 and {"unhashable": "server_state"}.get(what, what) in said[0], said
+    assert came["ahead"] is not None and came["ahead"] < 2.5, came  # (let go within so many seconds of its answer)
+    if what in ("timeout_keep_alive_task", "conn"):
+        assert came["idle"] is not None and came["idle"] < 2.5, came
+        assert f"connections are kept {cli.KEPT_SHORT:g} s between requests" in said[0], said
+    else:
+        assert came["idle"] is None, came  # (not let go within three seconds: kept for the whole keep-alive)
+        assert not [line for line in said if "s between requests" in line], said
+
+
+def test_the_web_server_installed_has_what_the_number_of_connections_kept_uses() -> None:
+    # The other side of the test above: with the web server installed, the number is kept. This fails where a later version no
+    # longer has what cli.Http uses of it, which would leave every connection kept its whole keep-alive, said once in the log.
+    from qkvm import cli
+
+    async def app(scope: Any, receive: Any, send: Any) -> None:
+        pass
+
+    async def lacking() -> list[str]:
+        # (A connection as the web server makes one, in its loop.)
+        config = uvicorn.Config(app, **cli.SERVER_OPTIONS)
+        config.load()
+        return cli.lacks(config.http_protocol_class(config=config, server_state=uvicorn.Server(config).server_state, app_state={}))  # type: ignore[call-arg]
+
+    missing = asyncio.run(lacking())
+    assert not missing, f"uvicorn {uvicorn.__version__} has not got {', '.join(missing)}, which the number of connections kept uses"
+
+
 # --- who may come, and how -----------------------------------------------------------------------------
 
 
@@ -878,7 +1303,11 @@ def test_a_caller_who_never_reads_the_answer_is_let_go(tmp_path: Path, monkeypat
     from qkvm import cli
 
     monkeypatch.setattr(cli, "STALLED_AFTER", 0.5)
-    live = LiveWall(tmp_path, **cli.SERVER_OPTIONS)
+    # Windows' own buffers take the whole of the page's script all the same (see the test below): qKVM then holds nothing
+    # of the answer, which is over, and the connection is an answered one, kept for its next request as every one is
+    # (timeout_keep_alive). It went within the time below by the web server's five seconds as it comes; with the 130 s
+    # qKVM keeps one now, it is let go here after two, so that this test is of what it was always of, everywhere.
+    live = LiveWall(tmp_path, **{**cli.SERVER_OPTIONS, "timeout_keep_alive": 2})
     # As over a network, where the system keeps little of an answer ready for a caller that takes none of it.
     # (On this computer alone it would swallow all of it, and nothing would be left waiting to be seen.)
     live._sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
@@ -921,6 +1350,11 @@ def test_an_answer_that_is_not_taken_is_not_waited_with_for_ever(monkeypatch: py
         def __init__(self, waiting: int, pace: float) -> None:
             super().__init__()
             self.waiting, self.pace, self.began, self.dropped = waiting, pace, time.monotonic(), False
+            self.protocol: asyncio.BaseProtocol | None = None
+
+        def get_protocol(self) -> asyncio.BaseProtocol:  # (the HTTP's still: no WebSocket was asked for on it)
+            assert self.protocol is not None
+            return self.protocol
 
         def get_write_buffer_size(self) -> int:
             return max(0, self.waiting - int(self.pace * (time.monotonic() - self.began)))
@@ -941,6 +1375,7 @@ def test_an_answer_that_is_not_taken_is_not_waited_with_for_ever(monkeypatch: py
         """Whether a connection with 200,000 bytes waiting is still there after half a second."""
         config = uvicorn.Config(nothing, **cli.SERVER_OPTIONS)
         line, http = Line(200_000, pace), cli.Http(config, ServerState(), {})
+        line.protocol = http
         http.connection_made(line)
         http.pause_writing()  # what the system says when more is waiting than it keeps ready
         await asyncio.sleep(0.5)

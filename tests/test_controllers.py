@@ -69,7 +69,7 @@ def test_the_chassis_the_computer_points_to_is_the_one_whose_sensors_are_read(tm
         with wall(tmp_path) as client:
             device = add(client, bmc.url)
             status = status_of(client, device, state="online")
-            assert [t["name"] for t in status["server"]["temperatures"]] == ["CPU0_TEMP", "CPU1_TEMP", "DIMM_A_TEMP"]
+            assert [t["name"] for t in status["server"]["temperatures"]] == ["TEMP_CPU_A", "TEMP_CPU_B", "TEMP_MEM_A"]
             assert status["health"]["temp"] == 61 and len(status["server"]["fans"]) == 2
             assert not any("Enclosure" in request for request in bmc.state.requests if request.endswith("/Thermal"))
     finally:
@@ -132,17 +132,17 @@ def test_a_controller_laid_out_as_openbmc_shows_its_sensors_and_says_where_its_c
             server = status["server"]
             # The temperatures come from ThermalMetrics, named after the sensor each reading points to; no health is said there.
             assert server["temperatures"] == [
-                {"name": "temperature_CPU0_TEMP", "celsius": 61, "ok": True},
-                {"name": "temperature_CPU1_TEMP", "celsius": 55, "ok": True},
-                {"name": "temperature_DIMM_A_TEMP", "celsius": 45, "ok": True},
+                {"name": "temperature_TEMP_CPU_A", "celsius": 61, "ok": True},
+                {"name": "temperature_TEMP_CPU_B", "celsius": 55, "ok": True},
+                {"name": "temperature_TEMP_MEM_A", "celsius": 45, "ok": True},
             ]
             assert status["health"]["temp"] == 61
             # The fans are a collection, each read on its own; one says revolutions, one a share, and the absent one is no fan.
             assert server["fans"] == [
-                {"name": "CPU0_FAN", "reading": 1650, "unit": "RPM", "ok": True},
-                {"name": "CPU1_FAN", "reading": 18, "unit": "%", "ok": False},
+                {"name": "FAN_CPU_A", "reading": 1650, "unit": "RPM", "ok": True},
+                {"name": "FAN_CPU_B", "reading": 18, "unit": "%", "ok": False},
             ]
-            assert server["unwell"] == ["CPU1_FAN"]
+            assert server["unwell"] == ["FAN_CPU_B"]
             assert status["about"] == {"model": "SRV-2200", "version": "1.42.0"}
             # Its console is a WebSocket on the controller that carries RFB: said, and read where a picture is asked for
             # (test_openbmc_console.py); none is asked for here.
@@ -265,11 +265,11 @@ def test_an_error_answered_with_200_is_not_taken_for_the_state_of_the_server(tmp
         bmc.stop()
 
 
-@pytest.mark.parametrize("claimed", ["elsewhere", "/redfish/v1/Chassis/chassis/ThermalSubsystem/Fans/fan_CPU0_FAN?x=1", "/redfish/v1/Chassis/chassis/ThermalSubsystem/Fans/fan_CPU0_FAN"])
+@pytest.mark.parametrize("claimed", ["elsewhere", "/redfish/v1/Chassis/chassis/ThermalSubsystem/Fans/fan_FAN_CPU_A?x=1", "/redfish/v1/Chassis/chassis/ThermalSubsystem/Fans/fan_FAN_CPU_A"])
 def test_a_fan_listed_somewhere_else_or_twice_is_not_read(tmp_path: Path, claimed: str) -> None:
     # A fan listed somewhere else (another listener on this computer, counting) is not asked for there. One
     # listed by a path the driver refuses (a query string) would be answered by the stand-in if it were
-    # followed, and CPU0_FAN would then be listed twice; the same for one listed twice over, word for word.
+    # followed, and FAN_CPU_A would then be listed twice; the same for one listed twice over, word for word.
     elsewhere = Trap()
     link_claimed = f"{elsewhere.url}/redfish/v1/Chassis/chassis/ThermalSubsystem/Fans/x" if claimed == "elsewhere" else claimed
     bmc = FakeBmc(BmcState(layout="openbmc", fan_claimed=link_claimed)).start()
@@ -277,9 +277,9 @@ def test_a_fan_listed_somewhere_else_or_twice_is_not_read(tmp_path: Path, claime
         with wall(tmp_path) as client:
             device = add(client, bmc.url)
             status = status_of(client, device, state="online")
-            assert [fan["name"] for fan in status["server"]["fans"]] == ["CPU0_FAN", "CPU1_FAN"]
+            assert [fan["name"] for fan in status["server"]["fans"]] == ["FAN_CPU_A", "FAN_CPU_B"]
             assert elsewhere.hits == 0
-            assert sum(1 for request in bmc.state.requests if request.endswith("/Fans/fan_CPU0_FAN")) == 1
+            assert sum(1 for request in bmc.state.requests if request.endswith("/Fans/fan_FAN_CPU_A")) == 1
     finally:
         bmc.stop()
         elsewhere.stop()
@@ -301,7 +301,7 @@ def test_a_look_does_not_wait_for_every_slow_fan(tmp_path: Path, monkeypatch: py
             status = status_of(client, device, state="online")
             assert time.monotonic() - began < 6.0  # not the ten seconds thirty-three fans at 0.3 s would take
             listed = [fan["name"] for fan in status["server"]["fans"]]
-            in_order = ["CPU0_FAN", "CPU1_FAN", *(f"EXTRA_{n}" for n in range(30))]  # (SYS_FAN5 is absent, and not a fan)
+            in_order = ["FAN_CPU_A", "FAN_CPU_B", *(f"EXTRA_{n}" for n in range(30))]  # (FAN_REAR_5 is absent, and not a fan)
             assert len(listed) <= 6 and listed == in_order[: len(listed)]
             assert status["server"]["temperatures"][0]["celsius"] == 61  # the temperatures, one read, are all there
     finally:
@@ -372,12 +372,12 @@ def test_a_fan_the_look_had_no_time_for_keeps_what_was_last_read_of_it(tmp_path:
     # are asked for first, so that every fan is read again in turn.
     monkeypatch.setattr(redfish, "SENSORS_WITHIN", 1.0)
     bmc = FakeBmc(BmcState(layout="openbmc", more_fans=6, last_fan_unwell=True)).start()
-    every = ["CPU0_FAN", "CPU1_FAN", *(f"EXTRA_{n}" for n in range(6))]
+    every = ["FAN_CPU_A", "FAN_CPU_B", *(f"EXTRA_{n}" for n in range(6))]
     try:
         with wall(tmp_path) as client:
             device = add(client, bmc.url)
             status = status_of(client, device, state="online")
-            assert [fan["name"] for fan in status["server"]["fans"]] == every and status["server"]["unwell"] == ["CPU1_FAN", "EXTRA_5"]
+            assert [fan["name"] for fan in status["server"]["fans"]] == every and status["server"]["unwell"] == ["FAN_CPU_B", "EXTRA_5"]
             bmc.state.fan_takes = 0.4  # from now on a look has time for two or three fans, not eight
             read_before = fan_reads(bmc)
 
@@ -389,7 +389,7 @@ def test_a_fan_the_look_had_no_time_for_keeps_what_was_last_read_of_it(tmp_path:
             for _ in range(10):
                 status = client.get("/api/v1/status").json()[device]
                 assert [fan["name"] for fan in status["server"]["fans"]] == every, status["server"]["fans"]
-                assert status["server"]["unwell"] == ["CPU1_FAN", "EXTRA_5"]
+                assert status["server"]["unwell"] == ["FAN_CPU_B", "EXTRA_5"]
                 time.sleep(0.2)
             # Every one of them was asked for again, the last ones in the list too.
             assert all(any(request.endswith(f"/Fans/fan_{name}") for request in bmc.state.requests[read_before:]) for name in every)
@@ -410,15 +410,15 @@ def test_a_fan_whose_read_keeps_failing_is_not_shown_with_its_last_reading_as_if
             def fans() -> dict[str, Any]:
                 return {fan["name"]: fan["reading"] for fan in status_of(client, device, state="online")["server"]["fans"]}
 
-            assert fans() == {"CPU0_FAN": 1650, "CPU1_FAN": 18}
-            bmc.state.fan_failing = "fan_CPU0_FAN"
+            assert fans() == {"FAN_CPU_A": 1650, "FAN_CPU_B": 18}
+            bmc.state.fan_failing = "fan_FAN_CPU_A"
             asked = len(bmc.state.requests)
             wait_until(lambda: client.get("/api/v1/status").status_code == 200 and len(bmc.state.requests) > asked + 3, "not looked at again")
-            wait_until(lambda: fans() == {"CPU0_FAN": None, "CPU1_FAN": 18}, f"the fan whose read fails still shows a reading: {fans()}")
+            wait_until(lambda: fans() == {"FAN_CPU_A": None, "FAN_CPU_B": 18}, f"the fan whose read fails still shows a reading: {fans()}")
             status = status_of(client, device, state="online")
-            assert status["server"]["unwell"] == ["CPU1_FAN"]
+            assert status["server"]["unwell"] == ["FAN_CPU_B"]
             bmc.state.fan_failing = ""
-            wait_until(lambda: fans() == {"CPU0_FAN": 1650, "CPU1_FAN": 18}, f"the fan's reading did not come back: {fans()}")
+            wait_until(lambda: fans() == {"FAN_CPU_A": 1650, "FAN_CPU_B": 18}, f"the fan's reading did not come back: {fans()}")
     finally:
         bmc.stop()
 
@@ -431,8 +431,8 @@ def test_a_reading_in_the_newer_shape_can_be_unwell_too(tmp_path: Path) -> None:
         with wall(tmp_path) as client:
             device = add(client, bmc.url)
             status = status_of(client, device, state="online")
-            assert status["server"]["temperatures"][0] == {"name": "temperature_CPU0_TEMP", "celsius": 61, "ok": False}
-            assert status["server"]["unwell"] == ["temperature_CPU0_TEMP", "CPU1_FAN"]
+            assert status["server"]["temperatures"][0] == {"name": "temperature_TEMP_CPU_A", "celsius": 61, "ok": False}
+            assert status["server"]["unwell"] == ["temperature_TEMP_CPU_A", "FAN_CPU_B"]
     finally:
         bmc.stop()
 
