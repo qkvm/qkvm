@@ -31,7 +31,7 @@ def flat(text: str) -> str:
 
 
 def test_the_readme_says_it() -> None:
-    readme = APP.joinpath("README.md").read_text(encoding="utf-8")
+    readme = APP.joinpath("GUIDE.md").read_text(encoding="utf-8")
     publishing = flat(readme[readme.index("### Publishing releases") : readme.index("## Command line")])
     for said in SAID:
         assert said in publishing, said

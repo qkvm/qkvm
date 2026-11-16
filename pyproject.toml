@@ -76,7 +76,7 @@ core-metadata-version = "2.4"
 
 # Named one by one: whatever else lies in the folder it is built in (a data folder, a key) stays out.
 [tool.hatch.build.targets.sdist]
-only-include = ["qkvm", "tests", "README.md", "CHANGELOG.md", "SECURITY.md", "CONTRIBUTING.md", "LICENSE", "pyproject.toml"]
+only-include = ["qkvm", "tests", "README.md", "GUIDE.md", "CHANGELOG.md", "SECURITY.md", "CONTRIBUTING.md", "LICENSE", "pyproject.toml"]
 core-metadata-version = "2.4"
 
 [tool.pytest.ini_options]

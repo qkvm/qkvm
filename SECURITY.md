@@ -82,7 +82,7 @@ and what happened. A way to reproduce it helps most.
   every board is known as "one of those", and qKVM asks for its password to be typed again
   whenever its tile is moved to another address.
 
-How the protections work is described in the README under *How it is protected*.
+How the protections work is described in the guide (GUIDE.md) under *How it is protected*.
 
 ## What is kept, and where
 
@@ -288,7 +288,7 @@ Nothing else: no telemetry, no licence check, nothing that reports use.
   (`RELEASE_KEYS` in `qkvm/update.py`), and a copy with a key built in installs a release only
   if that key signed it, whatever it was started with: a release that carries no valid
   signature is refused. A signed release is installed when you click for it, except where
-  *Updates* in the README says the app does not install one: a copy that runs from a container
+  *Updates* in the guide says the app does not install one: a copy that runs from a container
   image is updated by pulling the new image, and a release this copy cannot take in place (a
   Python it does not run under, a computer its release has no build for, or, for a release without
   a list of its libraries, a Python package this copy has not) is installed with pip instead. A copy built without a key (a
@@ -437,11 +437,11 @@ The encrypted migration recovery archive retains the exact pre-migration setting
 for recovery. Keep it private with the matching external key, and retire it under
 your backup-retention policy after acceptance. 0.2.0 has no command that restores
 settings from it: going back is the copy of the data folder made before the
-conversion (see the README). The explicit account reset and
+conversion (see the guide). The explicit account reset and
 inner-unlock-key invalidation paths also remove this local archive; failures are
 reported. Neither operation can erase older backups stored elsewhere.
 
 Advanced non-secret server settings can be changed with the offline
-`--configure-server FILE` command described in the README. It validates a restricted
+`--configure-server FILE` command described in the guide. It validates a restricted
 set of fields and requires the stopped server's storage key. It does not expose a
 plaintext vault export or add any credential-access API for companion clients.

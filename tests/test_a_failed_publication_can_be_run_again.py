@@ -15,7 +15,7 @@ from tests.workflow_text import APP, WORKFLOWS, jobs
 
 
 def publishing() -> str:
-    readme = APP.joinpath("README.md").read_text(encoding="utf-8")
+    readme = APP.joinpath("GUIDE.md").read_text(encoding="utf-8")
     return " ".join(readme[readme.index("### Publishing releases") : readme.index("## Command line")].replace("`", "").split())
 
 

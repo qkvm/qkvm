@@ -54,6 +54,6 @@ def test_the_names_are_checked_before_the_draft_is_made() -> None:
 
 
 def test_the_readme_says_to_publish_only_a_draft_whose_run_is_green() -> None:
-    readme = APP.joinpath("README.md").read_text(encoding="utf-8")
+    readme = APP.joinpath("GUIDE.md").read_text(encoding="utf-8")
     publishing = " ".join(readme[readme.index("### Publishing releases") : readme.index("## Command line")].split())
     assert "publish only a draft whose run is green" in publishing.lower()

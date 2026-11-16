@@ -37,7 +37,7 @@ def test_the_signed_image_record_keeps_what_each_image_said_of_its_native_code()
 
 
 def test_the_readme_says_what_a_run_again_and_the_archives_depend_on() -> None:
-    readme = (APP / "README.md").read_text(encoding="utf-8")
+    readme = (APP / "GUIDE.md").read_text(encoding="utf-8")
     publishing = " ".join(readme[readme.index("### Publishing releases") : readme.index("## Command line")].split())
     assert "within 30 days" in publishing and "run again" in publishing
     assert "artifact and log retention" in publishing and "at least 90 days" in publishing

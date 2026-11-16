@@ -8,7 +8,7 @@ import re
 from pathlib import Path
 
 APP = Path(__file__).resolve().parent.parent
-README = (APP / "README.md").read_text(encoding="utf-8")
+README = (APP / "GUIDE.md").read_text(encoding="utf-8")
 
 
 def test_every_file_the_readme_names_is_published_beside_it() -> None:

@@ -54,7 +54,7 @@ def test_what_the_start_says_others_can_do_in_an_open_data_folder_is_so(tmp_path
 
 
 def test_the_readme_says_the_same_of_who_may_write_the_data_folder() -> None:
-    readme = (Path(__file__).resolve().parent.parent / "README.md").read_text(encoding="utf-8")
+    readme = (Path(__file__).resolve().parent.parent / "GUIDE.md").read_text(encoding="utf-8")
     passage = " ".join(readme.split("**whoever can write to its data folder**", 1)[1].split("Stopping it this way", 1)[0].split())
     assert "can put there what qKVM runs" not in passage and "can change its files" in passage, passage
 

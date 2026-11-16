@@ -35,6 +35,6 @@ def test_the_policy_test_is_run_and_the_readme_says_what_the_latest_label_does()
     checks = "\n".join(steps(jobs(WORKFLOWS / "tests.yml")["checks"]))
     assert "python .github/security/test-newest-release.py" in checks
     assert (SECURITY / "newest-release.py").is_file()
-    readme = (APP / "README.md").read_text(encoding="utf-8")
+    readme = (APP / "GUIDE.md").read_text(encoding="utf-8")
     publishing = readme[readme.index("### Publishing releases") : readme.index("## Command line")]
     assert "Set as the latest release" in publishing and "releases/latest" in publishing

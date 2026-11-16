@@ -41,7 +41,7 @@ from tests.test_totp import code_for
 from tests.test_users import OTHER, account, browser
 from tests.test_wall import CSRF, PASSWORD, add, closed_port, snap, wait_until, wall
 
-README = (Path(__file__).resolve().parent.parent / "README.md").read_text(encoding="utf-8")
+README = (Path(__file__).resolve().parent.parent / "GUIDE.md").read_text(encoding="utf-8")
 CHAPTER = README.split("\n## The API\n", 1)[1].split("\n## Clients and versions\n", 1)[0]
 TABLE = CHAPTER.split("### The requests", 1)[1].split("### A machine", 1)[0]
 PAGES_OWN = CHAPTER.split("### The page's own", 1)[1]

@@ -15,6 +15,6 @@ def test_the_signed_artifact_is_kept_one_day() -> None:
 
 
 def test_the_readme_says_what_that_means_for_a_run_again() -> None:
-    readme = APP.joinpath("README.md").read_text(encoding="utf-8")
+    readme = APP.joinpath("GUIDE.md").read_text(encoding="utf-8")
     publishing = " ".join(readme[readme.index("### Publishing releases") : readme.index("## Command line")].split())
     assert "kept one day" in publishing and "signs anew" in publishing

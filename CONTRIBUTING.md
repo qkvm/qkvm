@@ -25,7 +25,7 @@ A pull request that is opened all the same is closed with a pointer to this page
 The licence lets you change qKVM and run what you changed: the GNU Affero General Public
 License, version 3 (see `LICENSE`). If you run a changed version for others, or pass it on,
 you owe them its source under the same licence. A fork that publishes releases of its own
-needs its own repository and its own signing key: *Publishing releases* in the README says
+needs its own repository and its own signing key: *Publishing releases* in the guide (GUIDE.md) says
 how. The name qKVM and its logo are not covered by the licence.
 
 To run the tests of a copy you changed: `python -m pytest`. They use stand-in KVMs, so no

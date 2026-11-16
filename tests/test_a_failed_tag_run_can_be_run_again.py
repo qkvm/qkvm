@@ -36,7 +36,7 @@ def test_every_upload_replaces_one_of_its_name() -> None:
 
 
 def publishing() -> str:
-    readme = APP.joinpath("README.md").read_text(encoding="utf-8")
+    readme = APP.joinpath("GUIDE.md").read_text(encoding="utf-8")
     return " ".join(readme[readme.index("### Publishing releases") : readme.index("## Command line")].replace("`", "").split())
 
 

@@ -35,7 +35,7 @@ def test_no_job_but_sign_names_release_and_no_job_but_image_names_registries() -
 
 def test_the_notes_and_the_readme_say_what_each_environment_holds() -> None:
     top = RELEASE.read_text(encoding="utf-8").split("\nname: Release\n", 1)[0]
-    readme = APP.joinpath("README.md").read_text(encoding="utf-8")
+    readme = APP.joinpath("GUIDE.md").read_text(encoding="utf-8")
     publishing = " ".join(readme[readme.index("### Publishing releases") : readme.index("## Command line")].split())
     for text in (" ".join(top.replace("#", " ").split()), publishing):
         assert "`registries`" in text or "registries" in text

@@ -17,7 +17,7 @@ def flat(text: str) -> str:
 def test_the_comment_and_the_readme_name_the_job_that_was_waiting() -> None:
     image = (WORKFLOWS / "release.yml").read_text(encoding="utf-8")
     comment = flat(image[image.index("\n  image:\n") : image.index("    concurrency:\n", image.index("\n  image:\n"))])
-    readme = APP.joinpath("README.md").read_text(encoding="utf-8")
+    readme = APP.joinpath("GUIDE.md").read_text(encoding="utf-8")
     publishing = flat(readme[readme.index("### Publishing releases") : readme.index("## Command line")])
     for text in (comment, publishing):
         assert "a third that waits behind it is cancelled" not in text and "A third one that waits behind a waiting one" not in text

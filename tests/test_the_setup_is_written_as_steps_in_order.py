@@ -44,5 +44,5 @@ def test_the_workflows_notes_give_the_steps_in_order() -> None:
 
 
 def test_the_readme_gives_the_steps_in_order() -> None:
-    readme = APP.joinpath("README.md").read_text(encoding="utf-8")
+    readme = APP.joinpath("GUIDE.md").read_text(encoding="utf-8")
     in_order(flat(readme[readme.index("### Publishing releases") : readme.index("## Command line")]))

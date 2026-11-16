@@ -24,7 +24,7 @@ def test_the_workflows_notes_say_each_environments_rules() -> None:
 
 
 def test_the_readme_says_each_environments_rules() -> None:
-    readme = APP.joinpath("README.md").read_text(encoding="utf-8")
+    readme = APP.joinpath("GUIDE.md").read_text(encoding="utf-8")
     publishing = flat(readme[readme.index("### Publishing releases") : readme.index("## Command line")])
     assert "if you like" not in publishing
     rules = publishing[publishing.index("Every one of the three environments, release, registries and pypi:") :]

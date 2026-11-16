@@ -25,7 +25,7 @@ def test_the_publications_first_step_refuses_a_pre_release() -> None:
 def test_the_readme_says_it_is_refused_and_what_mends_it() -> None:
     # (Third review, 5: the publication's event says pre-release whatever is changed afterwards, so a run again is
     # refused again; the release is immutable; only a new version mends it.)
-    readme = APP.joinpath("README.md").read_text(encoding="utf-8")
+    readme = APP.joinpath("GUIDE.md").read_text(encoding="utf-8")
     publishing = " ".join(readme[readme.index("### Publishing releases") : readme.index("## Command line")].split())
     assert "is refused" in publishing[publishing.index("Set as a pre-release") :][:400]
     assert "only a new version mends it" in publishing and "refused again" in publishing

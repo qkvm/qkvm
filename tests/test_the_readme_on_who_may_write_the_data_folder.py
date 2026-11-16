@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-README = (Path(__file__).resolve().parent.parent / "README.md").read_text(encoding="utf-8")
+README = (Path(__file__).resolve().parent.parent / "GUIDE.md").read_text(encoding="utf-8")
 PASSAGE = README.split("**whoever can write to its data folder**", 1)[1].split("Stopping it this way", 1)[0]
 WORDS = " ".join(PASSAGE.split())
 

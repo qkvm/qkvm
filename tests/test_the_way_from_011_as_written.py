@@ -15,7 +15,7 @@ APP = Path(__file__).resolve().parent.parent
 
 
 def section() -> str:
-    readme = (APP / "README.md").read_text(encoding="utf-8")
+    readme = (APP / "GUIDE.md").read_text(encoding="utf-8")
     start = readme.index("### From 0.1.x to 0.2.0, and back")
     return readme[start : readme.index("\n### ", start + 4)]
 
