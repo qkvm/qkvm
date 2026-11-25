@@ -75,7 +75,12 @@ def test_a_new_connection_to_the_same_device_is_told_what_the_last_one_was(kind:
                     await second._login()  # type: ignore[attr-defined]
                 assert again.value.code == "auth_failed"
             assert logins() == 1, "a new connection offered the rejected password as if for the first time"
-            # What is left of the first one's minute: kept beside the connections, and asked there each time.
+            # What is left of the first one's minute: kept beside the connections, and asked there each time. A minute for
+            # every driver, an engine with Intel AMT too: a password the device rejected is a verdict (kvm.Rejected.said_no),
+            # and waits the same ladder everywhere. (An AMT engine that refuses a password it took before is no rejection:
+            # it refuses this address for a while, after failed sign-ins, whatever the password, and is left quiet for
+            # amt.REFUSING_WAIT without a verdict, kvm.Rejected.later, as a JetKVM that names its lockout is. Only its no
+            # after that wait is a verdict, and waits this minute: tests/test_amt.py.)
             assert 50 <= kvm.REJECTED.wait_left(kvm.REJECTED.what("login", second.spec)) <= 60 + TICK
         finally:
             await second.close()

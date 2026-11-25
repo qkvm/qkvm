@@ -5,9 +5,12 @@ from __future__ import annotations
 # First of all: an update installed in place puts the libraries it brought first on the path here, before anything outside
 # the standard library is loaded (or steps back to the version before it). Nothing to do for any other copy.
 from . import _libs  # noqa: F401
+from . import _allocator  # (its apply() runs in main, before the wall starts a thread)
 
 import argparse
 import asyncio
+import contextlib
+import getpass
 import json
 import logging
 import logging.handlers
@@ -35,7 +38,7 @@ from uvicorn.protocols.websockets.websockets_sansio_impl import WebSocketsSansIO
 from websockets.exceptions import InvalidState
 from websockets.frames import Frame
 
-from . import activity, history, live, unlock, vault_migration
+from . import activity, backup, history, live, unlock, vault_migration
 from ._version import __version__
 from ._folders import GENERAL, READ, folder_judged, for_consoles, in_powershell, judged as one_judged, keeps_no_permissions, not_alone, not_ours, open_private, own_folder, private, private_folder, setowner_line
 from ._where import default_data_dir
@@ -44,6 +47,7 @@ from .kvm import WarningsOnly
 from .netbind import BindError, normalize, open_sockets, resolve
 from .server import SentOnlyWhile, create_app
 from .store import AuditLog, InstanceLock, ServerSettings, Store, StoreError, holds_nothing, sealed_beside
+from .tailcert import START_WITHIN
 from .tlscert import NotOurs
 from .update import UpdateError, check_startup_requirements
 from .vault_storage import MAGIC, MigrationRequired
@@ -55,6 +59,10 @@ if TYPE_CHECKING:
 log = logging.getLogger("qkvm")
 MAX_CRASHES = 5  # restarts allowed within CRASH_WINDOW before giving up
 CRASH_WINDOW = 60.0
+# Seconds a command run where the wall is stopped waits for its line of the activity log to be written: at the first start of
+# 0.4.0 the writer reads the whole log once before it (chain.py: some seconds for a large one), and the program does not end
+# before that is done.
+CLOSE_LOG_WITHIN = 120.0
 
 
 # Minimum library versions for the reviewed security/runtime baseline. These floors do not
@@ -630,6 +638,16 @@ SERVER_OPTIONS: dict[str, Any] = {
 }
 
 
+def served_as(core: Core, certfile: str | None, keyfile: str | None) -> dict[str, Any]:
+    """How the web server serves HTTPS (its options): with the wall's own certificate or --tls-cert's, and with Tailscale's
+    for this computer's name in its tailnet where --tls-tailscale asked for it (tailcert.py). Plain HTTP where `certfile` is
+    None."""
+    said: dict[str, Any] = {"ssl_certfile": certfile, "ssl_keyfile": keyfile}
+    if certfile is not None and core.tailscale_cert is not None:
+        said["ssl_context_factory"] = core.tailscale_cert.factory
+    return said
+
+
 def tls_pair(cert: str | None, key: str | None) -> tuple[Path, Path] | None:
     """The certificate and key given at start, as files that belong together. None: none were given.
 
@@ -711,9 +729,9 @@ def _own_name(entry: Path) -> bool:
         "audit.sqlite-journal", "history.sqlite-journal", vault_migration.ARCHIVE,
     )  # fmt: skip
     name, lowered = entry.name, entry.name.lower()
-    if name in own or _DAMAGED.fullmatch(name):
+    if name in own or _DAMAGED.fullmatch(name) or backup.HISTORY_COPIES.fullmatch(name):  # (and a backup's copy of the history)
         return True
-    if not (lowered in own or _DAMAGED.fullmatch(lowered)):
+    if not (lowered in own or _DAMAGED.fullmatch(lowered) or backup.HISTORY_COPIES.fullmatch(lowered)):
         return False
     if sys.platform == "win32":
         return True
@@ -1069,6 +1087,7 @@ def _serve(core: Core, running: InstanceLock | None) -> int:
         working = listening_as(core.store.server)
         first, restarted = not restarted, True
         core.addresses = addresses
+        core.ports = sorted({int(sock.getsockname()[1]) for sock in sockets})
 
         certfile = keyfile = None
         if core.https:
@@ -1089,6 +1108,11 @@ def _serve(core: Core, running: InstanceLock | None) -> int:
                 # with the certificate it had, which may not name the new address, rather than not at all.
                 cert, key = had
             certfile, keyfile = str(cert), str(key)
+            if first and core.tailscale_cert is not None:
+                # Tailscale's certificate for this computer's name: the copy kept, and asked for, within some seconds (what
+                # has not come by then is served when it comes: see the wall's keeper of it, server.py).
+                core.tailscale_cert.resume()
+                asyncio.run(core.tailscale_cert.renew(START_WITHIN))
         core.listening = core.urls(addresses, core.port, core.https)
         log.info("listening on %s", ", ".join(core.listening))
         if running is not None:
@@ -1103,6 +1127,8 @@ def _serve(core: Core, running: InstanceLock | None) -> int:
             say(f"  ({name}: no address yet, will start listening when it appears)")
         if core.https:
             say(f"  certificate SHA-256: {core.cert_fingerprint}")
+            for line in core.tailscale_cert.lines(core.port) if core.tailscale_cert is not None else []:
+                say(line)
         if core.updater.allow_unsigned and core.updater.keys:
             # Asked for, and without effect here: said, so that nobody takes an unsigned release to be let in.
             say("  --allow-unsigned-updates changes nothing: this copy has a release key built in, and installs only what that key signed.")
@@ -1129,7 +1155,7 @@ def _serve(core: Core, running: InstanceLock | None) -> int:
                 # Easy by default, and said as it is: until then the wall is whoever's comes first.
                 say("  Whoever opens it first chooses that password, so do it now. (Started with --setup-code, qKVM asks for a code printed here first.)")
 
-        config = uvicorn.Config(create_app(core), ssl_certfile=certfile, ssl_keyfile=keyfile, **SERVER_OPTIONS)
+        config = uvicorn.Config(create_app(core), **served_as(core, certfile, keyfile), **SERVER_OPTIONS)
         server = uvicorn.Server(config)
         core.stop = lambda server=server: setattr(server, "should_exit", True)
         core.restart_requested = False
@@ -1509,6 +1535,99 @@ def _keys_folder(data_dir: Path, selected: str | None) -> Path | None:
         return None
 
 
+def restore_from(args: argparse.Namespace, data_dir: Path) -> int:
+    """`--restore BACKUP`: a wall brought back from its backup into an empty data folder (backup.restore), and what came
+    back said. The key from its recovery kit (`--backup-key`), or typed where there is a terminal to type it at: never from
+    the command line, which other users of a computer may see. Nothing is started; the wall is started as ever after it."""
+    from . import backup
+    from .vault_storage import StorageError, key_path
+
+    if command_conflicts := [name for name, given in (("--reset-password", args.reset_password), ("--disable-2fa", args.disable_2fa), ("--roll-back", args.roll_back)) if given]:
+        say(f"qkvm: --restore cannot be combined with {', '.join(command_conflicts)}", error=True)
+        return 2
+    # (A folder that holds only what a restore into it left when it was stopped before it finished is gone into as an empty
+    # one: the restore takes that over, or is refused while it is still under way. backup.restore.)
+    if data_dir.exists() and (not data_dir.is_dir() or (any(data_dir.iterdir()) and not backup.left_by_a_restore(data_dir))):
+        say(f"qkvm: {_in_full(data_dir)} is not empty: a backup is restored into an empty data folder only (whatever is there would be mixed with it). Name a new folder with --data-dir, or move this one aside.", error=True)
+        return 2
+    try:
+        if args.backup_key:
+            with open(args.backup_key, "rb") as kit:
+                text = kit.read(65_536).decode("utf-8", errors="replace")
+            key = backup.key_in_kit(text)
+        elif not sys.stdin.isatty():
+            say("qkvm: give the backup key's recovery kit with --backup-key KIT_FILE: there is no terminal here to type the key at", error=True)
+            return 2
+        else:
+            key = backup.key_of(getpass.getpass("Backup key, as its recovery kit writes it: "))
+    except OSError as ex:
+        say(f"qkvm: the kit {args.backup_key} cannot be read ({ex.strerror or ex})", error=True)
+        return 2
+    except ValueError as ex:
+        say(f"qkvm: {ex}", error=True)
+        return 2
+    vault_key = args.vault_key_file or os.environ.get("QKVM_VAULT_KEY_FILE") or None
+    made = not data_dir.exists()
+
+    def nothing_left() -> int:
+        if made:
+            with contextlib.suppress(OSError):
+                data_dir.rmdir()  # (made here, and empty again: what the restore wrote, it took away)
+        return 2
+
+    try:
+        own_folder(data_dir)  # (where the storage key may lie is judged by the folder itself: it is to be there)
+        selected = key_path(data_dir, Path(vault_key) if vault_key else None)
+    except (StorageError, OSError) as ex:
+        say(f"qkvm: {ex}", error=True)
+        return nothing_left()
+    if refusal := _key_would_go_with_the_container(selected):
+        say(refusal, error=True)
+        return nothing_left()
+    try:
+        done = backup.restore(Path(args.restore), key, data_dir, Path(vault_key) if vault_key else None)
+    except backup.BackupError as ex:
+        say(f"qkvm: nothing was restored: {ex.message}", error=True)
+        return nothing_left()
+    except (OSError, ValueError) as ex:  # (StorageError is a ValueError)
+        said = ex.strerror if isinstance(ex, OSError) and ex.strerror else str(ex)
+        say(f"qkvm: nothing was restored: {said}{f' ({ex.filename})' if isinstance(ex, OSError) and ex.filename else ''}", error=True)
+        return nothing_left()
+    held = done.held
+    when = time.strftime("%Y-%m-%d %H:%M", time.localtime(held.made))
+    parts = [
+        f"{held.devices} {'machine' if held.devices == 1 else 'machines'}", f"{held.accounts} {'account' if held.accounts == 1 else 'accounts'} ({held.admins} admin{'' if held.admins == 1 else 's'})",
+        f"{held.tokens} {'token' if held.tokens == 1 else 'tokens'}", f"{held.actions} saved {'action' if held.actions == 1 else 'actions'}",
+        f"{held.destinations} alert {'destination' if held.destinations == 1 else 'destinations'}",
+    ]
+    parts += ["sign-in through an identity provider"] if held.signin else []
+    parts += ["the history"] if held.history is not None else []
+    say(f"qkvm: restored {Path(args.restore).name}, made {when} by qKVM {held.program}, into {_in_full(data_dir)}:")
+    say(f"      {', '.join(parts)}.")
+    if done.cleared:
+        say(f"      A restore into this folder had been stopped before it finished: what it had written ({len(done.cleared)} {'file' if len(done.cleared) == 1 else 'files'}) was taken away first.")
+    if held.not_opening:
+        say(f"      {held.not_opening} of its {held.secrets} saved secrets do not open with its key (damaged, or from before a reset of the accounts): they are as not saved.", error=True)
+    verdict = done.verdict
+    if verdict is None:
+        say(f"      The activity log was not checked: {done.unchecked}.")
+    elif verdict.intact and not verdict.unchained:
+        say(f"      The activity log checks intact: {verdict.entries} lines, up to line {verdict.last}, with this restore's own line at its end.")
+    else:
+        say(f"      The activity log: {verdict.summary()}", error=not verdict.intact)
+        for problem in verdict.problems[:10]:
+            say(f"        {f'line {problem.line}' if problem.line is not None else 'a line'}: {problem.said}", error=True)
+    say(f"      The server storage key is {done.key_file}: a new one, this folder's own. Keep a separate private backup of it.")
+    folder = f" to {done.folder}" if done.folder else ""
+    say(
+        "      Backups are off on the restored wall, and it has no backup key (a backup holds none): make a new backup key in Settings > Backups, "
+        f"keep its kit, and switch them on once it is the only wall writing{folder}. The kit you used opens only the backups made with it."
+    )
+    started = f"qkvm --data-dir {shlex.quote(str(_in_full(data_dir)))}" if args.data_dir else "qkvm"
+    say(f"      Start it ({started}) and sign in as before: until somebody signs in, it watches nothing and sends no alert.")
+    return 0 if verdict is None or verdict.intact else 1
+
+
 class _Once(argparse.Action):
     """An option that is given once. --data-dir given twice was read as the first by the starter (__main__.data_dir) and
     as the last here: an update of one folder was run for the wall of the other. Both refuse it."""
@@ -1574,6 +1693,13 @@ def main(argv: list[str] | None = None, starter_said: tuple[str, ...] = ()) -> i
     parser.add_argument("--tls-cert", metavar="FILE", help="serve HTTPS with this certificate (PEM, with the chain that leads to it) instead of one made here")
     parser.add_argument("--tls-key", metavar="FILE", help="the private key of --tls-cert (PEM, without a passphrase)")
     parser.add_argument(
+        "--tls-tailscale",
+        action="store_true",
+        help="serve HTTPS, and Tailscale's certificate for this computer's name in its tailnet to whoever asks for that name "
+        "(https://NAME.TAILNET.ts.net, where HTTPS certificates are on in the tailnet), renewed before it ends; the wall's own "
+        "certificate, or --tls-cert's, for every other name and address. Never Funnel",
+    )
+    parser.add_argument(
         "--unlock-file",
         metavar="FILE",
         help="open the saved device passwords at start with the key in this file, so that qKVM watches, alerts and answers "
@@ -1617,6 +1743,8 @@ def main(argv: list[str] | None = None, starter_said: tuple[str, ...] = ()) -> i
     migration.add_argument("--migrate-vault", action="store_true", help="offline: protect an existing legacy vault with a separate server key, preserving accounts and credentials")
     migration.add_argument("--verify-vault", action="store_true", help="offline: verify the protected settings, backup and matching storage key without contacting devices")
     migration.add_argument("--configure-server", metavar="FILE", help="offline: apply allowed_hosts/history_days/history_mb/activity_mb from a JSON object; other vault fields cannot be edited")
+    migration.add_argument("--restore", metavar="BACKUP", help="bring a wall back from a backup (Settings > Backups) into an empty data folder (--data-dir), with its recovery kit (--backup-key); nothing is started")
+    parser.add_argument("--backup-key", metavar="KIT", help="with --restore: the backup key's recovery kit, saved as a text file. Without it the key is asked for; it is never given on the command line")
     parser.add_argument("--version", action="version", version=f"qkvm {__version__}")
     args = parser.parse_args(argv)
 
@@ -1625,6 +1753,11 @@ def main(argv: list[str] | None = None, starter_said: tuple[str, ...] = ()) -> i
         # else and is open to more: the settings with the accounts in them, the logs, the activity log.
         os.umask(0o077)
     data_dir = Path(args.data_dir) if args.data_dir else default_data_dir()
+    if args.restore is not None:
+        return restore_from(args, data_dir)  # (before anything is made in the folder, or a lock taken there: it is to be empty)
+    if args.backup_key is not None:
+        say("qkvm: --backup-key goes with --restore", error=True)
+        return 2
     if command != "start":
         return ask(command, data_dir, bool(args.data_dir))
     try:
@@ -1634,6 +1767,22 @@ def main(argv: list[str] | None = None, starter_said: tuple[str, ...] = ()) -> i
         # A trial update installed by an older updater must fail before any settings migration. Status 1
         # lets even the original supervisor roll it back; status 2 is reserved for configuration errors.
         return 1
+    if backup.unfinished_restore(data_dir):
+        # (The review of 0.4.0's last round, L5.) What a restore under way, or stopped, has written is no wall yet: started on
+        # it, this was a first start beside the old wall's activity log (which then checked broken), and what the start wrote
+        # (its lock first) kept the same --restore from finishing. Nothing is written here.
+        say(f"qkvm: a restore into {_in_full(data_dir)} has not finished ({backup.RESTORING} is there, and no settings yet): it is under way, or it was stopped.", error=True)
+        say("      Run the same `qkvm --restore BACKUP --backup-key KIT --data-dir ...` command again: it takes over what the stopped one wrote and finishes it. Then start qKVM. Nothing was started.", error=True)
+        return 2
+    # glibc's malloc held to two arenas and a fixed trim threshold, before the first thread (the log's): for a wall that came to
+    # this version from inside the app, whose starter sets neither in its environment (_allocator). Said in the log below.
+    _, malloc_said = _allocator.apply()
+    if sys.platform == "win32":
+        # The same for the quieting of a connection reset as Windows' event loop closes it, which a starter from before 0.4.0
+        # does not put on (the last look at the hold round, L3): its own module, not the starter's (_resets).
+        from . import _resets
+
+        _resets.quiet_resets()
     lock = InstanceLock(data_dir)
     try:
         # A folder made here is its owner's alone: what is in it is not for the others who use this computer. (On Windows by
@@ -1820,6 +1969,8 @@ def main(argv: list[str] | None = None, starter_said: tuple[str, ...] = ()) -> i
         setup_logging(data_dir, args.log_level)
         for line in warned:
             log.warning("%s", line, extra=SAID)  # (said above, in words of its own)
+        for line in malloc_said:
+            log.warning("%s", line)
         vault_key = args.vault_key_file or os.environ.get("QKVM_VAULT_KEY_FILE") or None
         # A key is made by a migration, and by the start of a wall that has no settings yet.
         # (Not beside files sealed with a key: the key that is not found there is asked for, never made. See sealed_beside.)
@@ -1873,6 +2024,7 @@ def main(argv: list[str] | None = None, starter_said: tuple[str, ...] = ()) -> i
                 allow_from=networks_said("--allow-from", args.allow_from),
                 https=args.https,
                 tls_files=tls_pair(args.tls_cert, args.tls_key),
+                tailscale_cert=args.tls_tailscale,
                 unlock_secret=secret,
                 sso_header=args.sso_header,
                 audit_syslog=args.audit_syslog,
@@ -1923,7 +2075,7 @@ def main(argv: list[str] | None = None, starter_said: tuple[str, ...] = ()) -> i
             # ...and in the activity log, where whoever looks into what happened looks: an account's second step taken away is
             # one of the first things asked after an incident. (Written before the program ends: the log's writer is a thread.)
             core.audit.write("totp_disabled", "", account=account.name, note="from the command line where qKVM runs")
-            core.audit.flush()
+            core.audit.close(CLOSE_LOG_WITHIN)
             say(f"Two-factor sign-in is off for {account.name}. Their password is unchanged.")
             return 0
         if args.reset_password:
@@ -1934,7 +2086,7 @@ def main(argv: list[str] | None = None, starter_said: tuple[str, ...] = ()) -> i
                 return 2
             log.warning("accounts reset from the command line")
             core.audit.write("accounts_reset", "", note="from the command line where qKVM runs: every account and every saved password erased")
-            core.audit.flush()
+            core.audit.close(CLOSE_LOG_WITHIN)
             say("Accounts cleared. Start qKVM and open it to create the first one again, then re-enter the KVM passwords.")
             if left:
                 names = ", ".join(left)

@@ -14,10 +14,13 @@
 #   locks the libraries         the exact wheels of every library the version runs, for each Python and system an update
 #                               is installed in place on, held to PyPI's hashes; tries that set on Linux x86-64 and ARM64
 #                               and on Windows, with the oldest and the newest Python; and builds the image from it
+#   makes the SBOM              qkvm-1.2.3-sbom.cdx.json (CycloneDX 1.5): every library the lock names, read from the
+#                               metadata of each target's lock and the wheel as pip installs them there
 #   audits the installed wheel and both final container archives against fresh vulnerability data, and records
 #   and gates the native libraries inside the image that the scan cannot see
 #   signs SHA256SUMS            of qkvm-1.2.3-py3-none-any.whl, qkvm-1.2.3.tar.gz, qkvm-1.2.3-libraries.json (the
-#                               lock, which every copy's updater holds each library it fetches to) and qkvm-1.2.3-image.json
+#                               lock, which every copy's updater holds each library it fetches to), qkvm-1.2.3-sbom.cdx.json
+#                               and qkvm-1.2.3-image.json
 #                               (what each architecture's scan saw, and the run that keeps those archives), with
 #                               the RELEASE_SIGNING_KEY secret: a version that has a release key built in is not
 #                               published without it, anywhere. The runner's openssl signs, in a job that does only
@@ -120,10 +123,15 @@ on:
 permissions:
   contents: read
 
-# The run that makes a tag's draft and the run its publication starts never overlap.
+# The run that makes a tag's draft and the run its publication starts never overlap: one group, release-<tag>, where one
+# run runs and the next waits. Nothing there cancels the run that runs; what GitHub does cancel is a run that waits, once a
+# third joins the group (a run of the tag started again by hand while its publication waits, say). A rehearsal's branch
+# pushed again cancels that branch's older run, which the push made stale (it held the runners half an hour in the 0.4.0
+# cycle): only a push of a release-* branch has cancel-in-progress, and its group is the branch's, release-<branch>, which
+# no tag's is. So a superseded rehearsal's run started again by hand cancels the branch's newer run in its turn.
 concurrency:
   group: release-${{ github.event.release.tag_name || github.ref_name }}
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release-') }}
 
 env:
   TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || github.ref_name }}
@@ -293,15 +301,20 @@ jobs:
           [[ "$SUMS" =~ ^[0-9a-f]{64}$ ]]
           test "$(sha256sum release/SHA256SUMS | cut -d ' ' -f 1)" = "$SUMS"
           (cd release && sha256sum --check --strict SHA256SUMS)
+      # (The SBOM is read from the metadata of each target's lock and the wheel as pip installs them there, from the wheels
+      # downloaded and held to PyPI's hashes above: nothing fetched, nothing of a wheel run; make-sbom.py is Python's own
+      # library alone. It goes into LIBRARIES.sums, whose hash is handed on, and into the signed SHA256SUMS.)
       - id: lock
-        name: The lock, made with pip and packaging pinned by hash, and read back as every copy reads it
+        name: The lock, made with pip and packaging pinned by hash, and read back as every copy reads it; and the SBOM
         run: |
           set -euo pipefail
           python -m venv "$RUNNER_TEMP/locker"
           "$RUNNER_TEMP/locker/bin/python" -m pip install --require-hashes --no-deps --only-binary :all: -r .github/security/lock-requirements.txt
           "$RUNNER_TEMP/locker/bin/python" -I .github/security/make-libraries.py --version "${TAG#v}" \
-            --wheel "release/qkvm-${TAG#v}-py3-none-any.whl" --work "$RUNNER_TEMP/libraries" --out libraries
+            --wheel "release/qkvm-${TAG#v}-py3-none-any.whl" --work "$RUNNER_TEMP/libraries" --out libraries --environments "$RUNNER_TEMP/environments"
           "$RUNNER_TEMP/locker/bin/python" -m qkvm.release libraries "libraries/qkvm-${TAG#v}-libraries.json"
+          python -I -S .github/security/make-sbom.py --version "${TAG#v}" --wheel "release/qkvm-${TAG#v}-py3-none-any.whl" --lock "libraries/qkvm-${TAG#v}-libraries.json" --environments "$RUNNER_TEMP/environments" --output "libraries/qkvm-${TAG#v}-sbom.cdx.json"
+          (cd libraries && sha256sum -- "qkvm-${TAG#v}-sbom.cdx.json" >> LIBRARIES.sums)
           (cd libraries && sha256sum --check --strict LIBRARIES.sums)
           # (Into a variable first: a failing substitution in an argument of echo passes set -e unseen.)
           sums=$(sha256sum libraries/LIBRARIES.sums | cut -d ' ' -f 1)
@@ -650,8 +663,9 @@ jobs:
           done
 
       # The lock that the job libraries made, tried by the jobs after it, held to its hash; in the checksums that are signed,
-      # which every copy's updater holds it to before it fetches one library by it.
-      - name: The lock, in the checksums that are signed
+      # which every copy's updater holds it to before it fetches one library by it. And the SBOM it made from that lock,
+      # held to the same hash.
+      - name: The lock and the SBOM, in the checksums that are signed
         env:
           LIBRARIES: ${{ needs.libraries.outputs.sums }}
         run: |
@@ -661,6 +675,8 @@ jobs:
           (cd libraries && sha256sum --check --strict LIBRARIES.sums)
           cp "libraries/qkvm-${TAG#v}-libraries.json" release/
           (cd release && sha256sum -- "qkvm-${TAG#v}-libraries.json" >> SHA256SUMS)
+          cp "libraries/qkvm-${TAG#v}-sbom.cdx.json" release/
+          (cd release && sha256sum -- "qkvm-${TAG#v}-sbom.cdx.json" >> SHA256SUMS)
 
       # What each architecture's scan saw, what each image said of the native code the scanner cannot see, the commit,
       # and the run that keeps the archives: signed with the packages, so that the publication pushes those archives
@@ -782,17 +798,17 @@ jobs:
             exit 1
           fi
 
-      # The signed list names the four files of this version and nothing else, before a draft of it exists; and the
-      # folder whose every file the draft is made with holds those four, the list and its signature, and nothing
-      # else (each a plain file): a seventh would go onto the draft unchecked.
-      - name: The signed list is this version's four files, and the folder holds those, the list and its signature only
+      # The signed list names the five files of this version and nothing else, before a draft of it exists; and the
+      # folder whose every file the draft is made with holds those five, the list and its signature, and nothing
+      # else (each a plain file): an eighth would go onto the draft unchecked.
+      - name: The signed list is this version's five files, and the folder holds those, the list and its signature only
         run: |
           set -euo pipefail
           listed=$(awk '{print $2}' release/SHA256SUMS | LC_ALL=C sort | tr '\n' ' ')
-          test "$listed" = "qkvm-${TAG#v}-image.json qkvm-${TAG#v}-libraries.json qkvm-${TAG#v}-py3-none-any.whl qkvm-${TAG#v}.tar.gz "
+          test "$listed" = "qkvm-${TAG#v}-image.json qkvm-${TAG#v}-libraries.json qkvm-${TAG#v}-py3-none-any.whl qkvm-${TAG#v}-sbom.cdx.json qkvm-${TAG#v}.tar.gz "
           test -z "$(find release -mindepth 1 ! -type f)"
           held=$(ls -A release | LC_ALL=C sort | tr '\n' ' ')
-          test "$held" = "SHA256SUMS SHA256SUMS.sig qkvm-${TAG#v}-image.json qkvm-${TAG#v}-libraries.json qkvm-${TAG#v}-py3-none-any.whl qkvm-${TAG#v}.tar.gz "
+          test "$held" = "SHA256SUMS SHA256SUMS.sig qkvm-${TAG#v}-image.json qkvm-${TAG#v}-libraries.json qkvm-${TAG#v}-py3-none-any.whl qkvm-${TAG#v}-sbom.cdx.json qkvm-${TAG#v}.tar.gz "
 
       - name: Make the draft release, then check every file it holds against the signature
         env:
@@ -809,7 +825,7 @@ jobs:
           gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100" --paginate --slurp > "$RUNNER_TEMP/artifacts.json"
           until=$(python3 .github/security/image-digests.py publish-before "$RUNNER_TEMP/artifacts.json" --margin-days 2 --artifact-id "amd64=$AMD64_ARTIFACT" --artifact-id "arm64=$ARM64_ARTIFACT")
           gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft --verify-tag --title "qKVM ${TAG#v}" \
-            --notes "qKVM ${TAG#v}. What changed is in CHANGELOG.md. Publish this draft before $until: the image archives it sends to the registries are kept until then." release/*
+            --notes "qKVM ${TAG#v}. What changed is in CHANGELOG.md. qkvm-${TAG#v}-sbom.cdx.json is its SBOM: every library installing it brings in, for each Python and system it is built for, with its version, licence and the SHA-256 of its wheels, in CycloneDX 1.5. SHA256SUMS lists it and SHA256SUMS.sig signs that list, as for the packages: how to check it is under Updates in the guide (docs.qkvm.com). Publish this draft before $until: the image archives it sends to the registries are kept until then." release/*
           id=$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" --paginate | jq --arg tag "$TAG" '.[] | select(.tag_name == $tag) | .id')
           test "$(wc -w <<< "$id")" -eq 1
           gh api "repos/$GITHUB_REPOSITORY/releases/$id" --jq '.draft' | grep --quiet --line-regexp true
@@ -826,9 +842,9 @@ jobs:
           done
           # Signed with a key built in, every file it holds listed with its checksum, every file listed held.
           /usr/bin/python3 -m qkvm.release verify --all --signed --openssl "$drafted/SHA256SUMS" "${files[@]}"
-          # And the list names the four files of this version and nothing else, as the publication will require.
+          # And the list names the five files of this version and nothing else, as the publication will require.
           listed=$(awk '{print $2}' "$drafted/SHA256SUMS" | LC_ALL=C sort | tr '\n' ' ')
-          test "$listed" = "qkvm-${TAG#v}-image.json qkvm-${TAG#v}-libraries.json qkvm-${TAG#v}-py3-none-any.whl qkvm-${TAG#v}.tar.gz "
+          test "$listed" = "qkvm-${TAG#v}-image.json qkvm-${TAG#v}-libraries.json qkvm-${TAG#v}-py3-none-any.whl qkvm-${TAG#v}-sbom.cdx.json qkvm-${TAG#v}.tar.gz "
           # The very files the cryptography library checked in the job before (and openssl here).
           cmp "$drafted/SHA256SUMS" release/SHA256SUMS
           cmp "$drafted/SHA256SUMS.sig" release/SHA256SUMS.sig
@@ -878,10 +894,10 @@ jobs:
           /usr/bin/python3 -c "import cryptography" 2>/dev/null || { sudo apt-get update --quiet && sudo apt-get install --yes --quiet python3-cryptography; }
           # Signed with a key built in, every file it holds listed with its checksum, every file listed held.
           /usr/bin/python3 -m qkvm.release verify --all --signed "$RUNNER_TEMP/published/SHA256SUMS" "${files[@]}"
-          # And the list names the four files of this version and nothing else: the wheel the updater takes by this
-          # name, the lock of its libraries, the source archive, the image record.
+          # And the list names the five files of this version and nothing else: the wheel the updater takes by this
+          # name, the lock of its libraries, the source archive, the image record, the SBOM.
           listed=$(awk '{print $2}' "$RUNNER_TEMP/published/SHA256SUMS" | LC_ALL=C sort | tr '\n' ' ')
-          test "$listed" = "qkvm-${TAG#v}-image.json qkvm-${TAG#v}-libraries.json qkvm-${TAG#v}-py3-none-any.whl qkvm-${TAG#v}.tar.gz "
+          test "$listed" = "qkvm-${TAG#v}-image.json qkvm-${TAG#v}-libraries.json qkvm-${TAG#v}-py3-none-any.whl qkvm-${TAG#v}-sbom.cdx.json qkvm-${TAG#v}.tar.gz "
           mkdir "$RUNNER_TEMP/records"
           run=$(python3 .github/security/image-digests.py from-release --version "${TAG#v}" --commit "$GITHUB_SHA" "$RUNNER_TEMP/published/qkvm-${TAG#v}-image.json" "$RUNNER_TEMP/records")
           echo "run=$run" >> "$GITHUB_OUTPUT"

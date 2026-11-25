@@ -1,0 +1,73 @@
+# qKVM beside NetBird, in containers:   docker compose -f docker-compose.netbird.yml up -d
+#
+# NetBird's own container joins your NetBird network as the machine "qkvm", and qKVM's container shares its network:
+# the wall is reached at its NetBird address (https://<its 100.x address>:8787/), and reaches the KVMs over NetBird.
+# Nothing is published on this machine's own network: only the NetBird network reaches the wall.
+#
+# The setup key: make one in NetBird's dashboard (Setup Keys), and put it in a file called .env beside this one:
+#     NB_SETUP_KEY=...
+# Where you run NetBird's management yourself, its address as well:
+#     NB_MANAGEMENT_URL=https://netbird.example.org
+# Neither is written in here. The key is needed for the first start only: the machine's identity is kept in the
+# volumes netbird-config and netbird-state, and the key can be taken out of .env then.
+#
+# "Find KVMs" lists the NetBird network's machines once qKVM is given NetBird's management API and a token of a service
+# user, under Settings > Network: the token is kept encrypted in qKVM's vault and never shown again (see the guide's
+# chapter "Over Tailscale or NetBird").
+#
+# First run: choose a password at the address above, with the setup code from `docker compose -f
+# docker-compose.netbird.yml logs qkvm`.
+services:
+  netbird:
+    # NetBird 0.83.1, pinned by the digest of its image for every platform (the guide says how to move it on).
+    image: netbirdio/netbird:0.83.1@sha256:3c9d68ae8b730aaed841ff5374e3efad8be550099871a52b1a653d30e5f4faf2
+    container_name: qkvm-netbird
+    hostname: qkvm
+    restart: unless-stopped
+    environment:
+      NB_SETUP_KEY: ${NB_SETUP_KEY:-}
+      NB_MANAGEMENT_URL: ${NB_MANAGEMENT_URL:-https://api.netbird.io}
+    volumes:
+      - netbird-config:/etc/netbird
+      - netbird-state:/var/lib/netbird
+    cap_add:
+      - NET_ADMIN
+      - SYS_ADMIN
+      - SYS_RESOURCE
+    # To reach the wall from this machine's own network as well (it is the NetBird network only without this):
+    # ports:
+    #   - "8787:8787"
+
+  qkvm:
+    image: qkvm/qkvm
+    container_name: qkvm
+    restart: unless-stopped
+    network_mode: service:netbird
+    depends_on:
+      - netbird
+    volumes:
+      - qkvm-data:/data
+      - qkvm-keys:/keys
+    command: ["--https", "--setup-code"]
+    #
+    # /keys holds the independent server storage key. Back up this volume separately
+    # from /data. Losing it prevents recovery; account recovery codes cannot replace it.
+    # Run with as little as it needs.
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
+
+volumes:
+  qkvm-data:
+  qkvm-keys:
+  netbird-config:
+  netbird-state:

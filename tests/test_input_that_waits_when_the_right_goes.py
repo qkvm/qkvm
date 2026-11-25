@@ -102,7 +102,12 @@ def test_a_guests_key_waiting_for_its_console_is_not_sent_once_the_line_lost_the
             await device.close()
 
     asyncio.run(run())
-    assert (0x61, True) in screen.keys
+    # (The fake guest notes keys on its own thread, which on a loaded runner can be late: so the A is waited for, not
+    # looked for once. Once it is there, Ctrl, sent after it, would have been noted as well.)
+    deadline = time.monotonic() + 20
+    while (0x61, True) not in screen.keys:
+        assert time.monotonic() < deadline, f"the guest never got the A: {screen.keys}"
+        time.sleep(0.05)
     assert (0xFFE3, True) not in screen.keys, f"Ctrl went to the guest after the line lost the keyboard: {screen.keys}"
 
 

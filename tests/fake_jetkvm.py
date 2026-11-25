@@ -49,6 +49,7 @@ import base64
 import datetime
 import hashlib
 import json
+import socket
 import struct
 import time
 import uuid
@@ -144,6 +145,14 @@ class JetState:
     # False: an offer takes the viewer (as every offer does) and is never answered, as for one whose video connection never
     # comes about (UDP blocked between the two, its network addresses unreachable from the viewer's).
     answers_offers: bool = True
+    # False: it answers an offer, and so takes the viewer, as a real one does as it answers (cloud.go), and then lets that
+    # connection go at once, its network addresses never sent: the connection never comes up (UDP blocked between the two).
+    connects: bool = True
+    # True: it refuses every offer in so many words ({"error": ...}, as a real one does where it cannot make a session of
+    # it), and so takes nothing from the viewer it has.
+    refuses_offers: bool = False
+    # True: it takes each offer, as every offer does, and closes the signalling at once, unanswered.
+    closes_on_offer: bool = False
     sessions: int = 0  # video connections made so far
     actions: list[str] = field(default_factory=list)
     typed: list[tuple[int, list[int]]] = field(default_factory=list)  # every keyboard state with keys down that a message made
@@ -202,8 +211,12 @@ class FakeScreen(MediaStreamTrack):
         self.silent = state.silent_screens > 0
         if self.silent:
             state.silent_screens -= 1
+        # A picture is being encoded and sent: from the moment it was handed over until the next is asked for (the WebRTC
+        # library asks for the next only once it has sent the last).
+        self.sending = False
 
     async def recv(self) -> av.VideoFrame:
+        self.sending = False
         self.count += 1
         delay = self.started + self.count / 10 - time.monotonic()
         if delay > 0:
@@ -221,6 +234,7 @@ class FakeScreen(MediaStreamTrack):
         frame = frame.reformat(format="yuv420p")
         frame.pts = self.count * 9000
         frame.time_base = Fraction(1, 90000)
+        self.sending = True
         return frame
 
 
@@ -249,7 +263,7 @@ def make_fake_jetkvm(state: JetState) -> FastAPI:
 
     app = FastAPI(lifespan=lifespan)
     # The viewer's connection, its `rpc` and `hidrpc` channels, and whether it did the hidrpc handshake.
-    current: dict[str, Any] = {"pc": None, "rpc": None, "hid": None, "shaken": False}
+    current: dict[str, Any] = {"pc": None, "rpc": None, "hid": None, "shaken": False, "screen": None}
 
     def allowed(cookies: dict[str, str]) -> bool:
         if not state.setup:
@@ -672,7 +686,7 @@ def make_fake_jetkvm(state: JetState) -> FastAPI:
             old_rpc.send(json.dumps({"jsonrpc": "2.0", "method": "otherSessionConnected", "params": None}))
         asyncio.get_running_loop().call_later(state.hand_over_close, close_connection, old_pc)
         let_go_of_the_keyboard()  # (a real one let go of a key the previous viewer held, as the next one came; said to it)
-        current.update(pc=None, rpc=None, hid=None, shaken=False)  # (somebody else's now)
+        current.update(pc=None, rpc=None, hid=None, shaken=False, screen=None)  # (somebody else's now)
 
     def close_connection(pc: RTCPeerConnection) -> None:
         # Own both explicit and library-initiated cleanup until it finishes.
@@ -705,8 +719,22 @@ def make_fake_jetkvm(state: JetState) -> FastAPI:
             params = {"ready": ready, "width": state.width, "height": state.height, "fps": 60}
             rpc.send(json.dumps({"jsonrpc": "2.0", "method": "videoInputState", "params": params}))
 
+    told = asyncio.Lock()  # (what the screen did is said in the order it did it)
+
+    async def tell_video_in_turn(ready: bool) -> None:
+        """`tell_video`, once the picture being sent as the screen went has gone out. A real JetKVM's encoder takes some
+        milliseconds over a picture, and the screen's loss is noticed after that: no picture from before comes after it said
+        the screen went. The stand-in's encoder, Python's, in a thread, took longer on a slow runner (GitHub's Windows
+        runner, 2026-11-16) than the whole moment without signal: its picture from before came after the screen was back."""
+        async with told:
+            screen = current["screen"]
+            until = time.monotonic() + 10.0  # (a connection whose picture never goes out is ending: it is not waited for)
+            while not ready and screen is not None and screen.sending and current["screen"] is screen and time.monotonic() < until:
+                await asyncio.sleep(0.005)
+            tell_video(ready)
+
     app.state.hand_over, app.state.current, app.state.drop, app.state.close_hid = hand_over, current, drop, close_hid
-    app.state.tell_video = tell_video
+    app.state.tell_video, app.state.tell_video_in_turn = tell_video, tell_video_in_turn
 
     def say_on_rpc(text: str) -> None:
         """Say something on the viewer's `rpc` channel, word for word (a test's: what a real one never says)."""
@@ -790,17 +818,23 @@ def make_fake_jetkvm(state: JetState) -> FastAPI:
                 state.video_offers.append(offer["sdp"])
                 state.offers_at.append(time.monotonic())
 
-                # One viewer at a time: tell the previous one, then drop it.
                 current["loop"] = asyncio.get_running_loop()
+                if state.refuses_offers:
+                    await websocket.send_text(json.dumps({"error": "failed to create session"}))
+                    continue
+                # One viewer at a time: tell the previous one, then drop it.
                 hand_over()
+                if state.closes_on_offer:
+                    await websocket.close()
+                    return
                 if not state.answers_offers:
                     continue
 
                 pc = RTCPeerConnection(RTCConfiguration(iceServers=[]))
                 peers.add(pc)
-                current.update(pc=pc, rpc=None, hid=None, shaken=False)
+                current.update(pc=pc, rpc=None, hid=None, shaken=False, screen=FakeScreen(state))
                 state.sessions += 1
-                pc.addTrack(FakeScreen(state))
+                pc.addTrack(current["screen"])
 
                 @pc.on("connectionstatechange")
                 def on_state(pc: RTCPeerConnection = pc) -> None:
@@ -840,6 +874,9 @@ def make_fake_jetkvm(state: JetState) -> FastAPI:
                 ) + "\r\n"
                 answer = base64.b64encode(json.dumps({"type": "answer", "sdp": bare}).encode()).decode()
                 await websocket.send_text(json.dumps({"type": "answer", "data": answer}))
+                if not state.connects:
+                    close_connection(pc)
+                    continue
                 for candidate in candidates + state.extra_candidates:
                     await asyncio.sleep(0.01)
                     data = {"candidate": candidate, "sdpMid": "0", "sdpMLineIndex": 0}
@@ -892,9 +929,10 @@ class FakeJetKvm:
     the same `state` and no `tls_dir` is that.
     """
 
-    def __init__(self, state: JetState | None = None, port: int = 0, tls_dir: Path | None = None) -> None:
+    def __init__(self, state: JetState | None = None, port: int = 0, tls_dir: Path | None = None, sock: socket.socket | None = None) -> None:
+        """`sock`: one bound already (to a port a test held for it: see test_jetkvm's port_held), where `port` is not given."""
         self.state = state or JetState()
-        self._sock = local_socket(port)
+        self._sock = sock if sock is not None else local_socket(port)
         self.port: int = self._sock.getsockname()[1]
         tls = {}
         if tls_dir is not None:
@@ -935,14 +973,15 @@ class FakeJetKvm:
             loop.call_soon_threadsafe(self._app.state.say_on_rpc, text)
 
     def say_signal(self, ready: bool) -> None:
-        """The computer's screen goes to sleep, or comes back (from a test's thread), and the viewer is told so at once;
-        a screen that comes back sends its first picture `frames_after_signal` later."""
+        """The computer's screen goes to sleep, or comes back (from a test's thread), and the viewer is told so at once (a
+        screen that goes: once the picture being sent has gone out); a screen that comes back sends its first picture
+        `frames_after_signal` later."""
         if ready:
             self.state.frames_from = time.monotonic() + self.state.frames_after_signal
         self.state.signal = ready
         loop = self._app.state.current.get("loop")
         if loop is not None:
-            loop.call_soon_threadsafe(self._app.state.tell_video, ready)
+            asyncio.run_coroutine_threadsafe(self._app.state.tell_video_in_turn(ready), loop)
 
     def stop(self) -> None:
         self._server.should_exit = True

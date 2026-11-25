@@ -67,6 +67,7 @@ from .kvm import (
     KvmDevice,
     KvmError,
     Listening,
+    no_video,
     picture_size,
     plain,
     tier_for,
@@ -216,6 +217,9 @@ class Pass:
     device_id: str
     holder: Holder
     until: float
+    # The machine's connection the pass was given for: an edit of its tile (another address, another machine) puts another in
+    # its place, and the pass opens no line to that one (`gone`), as a line open by then ends (`retiring`). None: not bound.
+    device: Device | None = None
 
 
 # Whether a holder may still be on a line to this machine: None, or the code that says why not. Asked now and then
@@ -960,6 +964,8 @@ class Source:
         return False
 
     def offer(self, kind: int, key: bool, data: bytes) -> None:
+        if self.machine.trouble is not None:
+            self.machine.trouble_over()  # (a picture again: the lines are told how the machine is, not why there was none)
         self.counter += 1
         picture = Picture(kind, key, self.counter, data)
         if key:
@@ -998,6 +1004,8 @@ class Source:
                 if getattr(self.machine.device, "console_readable", True) is False:  # settled: a server with no console the wall reads
                     self.machine.no_live(ex.message)
                     return
+                if ex.code == "no_video":  # no picture can be made on this computer: its lines are told why, as its tile is
+                    self.machine.picture_trouble(ex)
                 # Down, or not giving a picture: said once a minute while it goes on, and tried again with a pause that grows.
                 now = time.monotonic()
                 if now - self._said_at >= SAY_AGAIN:
@@ -1330,7 +1338,7 @@ class ConsoleSource(Source):
 
     async def run(self) -> None:
         from .redfish import QUANTIZER, screen_jpeg
-        from .video import VideoSession
+        from .video import VideoSession, VideoUnavailable
 
         encoder = VideoSession()
         device = self.machine.device
@@ -1344,6 +1352,8 @@ class ConsoleSource(Source):
                     target = None if size == FULL or TIERS[size][0] >= width else TIERS[size][0]
                     try:
                         data = await asyncio.to_thread(screen_jpeg, width, height, shown, target, QUANTIZER[size], encoder)
+                    except VideoUnavailable as unable:  # (a VideoError, and so a ValueError: said, not let go of as below)
+                        raise no_video(unable) from None
                     except ValueError:
                         data = b""  # the screen changed size while its picture was being made: the next look has it whole
                     if data:
@@ -1470,6 +1480,7 @@ class Machine:
         self.hid: Hid | None = None
         self.input_at = 0.0  # when the holder last sent input (INPUT), or took keyboard and mouse: see IDLE_GIVE_BACK
         self.state: tuple[Any, Any, Any, Any] | None = None  # what the lines were last told of how the machine is
+        self.trouble: dict[str, Any] | None = None  # why no picture can be made of it while it is well (picture_trouble)
         self.watching: asyncio.Task[None] | None = None
 
     async def join(self, line: Line) -> None:
@@ -1540,7 +1551,24 @@ class Machine:
         for line in list(self.viewers):
             line.end("no_live", why)
 
+    def picture_trouble(self, ex: KvmError) -> None:
+        """No picture can be made of it for a reason of the wall's own while the machine is well (no_video: no video worker
+        can start on this computer, so a server's or a PC's screen cannot be made into pictures): its lines are told so, as
+        its tile is, in place of how the machine is, until a picture comes (`trouble_over`)."""
+        word = {"t": "state", "state": "error", "error": ex.as_dict()}
+        if word != self.trouble:
+            self.trouble = word
+            for line in list(self.viewers):
+                line.say(dict(word))
+
+    def trouble_over(self) -> None:
+        self.trouble = None
+        for line in list(self.viewers):
+            line.say(self._state_word())
+
     def _state_word(self) -> dict[str, Any]:
+        if self.trouble is not None:
+            return dict(self.trouble)
         state, code, message, pointer = self.state or ("connecting", None, None, None)
         word: dict[str, Any] = {"t": "state", "state": state}
         if code is not None:
@@ -2047,8 +2075,9 @@ class Lines:
         await handed_over(self.handing, device_id)
         return True
 
-    def issue(self, device_id: str, holder: Holder) -> str:
-        """A pass for one line to this machine, good for half a minute and for one use.
+    def issue(self, device_id: str, holder: Holder, device: Device | None = None) -> str:
+        """A pass for one line to this machine, good for half a minute and for one use; `device`: the connection it is for
+        (Pass.device), which the line is then opened to or not at all.
 
         KvmError `busy` (429) where the account has as many lines open and passes out as it may (MOST_LINES_EACH), or the
         wall as many passes out as it gives: never by taking another's pass away, which anybody who may look at one
@@ -2062,17 +2091,17 @@ class Lines:
         if len(self.passes) >= MOST_PASSES:
             raise KvmError("busy", "Live pictures are being opened on this wall by the hundred just now. Try again in a moment.", 429)
         ticket = secrets.token_urlsafe(24)
-        self.passes[ticket] = Pass(device_id, holder, now + PASS_LASTS)
+        self.passes[ticket] = Pass(device_id, holder, now + PASS_LASTS, device)
         return ticket
 
-    def redeem(self, ticket: Any, device_id: str) -> Holder | None:
-        """Whom this pass was given to, for this machine: None where it is no pass, was used, or has run out. Used up by this."""
+    def redeem(self, ticket: Any, device_id: str) -> Pass | None:
+        """The pass, given for this machine: None where it is no pass, was used, or has run out. Used up by this."""
         if not isinstance(ticket, str) or not TICKET.fullmatch(ticket):
             return None
         given = self.passes.pop(ticket, None)
         if given is None or given.device_id != device_id or given.until < time.monotonic():
             return None
-        return given.holder
+        return given
 
     def owed(self, task: asyncio.Task[None], device_id: str) -> None:
         """What a device is still owed (a letting go, a line closed to the end): waited for, within a time, before its connection is closed."""
@@ -2090,15 +2119,21 @@ class Lines:
         """One line, from its first message to its end. `address`: whom the line comes from, as the pass's holder was seen."""
         await ws.accept()
         hello = await self._hello(ws)
-        holder = self.redeem(hello.get("ticket"), device_id) if hello.get("t") == "hello" and hello.get("v") == FORM else None
-        if holder is None or holder.ip != address:
+        given = self.redeem(hello.get("ticket"), device_id) if hello.get("t") == "hello" and hello.get("v") == FORM else None
+        if given is None or given.holder.ip != address:
             # (A pass is for the address it was given to: one handed on to another host is no pass there.)
             await self._turn_away(ws, "no_pass", "This live line was not let in: it showed no pass this qKVM gave for it")
             return
+        holder = given.holder
         why, may_control = self.standing(holder, device_id)
         device = self.manager.devices.get(device_id)
         if why is not None or device is None:
             await self._turn_away(ws, why or "not_found", SAID.get(why or "not_found", "This line may not go on"))
+            return
+        if given.device is not None and given.device is not device:
+            # The tile was edited (or its connection made anew) between the pass and the line: what it is at now may be another
+            # machine than the one whose view asked for the pass, and its keys would go there. Ended as a line open then ends.
+            await self._turn_away(ws, "gone", "This machine was changed or taken off the wall. Open it again.")
             return
         if not self.offers(device):
             await self._turn_away(ws, "no_live", self.why_no_live(device))

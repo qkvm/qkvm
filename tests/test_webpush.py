@@ -11,13 +11,14 @@ import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote
 
 import httpx
 import pytest
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric import ec
 
-from qkvm import webpush
+from qkvm import egress, webpush
 from qkvm.alerts import Alert
 from tests.fake_push import NAMES, Browser, FakePush, signed, verified
 
@@ -200,7 +201,7 @@ def test_a_subscription_has_a_browsers_keys() -> None:
         "::ffff:10.0.0.1", "::ffff:127.0.0.1", "64:ff9b::a00:1", "64:ff9b::7f00:1", "2002:a00:1::1", "2002:c0a8:101::1", "::10.0.0.1",  # an IPv4 one inside
         "fe80::1%eth0", "not an address", "",
         # The local-use NAT64 prefix (RFC 8215): where its IPv4 sits is its translator's to choose, at /64 here 10.0.0.8,
-        # which read as /96 is 8.0.0.0 (the outside review of 0.3.0, Codex's M5); and at /96 a public one, all the same
+        # which read as /96 is 8.0.0.0 (the outside review of 0.3.0, M5); and at /96 a public one, all the same
         "64:ff9b:1:abcd:a:0:800:0", "64:ff9b:1::808:808",
     ],
 )  # fmt: skip
@@ -344,6 +345,98 @@ def test_a_refusal_says_the_services_reason_and_no_more_of_its_answer(service: F
     assert "HTTP 403, BadJwtToken" in said and "x" * 10 not in said
     service.service.body = b'{"reason":"<script>alert(1)</script>"}'
     assert "script" not in run(once())
+
+
+def letter_runs(text: str) -> list[str]:
+    """Every run of letters in a text that is long enough to be a part of it (egress.PART), in whatever case it is written,
+    40 at the most of each: what a push service's reason, a word of letters, can hold."""
+    runs = "".join(ch if ch.isalpha() and ch.isascii() else " " for ch in text).split()
+    return [run[:40] for run in runs if len(run) >= egress.PART]
+
+
+def test_a_refusal_never_says_back_a_part_of_what_the_request_carried(service: FakePush) -> None:
+    # The outside review of 0.4.0, L1, for every outbound request: a push service's reason is a word of letters, shown to
+    # whoever looks at the browser's alerts and written to the log. One that repeats a part of what it got (the signed
+    # token, or the path of the browser's address at it, which is what lets anybody send there) showed that part. Every run
+    # of letters of what it got, each said back by itself: also one in small letters, or with a capital and small letters,
+    # which read as a word (N5's rule kept such a run, and this test was narrowed to the others; the last look, L1).
+    phone, sent = Browser(path="/send/zQxWvBkPjYtRmLnHgDcF/qzxkvwpjtm/Vbnmqwrtz"), Sent()  # (letters, in every case; no word the answer says)
+    service.service.status = 404
+
+    async def once() -> str:
+        try:
+            await sent.pusher.send(target(phone), b"{}")
+        except webpush.NotDelivered as ex:
+            return str(ex)
+        finally:
+            await sent.pusher.close()
+        raise AssertionError("delivered")
+
+    for said_back in (lambda got: got.path, lambda got: got.headers["Authorization"].split("t=", 1)[1].split(".", 1)[1]):
+        checked = 0
+        while True:
+            echoed: list[str] = []
+
+            def echo(got: Any, said_back: Any = said_back, which: int = checked, echoed: list[str] = echoed) -> bytes:
+                runs = letter_runs(said_back(got))
+                echoed.append(runs[which] if which < len(runs) else "")
+                return json.dumps({"reason": echoed[-1]}).encode()
+
+            service.service.echo = echo
+            said = run(once())
+            assert said.startswith("The push service says this browser is no longer subscribed (HTTP 404)"), said
+            [word] = echoed
+            if not word:
+                break  # (every run of what it got said back, one at a time)
+            assert not [word[at : at + 6] for at in range(len(word) - 5) if word[at : at + 6] in said], (word, said)
+            checked += 1
+        assert checked >= 2, checked  # (the path's three runs; a token of some two hundred signs of base64 has several)
+    # A reason of its own is said as before.
+    service.service.echo = None
+    service.service.body = b'{"reason":"VapidPkHashMismatch"}'
+    assert "HTTP 404, VapidPkHashMismatch" in run(once())
+
+
+def test_a_refusal_never_says_back_a_part_of_the_query_of_the_browsers_address(service: FakePush) -> None:
+    # (The outside review of 0.4.0, round 6.2, M7.) A push service's address for a browser may carry a query
+    # (one service carries its token there), and that is as much what lets anybody send there as its path is. The path
+    # alone was looked for in the service's reason: a reason that repeats letters of the query, as they went or decoded,
+    # was shown and logged. (Its names, "token", are no secret, and fewer than six letters: no reason is taken for them.)
+    phone, sent = Browser(path="/w/?token=zQxWvBkPjYtRmLnHgDcF&u=Vbnm%71wrtzKplm"), Sent()
+    service.service.status = 404
+
+    async def once() -> str:
+        try:
+            await sent.pusher.send(target(phone), b"{}")
+        except webpush.NotDelivered as ex:
+            return str(ex)
+        finally:
+            await sent.pusher.close()
+        raise AssertionError("delivered")
+
+    echoed: list[str] = []
+    for said_back in (lambda got: got.path, lambda got: unquote(got.path)):  # (as it went, and decoded)
+        which = 0
+        while True:
+            echoed.clear()
+
+            def echo(got: Any, said_back: Any = said_back, which: int = which) -> bytes:
+                runs = letter_runs(said_back(got))
+                echoed.append(runs[which] if which < len(runs) else "")
+                return json.dumps({"reason": echoed[-1]}).encode()
+
+            service.service.echo = echo
+            said = run(once())
+            assert said.startswith("The push service says this browser is no longer subscribed (HTTP 404)"), said
+            [word] = echoed
+            if not word:
+                break
+            assert not [word[at : at + 6] for at in range(len(word) - 5) if word[at : at + 6] in said], (word, said)
+            which += 1
+        assert which >= 2, which  # (the token, and the other value: cut by its escape as it went, whole decoded)
+    service.service.echo = None
+    service.service.body = b'{"reason":"VapidPkHashMismatch"}'
+    assert "HTTP 404, VapidPkHashMismatch" in run(once())  # (a reason of the service's own is said as before)
 
 
 def test_a_push_service_that_never_answers_holds_up_no_other_browser(service: FakePush, monkeypatch: pytest.MonkeyPatch) -> None:

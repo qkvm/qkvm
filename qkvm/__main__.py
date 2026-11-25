@@ -30,11 +30,12 @@ if __name__ == "__main__" and not sys.flags.safe_path and sys.path and sys.path[
     # that is imported from here on: a file called json.py lying there (in Downloads, on a share) would be
     # run in its place, by this part of the program, before it had done anything at all. This program is
     # found already; nothing else it needs lies in that folder. (`python -P -m qkvm` does not look there in
-    # the first place, and is what the README says to type. Only that keeps out a file that Python itself
+    # the first place, and is what the guide says to type. Only that keeps out a file that Python itself
     # loads to find a module named with -m, before the first line here has run: types.py on every version,
     # and more on the older ones. From here on, nothing is taken from that folder.)
     del sys.path[0]
 
+import errno  # noqa: E402
 import json  # noqa: E402
 import re  # noqa: E402
 import signal  # noqa: E402
@@ -261,8 +262,15 @@ def made(path: Path, append: bool = False) -> int:
     return os.open(path, flags | getattr(os, "O_BINARY", 0), 0o600)
 
 
-def written(file: Path, text: str) -> None:
-    """Put `text` in `file`: in one piece or not at all, and its owner's alone, whatever the shell this was started from lets others do."""
+REPLACE_WAITS = (0.1, 0.2, 0.4, 0.8, 1.6)  # seconds between the tries of a replace refused while the file is open elsewhere
+
+
+def written(file: Path, text: str, still: "Any" = None) -> bool:
+    """Put `text` in `file`: in one piece or not at all, and its owner's alone, whatever the shell this was started from lets others do.
+
+    `still`: asked before every try after the first (a replace refused while another handle reads the file); where it says
+    no (the file is no longer what `text` was made from: another program wrote it meanwhile), nothing is written, and
+    False is answered. True: written."""
     being_written = file.with_name(file.name + ".new")
     try:
         being_written.unlink()  # (left by a start that was cut off: made anew, its own)
@@ -275,18 +283,36 @@ def written(file: Path, text: str) -> None:
         os.fsync(fh.fileno())  # on the disk before it takes the name: a power cut leaves zeros of the length of what never got there
     if sys.platform != "win32":
         os.chmod(being_written, 0o600)  # (it may have been there already, from a start that was cut off, as somebody else's to write)
-    os.replace(being_written, file)
+    for wait in (*REPLACE_WAITS, None):
+        try:
+            os.replace(being_written, file)
+            break
+        except PermissionError:
+            # On Windows a file that another handle has open (the program reading the note at this very moment) cannot be
+            # replaced; the reader lets go within moments. The one try there was left the update on trial without a word.
+            if wait is None:
+                raise
+            time.sleep(wait)
+            # ...and the reader may be the program, or `qkvm --roll-back`, about to write the note itself: what it wrote
+            # meanwhile is never put back to what was read before (the review of 0.4.0's last round, M1).
+            if still is not None and not still():
+                try:
+                    being_written.unlink()
+                except OSError:
+                    pass
+                return False
     if sys.platform != "win32":  # ...and the name, in its folder (Windows has no such asking: its journal keeps a rename whole)
         try:
             folder = os.open(file.parent, os.O_RDONLY)
         except OSError:
-            return  # (written all the same: what is not certain is only that a power cut this very moment keeps it)
+            return True  # (written all the same: what is not certain is only that a power cut this very moment keeps it)
         try:
             os.fsync(folder)
         except OSError:
             pass
         finally:
             os.close(folder)
+    return True
 
 
 def version_of(package: Path) -> tuple[int, ...] | None:
@@ -385,9 +411,10 @@ def proven(data: Path, version: object) -> None:
         # (Looked at once more, as late as can be: the program may have installed a newer one in this very
         # moment, and what it wrote is not to be put back to what was read before.)
         if pointer(data) == current:
-            written(file, json.dumps({**current, "proven": True}))
-    except OSError:
-        pass  # then it is on trial once more at the next start: nothing worse
+            written(file, json.dumps({**current, "proven": True}), still=lambda: pointer(data) == current)
+    except OSError as ex:
+        # Then it is on trial once more at the next start: nothing worse, and said.
+        noted(data, f"the updated version ({version}) started and stayed up, but that could not be written down ({ex.strerror or ex}): it is on trial again at the next start")
 
 
 def noted(data: Path, line: str) -> None:
@@ -415,7 +442,8 @@ def roll_back(data: Path) -> bool:
         # In one piece or not at all: cut off halfway, it would name no version, and the next start would run neither.
         # The one gone back to is on trial again only if it never got through one: a version that ran is
         # not taken back for a start that ends badly, and one that never did is, as far as the shipped files.
-        written(file, json.dumps({"version": previous, "previous": None, "proven": current.get("previous_proven") is True}))
+        if not written(file, json.dumps({"version": previous, "previous": None, "proven": current.get("previous_proven") is True}), still=lambda: note(data) == current):
+            raise OSError(errno.EAGAIN, "the update's note was changed by another program meanwhile: nothing was changed, try again")
     else:
         file.unlink(missing_ok=True)  # back to the files this copy shipped with
     return True
@@ -430,6 +458,33 @@ def gone_back(data: Path) -> bool:
         return False
 
 
+# On Linux with glibc the wall's process grew 1 to 3 MB an hour in the soaks while Python's own memory stayed level: memory
+# freed and kept by malloc, fragmented over its arenas (one malloc_trim(0) took a farm wall from 488 to 321 MB). The wall is
+# started with two arenas, and a trim threshold of its own: set, it is also fixed (glibc's own grows to 32 MB, and with it the
+# size from which a block is a mapping of its own, given back whole when it is freed). Whoever runs the wall and set either
+# keeps their own. (The starter itself stays at some 14 MB.) A farm wall of 250 stand-ins, 2.5 hours: 255 MB as glibc comes,
+# 226 with two arenas alone, 192 with the threshold too, and the same 193 with a threshold of 1 MB; growing 6, 10, 3 MB an hour.
+# Its cost: any threshold set also holds the size from which a block is a mapping of its own at 128 KB, so every picture of
+# a real KVM's size (200 KB) is one; served 40 a second, 3.70 ms of CPU each against 3.52 as glibc comes (and 3.72 with
+# 1 MB, which holds that size alike): about one hundredth of a core more. A larger mapping size would bring back the heap.
+ARENAS = 2
+TRIM_THRESHOLD = 131072  # bytes: glibc's own as it starts, held there
+
+
+def allocator(environment: "dict[str, str]") -> None:
+    """Into the wall's environment, on Linux with glibc: MALLOC_ARENA_MAX and MALLOC_TRIM_THRESHOLD_, each where it is not set."""
+    asked = getattr(os, "confstr", None)  # (Linux has it; the types of Windows do not)
+    if not sys.platform.startswith("linux") or asked is None:
+        return
+    try:
+        libc = asked("CS_GNU_LIBC_VERSION") or ""
+    except (ValueError, OSError):
+        libc = ""
+    if libc.startswith("glibc"):  # (musl, as on Alpine, has neither, nor needs them)
+        environment.setdefault("MALLOC_ARENA_MAX", str(ARENAS))
+        environment.setdefault("MALLOC_TRIM_THRESHOLD_", str(TRIM_THRESHOLD))
+
+
 def supervise(argv: list[str]) -> int:
     """Run the wall as a child process, starting it again whenever it asks for that."""
     # The child is this program, from the folder this copy of it lies in, and from nowhere else: `python -m`
@@ -440,6 +495,7 @@ def supervise(argv: list[str]) -> int:
     here = str(Path(__file__).resolve().parent.parent)
     path = os.pathsep.join(part for part in (here, os.environ.get("PYTHONPATH", "")) if part)
     environment = {**os.environ, CHILD: "1", "PYTHONPATH": path}
+    allocator(environment)
     data = data_dir(argv)
     told_to_stop: list[int] = []  # not empty once somebody has said so: a service manager, or a person with Ctrl+C
     # Started without a window (pythonw, a scheduled task) this process has nowhere to print to, and a child
@@ -493,16 +549,61 @@ def supervise(argv: list[str]) -> int:
         return status
 
 
+WSAECONNRESET = 10054  # Windows: "An existing connection was forcibly closed by the remote host"
+
+
+def quiet_resets() -> None:
+    """On Windows, no ERROR line and traceback in the log for a connection the other end reset as it was being closed.
+
+    Windows' event loop closes a connection with a shutdown() of its socket first (its connection-lost callback), and that
+    raises WinError 10054 where the other end had reset it already: a browser or a device that dropped it. The loop then
+    logs the error that nobody did anything about, with its traceback, three times an hour in a soak. Exactly that case is
+    let pass; every other error of the loop is logged as before. (On the loop, not as a filter of its logger: the program's
+    logging clears those as it sets itself up.) A Python whose loop has no such callback is left as it is."""
+    try:
+        from asyncio import proactor_events
+
+        the_callback = proactor_events._ProactorBasePipeTransport._call_connection_lost.__code__  # type: ignore[attr-defined]
+        loop = proactor_events.BaseProactorEventLoop
+        logged = loop.default_exception_handler
+    except Exception:  # (named otherwise in some later Python: nothing is changed, and the line is logged as it was)
+        return
+    if getattr(logged, "qkvm_quiets_resets", False):
+        return  # (put on already: by this starter, and now by the wall as well, for a wall whose starter has none)
+
+    def handler(self: Any, context: "dict[str, Any]") -> None:
+        found = context.get("exception")
+        # (Only where it replaced nothing: the callback runs the program's own connection_lost() first, and an error there
+        # becomes the 10054's __context__ when the shutdown in its `finally` then fails too. That error is the program's.)
+        if isinstance(found, ConnectionResetError) and getattr(found, "winerror", None) == WSAECONNRESET and found.__context__ is None and found.__cause__ is None:
+            last = found.__traceback__
+            while last is not None and last.tb_next is not None:
+                last = last.tb_next
+            if last is not None and last.tb_frame.f_code is the_callback:
+                return  # (raised by the callback's own shutdown(): nothing of the program's was under way)
+        logged(self, context)
+
+    handler.qkvm_quiets_resets = True  # type: ignore[attr-defined]
+    loop.default_exception_handler = handler  # type: ignore[method-assign]
+
+
 def main() -> int:
     argv = sys.argv[1:]
     passthrough = {"-h", "--help", "--version", "--reset-password", "--disable-2fa", "--roll-back"}
-    if os.environ.get(CHILD) != "1" and not passthrough.intersection(argv) and argv[:1] not in ([word] for word in ASKS):
+    # A restore from a backup (cli.restore_from) is a command of its own, run here and with this copy's own program: not as the
+    # starter's child, whose input is a pipe (the key it asks for could not be typed), nor with an update's code from the folder.
+    restoring = any(arg == "--restore" or arg.startswith("--restore=") for arg in argv)
+    if os.environ.get(CHILD) != "1" and not restoring and not passthrough.intersection(argv) and argv[:1] not in ([word] for word in ASKS):
         return supervise(argv)
 
     if "--roll-back" in argv:
         if sys.platform != "win32":
             os.umask(0o077)
-        went_back = roll_back(data_dir(argv))
+        try:
+            went_back = roll_back(data_dir(argv))
+        except OSError as ex:
+            print(f"qkvm: could not go back to the previous version: {ex.strerror or ex}", file=sys.stderr, flush=True)
+            return 1
         print("Back on the previous version." if went_back else "No update is installed; nothing to roll back.")
         return 0
 
@@ -510,7 +611,7 @@ def main() -> int:
     # program itself (--help, --version). Nothing that lies in the folder it is asked about is run: whoever
     # asks may be more than whoever owns that folder.
     asking = argv[:1] in ([word] for word in ASKS) or bool({"-h", "--help", "--version"}.intersection(argv))
-    update = None if asking else active_update(data_dir(argv), tell=True)
+    update = None if asking or restoring else active_update(data_dir(argv), tell=True)
     if update is not None:
         if sys.platform != "win32":
             # What Python writes beside the update's code (__pycache__) is judged with it at the next start: made as the shell
@@ -519,6 +620,8 @@ def main() -> int:
         import qkvm
 
         qkvm.__path__.insert(0, str(update))
+    if sys.platform == "win32":
+        quiet_resets()
     from qkvm.cli import main as run
 
     # (Handed over only where something was said: then it runs this copy's own program, never an update's, which may be of

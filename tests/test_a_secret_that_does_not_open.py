@@ -160,7 +160,8 @@ def test_a_saved_text_that_does_not_open_is_said_and_not_typed(tmp_path: Path) -
 def test_an_alert_address_that_does_not_open_is_no_address(tmp_path: Path) -> None:
     with wall(tmp_path) as admin:
         assert admin.put("/api/v1/alerts", json={"enabled": True, "webhook": "https://hooks.example/T0KEN"}).status_code == 200
-        admin.core.store.alerts.webhook = {"nonce": "!", "data": "x"}  # type: ignore[attr-defined]
+        first = admin.core.store.destinations[0]  # type: ignore[attr-defined]  # (0.4.0: the address is the first destination's)
+        first.secret = {"nonce": "!", "data": "x"}
         seen = admin.get("/api/v1/alerts")
         assert seen.status_code == 200 and "T0KEN" not in seen.text
         assert admin.post("/api/v1/alerts/test").status_code in (400, 409, 422)  # nowhere to send one to: said, not an error inside

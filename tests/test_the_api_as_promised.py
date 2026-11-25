@@ -9,6 +9,10 @@ request written as `GET /path` in the table's first column, the role in its seco
 code the answers were seen to have, which has to be named in the row, in backticks. A field that is added to
 an answer and not to its row fails here; so does one named in the row that the answer does not have, where
 the row says the answer has it.
+
+And the same for the list a program reads the promise from (qkvm/api_v1.json, 0.4.0): every field an answer was seen
+to have is in the list where the list describes that answer, of a kind the list allows it; every refusal is one the
+list names for that request, with that status, or one every request may answer with.
 """
 
 from __future__ import annotations
@@ -23,7 +27,7 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
-from qkvm import alerts, jetkvm, kvm, screens, server, update, vault
+from qkvm import alerts, jetkvm, kvm, promise, screens, server, update, vault
 from qkvm.core import Core
 from tests.fake_amt import AmtState, FakeAmt
 from tests.fake_jetkvm import FakeJetKvm, JetState
@@ -118,8 +122,29 @@ def test_what_the_table_promises_is_served_and_the_rest_is_the_pages_own(tmp_pat
 GENERIC = {"unauthorized", "not_allowed", "forbidden", "totp_required", "rate_limited", "invalid", "too_large", "length_required", "internal", "locked", "not_saved"}
 Where = tuple[str, str] | str  # a row of the table, as (method, path); or a record described under a "### " heading of the chapter
 # Rows asked by a test of their own, below, and not by the long one: a machine's activity and the picture of its screen
-# alert (promised in 0.3.2, as the Desktop App reads them), which take a screen watch that goes off.
-ASKED_BY_THEIR_OWN: set[Where] = {("GET", "/api/v1/audit"), ("GET", "/api/v1/devices/{}/alert-picture/{}")}
+# alert (promised in 0.3.2, as the Desktop App reads them), which take a screen watch that goes off; and the alerts' settings
+# (promised in 0.4.0, as they were in 0.3.2), which take an address to send to.
+ALERTS_ROWS: set[Where] = {("GET", "/api/v1/alerts"), ("PUT", "/api/v1/alerts"), ("POST", "/api/v1/alerts/pause"), ("POST", "/api/v1/alerts/test")}
+ACTIVITY_ROWS: set[Where] = {("GET", "/api/v1/audit"), ("GET", "/api/v1/devices/{}/alert-picture/{}")}
+ASKED_BY_THEIR_OWN: set[Where] = ACTIVITY_ROWS | ALERTS_ROWS
+# What a value of each of these types may be listed as, in qkvm/api_v1.json (a boolean is no number there, as in JSON).
+LISTED_AS = {str: {"str"}, int: {"int", "num"}, float: {"num"}, bool: {"bool"}, list: {"list"}, dict: {"dict"}, type(None): {"null"}}
+
+
+def listed_kinds(where: Where) -> dict[str, set[str]]:
+    """Every field qkvm/api_v1.json describes where `where` is described (a request's answer, all the way down, and what its
+    refusals carry; or the records of a section of the chapter), with what JSON each may be: of every record there that has it."""
+    records = promise.the_list()["records"]
+    if isinstance(where, str):
+        names, carried = {name for name, record in records.items() if record.get("described") == where}, {}
+    else:
+        entry = promise.requests()[where]
+        names, carried = promise.reached(entry), entry.get("carries", {})
+    found: dict[str, set[str]] = {}
+    for kinds in [carried, *(promise.kinds(records[name]) for name in names)]:
+        for field, kind in kinds.items():
+            found.setdefault(field, set()).update(promise.primitives(kind))
+    return found
 
 
 class Seen:
@@ -141,20 +166,28 @@ class Seen:
         return self.rows[where][1]
 
     def shaped(self, where: Where, answer: Any, shape: dict[str, tuple[type, ...]], exactly: bool = True) -> None:
-        """`answer` has these fields (and no others, unless `exactly` is off), each of its kind; the README names each where it describes this."""
+        """`answer` has these fields (and no others, unless `exactly` is off), each of its kind; the README names each where it
+        describes this, and so does the list (qkvm/api_v1.json), of a kind that takes what the answer had and what the shape allows."""
         assert isinstance(answer, dict), (where, answer)
         if exactly:
             assert set(answer) == set(shape), (where, set(answer) ^ set(shape))
         else:
             assert set(shape) <= set(answer), (where, set(shape) - set(answer))
+        listed = listed_kinds(self.place(where))
         for field, kinds in shape.items():
             assert isinstance(answer[field], kinds), (where, field, answer[field])
+            assert field in listed, f"{where}: {field} is answered, and not in qkvm/api_v1.json"
+            for kind in {*kinds, type(answer[field])}:
+                assert listed[field] & LISTED_AS[kind], f"{where}: {field} may be {kind.__name__}, and qkvm/api_v1.json says {sorted(listed[field])}"
         self.names.setdefault(self.place(where), set()).update(shape)
 
     def refused(self, method: str, path: str, reply: Any, status: int, code: str) -> None:
         assert (reply.status_code, reply.json()["code"]) == (status, code), (method, path, reply.status_code, reply.text[:200])
         assert reply.json()["message"], "a refusal without a sentence"
-        self.names.setdefault(self.place((method, path)), set()).add(code)
+        place = self.place((method, path))
+        assert isinstance(place, tuple)
+        assert status in promise.may_refuse(promise.requests()[place], code), f"{place}: {status} {code} is not in qkvm/api_v1.json"
+        self.names.setdefault(place, set()).add(code)
 
     def all_where_the_readme_describes_them(self, asked: set[Where] | None = None) -> None:
         """Every name seen is in the README where it describes it; and every request of the table was asked: the ones
@@ -173,10 +206,10 @@ MEDIA_IMAGE = {"id": STR, "name": STR, "where": STR, "size": INT + NULL, "partia
 MEDIA_OFFERS = {"drives": LIST, "boot": LIST, "restart": BOOL, "upload": BOOL, "where": STR, "writable": LIST, "delete": BOOL, "drops_input": BOOL}
 MEDIA_NOW = {"drive": STR, "image": STR, "name": STR, "where": STR, "read_only": BOOL, "first": BOOL, "by": STR, "at": NUM, "sha256": NULL}
 ACCOUNT = {"id": STR, "name": STR, "role": STR, "totp": BOOL, "must_enroll": BOOL, "sso": BOOL, "recovery_codes": INT, "token": BOOL}
-TILE = {"id": STR, "name": STR, "host": STR, "open_url": STR, "kind": STR, "picture": BOOL, "group": STR, "same_as": LIST, "can": LIST}
+TILE = {"id": STR, "name": STR, "host": STR, "open_url": STR, "kind": STR, "picture": BOOL, "group": STR, "same_as": LIST, "can": LIST, "target": STR}
 ADMINS_TILE = {**TILE, "url": STR, "custom_open_url": STR, "username": STR, "tls": STR, "fingerprint": STR + NULL, "has_password": BOOL, "alerts": BOOL, "fingerbot_strength": STR, "no_signal_minutes": INT, "unchanged_minutes": INT}
 STATUS = {
-    "can": LIST, "state": STR, "error": DICT + NULL, "last_seen_ago": INT + NULL, "video": DICT, "usb": DICT, "atx": DICT, "health": DICT,
+    "can": LIST, "target": STR, "state": STR, "error": DICT + NULL, "last_seen_ago": INT + NULL, "video": DICT, "usb": DICT, "atx": DICT, "health": DICT,
     "about": DICT, "ports": DICT + NULL,
 }  # fmt: skip
 SAVED_ACTION = {"id": STR, "name": STR, "kind": STR, "keys": STR, "enter": BOOL, "danger": BOOL, "changed": INT}
@@ -342,7 +375,9 @@ def test_every_promised_request_answers_as_the_table_says(tmp_path: Path, monkey
         assert by_id[amt_id]["can"] == ["power", "reset", "power_state", "bios_setup"]
         status = victor.get("/api/v1/status").json()
         assert set(status) == {kvm_id, jet_id, bmc_id, amt_id}
-        seen.shaped("How a machine is", status[kvm_id], {**STATUS, "fingerbot": DICT + NULL, "media": NULL})  # (null: no Fingerbot is paired with it, nothing is mounted)
+        # (null: no Fingerbot is paired with it, nothing is mounted; and it has shown its two inputs)
+        seen.shaped("How a machine is", status[kvm_id], {**STATUS, "fingerbot": DICT + NULL, "media": NULL, "several_inputs": BOOL})
+        assert status[kvm_id]["several_inputs"] is True
         seen.shaped("How a machine is", status[jet_id], {**STATUS, "kind": STR, "media": NULL})
         seen.shaped("How a machine is", status[bmc_id], {**STATUS, "kind": STR, "picture": BOOL, "screen": BOOL, "console": BOOL, "server": DICT, "media": NULL})
         seen.shaped("How a machine is", status[amt_id], {**STATUS, "kind": STR, "picture": BOOL, "screen": BOOL, "console": BOOL, "server": DICT})
@@ -370,7 +405,7 @@ def test_every_promised_request_answers_as_the_table_says(tmp_path: Path, monkey
         )  # fmt: skip
         seen.shaped(
             "How a machine is", status[amt_id]["server"]["amt"],
-            {"power": INT + NULL, "control": STR + NULL, "kvm": STR + NULL, "consent": BOOL + NULL, "listener": BOOL + NULL, "session_timeout": INT + NULL, "make": STR + NULL, "model": STR + NULL, "serial": STR + NULL, "bios": STR + NULL, "plain": BOOL, "view": STR},
+            {"power": INT + NULL, "control": STR + NULL, "kvm": STR + NULL, "consent": BOOL + NULL, "listener": BOOL + NULL, "session_timeout": INT + NULL, "make": STR + NULL, "model": STR + NULL, "serial": STR + NULL, "bios": STR + NULL, "plain": BOOL, "view": STR, "shutdown": STR + NULL},
         )  # fmt: skip
         assert status[amt_id]["screen"] is False and status[amt_id]["console"] is False and status[amt_id]["server"]["power"] == "On"
         assert by_id[amt_id]["amt_view"] == status[amt_id]["server"]["amt"]["view"] == "stills"
@@ -619,7 +654,7 @@ def test_every_promised_request_answers_as_the_table_says(tmp_path: Path, monkey
             assert device["new"] is False  # (each is on this wall already)
         for action in read.json()["actions"]:
             seen.shaped(("POST", "/api/v1/import/read"), action, FILE_ACTION)
-        seen.shaped(("POST", "/api/v1/import/read"), read.json()["alerts"], {"enabled": BOOL, "address": BOOL, "host": STR, "format": STR, "kinds": LIST})
+        seen.shaped(("POST", "/api/v1/import/read"), read.json()["alerts"], {"enabled": BOOL, "address": BOOL, "host": STR, "format": STR, "kinds": LIST, "destinations": LIST})
         seen.shaped(("POST", "/api/v1/import/read"), read.json()["wall"], {"interval": NUM, "update_check": BOOL})
         a_new_one = json.dumps({"format": "qkvm-export", "version": 1, "devices": [{"url": f"http://127.0.0.1:{closed_port()}", "kind": "kvmd", "name": "From a file"}]})
         taken = admin.post("/api/v1/import", json={"file": a_new_one, "take": ["devices"]})
@@ -684,7 +719,10 @@ def test_a_machines_activity_and_the_picture_of_its_alert_answer_as_the_table_sa
             assert read.status_code == 200, read.text
             seen.shaped(("GET", audit), read.json(), {"entries": LIST, "more": BOOL, "missing": NULL})
             entries = read.json()["entries"]
-            assert {entry["device_id"] for entry in entries} == {device} and other not in read.text  # its own, and nothing else
+            # Its own, and nothing else. (Not looked for in the hex digits of each line's place in the chain, which hold a machine's id,
+            # eight of them, by chance once in some millions of runs.)
+            said = json.dumps([{name: value for name, value in entry.items() if name != "chain"} for entry in entries])
+            assert {entry["device_id"] for entry in entries} == {device} and other not in said
             assert [entry["time"] for entry in entries] == sorted((entry["time"] for entry in entries), reverse=True)  # newest first
             assert {"device_added", "action", "alert"} <= {entry["event"] for entry in entries} and read.json()["more"] is False
             for entry in entries:
@@ -715,7 +753,81 @@ def test_a_machines_activity_and_the_picture_of_its_alert_answer_as_the_table_sa
     finally:
         fake.stop()
         inbox.close()
-    seen.all_where_the_readme_describes_them(ASKED_BY_THEIR_OWN)
+    seen.all_where_the_readme_describes_them(ACTIVITY_ROWS)
+
+
+ALERTS = {
+    "enabled": BOOL, "has_webhook": BOOL, "format": STR, "offline": BOOL, "no_signal": BOOL, "problem": BOOL, "recovered": BOOL, "link": STR,
+    "paused_until": NUM + NULL, "last_sent": NUM + NULL, "last_error": STR + NULL,
+}  # fmt: skip
+
+
+def test_the_alerts_settings_answer_as_the_table_says(tmp_path: Path) -> None:
+    # Promised in 0.4.0 as they were in 0.3.2 (a client may show and change them): the one address alerts are sent to,
+    # never shown again once saved, which changes are told, a pause, and a test alert to that address.
+    seen, inbox = Seen(), Inbox()
+    alerts_at, pause, test = "/api/v1/alerts", "/api/v1/alerts/pause", "/api/v1/alerts/test"
+    try:
+        with wall(tmp_path) as admin:
+            before = admin.get(alerts_at)
+            seen.shaped(("GET", alerts_at), before.json(), ALERTS)
+            assert (before.json()["enabled"], before.json()["has_webhook"], before.json()["paused_until"]) == (False, False, None)
+            account(admin, "olga", "operator")
+            olga = browser(admin, "olga")
+            seen.refused("GET", alerts_at, olga.get(alerts_at), 403, "not_allowed")
+            seen.refused("PUT", alerts_at, olga.put(alerts_at, json={"enabled": True}), 403, "not_allowed")
+            seen.refused("POST", test, admin.post(test, json={}), 409, "no_webhook")
+            seen.refused("PUT", alerts_at, admin.put(alerts_at, json={"enabled": True, "webhook": "ftp://hooks.invalid/x"}), 422, "invalid")
+            assert admin.get(alerts_at).json() == before.json()  # (a form refused for one field changed none)
+            saved = admin.put(alerts_at, json={"enabled": True, "webhook": inbox.url, "format": "json", "no_signal": False, "link": "http://127.0.0.1:8787/"})
+            assert saved.status_code == 200, saved.text
+            seen.shaped(("GET", alerts_at), saved.json(), ALERTS)  # (the three others answer "as GET /api/v1/alerts answers")
+            assert saved.json()["has_webhook"] is True and saved.json()["no_signal"] is False and saved.json()["link"] == "http://127.0.0.1:8787/"
+            assert inbox.url not in saved.text and inbox.url not in admin.get(alerts_at).text  # (the address is never shown)
+            tested = admin.post(test, json={})
+            assert tested.status_code == 200, tested.text
+            seen.shaped(("GET", alerts_at), tested.json(), ALERTS)
+            assert len(inbox.received) == 1 and isinstance(tested.json()["last_sent"], (int, float)) and tested.json()["last_error"] is None
+            paused = admin.post(pause, json={"minutes": 60})
+            seen.shaped(("GET", alerts_at), paused.json(), ALERTS)
+            assert paused.json()["paused_until"] > time.time() + 59 * 60
+            seen.refused("POST", pause, admin.post(pause, json={"minutes": 7 * 24 * 60 + 1}), 422, "invalid")
+            assert admin.post(pause, json={"minutes": 0}).json()["paused_until"] is None
+            nobody_there = f"http://127.0.0.1:{closed_port()}/hook"
+            assert admin.put(alerts_at, json={"enabled": True, "webhook": nobody_there}).status_code == 200
+            seen.refused("POST", test, admin.post(test, json={}), 502, "not_delivered")
+            assert admin.get(alerts_at).json()["last_error"]
+    finally:
+        inbox.close()
+    seen.all_where_the_readme_describes_them(ALERTS_ROWS)
+
+
+def test_what_nothing_is_served_at_is_refused_as_every_refusal_is(tmp_path: Path) -> None:
+    # "Every refusal is {"code": "...", "message": "..."}" (the chapter's Errors). The router's own answers to an address
+    # nothing is served at, and to one served by another method, were the framework's {"detail": "Not Found"} and
+    # {"detail": "Method Not Allowed"} to an admin (found writing down the promise, 0.4.0): a client that reads `code`, as
+    # a newer one asking an older wall for a request it has not got, read none. (To anybody else both are 403 not_allowed:
+    # what no rule lists takes an admin.)
+    words = json.loads((Path(server.__file__).parent / "static" / "words.json").read_text(encoding="utf-8"))
+    with wall(tmp_path) as admin:
+        for method, path, status, code in (
+            ("GET", "/api/v1/nothing", 404, "not_found"),
+            ("GET", "/api/nothing", 404, "not_found"),
+            ("GET", "/nothing", 404, "not_found"),
+            ("DELETE", "/api/v1/wall", 405, "method_not_allowed"),
+            ("GET", "/api/v1/devices/ab12cd34/live", 405, "method_not_allowed"),
+            ("POST", "/healthz", 405, "method_not_allowed"),
+        ):
+            reply = admin.request(method, path)
+            assert (reply.status_code, reply.headers["content-type"]) == (status, "application/json"), (method, path, reply.status_code, reply.text)
+            assert reply.json()["code"] == code and reply.json()["message"], (method, path, reply.text)
+            assert status in words["refusals"][code], code
+        assert "GET" in admin.delete("/api/v1/wall").headers["allow"]  # (and by which method it is served, as before)
+        robot = TestClient(admin.app, headers={"Authorization": f"Bearer {admin.post('/api/v1/tokens', json={'name': 'n', 'role': 'operator'}).json()['token']}"})
+        robot.portal = admin.portal
+        assert (robot.get("/api/v1/nothing").status_code, robot.get("/api/v1/nothing").json()["code"]) == (403, "not_allowed")
+    errors = CHAPTER.split("### Errors", 1)[1].split("\n### ", 1)[0]
+    assert "`method_not_allowed`" in errors and "| 405 |" in errors
 
 
 def test_a_servers_screen_is_in_can_once_its_console_can_be_read(tmp_path: Path) -> None:

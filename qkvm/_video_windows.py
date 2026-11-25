@@ -2,11 +2,14 @@
 
 Only public Python/PyAV runtime files are copied into a read/execute-only bundle.
 Each worker gets a distinct AppContainer identity, no network capabilities, three
-explicit pipe handles, no child processes, restricted UI access, and two of the
-machine's processors at most for all its threads together (see processors_for).
+explicit pipe handles, no child processes, restricted UI access, two of the
+machine's processors at most for all its threads together (see processors_for),
+and a desktop of its own that only it may use (see worker_desktop).
 """
 from __future__ import annotations
 
+from collections.abc import Iterator
+import contextlib
 import ctypes
 from ctypes import wintypes as wt
 import io
@@ -31,6 +34,7 @@ SIZE = ctypes.c_size_t
 kernel = ctypes.WinDLL("kernel32", use_last_error=True)
 advapi = ctypes.WinDLL("advapi32", use_last_error=True)
 userenv = ctypes.WinDLL("userenv", use_last_error=True)
+user = ctypes.WinDLL("user32", use_last_error=True)
 
 
 def api(dll: Any, name: str, args: list[Any], result: Any = wt.BOOL) -> Any:
@@ -147,6 +151,12 @@ SUSPECT_FOR = 60.0  # seconds every placement passes over a pair whose worker mi
 _pairs_lock = threading.Lock()
 _pair_load: dict[int, int] = {}  # processor-pair index -> how many live workers hold it
 _suspect: dict[int, float] = {}  # processor-pair index -> monotonic time until which it is passed over
+# Where this process begins among equally free pairs, drawn at random as it starts. Each qKVM on a computer knows only its
+# own workers: ranked from pair 0 in each, the first worker of every one of them went on processors 0 and 1 (where Windows
+# takes most interrupts, too). Begun at random, two qKVMs' first workers share a pair one time in as many as there are
+# pairs. Not pair loads kept for the whole computer: that would need a store every qKVM there could write, which a
+# process of another account could fill with whatever keeps workers together.
+_first_pair = int.from_bytes(os.urandom(4), "little")
 
 
 def _pair_count(own: list[int]) -> int:
@@ -169,17 +179,20 @@ def next_processors(avoid: int | None = None) -> tuple[int, int]:
     stall or be stalled, and passing it over would put a worker beside another while a pair stands
     free. (A worker being stopped counts on its pair until it ends, and one taken over can delay
     that: where no pair is empty meanwhile, its feed's next worker goes beside another feed's.
-    SECURITY.md says so.)"""
+    SECURITY.md says so.) Among pairs as free, this process's own order: from _first_pair on.
+    Within one process none of this changes; between qKVMs on one computer it is only likelier."""
     own = own_processors()
     if not own:
         raise OSError("no processor to run the video worker on")
     now = time.monotonic()
     with _pairs_lock:
+        count = _pair_count(own)
+
         def rank(i: int) -> tuple[bool, int, bool, int]:
             load = _pair_load.get(i, 0)
-            return (load > 0 and _suspect.get(i, 0.0) > now, load, i == avoid, i)
+            return (load > 0 and _suspect.get(i, 0.0) > now, load, i == avoid, (i - _first_pair) % count)
 
-        index = min(range(_pair_count(own)), key=rank)
+        index = min(range(count), key=rank)
         _pair_load[index] = _pair_load.get(index, 0) + 1
     return index, processors_for(own, index)
 
@@ -207,8 +220,18 @@ def release_processors(index: int) -> None:
 inheriting = threading.Lock()
 
 
-def runtime_acl(path: Path) -> None:
-    """Only the owner/admin/system may modify this public-code bundle."""
+def sid_text(sid: Any) -> str:
+    """A SID as its string (S-1-5-21-...)."""
+    text = wt.LPWSTR()
+    checked(api(advapi, "ConvertSidToStringSidW", [P, ctypes.POINTER(wt.LPWSTR)])(sid, ctypes.byref(text)))
+    try:
+        return str(text.value)
+    finally:
+        local_free(text)
+
+
+def user_sid_text() -> str:
+    """The user qKVM runs as, as a SID string."""
     token = P()
     current = api(kernel, "GetCurrentProcess", [], P)()
     checked(api(advapi, "OpenProcessToken", [P, wt.DWORD, ctypes.POINTER(P)])(current, 8, ctypes.byref(token)))
@@ -218,17 +241,16 @@ def runtime_acl(path: Path) -> None:
         info(token, 1, None, 0, ctypes.byref(size))
         data = ctypes.create_string_buffer(size.value)
         checked(info(token, 1, data, size, ctypes.byref(size)))
-        owner = ctypes.cast(data, ctypes.POINTER(P))[0]
-        text = wt.LPWSTR()
-        checked(api(advapi, "ConvertSidToStringSidW", [P, ctypes.POINTER(wt.LPWSTR)])(owner, ctypes.byref(text)))
-        try:
-            # All AppContainers can read public runtime code, but cannot modify it.
-            # No application data, user profile, environment or credentials are copied.
-            sddl = f"D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{text.value})(A;OICI;GRGX;;;S-1-15-2-1)"
-        finally:
-            local_free(text)
+        return sid_text(ctypes.cast(data, ctypes.POINTER(P))[0])
     finally:
         close_handle(token)
+
+
+def runtime_acl(path: Path) -> None:
+    """Only the owner/admin/system may modify this public-code bundle."""
+    # All AppContainers can read public runtime code, but cannot modify it.
+    # No application data, user profile, environment or credentials are copied.
+    sddl = f"D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{user_sid_text()})(A;OICI;GRGX;;;S-1-15-2-1)"
     descriptor = P()
     checked(api(advapi, "ConvertStringSecurityDescriptorToSecurityDescriptorW", [wt.LPCWSTR, wt.DWORD, ctypes.POINTER(P), P])(sddl, 1, ctypes.byref(descriptor), None))
     try:
@@ -237,6 +259,235 @@ def runtime_acl(path: Path) -> None:
         error = api(advapi, "SetNamedSecurityInfoW", [wt.LPWSTR, ctypes.c_int, wt.DWORD, P, P, P, P], wt.DWORD)(str(path), 1, 0x80000004, None, None, dacl, None)
         if error:
             raise ctypes.WinError(error)
+    finally:
+        local_free(descriptor)
+
+
+# A worker's user32.dll connects to a window station and a desktop as it loads, and Python's _ctypes (through ole32 and
+# oleaut32) and PyAV's avutil load it: where the worker may not connect, they fail with "A dynamic link library (DLL)
+# initialization routine failed", and no picture is made. An AppContainer may connect only where the station's and the
+# desktop's DACLs let in its SID or ALL APPLICATION PACKAGES. Windows lets every AppContainer onto the interactive WinSta0
+# and its desktop Default, and onto no other: not a service's station, nor an SSH session's.
+# What user32 needs, found by trying from a service's station on Windows 11 (less of either and it fails to initialize):
+STATION_RIGHTS = 0x00020020  # READ_CONTROL | WINSTA_ACCESSGLOBALATOMS (WinSta0 gives every AppContainer 0x20327)
+DESKTOP_RIGHTS = 0x00000081  # DESKTOP_READOBJECTS | DESKTOP_WRITEOBJECTS (Default gives every AppContainer 0xF00FF)
+DESKTOP_HEAP = 512  # KiB; the worker makes no window (a desktop on WinSta0 is given 20 MiB of the session's space otherwise)
+ALL_APPLICATION_PACKAGES = "S-1-15-2-1"
+SE_WINDOW_OBJECT, DACL_SECURITY_INFORMATION, INHERIT_ONLY_ACE = 7, 4, 0x08
+SE_DACL_PROTECTED, PROTECTED_DACL_SECURITY_INFORMATION, UNPROTECTED_DACL_SECURITY_INFORMATION = 0x1000, 0x80000000, 0x20000000
+
+
+class AclSize(ctypes.Structure):
+    _fields_ = [("count", wt.DWORD), ("used", wt.DWORD), ("free", wt.DWORD)]
+
+
+get_security_info = api(advapi, "GetSecurityInfo", [P, ctypes.c_int, wt.DWORD, P, P, ctypes.POINTER(P), P, ctypes.POINTER(P)], wt.DWORD)
+set_security_info = api(advapi, "SetSecurityInfo", [P, ctypes.c_int, wt.DWORD, P, P, P, P], wt.DWORD)
+acl_size = api(advapi, "GetAclInformation", [P, ctypes.POINTER(AclSize), wt.DWORD, ctypes.c_int])
+get_ace = api(advapi, "GetAce", [P, wt.DWORD, ctypes.POINTER(P)])
+delete_ace = api(advapi, "DeleteAce", [P, wt.DWORD])
+add_allowed_ace = api(advapi, "AddAccessAllowedAce", [P, wt.DWORD, wt.DWORD, P])
+equal_sid = api(advapi, "EqualSid", [P, P])
+sid_length = api(advapi, "GetLengthSid", [P], wt.DWORD)
+copy_sid = api(advapi, "CopySid", [wt.DWORD, P, P])
+descriptor_control = api(advapi, "GetSecurityDescriptorControl", [P, ctypes.POINTER(wt.WORD), ctypes.POINTER(wt.DWORD)])
+string_to_sid = api(advapi, "ConvertStringSidToSidW", [wt.LPCWSTR, ctypes.POINTER(P)])
+string_to_descriptor = api(advapi, "ConvertStringSecurityDescriptorToSecurityDescriptorW", [wt.LPCWSTR, wt.DWORD, ctypes.POINTER(P), P])
+create_desktop = api(user, "CreateDesktopExW", [wt.LPCWSTR, P, P, wt.DWORD, wt.DWORD, ctypes.POINTER(Attributes), wt.ULONG, P], P)
+close_desktop = api(user, "CloseDesktop", [P])
+create_mutex = api(kernel, "CreateMutexExW", [ctypes.POINTER(Attributes), wt.LPCWSTR, wt.DWORD, wt.DWORD], P)
+release_mutex = api(kernel, "ReleaseMutex", [P])
+wait_for = api(kernel, "WaitForSingleObject", [P, wt.DWORD], wt.DWORD)
+object_name = api(user, "GetUserObjectInformationW", [P, ctypes.c_int, P, wt.DWORD, ctypes.POINTER(wt.DWORD)])
+
+# Windows writes a DACL only whole: read, changed, written back. This qKVM's threads change a station's one at a time
+# (_station_lock), and every qKVM of this account in this session with them (_editing).
+_station_lock = threading.Lock()
+_dacl_mutexes: dict[str, Any] = {}  # a window object's name -> the mutex its DACL's changes are made under (kept open)
+_dacl_mutexes_lock = threading.Lock()  # (held only to look one up or make it, never while one is waited for)
+SHARED_WAIT = 2000  # ms that a change waits for another qKVM's change of the same DACL (each takes a few milliseconds)
+WAIT_OBJECT_0, WAIT_ABANDONED = 0x0, 0x80
+
+
+def _name_of(window_object: Any) -> str:
+    buffer, size = ctypes.create_unicode_buffer(256), wt.DWORD()
+    checked(object_name(window_object, 2, buffer, ctypes.sizeof(buffer), ctypes.byref(size)))  # UOI_NAME
+    return buffer.value
+
+
+def own_station() -> tuple[Any, str]:
+    """The window station qKVM runs on (a handle that is not to be closed), and its name."""
+    station = checked(api(user, "GetProcessWindowStation", [], P)())
+    return station, _name_of(station)
+
+
+def _shared(name: str) -> Any:
+    """The mutex every qKVM of this account in this session takes to change the DACL of the window object `name`
+    (Local\\qkvm-dacl-<name>), which only this account and SYSTEM may use; None where it cannot be had (another account
+    made one of that name first)."""
+    with _dacl_mutexes_lock:
+        mutex = _dacl_mutexes.get(name)
+        if mutex is None:
+            descriptor = P()
+            checked(string_to_descriptor(f"D:P(A;;GA;;;SY)(A;;GA;;;{user_sid_text()})", 1, ctypes.byref(descriptor), None))
+            try:
+                attributes = Attributes(ctypes.sizeof(Attributes), descriptor.value, False)  # (never inherited)
+                mutex = create_mutex(ctypes.byref(attributes), "Local\\qkvm-dacl-" + name, 0, 0x00100001)  # SYNCHRONIZE | MUTEX_MODIFY_STATE
+            finally:
+                local_free(descriptor)
+            if not mutex:
+                return None
+            _dacl_mutexes[name] = mutex
+        return mutex
+
+
+@contextlib.contextmanager
+def _editing(window_object: Any) -> Iterator[None]:
+    """Held around a read, change and write of a window object's DACL. Two qKVMs of one account share a station where they
+    run as services, as a test runner's processes over one SSH session do; each changing the DACL on its own, one wrote
+    over the other's entry before its worker could use it, or brought back an entry the other had taken out, left for the
+    life of the station. A qKVM that cannot have the mutex (another account made one of that name first), or waits
+    SHARED_WAIT for it in vain (one held by a process that hangs, or by another account's on purpose), changes the DACL
+    under its own lock alone: slower, or not safe from the other's changes then, and never refused. The mutex is waited
+    for with no lock of this process held (a mutex is a thread's: this process's threads wait their turns at it too), so
+    one that is held keeps only the starts and ends that change this DACL waiting, and each for SHARED_WAIT at most."""
+    mutex = _shared(_name_of(window_object))
+    # (WAIT_ABANDONED: the holder ended while it held it. The DACL it was changing was written whole, or not at all.)
+    owned = mutex is not None and wait_for(mutex, SHARED_WAIT) in (WAIT_OBJECT_0, WAIT_ABANDONED)
+    try:
+        with _station_lock:
+            yield
+    finally:
+        if owned:
+            release_mutex(mutex)
+
+
+def _dacl(station: Any) -> tuple[bytes | None, int]:
+    """A copy of the station's DACL (None: it has none, which lets everybody in), and how to write one back as it was:
+    protected or not (SetSecurityInfo takes the protection away unless it is told to keep it). The other DACL flag, AI,
+    Windows does not keep on a window station."""
+    dacl, descriptor = P(), P()
+    for _ in range(3):  # (ERROR_INSUFFICIENT_BUFFER: the DACL grew while it was read, by a change made without the mutex)
+        error = get_security_info(station, SE_WINDOW_OBJECT, DACL_SECURITY_INFORMATION, None, None, ctypes.byref(dacl), None, ctypes.byref(descriptor))
+        if error != 122:
+            break
+    if error:
+        raise ctypes.WinError(error)
+    try:
+        control, revision = wt.WORD(), wt.DWORD()
+        checked(descriptor_control(descriptor, ctypes.byref(control), ctypes.byref(revision)))
+        protection = PROTECTED_DACL_SECURITY_INFORMATION if control.value & SE_DACL_PROTECTED else UNPROTECTED_DACL_SECURITY_INFORMATION
+        if not dacl.value:
+            return None, protection
+        size = AclSize()
+        checked(acl_size(dacl, ctypes.byref(size), ctypes.sizeof(size), 2))  # AclSizeInformation
+        return ctypes.string_at(dacl.value, size.used), protection
+    finally:
+        local_free(descriptor)
+
+
+def _entries(acl: Any, count: int) -> list[tuple[int, int, int, int, int]]:
+    """Each entry of an ACL as (index, type, flags, mask, address of its SID)."""
+    found = []
+    for index in range(count):
+        ace = P()
+        checked(get_ace(acl, index, ctypes.byref(ace)))
+        address = int(ace.value or 0)
+        kind, flags = ctypes.string_at(address, 2)
+        mask = int.from_bytes(ctypes.string_at(address + 4, 4), "little")
+        found.append((index, kind, flags, mask, address + 8))  # ACCESS_ALLOWED_ACE and ACCESS_DENIED_ACE: header, mask, SID
+    return found
+
+
+def station_admits_app_containers(station: Any) -> bool:
+    """Whether the station lets every AppContainer connect, as Windows has it on the interactive WinSta0."""
+    return _admits(_dacl(station)[0])
+
+
+def _admits(acl: bytes | None) -> bool:
+    """The DACL read as Windows reads it, in order, each right decided by the first entry naming ALL APPLICATION PACKAGES
+    that names it, entries only to be inherited left out. An entry with a generic right in it is not reckoned with, and no
+    NULL DACL is ever changed (it lets everybody in): where in doubt, the worker is given an entry of its own, no harm."""
+    if acl is None:
+        return True
+    everyone = P()
+    checked(string_to_sid(ALL_APPLICATION_PACKAGES, ctypes.byref(everyone)))
+    try:
+        buffer = ctypes.create_string_buffer(acl, len(acl))
+        decided = allowed = 0
+        for _, kind, flags, mask, sid in _entries(buffer, int.from_bytes(acl[4:6], "little")):
+            if flags & INHERIT_ONLY_ACE or kind not in (0, 1) or not equal_sid(sid, everyone):
+                continue
+            if mask & 0xF0000000:
+                return False
+            if kind == 0:  # ACCESS_ALLOWED_ACE_TYPE
+                allowed |= mask & ~decided
+            decided |= mask
+        return allowed & STATION_RIGHTS == STATION_RIGHTS
+    finally:
+        local_free(everyone)
+
+
+def grant_station(station: Any, sid: Any) -> bool:
+    """Let one AppContainer, a worker's own SID, connect to qKVM's window station where the station does not let every
+    AppContainer in (a service's, an SSH session's): an entry of its own with STATION_RIGHTS, at the end of the DACL, after
+    every entry that denies. False where none was needed. The DACL is otherwise left as it was, entry for entry. Taken
+    out when the worker is waited for (AppProcess.wait): a qKVM that ends without that (TerminateProcess, a crash) leaves
+    its workers' entries until the station ends, on a service's until the computer restarts; about 1,300 fill the DACL,
+    and then this refuses ("no room") until then (SECURITY.md). Judged
+    first without the mutex (on WinSta0 every start): a station that needs no entry waits for nothing."""
+    if station_admits_app_containers(station):
+        return False
+    with _editing(station):
+        acl, protection = _dacl(station)
+        if acl is None or _admits(acl):
+            return False
+        total = len(acl) + 8 + sid_length(sid)  # ACCESS_ALLOWED_ACE: header, mask, then the SID
+        if total > 0xFFFF:
+            raise OSError("the window station's DACL has no room for the video worker's entry")
+        buffer = ctypes.create_string_buffer(acl[:2] + total.to_bytes(2, "little") + acl[4:], total)  # AclSize: room for it
+        checked(add_allowed_ace(buffer, acl[0], STATION_RIGHTS, sid))  # (at the end, in the ACL's own revision)
+        error = set_security_info(station, SE_WINDOW_OBJECT, DACL_SECURITY_INFORMATION | protection, None, None, buffer, None)
+        if error:
+            raise ctypes.WinError(error)
+        return True
+
+
+def revoke_station(station: Any, sid: Any) -> None:
+    """Take a worker's own entry (grant_station) out of the station's DACL again, leaving every other as it is."""
+    with _editing(station):
+        acl, protection = _dacl(station)
+        if acl is None:
+            return
+        buffer = ctypes.create_string_buffer(acl[:2] + len(acl).to_bytes(2, "little") + acl[4:], len(acl))  # AclSize: what is in use
+        theirs = [index for index, kind, _, _, entry in _entries(buffer, int.from_bytes(acl[4:6], "little")) if kind == 0 and equal_sid(entry, sid)]
+        if not theirs:
+            return
+        for index in reversed(theirs):
+            checked(delete_ace(buffer, index))
+        error = set_security_info(station, SE_WINDOW_OBJECT, DACL_SECURITY_INFORMATION | protection, None, None, buffer, None)
+        if error:
+            raise ctypes.WinError(error)
+
+
+def worker_desktop(name: str, sid: Any) -> Any:
+    """A desktop of its own for one worker, on qKVM's window station. Its DACL lets in SYSTEM, qKVM's user, and of all
+    AppContainers that worker's alone, with what its user32.dll needs to connect (DESKTOP_RIGHTS). No other process is on
+    it; the worker makes no window there, and its job can neither make nor switch desktops nor use another's windows.
+    Not a boundary in a signed-in session: a worker taken over can open WinSta0's Default, which Windows lets every
+    AppContainer use, move a thread to it (SetThreadDesktop, which the job does not stop) and read the screen there, as it
+    could on Default before 0.4.0 (SECURITY.md). On a service's or SSH session's station there is no other it may use.
+    Before, a worker shared the desktop it was started from: the user's own (WinSta0\\Default) where qKVM runs in a
+    signed-in session, and one it could not connect to where qKVM runs as a service. The handle is qKVM's alone (not
+    inherited); the desktop goes when it and the worker's are closed."""
+    sddl = f"D:P(A;;GA;;;SY)(A;;GA;;;{user_sid_text()})(A;;{DESKTOP_RIGHTS:#x};;;{sid_text(sid)})"
+    descriptor = P()
+    checked(string_to_descriptor(sddl, 1, ctypes.byref(descriptor), None))
+    try:
+        attributes = Attributes(ctypes.sizeof(Attributes), descriptor.value, False)
+        # READ_CONTROL | DESKTOP_CREATEWINDOW for qKVM's own handle: without the second, Windows cannot make the desktop's
+        # own window and refuses with ERROR_NOT_ENOUGH_MEMORY.
+        return checked(create_desktop(name, None, None, 0, 0x00020002, ctypes.byref(attributes), DESKTOP_HEAP, None))
     finally:
         local_free(descriptor)
 
@@ -281,12 +532,16 @@ class AppProcess:
         self._job: Any = None
         self._profile: str | None = None
         self._pair: int | None = None  # the processor pair this worker holds, given back when it ends
+        self._desktop: Any = None  # the desktop made for it (worker_desktop), closed when it ends
+        self._station: Any = None  # qKVM's window station, where it was given an entry for this worker (grant_station)
+        self._sid: Any = None  # a copy of the worker's SID, whose entry is taken out of the station's DACL when it ends
         self.returncode: int | None = None
         self.stdin: Any = None
         self.stdout: Any = None
         root = bundle(package, script)
         sid = P()
-        profile = "qkvm.video." + uuid.uuid4().hex
+        ident = uuid.uuid4().hex
+        profile = "qkvm.video." + ident
         result = create_profile(profile, "qKVM isolated video", "Credential-free video worker", None, 0, ctypes.byref(sid))
         if result != 0:
             raise OSError(f"Cannot create video AppContainer ({result & 0xFFFFFFFF:#x})")
@@ -322,8 +577,18 @@ class AppProcess:
             # before the first instruction, without relying on either mitigation.
             for key, value in [(0x20009, capabilities), (0x20002, inherited)]:
                 checked(update(attribute_list, 0, key, ctypes.byref(value), ctypes.sizeof(value), None, None))
+            # The worker is started on a desktop of its own, on qKVM's window station, which its SID alone of all
+            # AppContainers may use; where the station lets no AppContainer in, its SID is given an entry there too.
+            station, station_name = own_station()
+            self._desktop = worker_desktop("qkvm-video-" + ident, sid)
+            own_sid = ctypes.create_string_buffer(sid_length(sid))
+            checked(copy_sid(len(own_sid), own_sid, sid))
+            if grant_station(station, own_sid):
+                self._station, self._sid = station, own_sid
+            desktop = ctypes.create_unicode_buffer(station_name + "\\qkvm-video-" + ident)
             startup = StartupEx()
             startup.startup.cb = ctypes.sizeof(startup)
+            startup.startup.desktop = ctypes.cast(desktop, wt.LPWSTR)
             startup.startup.flags = 0x101  # STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW
             startup.startup.show = 0
             startup.startup.stdin, startup.startup.stdout, startup.startup.stderr = read_in.value, write_out.value, null
@@ -414,7 +679,13 @@ class AppProcess:
 
     def wait(self, timeout: float | None = None) -> int:
         with self._state_lock:
-            return self._wait(timeout)
+            code = self._wait(timeout)
+            # (Its entry in the station's DACL is taken out after the lock is let go: that change may wait SHARED_WAIT for
+            # another qKVM's, and kill(), cpu_seconds() and the reaper's waits need the lock meanwhile.)
+            station, self._station = self._station, None
+        if station is not None:
+            revoke_station(station, self._sid)  # (last: where it cannot be done, everything else has been given back)
+        return code
 
     def _wait(self, timeout: float | None) -> int:
         if self._handle is not None:
@@ -437,6 +708,9 @@ class AppProcess:
         if self._pair is not None:
             release_processors(self._pair)
             self._pair = None
+        if self._desktop is not None:
+            close_desktop(self._desktop)
+            self._desktop = None
         return self.returncode or 0
 
 

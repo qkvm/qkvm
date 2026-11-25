@@ -121,7 +121,7 @@ Windows may say it protected your PC: the app is not yet signed with a certifica
 | **PiKVM-style KVMs** | Whatever speaks the kvmd interface, its H.264 passed on as it comes |
 | **JetKVM** | Over its own channel, typing in the keyboard layout its computer uses |
 | **Servers** | Any controller that speaks Redfish: state, power, health, temperatures and fans. AMI MegaRAC: the screen, keyboard and mouse. OpenBMC: the screen |
-| **PCs with Intel AMT** | Power, start into BIOS setup, and the screen through Intel's own KVM (experimental) |
+| **PCs with Intel AMT** | Power, start into BIOS setup, and the screen through Intel's own KVM |
 | **Proxmox VE** | Its guests through Proxmox's own API: the screen, keyboard and mouse, and power |
 | **VNC servers** | QEMU and libvirt guests, TigerVNC and others: the screen, keys and typed text |
 

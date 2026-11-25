@@ -1,0 +1,80 @@
+# qKVM beside Tailscale, in containers:   docker compose -f docker-compose.tailscale.yml up -d
+#
+# Tailscale's own container joins your tailnet as the machine "qkvm", and qKVM's container shares its network: the wall
+# is reached at https://qkvm.<your tailnet>.ts.net:8787/ with Tailscale's certificate for that name (--tls-tailscale,
+# once HTTPS certificates are on in the tailnet), reaches the KVMs over the tailnet, and "Find KVMs" lists the tailnet's
+# machines, read from Tailscale's local API over its socket, which is mounted into qKVM's container read-only.
+# Nothing is published on this machine's own network: only the tailnet reaches the wall. Never use Funnel for it.
+#
+# The auth key: make one in Tailscale's admin console (Settings > Keys), tagged (tag:qkvm, see the guide's chapter
+# "Over Tailscale or NetBird" for the access rules), and put it in a file called .env beside this one:
+#     TS_AUTHKEY=tskey-auth-...
+# It is not written in here, and is needed for the first start only: the machine's identity is kept in the volume
+# tailscale-state, and the key can be taken out of .env then. Without one, `docker compose logs tailscale` shows an
+# address to sign the machine in at instead.
+#
+# First run: choose a password at the address above, with the setup code from `docker compose -f
+# docker-compose.tailscale.yml logs qkvm`.
+services:
+  tailscale:
+    # Tailscale v1.104.7, pinned by the digest of its image for every platform (the guide says how to move it on).
+    image: tailscale/tailscale:v1.104.7@sha256:72c1e19e0aedca96b8533bbb0b4368564410ff20b17e53b804eb6c1f04a31be4
+    container_name: qkvm-tailscale
+    hostname: qkvm
+    restart: unless-stopped
+    environment:
+      TS_AUTHKEY: ${TS_AUTHKEY:-}
+      TS_HOSTNAME: qkvm
+      TS_STATE_DIR: /var/lib/tailscale
+      # Where qKVM looks for Tailscale's local API (the place tailscaled keeps it on Linux).
+      TS_SOCKET: /var/run/tailscale/tailscaled.sock
+      # The tailnet as a network of this container's own (not a proxy): qKVM reaches the KVMs through it.
+      TS_USERSPACE: "false"
+      # qKVM runs as uid 10001: it may ask for this machine's certificate, and for nothing else that changes anything.
+      TS_PERMIT_CERT_UID: "10001"
+    volumes:
+      - tailscale-state:/var/lib/tailscale
+      - tailscale-socket:/var/run/tailscale
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    # To reach the wall from this machine's own network as well (it is the tailnet only without this):
+    # ports:
+    #   - "8787:8787"
+
+  qkvm:
+    image: qkvm/qkvm
+    container_name: qkvm
+    restart: unless-stopped
+    network_mode: service:tailscale
+    depends_on:
+      - tailscale
+    volumes:
+      - qkvm-data:/data
+      - qkvm-keys:/keys
+      - tailscale-socket:/var/run/tailscale:ro
+    command: ["--https", "--setup-code", "--tls-tailscale"]
+    #
+    # /keys holds the independent server storage key. Back up this volume separately
+    # from /data. Losing it prevents recovery; account recovery codes cannot replace it.
+    # Run with as little as it needs.
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
+
+volumes:
+  qkvm-data:
+  qkvm-keys:
+  tailscale-state:
+  tailscale-socket:

@@ -9,10 +9,20 @@ import subprocess
 import time
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 
-from qkvm import activity, amt, history, jetkvm, kvm, redfish
+from qkvm import activity, amt, egress, history, jetkvm, kvm, netbind, redfish, tailnet, video
+from tests import stand_ins
+
+# Where qKVM looks for the tailnets of the computer it runs on, as the program has it: kept for the tests of the lookups
+# themselves, which put a lookup back over no_tailnet_of_the_computer's nothing (with a PATH of their own).
+THE_COMPUTERS_OWN: dict[str, Any] = {
+    "sockets": tailnet.SOCKETS,
+    "tailscale_command": netbind.tailscale_command,
+    "netbird_command": netbind.netbird_command,
+}
 
 TICK = 0.02  # what a clock may be out by: on Windows before Python 3.13 it ticks every sixteen thousandths of a second
 SCALE = 300.0  # how much shorter every wait is for a test that asks for `scaled`: a minute is a fifth of a second
@@ -67,6 +77,35 @@ def deployment_mode(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     monkeypatch.delenv("QKVM_CONTAINER", raising=False)
     monkeypatch.delenv("QKVM_VAULT_KEY_FILE", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def no_tailnet_of_the_computer(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No test asks the tailnets of the computer it runs on: no tailscale or netbird command is found, and Tailscale's
+    local API is looked for nowhere. A runner of the tests may be in a tailnet, tailscaled running and its socket where
+    qKVM looks for it: a search there asked that tailnet's machines, and the tests read what the runner's tailscaled said
+    in place of their stand-ins. A test that wants a tailnet sets a stand-in of its own over this (a command, a socket in a
+    folder of its own); the tests of the lookups themselves put them back from THE_COMPUTERS_OWN, with a PATH of their own.
+    (What a test starts as a process of its own is not held by this: none of those searches, or asks for a certificate.)"""
+    monkeypatch.setattr(tailnet, "SOCKETS", ())
+    for module in (tailnet, netbind):
+        monkeypatch.setattr(module, "tailscale_command", lambda: None)
+        monkeypatch.setattr(module, "netbird_command", lambda: None)
+
+
+@pytest.fixture(autouse=True)
+def alert_stand_ins(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The alerts of a test reach its stand-ins on loopback, by the names they registered (stand_ins.py, fake_alerts.py), and nothing
+    else there: every other address is judged by the wall's real outbound rules (egress.vetted), in the tests too."""
+    stand_ins.STAND_INS.clear()
+    real = egress.vetted
+
+    async def vetted(host: str, port: int, *, private_ok: bool, own: frozenset[str], own_ports: frozenset[int] = frozenset()) -> tuple[list[str], int]:
+        if host in stand_ins.STAND_INS:
+            return ["127.0.0.1"], stand_ins.STAND_INS[host]
+        return await real(host, port, private_ok=private_ok, own=own, own_ports=own_ports)
+
+    monkeypatch.setattr(egress, "vetted", vetted)
 
 
 @pytest.fixture(autouse=True)
@@ -177,8 +216,10 @@ def logging_as_it_was() -> Iterator[None]:
 def nothing_rejected_before() -> None:
     """Which passwords devices said no to is remembered beside the connections to them, for as long as the
     program runs. The stand-in device of one test may be given the port another one's had: it is not to
-    find that one's rejected password waiting for it."""
+    find that one's rejected password waiting for it. (Nor one an engine with Intel AMT took: amt._SIGN_INS.)"""
     kvm.REJECTED.clear()
+    amt._SIGN_INS.clear()
+    amt._LAST_TRIED.clear()
 
 
 @pytest.fixture(autouse=True)
@@ -186,9 +227,41 @@ def nothing_paced_before() -> None:
     """What paces a KVM's power buttons and the questions to its Fingerbot is kept beside the connections as well, by the
     KVM's address and its pinned certificate, for as long as the program runs (kvm.PACED): the stand-in of one test, at the port
     another one's had, or a KVM with the same certificate, is not to find that one's press still held. (And a JetKVM's
-    connections made anew in a row for a key frame it did not send, jetkvm._DEAF, by address too.)"""
+    connections made anew in a row for a key frame it did not send, jetkvm._DEAF, by address too; and which KVMs have shown
+    several inputs, kvm.SEVERAL_SEEN: a stand-in of one input at a port another test's switch had is not to be said to have several.)"""
     kvm.PACED.clear()
+    kvm.SEVERAL_SEEN.clear()
     jetkvm._DEAF.clear()
+
+
+@pytest.fixture(autouse=True)
+def video_not_said_unavailable_before() -> None:
+    """Why video cannot start on this computer is kept for as long as the program runs (video.unavailable(), which /healthz
+    says): a worker of one test that could not start (a stand-in's, or one that took too long on a slow machine) is not to
+    be said of the next test's wall; nor its starts that took too long be counted with the next test's."""
+    video._unavailable = None
+    video._slow_starts = 0
+    video._last_started = video._last_slow_ended = float("-inf")
+
+
+@pytest.fixture
+def a_video_worker_first() -> None:
+    """The process's first isolated video worker, made and closed before the test, for as long as that takes. On Windows the
+    first start copies Python and PyAV into a bundle of their own and launches from there, scanned, which no bound of the
+    wall's covers: on the Windows test VM running 16 test files at a time, 3 to 16 s, 8 starts of 20 past the wall's own
+    START_WITHIN (then "slow to start", and asked again); the starts after it in the same process, one for each console or
+    session that makes a picture, mostly 1 to 13 s, and now and then past it too. (There every test process put its workers
+    on the same two processors: each places its own on the pair it has used least, and knows nothing of the others.) A
+    wait for the condition: the minutes are room only. (As tests/test_a_comets_keys_and_mouse_as_the_real_one_took_them.py
+    does for its pointer.)"""
+    deadline = time.monotonic() + 300
+    while True:
+        try:
+            video.Worker().close()
+            return
+        except video.VideoError:
+            assert time.monotonic() < deadline, "no isolated video worker could be started"  # (one that took too long: again)
+        time.sleep(0.05)
 
 
 @pytest.fixture(autouse=True)

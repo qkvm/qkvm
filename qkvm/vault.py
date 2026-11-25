@@ -137,6 +137,11 @@ class Vault:
     def adopt(self, key: bytes) -> None:
         self._key = key
 
+    def held_key(self) -> bytes:
+        """The data key itself, for a backup to carry (backup.py: sealed there with the backup key, with the records it opens
+        and the secrets it seals); VaultLocked where it is not open. Nothing else hands it out, and it is written nowhere."""
+        return self._require_key()
+
     def lock(self) -> None:
         self._key = None
 

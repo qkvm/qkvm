@@ -1,5 +1,424 @@
 # Changes
 
+## 0.4.0
+
+Be told where you work: alerts by mail, Slack, Microsoft Teams, Telegram, Discord, PagerDuty, ntfy and a signed
+webhook, each told what it asked for. Sign in through your team's identity provider. Hold the wall to what it says: an
+activity log that shows an edit, the API written down as a promise, and encrypted backups every night. Reach it over
+Tailscale or NetBird. Intel AMT is no longer experimental, a wall can no longer freeze where 0.3.x could, and a wall
+run as a Windows service shows its pictures. Upgrade with `pip install --upgrade qkvm` or
+`docker pull qkvm/qkvm:0.4.0`; from 0.3.0, 0.3.1 and 0.3.2 the app's own update installs it in place. 0.4.0 needs the
+same libraries as 0.3.2. Read "Upgrading from 0.3.x" first: alerts no longer go through a proxy.
+
+### New
+
+- **Alerts to several destinations.** *Settings > Alerts > Add destination*, fifty at the most, of nine kinds: mail by
+  your own mail server or Gmail (always encrypted: STARTTLS on 587 or TLS on 465, its certificate checked), mail
+  through Resend, Slack, Microsoft Teams (a Workflows webhook, sent an Adaptive Card), Telegram, Discord, PagerDuty
+  (Events API v2: trouble opens an incident, back to normal resolves it), ntfy, and a JSON webhook signed as Standard
+  Webhooks sign (the fields 0.3.2 sent, with `id`, `what` and `severity` added). Every address, key, token and password
+  of a destination is stored encrypted with the saved passwords and never shown again; a password, token or key goes
+  only where it was saved for, and is typed again for another host, port or region.
+  - **Routing:** each destination is told the events it ticks, from the severity it chooses (critical, error, warning),
+    of all machines or of chosen machines and groups. "Back to normal" is told exactly where the trouble was told, so
+    an incident opened is closed, after a restart too. **Quiet hours** that recur by the day, beside the pause;
+    **reminders** of what is still wrong (off by default); **one message** for many machines that change at once (a
+    switch that dies); *Minimal content* leaves the address and the tile's text out. *Backup failed* is an event too.
+  - **Delivery:** each destination by itself, in the order things happened, so that one that is slow holds up no other;
+    tried again after 5, 30 and 120 seconds where its service was busy or broken, never where it said no. **Send test**
+    says what the service answered, in its own words, with the destination's secrets taken out; **Log** shows the last
+    fifty deliveries since qKVM started. A destination that begins to fail, and one that works again, is a line in the
+    activity log. What waits to be sent when its destination or the alerts are switched off is dropped (*Not sent* in
+    the log), even where they are on again before its next try. A pause or quiet hours stop new alerts, and what
+    changes meanwhile is told when they end, where it is
+    still so; an alert already on its way when they begin still goes, within its own tries (the last ending some three
+    and a half minutes after its first began where a service does not answer, some four and a half for PagerDuty's two
+    events of one change, and up to ten minutes more for each wait a service asks for; alerts for one destination go in
+    turn; once a message of a change went, the rest of it goes, and a change tried again sends only what did not go).
+    A screen watch that ends within a destination's quiet hours is told there when they end. A destination edited to
+    send elsewhere (another address, chat, routing key or recipients) starts with nothing known of the machines, and
+    what waited for it is dropped. A mail password has four signs at least and is kept as typed; a mail that some of
+    its addresses refused says which. Browsers told by Web Push follow the same rules.
+  - **Outbound rules:** before every send the name is looked up and every address it leads to is judged, and the
+    connection goes to an address that was judged; no redirect is followed and no proxy used. Never sent to: the wall
+    itself (qKVM's own port, at any of its addresses), link-local addresses and the metadata services of clouds,
+    multicast, the ranges kept for other uses, and an IPv6 address that names an interface (`%`). This computer
+    (`localhost`, `127.0.0.1`, `::1`, its own addresses) and your own network's addresses (10.x, 172.16 to 31.x,
+    192.168.x, fc00::/7, and 100.64.0.0/10, where Tailscale's are) only where the destination's *May be a private
+    address* is ticked, which is off for a new one. An alert never carries a password, a token or a picture, and its
+    words are fixed: there are no templates.
+- **Sign in through an identity provider** (OpenID Connect: Microsoft Entra ID, Google Workspace, Authentik, Keycloak
+  and the others), free as the rest of qKVM. *Settings > Accounts > Identity provider*: the provider's groups give the
+  roles (the highest of them), and anybody else it signs in may be given one role, with an email domain where the
+  provider lets people sign up, and always for Google. The authorization code flow with PKCE, and the ID token held to
+  every rule: its signature against the provider's keys (RS256 or ES256 only) and its claims. An account is known by the
+  provider's own number for the person, never by a name that is taken. A sign-in lasts 8 hours at the most, and every
+  sign-in the provider made ends at once when anything in the wall's settings that decides roles is changed. The
+  wall's own passwords keep working beside it, and qKVM keeps one admin who signs in with one. Every sign-in, refusal
+  and change of role is in the activity log.
+- **An activity log that shows an edit.** Each line is chained to the one before and signed with a key the data folder
+  does not hold in the clear (it is kept in the settings, which the vault key seals). The wall seals the chain at each
+  start and stop, every hour and before its oldest file goes, and can keep heads outside itself: every line goes to
+  syslog with its place in the chain (`--audit-syslog`), and an alert destination can be sent the head once a day
+  (*Daily seal of the activity log*, sent within a pause and quiet hours too). *Settings > Activity > Check the log*
+  reads it through on the wall;
+  `python -m qkvm.checklog` checks a download or the files away from it (exit 0 intact, 1 broken, 2 could not check,
+  3 intact with lines not proved; with `--part`, a download that is only a part of the log, 4 where it is intact as far
+  as it goes and not proved complete). The order the lines come in decides nothing. Somebody who edits the files
+  without the vault key is caught; somebody who holds the data folder and the vault key together is shown only by the
+  heads kept elsewhere.
+- **The API v1 is written down as a promise**, in the guide's chapter *The API*: within `/api/v1/` requests, fields,
+  states, codes and words are added, and none is taken away or given another meaning. A `/api/v2/`, if one ever comes,
+  is served beside it, and v1 goes on for at least twelve months and two minor releases after that, with `Deprecation`
+  and `Sunset` headers meanwhile. `qkvm/api_v1.json`, in every installed copy, lists it for a program, and qKVM's own
+  tests fail where the code and the list differ. `python -P -m qkvm.conformance <address> --token-file FILE` holds a
+  running wall to it, reading only (nothing but GET: nothing is changed or pressed, no live line is opened), and exits
+  0 where all is as promised, 1 where it is not and 2 where it could not check: a test for a client's release. An
+  older wall is held to its own version's promise.
+- **Scheduled backups, always encrypted.** *Settings > Backups*: every day at the hour you choose, one file in a folder
+  you name (a mounted share, or a folder another tool copies elsewhere), the newest 7 kept unless you choose otherwise,
+  with the history where ticked. Sealed with a backup key of its own (AES-256-GCM, with a key for each file derived
+  from it), which is shown once as a printable recovery kit and kept sealed in the vault, so that a backup at night
+  needs nobody. A backup takes its name only once it has been read back whole; *Verify the latest* reads it again and
+  says what it holds; a run that fails is told to the destinations that ask for *Backup failed* and is a line in the
+  activity log. `qkvm --restore FILE --backup-key KIT --data-dir NEW` brings the wall back into an empty folder on
+  another computer, and refuses a file that was changed, cut off, made with another key or by a later version.
+  Whoever has a backup and its kit has every device password in it: keep the kit as carefully as the wall's own key.
+  No backup holds a backup key: a wall restored from one has backups off until its admin makes a new kit. A folder
+  takes one run at a time by whatever name it is reached; a run that does not end within the hour is said failed and
+  told, and one stuck on a share holds only that share. A restore holds the folder it restores into: a second restore
+  there is refused until the first ends, and one that was stopped before it finished is taken over by the next, which
+  takes away what it wrote, and nothing else, and begins again.
+- **Over Tailscale or NetBird.** *Find KVMs* lists a tailnet's machines from Tailscale's command or, in a container
+  beside Tailscale's, from its local API over its socket (only one that is root's or qKVM's own account's), and a
+  NetBird network's from its client or from its management API (with a token kept in the vault, under *Settings >
+  Network*). `--tls-tailscale` serves Tailscale's own certificate for the wall's name under ts.net, which browsers
+  trust, renewed without a restart. `docker-compose.tailscale.yml` and `docker-compose.netbird.yml` run qKVM in the
+  network of the tailnet's own container (its image pinned by digest), and the guide's chapter *Over Tailscale or
+  NetBird* says how to let only the wall reach the KVMs, and why never Funnel.
+- **Open in.** An admin gives a machine its page on MeshCentral, its RustDesk ID or its Remote Desktop host (*Open
+  in...*, in the tile's menu), and operators and admins open it from there; for Remote Desktop the menu hands out an
+  `.rdp` file that holds the host alone. They are plain links: no password or token is kept for them or put in them,
+  and the wall fetches nothing from them.
+- **The guide says how to run a VNC server safely** on a machine that has no KVM in front of it, and what such a
+  server cannot do (*No KVM in front of it? A VNC server*).
+
+### Changed
+
+- **Intel AMT is no longer experimental.** Five more business PCs were on the wall, two walls at once, and what their
+  engines did is built in, and was tried on them again:
+  - A plain no to a password the engine took before is answered once more, with its fresh challenge. Refused again,
+    the tile says that the engine refuses sign-ins from qKVM for now, and nothing is sent to it for 16 minutes: an
+    engine refuses one address for a while after failed sign-ins, and every try meanwhile keeps it refusing. One that
+    still refuses after the wait is tried once more some 90 seconds later; *Login rejected* is said only of a refusal
+    then.
+  - *Shutting down* is shown from a shutdown until the PC is seen off (the engine itself says nothing of it). *Shut
+    down* pressed again says it is under way; *Hold power button* meanwhile, where the engine offers no power cut,
+    says why nothing was sent; a PC not off three minutes after says what may be the matter.
+  - While another viewer has the engine's KVM (another wall, Intel's or MeshCentral's tools), the tile says *In use by
+    another viewer* (409 `in_use`), and its port is asked again after 15 seconds, 30, then once a minute.
+  - A PC that asks for the consent code, or has no KVM (vPro Essentials), says so and what to do; one reached over
+    plain HTTP says so on its tile.
+  - A tile set to *Live KVM* keeps its session while a picture is being made. It was let go of under the picture, and
+    the next look opened another, with Intel's border on the PC again.
+  - The guide says, in short, how to set a PC up for qKVM.
+- **GL.iNet's newer firmware**, from Comets that run it:
+  - A KVM whose mouse is set to move by steps says that it can be set to absolute on the KVM's own page.
+  - A virtual drive that says offline is said to be not ready, to be tried again once the machine behind it has
+    started.
+  - **A reset is judged by the screen** on a KVM with the kvmd interface: done once the screen is seen to change from
+    what it was just before the press, else said pressed and not seen to change, never not carried out. (A Comet's
+    computer kept its video signal up through its restart.) Where the screen cannot be read just before the press, the
+    reset is done when the button is let go, as before.
+- **The manual is GUIDE.md**, and README.md a short page that leads to it; the page and its messages call it the
+  guide.
+- **An address nothing is served at, or one served by another method, is refused as every refusal is promised to be**:
+  `{"code": "...", "message": "..."}`, 404 `not_found` or 405 `method_not_allowed` (a new code) with `Allow`. An admin
+  was answered the web framework's `{"detail": "..."}` there.
+
+### Fixed
+
+- **A wall could freeze for good.** Where Python's garbage collector ran the clean-up of an earlier answer (a
+  download's, a served image's) while the same thread held the lock that clean-up takes, the thread waited for itself,
+  every request of the wall with it, and the process could not even end. Seen once in many runs of the tests, in a
+  download of the activity log; 0.3.x has the same code. The clean-up is handed to a thread of its own now, which
+  holds no lock.
+- **Pictures under a Windows service or an SSH session.** qKVM run as a Windows service, by a task that runs whether
+  anybody is signed in or not, or over SSH, showed no picture of a JetKVM, a server, a PC with Intel AMT, a VNC server
+  or a Proxmox guest: its video workers could not load their libraries on the desktop qKVM was started from. Each
+  worker now starts on a desktop of its own (see Security). Where no worker can start at all, those tiles say why
+  (`no_video`), `GET /healthz` says `"video": "unavailable"` (not why: it answers anybody), and the log says it once;
+  each tile said an error of its own before. A start that only took longer than 15 seconds counts as none only three
+  times in a row. KVMs with the kvmd interface need no worker for their pictures.
+- **A JetKVM's last picture from before its screen went dark is not shown as its screen.** Its video library lets a
+  picture go only once the next one begins, and a busy wall took the last picture from before for the screen that had
+  come back, until the next one. Each picture is stamped now with when its first packet came.
+- **A JetKVM whose video worker is slow to start is not said to be offline.** On a busy computer that took up to 18
+  seconds, and meanwhile its tile, its history and the alerts said offline.
+- **A stock PiKVM whose computer has no video signal no longer sends alerts in pairs.** Stock kvmd stops its video
+  while nobody watches and then says nothing of the signal, which was taken for a picture: "has no video signal" and
+  "has a picture again" went out each time somebody looked. A signal the KVM does not say keeps the last word of it
+  now. (Found by a soak of 500 stand-in machines; 0.3.x has the same code.)
+- **The guide's way to start qKVM with Windows kept it running for three days.** The task its `schtasks` line makes is
+  ended by Windows after three days, and on a laptop as soon as it runs on its battery. A second line now lifts both
+  (*Keeping it running, Start it with Windows*). Found by a soak of the release on Windows; the guide had the same
+  line since 0.1.
+- **A sign-in made at once after a session ended elsewhere stays.** When a session ended elsewhere (signed out
+  everywhere, a password changed, a restart), a sign-in made at once could be thrown back to the sign-in page by a
+  late answer to the session before, and a dialog or the large view's last picture stayed on show until the sign-in
+  page came. The wall leaves the screen at once now, a late answer of an ended session ends no newer one, and on the
+  way back the sign-in page waits at most 5 seconds for the identity provider's button (as long as before at its
+  first opening, the button added if it comes later).
+- **A KVM that closes the connections kept to it all at once no longer shows offline for some seconds.** A look is
+  tried again on a connection of its own; nothing that acts is tried again.
+- **Keys to a KVM whose switch hangs are refused after two seconds**, not eight.
+- **Two clicks on Actions while the page waits for its first word of a machine open one menu**, and keys from the
+  large view the wall refused give keyboard and mouse back, as its question says.
+- **The activity log names the input a key action was for**, or that it went as for a KVM of one input, and logs keys
+  refused for their input before anything went. Keys whose tile was taken off the wall while their own request
+  signed in again said they may have gone; they say nothing went.
+- **A PC's view chosen for a tile now pointed at a KVM is refused as `machine_changed`**, not `invalid`, so that the
+  page fetches the wall again.
+- **A wall of many tiles loads each tile once** (10,000 tiles in 0.25 s, where it took 1.7 s).
+- **A JetKVM picture stamped as its screen came back is taken as from before.** On Windows with Python 3.11 and 3.12,
+  whose clock moves in steps of some 16 ms, a picture of the same step could pass for the returned screen.
+- **A JetKVM tile whose video connection came to nothing tries again by itself**; it stayed red until opened large.
+  Where the JetKVM refused the offer, the tile tries again after 5 seconds and up to every 2 minutes. After any other
+  failed offer, which may have taken the JetKVM's one viewer from somebody at its own page, it makes one more, then
+  says why and waits to be opened. Only a tile on screen tries; a look at the status does not.
+- **No "Task exception was never retrieved" from the WebRTC library** when a JetKVM connection ends on a busy
+  computer.
+- **A VNC server's idle video workers are stopped**: its picture encoder and its Tight JPEG decoder (some 35 MB each)
+  stop a minute and a half after the last look and start again at the next. They were kept for every VNC server
+  anybody had looked at, for as long as it was on the wall. Many of them starting again at once start a few at a time,
+  in threads of their own, so that the rest of the wall does not wait for them.
+- **Video runtimes earlier runs left in the temporary folder are removed** once nothing in them is open (a wall that
+  Windows ended as it restarted left some 90 MB there each time).
+- **A wall's memory on Linux.** On Linux with glibc the wall's process grew 1 to 3 MB an hour over the days while
+  Python's own memory stayed level: memory freed and kept by malloc in its arenas. Every 0.4.0 wall now keeps malloc to
+  two arenas and a fixed trim threshold of 131072 bytes, however it came to 0.4.0 (pip, the service, the image, or an
+  update from inside the app: the wall asks glibc itself where its starter set nothing); whoever set
+  `MALLOC_ARENA_MAX`, `MALLOC_TRIM_THRESHOLD_` or the same in `GLIBC_TUNABLES` keeps their own. Freed memory piles up
+  more slowly, for about 1% of a processor core on a wall serving 40 pictures a second.
+- **An update kept on trial on Windows.** Marking an update that had started and stayed up was tried once, and a
+  moment when the program read its note made it fail without a word: the update was on trial again at the next start.
+  It is tried again for a few seconds now (going back alike), never over a note another program wrote meanwhile, and
+  said in qkvm.log where it still cannot be written. `qkvm --roll-back` that meets such a note says so and changes
+  nothing. (That is the starter's: a wall updated from inside the app has it once the package itself is upgraded.)
+- **A restore stopped near its end.** A restore stopped right after it wrote the settings, before its line in the
+  activity log, left a wall without that line, and the same command refused to finish it. The line (and the log's
+  check) now comes before the settings: stopped before them, the same command takes the restore over and finishes it.
+  A start on a folder whose restore has not finished (under way, or stopped) is refused, with what to do: run the same
+  `--restore` again.
+- **Windows: no ERROR for a connection reset as it closed.** qkvm.log got an asyncio ERROR and a traceback each time a
+  browser or a device reset a connection as Windows' event loop closed it (WinError 10054). That one case is no line
+  now, unless it hid an error of qKVM's own; every other error of the loop is logged as before.
+
+### Security
+
+- **Alerts are held to the outbound rules above, the address carried over from 0.3.2 too.** 0.3.2 posted to whatever
+  address was saved, through the environment's proxy where one was named: a link-local address (where clouds keep their
+  metadata service) or the wall's own port was sent to as any other. Those are refused now, and this computer and
+  private addresses are reached only where *May be a private address* is ticked (it is, for the address carried over:
+  see below).
+- **Each video worker on Windows starts on a desktop of its own**, which lets in SYSTEM, qKVM's account and that worker
+  alone; until 0.4.0 a worker in a signed-in session started on the user's own desktop. Where qKVM's window station
+  lets no AppContainer in (a service's, an SSH session's), the worker's own identity is given one entry there, taken out
+  again when the worker ends. SECURITY.md now also says what a worker taken over could still reach in a signed-in
+  session (as before 0.4.0), and that the station entries of a qKVM ended from outside stay until the station ends.
+- **Several qKVMs on one Windows computer no longer crowd their video workers onto the same two processors.** Each
+  began at the first pair, where Windows takes most interrupts too; each begins at a pair drawn at random now. (Found
+  in this release's work, and confirmed by a review.)
+- Each part of this release's new code was read by a fresh reviewer of our own, and its fixes again; then the whole of
+  it by an outside review in two rounds, and its fixes by two more fresh reviews. Every finding of high or medium was
+  fixed before the release, with tests; one, that alerts no longer use the environment's proxy, is said instead
+  (below). Among them: a destination's saved password could follow an edit of its address to another host; the
+  activity log could be edited without the vault key and still check as intact, and a log cut short with its lines
+  turned round was taken as intact by the offline check; a sign-in by the provider could keep its role for up to 30
+  days after its groups changed; two walls backing up to one folder pruned each other's backups; a new recovery kit
+  made while a backup was being made could be opened by the kit before it (no backup holds a backup key now); an IPv6
+  address that names an interface passed the outbound rules; an alert waiting to be sent again went out after the
+  alerts were switched off; a service that said a token back in an error had it shown to the admin. A second outside
+  round, on the release candidate, found three of high: a power button, keys or typed text confirmed for one machine
+  went to the one an admin put at its tile meanwhile; a person in a provider's group was given the role for anybody
+  else where that was higher; a mail password of fewer than four signs came back whole in what the server said. All
+  are fixed, with its medium findings: among them, a failed restore took away the files and the key of one that had
+  ended well, a mail some of its addresses refused was logged as delivered, one the server took before hanging up
+  was sent four times, and a push service's reason could repeat the query of a browser's address. A re-check of those
+  fixes found that a menu left open while its tile was pointed at another machine still sent its one-click keys
+  there, and that keys and text on a KVM with several inputs went to whichever computer was on screen: both go only
+  where the page showed now (409 `machine_changed`, and `input_changed`). Also fixed then: a failed restore took away
+  a `--vault-key-file` another restore used; a full disk while the first storage key was written left a key no retry
+  could use; a mail its server took was sent again when the time ran out while its refusals were written up; a
+  restore that ended well could be taken for a stopped one; what was left of a PagerDuty change went to a routing
+  key edited meanwhile. A second re-check found that a question could name the tile as it was at the click while its
+  request carried the machine the menu showed, that the key and text editors lost the KVM's port, that a KVM whose
+  switch did not answer was offered keys naming no input, that the Ctrl+Alt+Del action was not held to the input,
+  that the AMT view buttons named no PC, that a failed restore could take away a storage key another restore had
+  taken up, that a first key cut short by a stop left none a retry could use, and that a mail refused by every
+  address was given up where the first refusal was for good. All are fixed: keys and text now go only where the KVM
+  itself, asked right before they go, shows the input the page showed. A third re-check found that a page just
+  opened, or a tile pointed at another machine, offered keys naming no input on a KVM with several (no word of it yet,
+  or the word of the one before); that a KVM whose switch listed its inputs without the one on screen, or whose wall
+  was locked and opened again, was taken for one of a single input; that Ctrl+Alt+Del and Alt+F4 confirmed in the
+  large view named no input; and that making a first storage key took away files beside it named like its own
+  (another wall's key, another restore's key in the making), failed for a long key name or a volume without hard
+  links, and could refuse a key another restore had just put in place. A narrow look at those fixes found that keys
+  could still go naming no input to a KVM with several (a page holding an older status or a failed first contact; an
+  action that waited for control to be let go), that the large view's Ctrl+Alt+Del and Alt+F4 went over the live line
+  where the page took the KVM for one of a single input, and that making a first storage key could take away a file
+  named as its lock or its staging file, and put a key in its place before it was whole or private on a volume without
+  hard links. The page's keys now say the input they are for, or that they take the KVM for one of a single input,
+  and the wall refuses those where it finds several; a key is made only on a volume that takes hard links. These are
+  fixed, but for the limits under Known.
+- **0.4.0 was held at its release to fix every issue still known**, and each fix was read by a fresh reviewer of our
+  own, and the fixes of those again. They found, and this release fixes: a status, a picture, the Media box (since
+  0.3.2), a PC's KVM switch, a server's console, *Open in*, the certificate box and *Trust*, and the list of computers
+  to wake could be of, or act on, the machine an edit had put under the tile, where the page still held the wall as
+  it was. Each now names the machine it was asked for (`target`, refused with 409 `machine_changed`), the page fetches
+  the wall again, and a Media box and its questions close once their tile is at another machine. Keys sent as for a
+  KVM of one input went where its switch had not answered (a 502 while kvmd restarted, no answer, a proxy's page),
+  where its answer said a switch was there but listed no input yet, and after a restart that forgot that the KVM had
+  shown several inputs; a KVM with several inputs could be taken for one past 4,096 remembered; a switch not in step
+  had its input taken as said; and keys confirmed for an input could wait seconds for a free connection after the KVM
+  said its input, so that a switch at its buttons meanwhile sent them to the other computer. Keys as for one input go
+  only on kvmd's own word that it has no switch now, what a wall learned of a KVM's inputs is kept with its tile
+  (across restarts, locks and a certificate trusted anew; let go of after ten minutes of kvmd's word that its switch
+  is gone), and keys leave within half a second of the KVM's answer or are refused. On Windows a vault key named as
+  the staging file with a trailing dot, a space or `::$DATA` was taken and could be removed: names are judged as
+  Windows opens them.
+
+### Releasing
+
+- **Each release lists what it brings in**, from 0.4.0 on: `qkvm-<version>-sbom.cdx.json`, an SBOM in CycloneDX 1.5 of
+  every library that installing it brings in, for each Python and system it is built for, with each one's version,
+  licence, package URL and the SHA-256 of its wheels. It is listed in `SHA256SUMS` and signed with the release;
+  `python -m qkvm.release verify --signed SHA256SUMS qkvm-<version>-sbom.cdx.json` checks a copy.
+- **Which versions get fixes** is written down, in the guide (*Updates, Which versions get fixes*) and in SECURITY.md:
+  before 1.0, only the newest release gets fixes, security fixes too, as the next release, and nothing is carried
+  back to an older line; long-term support starts with 1.0. A security fix is announced by a GitHub security
+  advisory, a *Security* part in its version's chapter here, and the release itself.
+- **An update is tried on a data folder made by the released 0.3.2** (accounts with two-factor sign-in, a token, five
+  devices of four kinds, saved actions, the alert address, history and an export): in 0.4.0 everything in it is there
+  and works, and the released 0.3.2, started on it again afterwards, finds its alert address.
+- Tests that failed only on a slow or busy Windows computer wait for what they mean now, not for a moment of the
+  clock: those that failed on GitHub's Windows runners, and seven that failed where sixteen test files ran at once.
+  Two of them had found defects of the wall: the JetKVM's picture and its slow video worker above.
+- A newer push of a `release-X.Y.Z` rehearsal branch cancels that branch's older Release and Tests runs; a tag's run
+  and its publication share a group no rehearsal joins (where GitHub still cancels a run that waits once a third
+  joins).
+
+### Upgrading from 0.3.x
+
+- **By pip:** `pip install --upgrade qkvm`, then start qKVM again. **By Docker:** pull `qkvm/qkvm:0.4.0` and start the
+  container again with the same volumes. **From the app** (*Settings, Updates*): 0.3.0, 0.3.1 and 0.3.2 install it in
+  place. From 0.2.x, update to 0.3.2 first.
+- **The alert address of 0.3.2 is the first destination**, of the kind its *Service* said, with *May be a private
+  address* ticked, so that one on `127.0.0.1` or `localhost` keeps working. New for it: link-local addresses and the
+  wall's own port are refused, and a JSON webhook carried over is sent unsigned until *Make a new one*, in its *Edit*
+  box, gives it a secret. A name that leads to several addresses is tried at each in turn, as 0.3.2 did (`localhost`
+  leads to `::1` first on some computers). `GET` and `PUT /api/v1/alerts` and `POST /api/v1/alerts/test` keep their
+  fields and their meaning, of the first destination.
+- **Alerts go through no proxy any more.** A wall that reaches the internet only through a proxy (`HTTPS_PROXY`,
+  `HTTP_PROXY`) stops alerting after the update, and the activity log and the list of destinations say why. Let the
+  firewall pass the wall's connections to the services it alerts (HTTPS on 443 to their hosts, the mail server on 587
+  or 465), or alert a service on your own network (an ntfy or a mail relay, with *May be a private address* ticked)
+  that passes them on.
+- **The activity log is taken in once**, before its first line (some 3 s for 50 MB), and the lines of 0.3.2 check as
+  "from before the chain". Each line is some 136 bytes longer with its place in the chain, so the same `activity_mb`
+  (50 MB, unless it was changed) keeps some 45% fewer lines: about five months of a busy wall, where it was nine.
+  Raise `activity_mb` to keep as long as before.
+- **Going back to 0.3.2** (an update that does not start, `qkvm --roll-back`, or `pip install qkvm==0.3.2`) finds what
+  0.3.2 saved, its alert address too while the first destination is unchanged; what only 0.4.0 has (more
+  destinations, the identity provider, backups) it does not see. The lines 0.3.2 writes meanwhile, after a 0.4.0 that
+  stopped as it should, are taken in at the next start of 0.4.0 and said as not proved by the chain.
+
+### Known
+
+- The Docker image keeps the three exceptions for SQLite's findings (its FTS5 search and secure delete, its session
+  extension; none reachable from qKVM), which Debian calls minor and has not fixed for trixie, and takes two for
+  OpenSSL's (memory its QUIC code keeps, both rated low by OpenSSL; qKVM has no QUIC), which Debian has not fixed
+  yet, until 2026-12-24 (the second of OpenSSL's until 2026-12-25) or Debian's fixes, whichever comes first.
+- What this release changed for Intel AMT was built from what five real engines did and tried on them again, except
+  the consent code (none of them asks for one). Not built yet: a state that says a PC's monitor is on a
+  graphics card other than Intel's (the engine's KVM shows Intel's graphics alone), and a way to type a consent code
+  that somebody at the PC reads out.
+- On a real tailnet, on Linux, Tailscale's machines were listed alike by its command and by its local API, and
+  `--tls-tailscale` served Tailscale's certificate, which a browser's check takes, once Tailscale had made it (the
+  first can take a minute or two; the wall's own certificate is served meanwhile). NetBird's management API,
+  `--tls-tailscale` on Windows and the Compose files were tried against stand-ins only.
+- Sign-in through an identity provider was tried against a stand-in provider; the setups the guide gives for Entra ID,
+  Google, Authentik and Keycloak were written from their documentation. SAML and SCIM are not offered, and the Desktop
+  App does not sign in to a wall through its provider. A key the provider has taken out of its set is still taken for
+  up to an hour.
+- A reset judged by the screen was built from what a real Comet did, and tried against a stand-in. The RustDesk link
+  (`rustdesk://connection/new/<ID>`) was not tried with the RustDesk app.
+- The delivery log, and what quiet hours hold back, are kept in memory: a restart forgets them. A screen watch that
+  goes off within quiet hours is not told there, nor then its end. Where a screen watch's start went is kept in
+  memory: after a restart its end goes wherever *Back to normal* is heard. Mail goes out on ports 587 and 465 alone.
+- Backups to a network share were not tried. Browsers told the alerts by Web Push are not told of a failed backup. A
+  run that failed is made again at the next day's hour, or with *Back up now*. The guide gives the restore of a plain
+  install; for a wall in Docker it is not written out yet.
+- On Windows, where qKVM is ended from outside (killed, or a crash), each of its running video workers leaves its
+  entry in a service's window station until the station ends; some 1,300 fill it, and then no worker starts there
+  until the computer restarts (SECURITY.md).
+- On the PiKVM V4, its power and reset buttons were not pressed, its power light could not be read on the test
+  machine's board, and a computer was not started from an image there.
+- An action, a picture, a console's way in, the Media box and a machine's *Open in* links are tied to the machine
+  their question or view named (`target`). Where what qKVM knows of a machine grows (its certificate or its number
+  first remembered, a JetKVM followed onto HTTPS), an action asked for just before is refused once, and asked again
+  goes, and an open Media box closes (an upload under way with it). A script that sends no `target` acts as before.
+- Secrets are taken out of what alert services, the identity provider and NetBird say back: a token or key whatever
+  its letters, and a password in an address, whole in any spelling and wherever six of its signs stand together; the
+  words of an address of small letters alone, and a mail login's password, only whole (in any case and spelling) and
+  where they stand whole, so that the server's own words stay; a short mail password of one run of letters and digits
+  only as it is spelt. What a KVM, a server's controller or Proxmox says in an error is shown as it came.
+- An alert waiting to be tried again when qKVM stops is not sent after the start. A machine's trouble that was not
+  delivered counts as told, and its end is still sent: given up on after its tries, refused at one try, given way
+  when a hundred waited, or not to be sent at all (the saved passwords locked). A browser told by Web Push may be told
+  that a machine is back to normal without its trouble, where a switch dropped the trouble, and a newly added
+  destination may be told so of a trouble from before it. Where a mail server takes an alert for some of its
+  addresses and refuses others for now, those miss that alert. The log of a mail some addresses refused gives up to
+  300 signs of their addresses and reasons, so it may name none of them whole; of one refused by all, it gives the
+  first refusal for now, else the first.
+- In these rare combinations a destination can be told that a machine or the backups are back to normal without
+  having been told the trouble, or not be told a recovery it was owed: switched off and on while an older backup's
+  recovery waits and another backup fails; alerts switched off and on while a screen watch's start waits, the watch
+  then ending, going off again and ending again within quiet hours; a restart between an edit reaching the disk and
+  the alerts' next write of what they told. An edit of a destination that cannot be saved (a full or read-only disk)
+  while a trouble alert waits for it loses that alert: it is not tried again. On a wall of more than 10,000 machines,
+  a restart keeps, in each of the alerts' saved records, what they knew of the first 10,000 by their ids, as of the
+  last time those records could be saved whole (one grown too large is not saved).
+- On a KVM with several inputs, keys and text go only where the KVM itself, asked right before they go, shows the
+  input the page showed, and only within half a second of its answer; a switch in that half second, or while the KVM
+  types a long text, can still send them to the other computer. Keys the page sends as for a KVM of one input go only
+  on kvmd's own word that it has no switch: a KVM a wall has never seen list its inputs (just added while its switch
+  is not up, or after an edit of its address, check, machine or identity) is taken at that word, and so is one whose
+  switch kvmd says for ten minutes is not there while it still routes (its link to kvmd lost, or switched off in
+  kvmd's settings); a switch plugged in again then takes keys as for one input while it starts. A restart of the wall
+  starts the ten minutes again. Keys typed in the large view or on its on-screen keyboard (its Ctrl+Alt+Del and Alt+F4 there too), its
+  Win, Alt+Tab and PrtSc, and chords typed on the person's own keyboard (Right Ctrl+Delete and the like) go over the
+  live line, which names no input: they reach whichever computer the KVM shows as they arrive. The large view's
+  Ctrl+Alt+Del and Alt+F4 buttons, typed text and the Actions menu name the input, or say they take the KVM for one of
+  a single input, and are held to it; on a KVM of one input each of them asks its switch first (one more short
+  request, of two seconds once it has a connection) and briefly lets go of control in the large view. A script that sends neither
+  `input` nor `one_input` acts as before. The status's `ports.active` is the last look and may lag; it decides nothing.
+- A stock PiKVM's signal that comes back while nobody watches is seen at the next look that starts its picture: until
+  then the machine stays without signal, and a watch of minutes without signal can go off.
+- On Linux and macOS a vault key folder on a volume without hard links, or one
+  that shows its files to others (FAT, exFAT), is refused, and an empty `.qkvm-key.lock` stays beside a key once one
+  was made there. On Windows a first key is not made in a folder that holds such a file (carried from Linux or macOS,
+  or left by a power cut): remove it by hand while no qKVM is making a key there.
+- A folder on a share that gives no file numbers is held with every share of its volume number. Where that number
+  is 0 it is told apart by its server and share, so the same share reached by another name is taken for another
+  folder; on Linux a share mounted twice is another folder whatever its number. Each run still keeps its own file in
+  the making.
+- The Docker image's health check asks port 8787: a container started with another `--port` is said to be unhealthy.
+  Keep 8787 inside and map it (`-p 9000:8787`), or in Compose give the check its port, as
+  `test: ["CMD", "python", "-P", "-s", "-m", "qkvm.healthcheck", "9000"]` (the image has no shell for `--health-cmd`).
+- Some of this release's browser tests were run on Windows alone as their pages were made, and on Linux in the whole
+  suite since. A few tests still fail now and then where a Windows computer runs many test files at once.
+
 ## 0.3.2
 
 Fixes found in 0.3.1's reviews, by the Desktop App, and on real devices. Upgrade with `pip install --upgrade qkvm` or

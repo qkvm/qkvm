@@ -101,7 +101,11 @@ def test_every_kind_of_field_a_record_has_is_one_the_check_knows() -> None:
 
     from qkvm import store
 
-    for record in (store.ServerSettings, store.AlertSettings, store.DeviceRecord, store.UserRecord, store.TokenRecord, store.ActionRecord):
+    records = (
+        store.ServerSettings, store.AlertSettings, store.OidcSettings, store.BackupSettings, store.DeviceRecord, store.UserRecord, store.TokenRecord,
+        store.ActionRecord, store.DestinationRecord,
+    )  # fmt: skip
+    for record in records:
         for each in fields(record):
             for kind in (part.strip() for part in str(each.type).split("|")):
                 assert kind == "None" or (kind in store._HOLDS and kind in store._CALLED), (record.__name__, each.name, kind)
@@ -112,7 +116,7 @@ def test_what_the_check_makes_of_nothing_in_each_kind_of_field() -> None:
     # did not ask. Not what the field is when it is not written: except where empty is of no use and what
     # is declared gives nothing away; and for what somebody may do, the least there is.
     from qkvm import store
-    from qkvm.store import DEFAULT_PORT, ActionRecord, AlertSettings, DeviceRecord, ServerSettings, TokenRecord, UserRecord
+    from qkvm.store import ALERT_EVENTS, DEFAULT_PORT, ActionRecord, AlertSettings, DestinationRecord, DeviceRecord, ServerSettings, TokenRecord, UserRecord
 
     nothing: Any = None
     device = DeviceRecord(id="ab12cd34", name=nothing, url="https://192.168.1.20", username=nothing, open_url=nothing, tls=nothing, kind=nothing, group=nothing, ident=nothing, alerts=nothing)
@@ -132,14 +136,25 @@ def test_what_the_check_makes_of_nothing_in_each_kind_of_field() -> None:
     assert (server.bind, server.port, server.https, server.interval, server.allowed_hosts, server.update_check, server.metrics_token, server.metrics_created, server.require_totp) == (
         ["local"], DEFAULT_PORT, False, 1.0, [], False, "", None, "",
     )  # fmt: skip
-    alerts = AlertSettings(enabled=nothing, format=nothing, offline=nothing, no_signal=nothing, problem=nothing, recovered=nothing, link=nothing, paused_until=nothing)
+    alerts = AlertSettings(enabled=nothing, offline=nothing, no_signal=nothing, problem=nothing, recovered=nothing, link=nothing, paused_until=nothing)
     store._as_declared(alerts, "alerts")
-    assert (alerts.enabled, alerts.format, alerts.offline, alerts.no_signal, alerts.problem, alerts.recovered, alerts.link, alerts.paused_until) == (False, "auto", False, False, False, False, "", 0.0)
+    assert (alerts.enabled, alerts.offline, alerts.no_signal, alerts.problem, alerts.recovered, alerts.link, alerts.paused_until) == (False, False, False, False, False, "", 0.0)
+    # (0.4.0) A destination: what it is told of, and from what severity, are what a new one is told when empty (all of
+    # it): empty is of no use there, and gives nothing away. The rest is the empty one of its kind.
+    place = DestinationRecord(
+        id="d1", kind=nothing, name=nothing, enabled=nothing, host=nothing, config=nothing, private=nothing, minimal=nothing, events=nothing,
+        least=nothing, groups=nothing, quiet_from=nothing, quiet_to=nothing, quiet_days=nothing, remind=nothing, created=nothing,
+    )  # fmt: skip
+    store._as_declared(place, "the destination")
+    assert (place.kind, place.name, place.enabled, place.host, place.config, place.private, place.minimal, place.events, place.least) == (
+        "", "", False, "", {}, False, False, list(ALERT_EVENTS), "info",
+    )  # fmt: skip
+    assert (place.devices, place.groups, place.quiet_from, place.quiet_to, place.quiet_days, place.remind, place.created) == (None, [], 0, 0, [], 0, 0.0)
 
 
 def test_what_the_check_takes_and_refuses_one_rule_at_a_time() -> None:
     from qkvm import store
-    from qkvm.store import AlertSettings, DeviceRecord, UserRecord
+    from qkvm.store import AlertSettings, DestinationRecord, DeviceRecord, UserRecord
 
     def device(**fields: Any) -> DeviceRecord:
         return DeviceRecord(**{"id": "ab12cd34", "name": "A KVM", "url": "https://192.168.1.20", **fields})
@@ -171,7 +186,7 @@ def test_what_the_check_takes_and_refuses_one_rule_at_a_time() -> None:
     for name in ("secret", "cert_pem"):
         store._as_declared(device(**{name: odd}), "the device")
     store._as_declared(UserRecord(id="admin", name="admin", totp=odd), "the account")
-    store._as_declared(AlertSettings(webhook=odd), "alerts")
+    store._as_declared(DestinationRecord(id="d1", kind="slack", secret=odd), "alerts")
     # And the refusal says which field of which record, and what belongs there.
     assert refused(device(open_url=7)) == 'this one: "open_url" has to be a text'
     assert refused(UserRecord(id="admin", name="admin", devices=7)) == 'this one: "devices" has to be a list of texts, or null'  # type: ignore[arg-type]

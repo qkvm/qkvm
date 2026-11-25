@@ -147,6 +147,7 @@ class BmcState:
     tasks: dict[str, dict[str, Any]] = field(default_factory=dict)
     # One of its moments: until this time (time.monotonic()), whatever is asked is answered with an error.
     unwell_until: float = 0.0
+    refused: list[str] = field(default_factory=list)  # every request answered with that error (or while it restarts), as "GET /path"
     comes_back_after: float | None = None  # seconds after which a server that went off is on again by itself
     power_takes: float = 0.0  # seconds between a power command being accepted and the server being seen in its new state
     power_later: tuple[float, str] | None = None
@@ -313,6 +314,7 @@ def make_fake_bmc(state: BmcState) -> FastAPI:
         if time.monotonic() < max(state.away_until, state.unwell_until):  # restarting, or busy with itself: there, and not ready
             # (Some controllers say so with HTTP 200 and an error body where the resource belongs.)
             said: Any = "Service Unavailable" if state.errors_in_200 == "text" else {"message": "Service Unavailable"}
+            state.refused.append(f"{request.method} {path}")
             return JSONResponse({"error": said}, status_code=200 if state.errors_in_200 else 503)
         open_to_all = path in (v1, "/viewer.html") or (path == f"{v1}/SessionService/Sessions" and request.method == "POST")
         if path == v1 and request.headers.get("x-auth-token") not in state.tokens:

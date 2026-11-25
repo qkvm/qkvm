@@ -31,11 +31,21 @@ def tailscale_command() -> str | None:
     of that name that happens to lie in the folder the program was started from.
     """
     names = ("tailscale.exe",) if sys.platform == "win32" else ("tailscale", "Tailscale")
+    return _installed(names, "Tailscale", Path("/Applications/Tailscale.app/Contents/MacOS"))
+
+
+def netbird_command() -> str | None:
+    """The full path of NetBird's command-line tool, or None if it is not installed (looked up as Tailscale's is)."""
+    return _installed(("netbird.exe",) if sys.platform == "win32" else ("netbird",), "Netbird", None)
+
+
+def _installed(names: tuple[str, ...], windows_folder: str, mac_place: Path | None) -> str | None:
+    """The first of `names` in its own folder under Program Files (Windows), on the PATH, or in `mac_place` (macOS)."""
     places = [Path(place) for place in os.environ.get("PATH", "").split(os.pathsep) if place]
     if sys.platform == "win32":
-        places.insert(0, Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "Tailscale")
-    elif sys.platform == "darwin":
-        places.append(Path("/Applications/Tailscale.app/Contents/MacOS"))
+        places.insert(0, Path(os.environ.get("ProgramFiles", "C:/Program Files")) / windows_folder)
+    elif sys.platform == "darwin" and mac_place is not None:
+        places.append(mac_place)
     for place in places:
         if not place.is_absolute():
             continue  # "." and the like: exactly what this function exists to leave out

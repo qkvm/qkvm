@@ -21,12 +21,14 @@ import httpx
 import pytest
 import uvicorn
 
-from qkvm import kvm, netbind, server, update, vault
+from qkvm import cli, kvm, netbind, server, update, vault
+from tests.conftest import THE_COMPUTERS_OWN
 from qkvm.core import Core
 from qkvm.kvm import KvmError, bounded
 from qkvm.server import _CHANGES, create_app
 from qkvm.update import UpdateError, Updater
 from tests import ServerThread
+from tests.test_discover import searched
 from tests.fake_github import FakeGitHub, make_wheel
 from tests.fake_kvm import FakeKvm
 from tests.test_users import OTHER, visitor
@@ -226,6 +228,25 @@ class LiveWall:
         self._serving.join(timeout=10)
 
 
+# How a wall started for the pages' tests (test_in_a_browser.a_wall) keeps a connection between requests: as the program
+# does (cli.SERVER_OPTIONS), longer than the script beside it (httpx: five seconds), so that the script lets go first, as
+# the program means whoever is in front of it to. Uvicorn's own is five seconds as well: the script's request on a
+# connection that had sat idle while a browser ran, 5.4 s on the PC this was written on, was reset as the wall let go of
+# it, on a loaded runner (the push test, GitHub's Linux runner, 2026-11-16: httpx.ReadError, ECONNRESET).
+KEPT_AS_THE_PROGRAM: dict[str, Any] = {"timeout_keep_alive": cli.SERVER_OPTIONS["timeout_keep_alive"]}
+
+
+def test_a_wall_started_for_the_pages_keeps_a_connection_longer_than_the_script_beside_it(tmp_path: Path) -> None:
+    script_keeps = httpx.Limits().keepalive_expiry  # (httpx's own, as every script of the tests has it)
+    assert script_keeps is not None
+    longer = httpx.Limits(keepalive_expiry=script_keeps + 60)  # (this one holds on: what the wall does is seen)
+    with LiveWall(tmp_path, **KEPT_AS_THE_PROGRAM) as live, httpx.Client(base_url=live.url, timeout=10, limits=longer) as holding:
+        first = holding.get("/healthz").extensions["network_stream"].get_extra_info("client_addr")
+        time.sleep(script_keeps + 0.5)  # idle a little longer than a script keeps a connection
+        again = holding.get("/healthz").extensions["network_stream"].get_extra_info("client_addr")
+        assert again == first, "the wall let go of the connection before a script beside it would have"
+
+
 def test_a_request_sent_only_halfway_holds_up_nobody_else(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(server, "BODY_TIMEOUT", 1.5)
     with LiveWall(tmp_path) as live, httpx.Client(base_url=live.url, headers=CSRF, timeout=10) as admin:
@@ -328,6 +349,7 @@ def test_the_tailscale_tool_is_never_taken_from_the_current_folder(tmp_path: Pat
     monkeypatch.chdir(here)
     monkeypatch.setenv("ProgramFiles", str(tmp_path / "nothing-installed"))
     monkeypatch.setenv("PATH", os.pathsep.join([".", "", "relative/bin"]))
+    monkeypatch.setattr(netbind, "tailscale_command", THE_COMPUTERS_OWN["tailscale_command"])  # (the real lookup, over conftest's nothing)
     if os.name != "nt" and Path("/Applications/Tailscale.app").exists():
         pytest.skip("a real Tailscale is installed in its standard place")
     assert netbind.tailscale_command() is None
@@ -535,7 +557,7 @@ def test_a_jetkvm_that_never_stops_talking_does_not_fill_the_memory(monkeypatch:
     address = {"type": "new-ice-candidate", "data": {"candidate": "candidate:1 1 udp 1 192.0.2.1 9 typ host " + "x" * 100_000}}
 
     async def within(seconds: float, ws: Talkative) -> Any:
-        return await asyncio.wait_for(jetkvm._await_answer(kvm.Listening(ws, 2**20)), seconds)
+        return await asyncio.wait_for(jetkvm._await_answer(kvm.Listening(ws, 2**20), jetkvm._Session()), seconds)
 
     # No answer, only addresses, without end: given up on when the time for an answer is over.
     endless = Talkative([], address)
@@ -569,7 +591,7 @@ def test_an_answer_nested_too_deep_to_read_is_just_a_wrong_answer(tmp_path: Path
     body = b"[" * 60_000
     head = "HTTP/1.1 200 OK|Content-Type: application/json|Content-Length: %d|Connection: close||" % len(body)
     deep = Elsewhere(head.replace("|", chr(13) + chr(10)).encode() + body)
-    monkeypatch.setattr(discover, "targets", lambda: ([discover.Target("127.0.0.1", deep.url, deep.url)], ["test network"]))
+    monkeypatch.setattr(discover, "targets", searched([discover.Target("127.0.0.1", deep.url, deep.url)], ["test network"]))
     with wall(tmp_path) as admin:
         result = admin.post("/api/v1/discover")
         assert result.status_code == 200 and result.json()["found"] == []

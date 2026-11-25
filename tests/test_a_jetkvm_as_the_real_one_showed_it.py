@@ -800,9 +800,17 @@ def test_a_status_read_whose_power_question_alone_was_cut_off_asks_again(monkeyp
         jet.stop()
 
 
-def test_a_connection_made_anew_by_the_wall_is_not_the_jetkvm_going_offline(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+def test_a_connection_made_anew_by_the_wall_is_not_the_jetkvm_going_offline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, a_video_worker_first: None
+) -> None:
     # (Found by the second review: the tile, the line and the log said the JetKVM was offline for a moment, of a
     # JetKVM that is there: it was the wall that ended the connection.)
+    # (Each connection decodes in a video worker of its own, started before anything is asked of the JetKVM: seconds on a busy
+    # computer, up to 18 s on the Windows test VM running 16 test files at a time, and a start past its own time is tried again
+    # after a pause. There the first picture came after the twenty seconds this gave it, and the new connection after the six
+    # it watched: each is waited for, and the new connection watched from the key until it is there and two seconds more.
+    # Until the first connection was there, the line said "connecting" of the JetKVM, as it does of one nothing is known of
+    # yet: what it says from the key on is all "online", and nothing it says is "offline".)
     monkeypatch.setattr(jetkvm, "TAKE_WITHIN", 1.0, raising=False)
     caplog.set_level(logging.INFO, logger="qkvm")
     jet = FakeJetKvm(JetState(hidrpc=False, width=640, height=360)).start()
@@ -811,19 +819,27 @@ def test_a_connection_made_anew_by_the_wall_is_not_the_jetkvm_going_offline(tmp_
             admin = wall.browser()
             device = wall.add(admin, jet.url)
             line = wall.line(admin, device, max_fps=5)
-            assert line.picture(timeout=20).kind == 2
+            assert line.picture(timeout=120).kind == 2  # (room only)
             line.say(t="control", on=True)
             assert line.word("control")["on"] is True
+            before = [word for word in line.words if word["t"] == "state"]
+            line.words = [word for word in line.words if word["t"] != "state"]
+            assert all(word["state"] in ("connecting", "online") for word in before), before
             sessions = jet.state.sessions
             jet.state.together = 1.5
             line.say(t="k", u=0x05, d=True)
             line.say(t="k", u=0x05, d=False)
             states = []
             began = time.monotonic()
-            while time.monotonic() - began < 6:
+            anew = None  # (when the new connection was offered)
+            while time.monotonic() - began < 6 or anew is None or time.monotonic() - anew < 2:
                 states.append(admin.get("/api/v1/status").json()[device]["state"])
                 if time.monotonic() - began > 2:
                     jet.state.together = 0.005
+                if anew is None and jet.state.sessions > sessions:
+                    anew = time.monotonic()
+                if anew is None and time.monotonic() - began > 60:  # (room only)
+                    break
                 time.sleep(0.05)
             assert jet.state.sessions > sessions, "the connection was not made anew"
             assert set(states) == {"online"}, states

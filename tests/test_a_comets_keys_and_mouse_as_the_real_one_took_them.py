@@ -34,8 +34,11 @@ def fast(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(live, "STATE_EVERY", 0.1)
 
 
-def test_the_line_says_how_a_kvms_pointer_is_moved_and_says_it_again_when_that_changes(tmp_path: Path) -> None:
-    comet = FakeKvm(FakeState(mouse_absolute=False)).start()
+@pytest.mark.parametrize("newer", [False, True], ids=["glkvm", "glkvm-newer"])
+def test_the_line_says_how_a_kvms_pointer_is_moved_and_says_it_again_when_that_changes(tmp_path: Path, newer: bool) -> None:
+    # `newer`: /api/hid as GL.iNet's newer firmware answered on a real Comet, 2026-11-16: its jiggler with settings of its own,
+    # switched off there, beside a mouse set to relative ("usb_rel"), which absolute moves did nothing on.
+    comet = FakeKvm(FakeState(mouse_absolute=False, jiggler_settings=newer, jiggler_settings_on=not newer)).start()
     try:
         with Wall(tmp_path) as wall:
             admin = wall.browser()
@@ -73,6 +76,20 @@ def test_a_jetkvms_pointer_is_moved_both_ways(tmp_path: Path, monkeypatch: pytes
         await hold(self, session)
 
     monkeypatch.setattr(jetkvm.JetKvmDevice, "_hold", delayed)
+
+    def a_video_worker_started() -> bool:
+        try:
+            video.Worker().close()
+        except video.VideoError:
+            return False  # (a first start may take longer than the wall gives one, START_WITHIN: started again)
+        return True
+
+    # The process's first isolated video worker is made before the line, for as long as that takes: on Windows its first
+    # start copies Python and PyAV into a bundle of their own and launches from there, scanned, which no bound of the
+    # wall's covers (on the PC this was written on 4 to 11 s, against 0.4 s for the next; on GitHub's runner of 2026-11-16,
+    # 1 h 35 min a job, this test, the first of the run to start one, waited its whole 35 s for a picture, and the one
+    # after it, with a worker made already, had its picture in 1.5 s). A wait for the condition: the minutes are room only.
+    wait_until(a_video_worker_started, "no isolated video worker could be started", timeout=300)
     jet = FakeJetKvm(JetState(width=640, height=360)).start()
     try:
         with Wall(tmp_path) as wall:

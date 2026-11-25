@@ -798,10 +798,12 @@ def decode_jpeg(data: bytes, width: int, height: int, session: VideoSession | No
     """A JPEG as three bytes a pixel. RfbError where it is not a picture of that size, or none at all."""
     if picture_size(data) != (width, height):
         raise RfbError(PROTOCOL, "a JPEG that is not of its rectangle's size")
-    from .video import decode_jpeg as isolated_jpeg
+    from .video import VideoUnavailable, decode_jpeg as isolated_jpeg
 
     try:
         return isolated_jpeg(data, width, height, session)
+    except VideoUnavailable:
+        raise  # (no worker can start on this computer: not the server's doing, and said as that where the connection ends)
     except Exception as ex:
         raise RfbError(PROTOCOL, f"a JPEG that cannot be read ({type(ex).__name__})") from None
 
@@ -1007,6 +1009,14 @@ class Client:
         x = min(max(0, x), max(0, self.width - 1))
         y = min(max(0, y), max(0, self.height - 1))
         await self._write(struct.pack(">BBHH", POINTER_EVENT, buttons & 0xFF, x, y))
+
+    def rest_decoder(self) -> None:
+        """Let the video worker its Tight JPEGs are decoded in (some 35 MB) rest, where nothing is drawn now (`drawing`
+        False: nobody looks, and a JPEG that comes is read and let go of): the connection may be kept open for as long as
+        its server is on the wall, and its worker was kept with it. The next JPEG drawn starts another
+        (video.VideoSession.rest)."""
+        if not self.drawing:
+            self._video_decoder.rest_soon()
 
     async def close(self) -> None:
         try:

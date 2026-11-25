@@ -40,8 +40,8 @@ def test_the_word_about_an_address_that_does_not_open_outlasts_a_save_that_leave
     settings = {"enabled": True, "format": "auto", "offline": True, "no_signal": True, "problem": True, "recovered": True}
     with wall(tmp_path) as admin:
         assert admin.put("/api/v1/alerts", json={**settings, "webhook": "http://127.0.0.1:9/hook"}).status_code == 200
-        saved = admin.core.store.alerts.webhook  # type: ignore[attr-defined]
-        admin.core.store.alerts.webhook = {"nonce": "!", "data": saved["data"]}  # type: ignore[attr-defined]  # (as a hand or a disk leaves it)
+        first = admin.core.store.destinations[0]  # type: ignore[attr-defined]  # (0.4.0: the address is the first destination's)
+        first.secret = {"nonce": "!", "data": first.secret["data"]}  # (as a hand or a disk leaves it)
         first = admin.get("/api/v1/alerts").json()
         assert first["has_webhook"] is False and "does not open any more" in (first["last_error"] or "")
         # Somebody unticks one kind of alert and saves. No address is typed: the form says to leave it empty to keep the saved one.

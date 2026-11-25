@@ -1,5 +1,5 @@
 """A server's mount after its tile was given another controller at the same address, as the outside review's third
-round (Codex) found it: an edit racing a mount bound what was lent to the new controller while the old one was handed
+round found it: an edit racing a mount bound what was lent to the new controller while the old one was handed
 the address, and read the image; and a mount the old controller held stayed good across an edit to another one and
 back. What is lent is the controller's that the mounting driver itself checked, and an edit that changes a tile's
 controller ends it.

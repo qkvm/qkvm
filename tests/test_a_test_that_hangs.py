@@ -7,6 +7,7 @@ faulthandler gives every test a time (pyproject.toml), and at its end writes out
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import time
@@ -31,12 +32,16 @@ def test_every_test_is_given_a_time_after_which_the_run_ends() -> None:
 
 def test_a_test_that_hangs_ends_the_run_with_where_it_hung(tmp_path: Path) -> None:
     (tmp_path / "test_hangs.py").write_text(HANGS, encoding="utf-8")
+    # The run in a folder of its own, its temporary files too: run beside other test processes on Windows (each with a
+    # temporary folder of its own beside this one's), it met another's as that one was taken away, and failed on that.
+    own = tmp_path / "temp"
+    own.mkdir()
     began = time.monotonic()
     # The project's own settings, with the time made two seconds: the stand-in test waits for ever.
     ran = subprocess.run(
         [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-q", "-c", str(APP / "pyproject.toml"), "--rootdir", str(tmp_path),
-         "-o", "faulthandler_timeout=2", str(tmp_path / "test_hangs.py")],
-        capture_output=True, text=True, timeout=120, cwd=tmp_path,
+         "--confcutdir", str(tmp_path), "--basetemp", str(tmp_path / "basetemp"), "-o", "faulthandler_timeout=2", str(tmp_path / "test_hangs.py")],
+        capture_output=True, text=True, timeout=120, cwd=tmp_path, env={**os.environ, "TEMP": str(own), "TMP": str(own), "TMPDIR": str(own)},
     )  # fmt: skip
     assert time.monotonic() - began < 60
     assert ran.returncode != 0, ran.stdout[-2000:]

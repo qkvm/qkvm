@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import Iterator
+from collections.abc import Awaitable, Callable, Iterator
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -1888,23 +1888,41 @@ def test_the_token_said_back_in_another_spelling_is_not_said_at_all() -> None:
         assert said_back(f"upstream failed for {spelling}") == proxmox.SAID_THE_TOKEN, spelling
 
 
-async def misbehave_whenever_served(pve: FakeProxmox, device: ProxmoxGuest, how: str, served: float, seconds: float) -> None:
-    """Ask for the guest's screen as a tile does for `seconds`; every console that has served `served` seconds then
-    misbehaves (`how`, the VNC stand-in's way), and the next one serves well again until it has served as long."""
+async def up_to_the_top_rung(pve: FakeProxmox, device: ProxmoxGuest, ask: Callable[[], Awaitable[None]], consoles: int = 3, after: float = 3.0) -> None:
+    """`ask` (a round of what a tile asks, and what the test does to the guest's consoles meanwhile) again and again, until
+    `consoles` consoles have been opened and the last of them has ended, and then `after` seconds more: a ladder at its top
+    rung opens no other in them, and one undone opens the next within a low rung. At once where one more is opened.
+
+    (Not for a time fixed beforehand: each console's first picture starts the video worker it is made in, and the eight
+    seconds these tests watched saw one console or two where a busy computer's first start took nine to sixteen, the
+    Windows test VM running 16 test files at a time. See cut_whenever_served's `from_first_picture`, and register row 28.)"""
+    give_up = time.monotonic() + 120  # (room only)
+    deadline = None
+    while deadline is None or time.monotonic() < deadline:
+        assert time.monotonic() < give_up, f"{consoles_opened(pve)} consoles in two minutes"
+        await ask()
+        if consoles_opened(pve) > consoles:
+            return
+        session = device._console._session  # (the last one asked for: made before Proxmox is asked for its console)
+        if deadline is None and consoles_opened(pve) >= consoles and (session is None or session.done.is_set()):
+            deadline = time.monotonic() + after
+
+
+async def misbehave_once_served(pve: FakeProxmox, device: ProxmoxGuest, how: str, served: float) -> None:
+    """Ask for the guest's screen once, as a tile does; a console that has served `served` seconds then misbehaves (`how`,
+    the VNC stand-in's way), and the next one serves well again until it has served as long."""
     screen = pve.state.guests[100].screen
-    deadline = time.monotonic() + seconds
-    while time.monotonic() < deadline:
-        session = device._console._session
-        if session is None or session.done.is_set():
-            screen.hostile = ""
-        try:
-            await device.snapshot(640)
-        except KvmError:
-            pass
-        session = device._console._session
-        if session is not None and not session.done.is_set() and session.let_in_at is not None and time.monotonic() - session.let_in_at >= served:
-            screen.hostile = how
-        await asyncio.sleep(0.05)
+    session = device._console._session
+    if session is None or session.done.is_set():
+        screen.hostile = ""
+    try:
+        await device.snapshot(640)
+    except KvmError:
+        pass
+    session = device._console._session
+    if session is not None and not session.done.is_set() and session.let_in_at is not None and time.monotonic() - session.let_in_at >= served:
+        screen.hostile = how
+    await asyncio.sleep(0.05)
 
 
 @pytest.mark.parametrize("how", ["silent", "unknown_message"], ids=["hangs", "sends-what-is-not-taken"])
@@ -1920,7 +1938,7 @@ def test_a_console_that_serves_a_while_and_then_fails_climbs_its_ladder(pve: Fak
         device = a_guest(pve)
         try:
             await device.status()
-            await misbehave_whenever_served(pve, device, how, served=0.6, seconds=8.0)
+            await up_to_the_top_rung(pve, device, lambda: misbehave_once_served(pve, device, how, served=0.6))
             assert consoles_opened(pve) == 3, f"{consoles_opened(pve)} consoles"
         finally:
             await device.close()
@@ -2014,10 +2032,12 @@ def test_a_proxmox_whose_uptime_falls_at_every_look_does_not_undo_the_ladder_of_
         device = a_guest(pve)
         try:
             await device.status()
-            deadline = time.monotonic() + 8.0
-            while time.monotonic() < deadline:
+
+            async def a_look_and_a_picture() -> None:
                 await device._refresh_status()
                 await cut_whenever_served(pve, device, served=0.6, seconds=0.1)
+
+            await up_to_the_top_rung(pve, device, a_look_and_a_picture)
             # (cut, opened again at once; cut, 0.4 s; cut, 60 s)
             assert consoles_opened(pve) == 3, f"{consoles_opened(pve)} consoles"
         finally:

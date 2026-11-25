@@ -2,19 +2,24 @@
 
 Built from Intel's published class reference (the shapes of CIM_AssociatedPowerManagementService,
 CIM_PowerManagementService.RequestPowerStateChange, IPS_KVMRedirectionSettingData, CIM_KVMRedirectionSAP,
-IPS_OptInService, IPS_HostBasedSetupService, AMT_RedirectionService and the hardware classes), not from a
-real machine: none has been met yet. It challenges with HTTP Digest as the engine does, answers canned SOAP
-in both control modes with a KVM that is enabled, disabled or absent, takes a power command and changes its
-state, and can be told to answer wrongly: another kind of content, too much, too slowly, a fault.
+IPS_OptInService, IPS_HostBasedSetupService, AMT_RedirectionService and the hardware classes), and since from
+what real engines did (one business PC in 2026-10; five more on 2026-11-17: a plain 401 to a
+password they had taken while another client used them, a refusal of one address after failed sign-ins that
+lasted while it was tried, a shutdown that took its time, one KVM session at a time). It challenges with HTTP
+Digest as the engine does, answers canned SOAP in both control modes with a KVM that is enabled, disabled or
+absent, takes a power command and changes its state, and can be told to answer wrongly: another kind of
+content, too much, too slowly, a fault.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import re
 import secrets
 import socket
+import struct
 import threading
 import time
 import xml.etree.ElementTree as ET
@@ -67,8 +72,30 @@ class AmtState:
     drops: list[int] = field(default_factory=list)  # power states that are taken and not brought about
     power_takes: float = 0.0  # seconds between a power command being taken and the PC being seen in its new state
     power_later: tuple[float, int] | None = None
+    # A shutdown (12) as a real engine took it (2026-11-17): answered at once, and the PC off `graceful_takes` seconds later
+    # (Windows took about 80 s), its power said as `graceful_says` meanwhile, and the states in `withheld_while_shutting` not
+    # offered meanwhile (a power cut, 8, was refused "from the state it is in" then). 0: the PC is off at once, as before.
+    graceful_takes: float = 0.0
+    graceful_says: int = 2
+    withheld_while_shutting: tuple[int, ...] = (8,)
+    shutting_until: float = float("-inf")
     stale_once: bool = False  # the first signed request is told that its nonce ran out, and asked again
     forgets_without_saying: bool = False  # a nonce it does not know is answered with a plain no, not with "stale"
+    # Two clients on one engine (a production wall and a trial wall, 2026-11-17): a real engine answered the Digest answer
+    # of a password it had taken all evening with a plain 401 (no stale="true"), and took it again later. The stand-in: for
+    # each of the next `cut_in` signed requests, another client asks something just before it, and the engine keeps that
+    # client's nonce and forgets the one this request answers (with `forgets_without_saying`: a plain no to it).
+    cut_in: int = 0
+    # Intel AMT's refusal of an address after failed sign-ins, as the same night showed it: every try from the trial wall got
+    # a 401 while a wall at another address was let in, and 15 minutes of quiet lifted it. The stand-in: after `block_after`
+    # signed requests in a row from one address were refused (a wrong password, or a plain no to a nonce it forgot; 0: never),
+    # every signed request from that address is refused with a plain 401, whatever it carries, on both ports, until the
+    # address has been quiet for `block_quiet` seconds; each try meanwhile starts the quiet again.
+    block_after: int = 0
+    block_quiet: float = 0.0
+    refused_in_a_row: dict[str, int] = field(default_factory=dict)  # by address
+    blocked_at: dict[str, float] = field(default_factory=dict)  # address -> the last try while it was refused so
+    blocked_refusals: int = 0  # signed requests (and redirection sign-ins) refused for the block alone
     strict_nc: bool = False  # a nonce count not above the last one seen for that nonce is a replay, and a plain no
     nonce_uses: int = 0  # a nonce takes this many signed requests, and is said to have run out after (0: as many as come)
     nonce_used: dict[str, int] = field(default_factory=dict)
@@ -95,6 +122,12 @@ class AmtState:
     # whole picture was sent (the first request is answered with the size alone), whatever the viewer's pace.
     sessions_end_after_requests: int = 0
     start_status: int | None = None  # what the start of a session is answered with; None: 0 where the KVM is on, 1 where not
+    # One KVM session per engine: how the start of another is answered while one is open (`kvm_open`, another viewer's
+    # counted in too). "reset": the connection is reset once the start is read, as a real engine of 2026-11-17 did (the
+    # other wall said "the connection to the server ended (ConnectionResetError)"); "in_use": answered 2, as an earlier one
+    # did; "": served beside it (what the stand-in did before).
+    second_session: str = ""
+    sessions_refused: int = 0  # starts of a KVM session refused or reset for another that was open
     auth_types: list[int] = field(default_factory=lambda: [4])  # the sign-ins it offers on the redirection port
     redirection_password: str | None = None  # the password its redirection port takes, where it is not `password` (a test's own make)
     put_fails: bool = False  # a Put of AMT_RedirectionService is answered with a fault (the access point's change has gone through)
@@ -183,6 +216,35 @@ def barring(state: AmtState) -> bool:
     return bool(state.kvm_open or state.sol_open) or time.monotonic() - state.session_ended_at < state.bars_linger
 
 
+def blocked(state: AmtState, address: str) -> bool:
+    """Whether a sign-in from `address` is refused for the block alone (see AmtState.block_after); a try meanwhile is a
+    knock that starts the quiet again, and is counted."""
+    knocked = state.blocked_at.get(address)
+    if knocked is None:
+        return False
+    now = time.monotonic()
+    if now - knocked >= state.block_quiet:
+        del state.blocked_at[address]  # quiet long enough: lifted, and the count begins again
+        state.refused_in_a_row[address] = 0
+        return False
+    state.blocked_at[address] = now
+    state.blocked_refusals += 1
+    return True
+
+
+def refused(state: AmtState, address: str) -> None:
+    """One more sign-in from `address` refused in a row: the block begins at `block_after` of them."""
+    times = state.refused_in_a_row.get(address, 0) + 1
+    state.refused_in_a_row[address] = times
+    if state.block_after and times >= state.block_after:
+        state.blocked_at[address] = time.monotonic()
+
+
+def shutting(state: AmtState) -> bool:
+    """Whether a shutdown the engine took is under way (see AmtState.graceful_takes)."""
+    return time.monotonic() < state.shutting_until
+
+
 def _fields(header: str, values: list[tuple[str, Any]]) -> str:
     """Properties of an instance as the engine writes them, in the order given (it writes them alphabetically)."""
     parts = []
@@ -219,8 +281,9 @@ def make_fake_amt(state: AmtState) -> FastAPI:
             return None
         consent = state.consent or state.control == 1
         if short == "CIM_AssociatedPowerManagementService":
-            offered = [one for one in state.offered if not (barring(state) and one in KVM_BARS)]
-            yield_ = _fields(short, [("AvailableRequestedPowerStates", offered or None), ("PowerState", power_now())])
+            power = power_now()
+            offered = [one for one in state.offered if not (barring(state) and one in KVM_BARS) and not (shutting(state) and one in state.withheld_while_shutting)]
+            yield_ = _fields(short, [("AvailableRequestedPowerStates", offered or None), ("PowerState", power)])
             refs = _ref("ServiceProvided", amt.POWER_SERVICE, {"CreationClassName": "CIM_PowerManagementService", "Name": "Intel(r) AMT Power Management Service", "SystemCreationClassName": "CIM_ComputerSystem", "SystemName": "Intel(r) AMT"})
             refs += _ref("UserOfService", amt.COMPUTER, {"CreationClassName": "CIM_ComputerSystem", "Name": "ManagedSystem"})
             made = [yield_.replace(f"</g:{short}>", refs + f"</g:{short}>")]
@@ -263,7 +326,8 @@ def make_fake_amt(state: AmtState) -> FastAPI:
         elif short == "IPS_KVMRedirectionSettingData":
             made = [_fields(short, [("BackToBackFbMode", False), ("DefaultScreen", 0), ("DoubleBufferMode", False), ("DoubleBufferState", False), ("ElementName", "Intel(r) KVM Redirection Settings"), ("EnabledByMEBx", state.kvm != "mebx"), ("InstanceID", "Intel(r) KVM Redirection Settings"), ("Is5900PortEnabled", False), ("OptInPolicy", consent), ("OptInPolicyTimeout", 300), ("RFBPassword", ""), ("SessionTimeout", state.session_timeout)])]
         elif short == "CIM_KVMRedirectionSAP":
-            enabled = {"enabled": 6, "disabled": 3, "mebx": 3}.get(state.kvm, 3)
+            # (2: enabled, with a session open, anybody's; 6: enabled and idle; 3: disabled)
+            enabled = {"enabled": 2 if state.kvm_open else 6, "disabled": 3, "mebx": 3}.get(state.kvm, 3)
             made = [_fields(short, [("CreationClassName", "CIM_KVMRedirectionSAP"), ("ElementName", "KVM Redirection Service Access Point"), ("EnabledState", enabled), ("KVMProtocol", 4), ("Name", "KVM Redirection Service Access Point"), ("RequestedState", 2 if enabled != 3 else 3), ("SystemCreationClassName", "CIM_ComputerSystem"), ("SystemName", "ManagedSystem")])]
         elif short == "IPS_OptInService":
             made = [_fields(short, [("CanModifyOptInPolicy", 0 if state.control == 1 else 1), ("CreationClassName", "IPS_OptInService"), ("ElementName", "Intel(r) AMT OptIn Service"), ("Name", "Intel(r) AMT OptIn Service"), ("OptInCodeTimeout", 120), ("OptInDisplayTimeout", 300), ("OptInRequired", 1 if consent else 0), ("OptInState", 0), ("SystemCreationClassName", "CIM_ComputerSystem"), ("SystemName", "Intel(r) AMT")])]
@@ -319,6 +383,10 @@ def make_fake_amt(state: AmtState) -> FastAPI:
                 return Response("busy", status_code=state.unsigned_status, media_type="text/plain")
             return challenge()
         state.logins += 1
+        address = request.client.host if request.client is not None else ""
+        if blocked(state, address):
+            state.rejections += 1
+            return challenge()  # (refused for the block alone, whatever the answer carries)
         fields: dict[str, str] = {}
         at, rest = 0, header[7:]
         while at < len(rest):
@@ -339,16 +407,25 @@ def make_fake_amt(state: AmtState) -> FastAPI:
         good = fields.get("username") == state.username and (fields.get("realm") == realm_of(state) or not state.checks_realm) and fields.get("uri") == amt.WSMAN and fields.get("response") == expected
         if not good:
             state.rejections += 1
+            refused(state, address)
             return challenge()
+        if state.cut_in and nonce in state.nonces:
+            state.cut_in -= 1
+            del state.nonces[nonce]  # (another client asked just now, and only its nonce is kept)
+            challenge()
         if nonce not in state.nonces or state.stale_once or (state.nonce_uses and state.nonce_used.get(nonce, 0) >= state.nonce_uses):
             state.stale_once, state.stale_sent = False, state.stale_sent + 1
+            if state.forgets_without_saying:
+                refused(state, address)  # (a plain no, as to a wrong password: the engine counts it alike)
             return challenge(stale=not state.forgets_without_saying)  # the password was right, the nonce had run out: told so, and asked again
         count = int(fields.get("nc", "0") or "0", 16)
         if state.strict_nc and count <= state.nonces[nonce]:
             state.replays += 1
+            refused(state, address)
             return challenge()  # a count that did not grow is a replay, to an engine that checks: a plain no
         state.nonces[nonce] = max(state.nonces[nonce] + 1, count)
         state.nonce_used[nonce] = state.nonce_used.get(nonce, 0) + 1
+        state.refused_in_a_row[address] = 0
         return None
 
     @app.middleware("http")
@@ -431,6 +508,7 @@ def make_fake_amt(state: AmtState) -> FastAPI:
                 await asyncio.sleep(state.power_answer_takes)
             state.actions.append(wanted)
             barred = barring(state) and wanted in KVM_BARS  # (a real engine answered 2 then, and did nothing)
+            barred = barred or (shutting(state) and wanted in state.withheld_while_shutting)
             returned = state.returns if state.returns is not None else 0 if (not state.offered or wanted in state.offered) and not barred else 2
             if returned == 0 and wanted not in state.drops:
                 becomes = {2: 2, 3: 3, 4: 4, 7: 7, 8: 8, 6: 6, 12: 8, 13: 6}.get(wanted, 2)  # a reset or a cycle ends on
@@ -438,7 +516,13 @@ def make_fake_amt(state: AmtState) -> FastAPI:
                     state.came_on_at = time.monotonic()
                 if wanted in (2, 5, 10) and state.bios_setup_armed:
                     state.bios_setup_armed = False  # a boot into the setup is single-use: it clears on the next power-on, reset or cycle
-                if state.power_takes:
+                if shutting(state):
+                    state.shutting_until, state.power_later = float("-inf"), None  # (what is taken now goes before the shutdown)
+                if wanted == 12 and state.graceful_takes:
+                    # (The operating system shuts down in its own time: the PC is said as `graceful_says` until then.)
+                    state.shutting_until = time.monotonic() + state.graceful_takes
+                    state.power, state.power_later = state.graceful_says, (state.shutting_until, 8)
+                elif state.power_takes:
                     state.power_later = (time.monotonic() + state.power_takes, becomes)
                 else:
                     state.power = becomes
@@ -549,6 +633,17 @@ def make_fake_amt(state: AmtState) -> FastAPI:
     return app
 
 
+class _Asking:
+    """A connection to the redirection port, as the VNC stand-in's handler has it, and whether it asked for a session (one
+    mark in `asked`: see FakeRedirection._session)."""
+
+    def __init__(self, wire: Any, asked: list[bool]) -> None:
+        self.wire, self.asked = wire, asked
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.wire, name)
+
+
 class FakeRedirection(FakeVnc):
     """The engine's redirection port: Intel's handshake (start, which sign-ins, Digest, "the KVM may begin"), then the
     KVM as RFB, which the VNC stand-in speaks with the manners of a real engine's (see `amt_screen`).
@@ -563,28 +658,44 @@ class FakeRedirection(FakeVnc):
         self.amt = amt_state
 
     async def _handle(self, wire: Any) -> None:
-        self.amt.redirections += 1
-        self.amt.redirected_at.append(time.monotonic())
-        self.amt.redirection_open += 1
+        asked: list[bool] = []  # (whether the connection asked for a session: then it is counted, see `_session`)
         try:
-            await super()._handle(wire)
+            await super()._handle(_Asking(wire, asked))
         finally:
-            self.amt.redirection_open -= 1
+            if asked:
+                self.amt.redirection_open -= 1
 
     async def _session(self, wire: Any) -> None:
         state = self.amt
+        # What every client of a redirection port sends first is the start of a session (its first byte 0x10, for the KVM
+        # and the serial console alike); only what does is counted as a connection to the port. Counted at the connection,
+        # another test's client that reached this port on a busy computer (one pointed at a port taken for closed, or at a
+        # stand-in of its own that had stopped) was a session of this wall's: "assert 4 == 0" where it had opened none.
+        start = await wire.read(8)
+        if start[0] != amt.START_KVM[0]:
+            return  # (somebody else's: a viewer waiting for a greeting says nothing, a browser says GET)
+        state.redirections += 1
+        state.redirected_at.append(time.monotonic())
+        state.redirection_open += 1
+        wire.asked.append(True)
         if not state.listener:
             return  # (a real engine does not listen at all then; hung up on at once is as near as a stand-in gets)
         if time.monotonic() - state.came_on_at < state.starting_for:
             await asyncio.sleep(state.starting_for)  # (no answer while the PC starts: the session is not begun)
             return
         odd = state.redirect_odd
-        start = await wire.read(8)
         if odd == "not_redirection":
             await wire.write(b"HTTP/1.1 400 Bad Request" + bytes((13, 10, 13, 10)))
             return
         sol = start == START_SOL
         if start != amt.START_KVM and not sol:
+            return
+        if not sol and state.kvm_open and state.second_session:
+            state.sessions_refused += 1
+            if state.second_session == "reset":
+                self._reset(wire)  # (another viewer has the KVM: the connection is reset, nothing said)
+                return
+            await wire.write(bytes((amt.STARTED, amt.IN_USE, 0, 0, 1, 0, 12, 0, 0, 0, 0, 0, 0)))
             return
         status = state.start_status if state.start_status is not None else (0 if state.kvm == "enabled" or sol else 1)
         await wire.write(bytes((amt.STARTED, status, 0, 0, 1, 0, 12, 0, 0, 0, 0, 0, 0)))  # (a reply of a real engine's shape: versions, and no maker's part)
@@ -630,10 +741,14 @@ class FakeRedirection(FakeVnc):
         if odd == "neither":
             await wire.write(bytes((amt.AUTHENTICATED, 7, 0, 0, amt.DIGEST, 0, 0, 0, 0)))
             return
-        if not good:
+        address = self._address(wire)
+        if blocked(state, address) or not good:
+            if not good:
+                refused(state, address)
             state.redirection_rejections += 1
             await wire.write(bytes((amt.AUTHENTICATED, amt.ASKING, 0, 0, amt.DIGEST, 0, 0, 0, 0)))
             return
+        state.refused_in_a_row[address] = 0
         await wire.write(bytes((amt.AUTHENTICATED, amt.ACCEPTED, 0, 0, amt.DIGEST, 0, 0, 0, 0)))
         if sol:
             await self._serial_console(wire)
@@ -752,6 +867,21 @@ class FakeRedirection(FakeVnc):
             state.session_ended_at = time.monotonic()
 
     @staticmethod
+    def _address(wire: Any) -> str:
+        """The address a connection to the redirection port came from (as the WS-Management side keys its block by)."""
+        peer = wire.writer.get_extra_info("peername") if hasattr(wire, "writer") else None
+        return str(peer[0]) if isinstance(peer, tuple) and peer else ""
+
+    @staticmethod
+    def _reset(wire: Any) -> None:
+        """End the connection with a reset, not an orderly close: what the wall reads next is ConnectionResetError."""
+        raw = wire.writer.get_extra_info("socket")
+        if raw is not None:
+            with contextlib.suppress(OSError):
+                raw.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        wire.writer.transport.abort()
+
+    @staticmethod
     async def _sign_in(wire: Any) -> list[bytes] | None:
         """The eight texts of a Digest sign-in message, or None where it is no such message."""
         head = await wire.read(9)
@@ -817,7 +947,12 @@ class FakeAmt:
             try:
                 if first.getsockname()[1] + 2 > 65535:
                     raise OSError("no port two above it")  # (the system handed out 65534 or 65535: bind() would raise OverflowError)
-                return first, local_socket(first.getsockname()[1] + 2)
+                second = local_socket(first.getsockname()[1] + 2)
+                # (Listening at once: a socket bound with SO_REUSEADDR that does not listen yet can share its port with another
+                # test process's, and then the second to listen is refused. Listening, the port is this one's alone.)
+                first.listen(128)
+                second.listen(128)
+                return first, second
             except OSError:
                 first.close()
                 if port:
@@ -858,6 +993,8 @@ class V6Amt(FakeAmt):
                     raise OSError
                 second = socket.socket(socket.AF_INET6)
                 second.bind(("::1", at + 2))
+                first.listen(128)
+                second.listen(128)
                 return first, second
             except OSError:
                 first.close()

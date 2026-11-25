@@ -319,7 +319,7 @@ def test_a_message_nested_thousands_deep_is_not_an_error_of_the_program() -> Non
 
     async def answered() -> None:
         with pytest.raises(KvmError) as refused:
-            await jetkvm._await_answer(Heard())  # type: ignore[arg-type]
+            await jetkvm._await_answer(Heard(), jetkvm._Session())  # type: ignore[arg-type]
         assert refused.value.code == "bad_response"
 
     asyncio.run(answered())
@@ -364,7 +364,7 @@ def test_every_field_of_how_a_jetkvm_answers_an_offer_with_one_wrong_value_at_a_
                 else:
                     message[part] = value
                 try:
-                    answer, candidates = await jetkvm._await_answer(Heard([message, good]))  # type: ignore[arg-type]
+                    answer, candidates = await jetkvm._await_answer(Heard([message, good]), jetkvm._Session())  # type: ignore[arg-type]
                 except KvmError:
                     pass  # refused, as something a device has no business sending
                 else:

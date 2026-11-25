@@ -39,6 +39,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, BinaryIO
 
+from . import chain
 from ._folders import open_private
 from .store import LONGEST_LINE, AuditLog, Gate, entry_of, into_wal, open_shared, sqlite_open
 
@@ -85,7 +86,7 @@ KINDS: dict[str, frozenset[str]] = {
         "media_mounted", "media_mount_failed", "media_booted", "media_boot_failed", "media_restarted", "media_restart_failed",
         "media_unmounted", "media_unmount_failed", "media_uploaded", "media_upload_failed", "media_deleted", "media_delete_failed",
     }),
-    "alert": frozenset({"alert", "alerts_paused", "alerts_resumed"}),
+    "alert": frozenset({"alert", "alerts_paused", "alerts_resumed", "alert_not_delivered", "alert_delivered_again"}),
 }
 KIND_NAMES = ("signin", "action", "change", "alert")
 KINDS_MARK = hashlib.sha256(json.dumps({kind: sorted(events) for kind, events in KINDS.items()}, sort_keys=True).encode()).hexdigest()[:16]
@@ -190,8 +191,9 @@ class Facts:
 
     @functools.cached_property
     def said(self) -> str:
-        """Every value of it, in one case: what words are looked for in."""
-        return _clean(" ".join(str(value) for value in self.entry.values())).casefold()
+        """Every value of it, in one case: what words are looked for in. (Not its place in the chain: a hundred hex digits a
+        line that nobody looks for by a word, and that would make the index a quarter larger.)"""
+        return _clean(" ".join(str(value) for name, value in self.entry.items() if name != chain.FIELD)).casefold()
 
 
 @dataclass(frozen=True)

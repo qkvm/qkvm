@@ -18,7 +18,7 @@ import pytest
 from qkvm import exchange, kvm, netbind, update, vault
 from qkvm.netbind import BindError
 from qkvm.store import Store, StoreError
-from tests.test_wall import add, closed_port, wall
+from tests.test_wall import add, closed_port, port_to_listen_on, wall
 from tests.settings_file import settings_text, write_settings_text
 
 
@@ -156,7 +156,7 @@ def test_an_address_the_system_will_not_listen_on_is_a_sentence_and_no_traceback
         def bind(self, where: Any) -> None:
             raise says[0]
 
-    port = closed_port()
+    port = port_to_listen_on()
     monkeypatch.setattr(socket, "socket", Refusing)
     while says:
         with pytest.raises(BindError, match="cannot listen on"):

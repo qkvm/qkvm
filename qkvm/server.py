@@ -6,6 +6,7 @@ import asyncio
 import contextvars
 import csv
 import dataclasses
+import functools
 import hashlib
 import inspect
 import io
@@ -13,6 +14,7 @@ import json
 import logging
 import math
 import os
+import queue
 import re
 import secrets
 import shutil
@@ -21,22 +23,24 @@ import time
 import unicodedata
 import weakref
 from collections.abc import AsyncIterator, Awaitable, Callable
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Annotated, Any, Literal, TypeVar
 from urllib.parse import urlsplit
 
 import httpx
 from fastapi import FastAPI, Query, Request, WebSocket
+from fastapi.exception_handlers import http_exception_handler
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
-from pydantic import BaseModel, Field, field_validator
+from fastapi.responses import JSONResponse, PlainTextResponse, RedirectResponse, Response, StreamingResponse
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.requests import ClientDisconnect
 
-from . import about, activity, alerts, amt, discover, exchange, history, live, metrics, proxmox, qr, screens, totp, vncdevice, webpush
+from . import about, activity, alerts, amt, backup, chain, destinations, discover, egress, exchange, history, live, metrics, oidc, open_in, proxmox, qr, screens, tailcert, tailnet, totp, unlock, video, vncdevice, webpush
 from ._version import __version__
-from .core import Core, DeviceManager, auth_mark, driver_for, identity, unknown_kind
-from .kvm import FINGERBOT_PRESSES, KEYS, MAX_PROBE, MAX_TEXT, MOST_UPLOAD, POWER_KEY_REFUSED, PRESS_ANSWERED, PRESS_SENT, REJECTED, RETIRED, AlreadySo, Carried, Device, DeviceSpec, KvmError, MediaOffer, UploadCut, bounded, can_do, fetch_certificate, fingerprint, https_instead, listens, names_the_power_key, on_https, other_way, plain, publicly_trusted, read_json, saved_fingerprint, saved_mark
+from .core import RUN_STILL_WAITING, Core, DeviceManager, auth_mark, driver_for, identity, unknown_kind
+from .kvm import FINGERBOT_PRESSES, INPUT_ASKED, KEYBOARD_ACTIONS, KEYS, MAX_PROBE, MAX_TEXT, MOST_UPLOAD, ONE_INPUT, POWER_KEY_REFUSED, PRESS_ANSWERED, PRESS_SENT, REJECTED, RETIRED, AlreadySo, Carried, Device, DeviceSpec, KvmError, MediaOffer, UploadCut, bounded, can_do, fetch_certificate, fingerprint, https_instead, input_refused, listens, names_the_power_key, on_https, one_input_refused, other_way, plain, publicly_trusted, read_json, saved_fingerprint, saved_mark
 from .netbind import BindError, lan_ip, normalize, resolve, tailscale_ip
 from .served import SERVED_PATH, MOST_AT_ONCE, Binding, identity_follows, MOST_REFUSED_SAID, Lending, Opening, Slot, address_of, basic_matches, byte_range, hand_to_readers, let_go_and_give_back, read_at, same_address, scrubbed
 from .served import READERS as SERVED_READERS
@@ -46,6 +50,7 @@ from .security import (
     REMEMBER_TTL,
     SSO_LIVE_UNCONFIRMED,
     SECURITY_HEADERS,
+    Session,
     client_allowed,
     client_ip,
     host_allowed,
@@ -56,7 +61,7 @@ from .security import (
     shares_our_name,
     sso_name,
 )
-from .store import AMT_VIEWS, FINGERBOT_STRENGTHS, KINDS, ROLES, ActionRecord, AuditLog, DeviceRecord, PushRecord, TokenRecord, UserRecord, as_a_line, device_url
+from .store import AMT_VIEWS, FINGERBOT_STRENGTHS, KINDS, ROLES, ActionRecord, AuditLog, CheckHalted, DestinationRecord, DeviceRecord, NetbirdSettings, OidcSettings, PushRecord, TokenRecord, UserRecord, as_a_line, device_url, position_of, sealed_for
 from .update import NoLongerAllowed, Unfit, UpdateError
 from .vault import NoMemory, Vault, VaultLocked, new_recovery_key, tidy_recovery_key
 
@@ -85,6 +90,11 @@ ASSET_TYPES = {
 API_VERSIONS = ("v1",)
 
 PUBLIC = {"/", "/healthz", "/metrics", "/api/v1/session", "/api/v1/setup", "/api/v1/login", "/api/v1/recover", "/api/v1/display"}
+# ...and signing in through an identity provider (oidc.py): whether the sign-in page offers it, the press of its button (a
+# POST, so the page's own header is asked of it like every change), and the way back from the provider (a GET the provider's
+# redirect makes, which carries the browser's cookie of the sign-in and nothing the wall trusts by itself).
+PUBLIC |= {"/api/v1/oidc/offer", "/api/v1/oidc/begin", oidc.CALLBACK}
+OIDC_REFUSALS_SAID = 60.0  # seconds between lines in the activity log of ways back from a provider that no sign-in on this wall began
 # ...and what is below these: the page's files, and an image mounted on a server, which its controller reads by an address
 # made for that mount alone, from its own address alone (served.py; "/media/{token}/{name}").
 PUBLIC_UNDER = ("/static/", "/media/")
@@ -103,6 +113,13 @@ UPDATE_CHECK_EVERY = 24 * 3600.0
 BACKGROUND_OWED = 5.0  # seconds a stopping wall gives what a request set going to finish (see lifespan)
 HOUSEKEEPING_EVERY = 30.0  # seconds between the rounds that tidy up, lock up, and look whether the addresses are still the same
 HISTORY_LOOK_EVERY = 60.0  # seconds between the looks the history takes at every machine by itself (see history.py)
+BACKUP_LOOK = 30.0  # seconds between two looks of the clock at whether a backup is due (backup.py)
+RUN_WAIT = 60.0  # seconds "Back up now" waits for its run before it answers that it is still running
+HISTORY_AGAIN = 5.0  # seconds a run waits before it asks a history that was busy again (three times in all)
+BACKUP_STUCK = 3600.0  # seconds after which a run its folder holds is said to have failed, and alerted, its thread still held
+SCHEDULE_AHEAD = 25 * 3600.0  # the next backup by the clock is never further away than this (a day, and an hour the clock may skip)
+VERIFY_WITHIN = 600.0  # seconds Verify waits for the folder (reading a backup whole) before it says the folder does not answer
+FOLDER_WITHIN = 30.0  # seconds a look at where a folder lies waits for it (a setting saved)
 HISTORY_READS_AT_ONCE = 3  # reads of the history under way at once, from everybody together; beyond that: come back in a moment
 # Of one account or token, one read of the history at a time: the next waits its turn for so many seconds at the most
 # (with one waiting already, or longer than that: come back in a moment). And after a read the same one waits as long
@@ -117,6 +134,11 @@ ACTIVITY_READS_AT_ONCE = 3
 ACTIVITY_TURN_WAIT = activity.CATCH_UP + activity.READ_PATIENCE
 SPOOL_IN_MEMORY = 8_000_000  # bytes of a download of the activity log made in memory; beyond that in a temporary file in the data folder
 DOWNLOADS_AT_ONCE = 3  # downloads of the activity log made or being sent at once, from everybody together (one of each account)
+CHECK_WAIT = 20.0  # seconds a request to check the activity log waits for the check before it is answered with how far it got
+# The activity log's daily seal to the alert destinations that asked for it (chain.py): the first after a start, then each
+# destination again so long after the last it was sent, looked for so often (one in its quiet hours waits for their end).
+LOG_SEAL_FIRST, LOG_SEAL_EVERY, LOG_SEAL_LOOK = 600.0, 86400.0, 900.0
+MOST_PROBLEMS_SHOWN = 50  # problems of a check of the activity log the page is given; the rest are counted
 # The actions the history keeps as power events, pressed from the wall. The rest (keys, text) is the activity log's.
 POWER_ACTIONS = frozenset({"atx_power", "atx_power_long", "atx_reset", "fingerbot_power", "fingerbot_power_long", "power_on", "power_off", "bios_setup", "wol", "reboot"})
 # Hostnames every device has out of the box; useless as a tile name.
@@ -161,9 +183,10 @@ MEDIA_DRIVE_SAID = {"cd": "a CD-ROM drive", "flash": "a USB flash drive", "disk"
 # again whether what they checked still holds: see `one_change` in their handlers.
 _CHANGES = re.compile(
     r"(POST|PUT|DELETE) /api/v1/(setup|totp/enable|users(/[^/]+)?"
-    r"|actions(/[^/]+)?|settings(/media)?|alerts(/pause)?|update|metrics/token|security|tokens(/[^/]+)?|wall/order)|DELETE /api/v1/devices/[^/]+"
+    r"|actions(/[^/]+)?|settings(/media)?|backups|alerts(/pause|/destinations(/[^/]+(/secret)?)?)?|update|metrics/token|security|tokens(/[^/]+)?|wall/order)"
+    r"|DELETE /api/v1/devices/[^/]+"
     r"|POST /api/v1/devices/remove|POST /api/v1/push(/key)?|DELETE /api/v1/push/[^/]+"
-    r"|PUT /api/v1/devices/[^/]+/view"
+    r"|PUT /api/v1/devices/[^/]+/(view|open-in)"
 )
 
 # What no path of this program has in it: a character that is none (a line feed, a tab, a zero).
@@ -279,6 +302,43 @@ class AlertsIn(BaseModel):
     problem: bool = True
     recovered: bool = True
     link: str | None = Field(None, max_length=300)  # the wall's own address, for alerts to point at; None: as it was
+    # (0.4.0) The first destination may be a private address (destinations.py); None: as it was, and off for a new one.
+    private: bool | None = None
+
+
+class DestinationIn(BaseModel):
+    """A place the alerts go (destinations.py), as the page's box for its kind sends it. A secret left empty keeps the one
+    saved (an address with a token in it, a key, a token, a password)."""
+
+    kind: str = Field(max_length=20)
+    name: str = Field("", max_length=80)
+    enabled: bool = True
+    private: bool = False  # may be a private address (RFC 1918, fc00::/7, 100.64.0.0/10)
+    minimal: bool = False  # the machine's name, what happened and the link, and nothing else
+    events: list[str] | None = Field(None, max_length=20)  # None: all of them
+    least: str = Field("info", max_length=10)
+    devices: list[str] | None = Field(None, max_length=10_000)  # ids of the machines it is told about; None: all, new ones too
+    groups: list[str] = Field(default_factory=list, max_length=100)
+    quiet_from: int = -1  # minutes of the day; -1: no quiet hours
+    quiet_to: int = -1
+    quiet_days: list[str] = Field(default_factory=list, max_length=7)
+    remind: int = 0
+    log_seal: bool = False  # told the activity log's head once a day (chain.py; never to PagerDuty)
+    # Its kind's own.
+    url: str = Field("", max_length=2048)  # Slack, Teams, Discord, ntfy, a webhook
+    token: str = Field("", max_length=500)  # a Telegram bot's, an ntfy access token
+    forget_token: bool = False
+    forget_signing: bool = False  # a webhook sent without a signature
+    key: str = Field("", max_length=200)  # PagerDuty's routing key, Resend's API key
+    password: str = Field("", max_length=500)  # the mail server's
+    host: str = Field("", max_length=253)  # the mail server
+    port: int | None = None
+    user: str = Field("", max_length=200)
+    sender: str = Field("", max_length=320)
+    to: list[str] | str = Field(default_factory=list, max_length=50)
+    chat: str = Field("", max_length=40)  # a Telegram chat
+    region: str = Field("", max_length=4)  # PagerDuty's service region
+    format: str = Field("", max_length=10)  # a webhook carried over from 0.3.2: "auto" works its service out from its address
 
 
 class PushKeysIn(BaseModel):
@@ -323,8 +383,45 @@ class SecurityIn(BaseModel):
     require_totp: Literal["", "admin", "operator", "viewer"]  # who has to have two-factor sign-in: that role and above
 
 
+class GroupRoleIn(BaseModel):
+    group: str = Field(max_length=oidc.MOST_GROUP)  # a group's name, as the identity provider writes it
+    role: Literal["admin", "operator", "viewer"]
+
+
+class NetbirdIn(BaseModel):
+    """NetBird's management API, as Settings > Network sends it (tailnet.py): an address ("" switches it off), the token ("":
+    keep the one saved, for the same address only), and whether the address may be a private one."""
+
+    url: str = Field("", max_length=600)
+    token: str = Field("", max_length=600)
+    private: bool = False
+
+
+class OidcIn(BaseModel):
+    """Signing in through an identity provider (oidc.py), as Settings > Accounts sends it. Each field is checked by
+    oidc's own rules; with `enabled`, every one the sign-in needs has to be there."""
+
+    enabled: bool
+    name: str = Field("", max_length=80)
+    issuer: str = Field("", max_length=600)
+    client_id: str = Field("", max_length=300)
+    client_secret: str = Field("", max_length=600)  # empty: keep the one saved (for the same issuer and client id only)
+    scopes: str = Field("openid profile email", max_length=600)
+    groups_claim: str = Field("groups", max_length=120)
+    roles: list[GroupRoleIn] = Field(default_factory=list, max_length=100)
+    anyone: Literal["", "admin", "operator", "viewer"] = ""
+    domain: str = Field("", max_length=260)
+    private: bool = False
+    redirect_uri: str = Field("", max_length=600)
+
+
 LONGEST_PAUSE = 7 * 24 * 60  # minutes alerts can be paused for
 PUSH_KEY_FOR = "alerts:push-key"  # what the wall's key for Web Push is sealed for (store.AlertSettings.push_key)
+DOES_NOT_OPEN = "The saved address does not open any more (the settings file was edited, or is damaged). Enter it again."
+MOST_DESTINATIONS = 50  # places alerts go, on one wall
+REMINDER_MINUTE = 60.0  # seconds of a minute of a destination's reminders (a test makes it shorter)
+TROUBLE = ("offline", "no_signal", "auth", "error")  # the states a reminder is of
+TEST_EVERY = 3.0  # seconds between two tests of one destination
 MOST_BROWSERS_EACH = 10  # browsers one account may have told the alerts by Web Push
 MOST_BROWSERS = 200  # ...and all accounts together
 PUSH_TEST_EVERY = 5.0  # seconds between two test alerts of one account to its browsers
@@ -418,6 +515,9 @@ class ProxmoxIn(BaseModel):
 
 class TrustIn(BaseModel):
     fingerprint: str = Field(max_length=120)
+    # The tile's `target` as the box that showed the certificate had it (target_of): refused, nothing pinned (409
+    # `machine_changed`), where the tile is at another machine by then (the second fresh review of the HA round, L2). None: not asked.
+    target: str | None = Field(None, min_length=1, max_length=64)
 
 
 class ActionIn(BaseModel):
@@ -436,10 +536,25 @@ class ActionIn(BaseModel):
     # The sender has this machine's large view or live view open: a PC with Intel AMT then opens a session before switching
     # on (or starting into its BIOS setup), so the start shows from the first moment.
     watching: bool = False
+    # The tile's `target` as the sender saw it, when its confirmation was shown (target_of): refused, nothing sent (409
+    # `machine_changed`), where the tile is at another machine by then. None (a script, a client before 0.4.0): not asked, as before.
+    target: str | None = Field(None, min_length=1, max_length=64)
+    # On a KVM with several inputs, the one the sender saw on screen (the status's `ports.active`), for keys and typed text (a
+    # saved action's and the dedicated Ctrl+Alt+Del too), which go to that one's computer: refused, nothing sent (409
+    # `input_changed`), where the KVM itself, asked right before they go, shows another or does not say which (kvm.INPUT_ASKED).
+    # None: not asked, as before. Power and the rest are the KVM's own, whichever is on screen.
+    input: int | None = Field(None, ge=0, le=63)
+    # Instead of `input`: the sender took the KVM for one of a single input (its status said no `several_inputs` and no `ports`).
+    # Refused the same way, nothing sent, where the wall knows it has several, or its switch, asked right before they go, lists
+    # several; a machine with no inputs to choose from takes it as so (kvm.ONE_INPUT). False: not asked, as before.
+    one_input: bool = False
 
 
 class KvmSwitchIn(BaseModel):
     on: bool  # a PC's Intel AMT KVM on (true) or off, on its management engine
+    # The tile's `target` as the sender saw it (target_of), as an action's: refused, nothing changed on either engine (409
+    # `machine_changed`), where the tile is at another PC by then (the fresh review of the HA round, H1). None: not asked, as before.
+    target: str | None = Field(None, min_length=1, max_length=64)
 
 
 def media_listed(device_id: str, spec: DeviceSpec) -> str:
@@ -452,6 +567,20 @@ def media_listed(device_id: str, spec: DeviceSpec) -> str:
     of it can be read out of it. (Where the machine's number is first learned between a list and its change, that change is
     refused once, and the box lists again.)"""
     said = "\0".join((device_id, spec.base_url, spec.kind, spec.tls, spec.cert_pem or "", spec.machine, spec.ident))
+    return hashlib.sha256(said.encode("utf-8", "surrogatepass")).hexdigest()[:32]
+
+
+def target_of(record: DeviceRecord) -> str:
+    """The machine a tile is at, as a mark: `target` in the wall's view of the tile. Made as media_listed is, of the tile, the
+    address and the kind it is spoken to as, how its certificate is checked, and what it is known by there (its pinned
+    certificate, the number its machine gives for itself, its identity). An action (power, keys, typed text, a saved action,
+    one tile's or a bulk run's) and a live line's pass that send it back are refused, nothing sent, where the tile is at
+    another machine by then (409 `machine_changed`): a confirmation seen for one machine went to the one an admin's edit put
+    in its place meanwhile, by the same tile id (the outside review of 0.4.0, H3). Made anew of what is so each time, it cannot
+    stand for another machine after a restart or an edit taken back; nothing in it is secret, and none of it can be read out
+    of it. Where what qKVM knows of the machine grows meanwhile (its certificate or its number first remembered, the JetKVM
+    followed onto HTTPS), it changes too, and the action sent with the mark before is refused once."""
+    said = "\0".join(("target", record.id, record.url, record.kind, record.tls, record.cert_pem or "", record.machine, record.ident))
     return hashlib.sha256(said.encode("utf-8", "surrogatepass")).hexdigest()[:32]
 
 
@@ -483,6 +612,22 @@ class DeleteIn(BaseModel):
 
 class AmtViewIn(BaseModel):
     view: Literal["health", "stills", "live"]  # which of its three views a PC with Intel AMT is in (store.AMT_VIEWS)
+    # The tile's `target` as the sender saw it (target_of), as an action's: refused, nothing changed (409 `machine_changed`),
+    # where the tile is at another PC by then (the outside review 6.2 second re-check, M1). None: not asked, as before.
+    target: str | None = Field(None, min_length=1, max_length=64)
+
+
+class OpenInIn(BaseModel):
+    """A machine's "Open in" links (open_in.py), all of them: one left out or empty is none of that kind. Each is checked by
+    open_in.checked in the route, which says in words what is wrong with one; here, only that each is a text of a length."""
+
+    model_config = ConfigDict(extra="forbid")  # (a kind this version does not know is refused, not dropped without a word)
+    meshcentral: str = Field("", max_length=2 * open_in.MOST[open_in.MESHCENTRAL])
+    rustdesk: str = Field("", max_length=2 * open_in.MOST[open_in.RUSTDESK])
+    rdp: str = Field("", max_length=2 * open_in.MOST[open_in.RDP])
+    # The tile's `target` as the sender saw it (target_of), as an action's: refused, nothing saved (409 `machine_changed`), where
+    # the tile is at another machine by then (the fresh review of the HA round, L1). None: not asked, as before.
+    target: str | None = Field(None, min_length=1, max_length=64)
 
 
 class CustomActionIn(BaseModel):
@@ -495,20 +640,20 @@ class CustomActionIn(BaseModel):
     danger: bool = False
 
 
-Part = Literal["devices", "actions", "alerts", "wall"]
+Part = Literal["devices", "actions", "alerts", "wall", "signin"]
 
 
 class ExportIn(BaseModel):
     password: str = Field(max_length=256)  # handing the wall's secrets out asks for the password again
     # What the file is encrypted with. Empty: a plain file, with every secret left out.
     passphrase: str = Field("", max_length=256)
-    parts: list[Part] = Field(min_length=1, max_length=4)
+    parts: list[Part] = Field(min_length=1, max_length=5)
 
 
 class ImportIn(BaseModel):
     file: str = Field(max_length=exchange.MAX_SEALED)  # the file's text (a plain one is held to less where it is read)
     passphrase: str = Field("", max_length=256)
-    take: list[Part] = Field(default_factory=list, max_length=4)  # for /api/v1/import: which of its parts to take
+    take: list[Part] = Field(default_factory=list, max_length=5)  # for /api/v1/import: which of its parts to take
 
 
 class UpdateSettingsIn(BaseModel):
@@ -524,6 +669,14 @@ class SettingsIn(BaseModel):
     port: int = Field(ge=1, le=65535)
     https: bool
     interval: float = Field(ge=0.2, le=60)
+
+
+class BackupsIn(BaseModel):
+    enabled: bool
+    folder: str = Field("", max_length=1000)  # where they go, on the computer qKVM runs on: a whole path ("": none yet)
+    hour: int  # the hour of the day they are made at, the wall's local time (0 to 23)
+    keep: int  # how many are kept (1 to 365)
+    history: bool = False  # the history as well
 
 
 class MediaSettingsIn(BaseModel):
@@ -574,7 +727,7 @@ class Downloads:
     everybody together, and one of each account."""
 
     def __init__(self, at_once: int) -> None:
-        self._lock = threading.Lock()  # (given back from the loop, and from whatever thread lets go of an answer never sent)
+        self._lock = threading.Lock()  # (given back on the loop, and by the thread that lets go of answers never sent: _LEFT)
         self._at_once = at_once
         self._of: set[str] = set()
 
@@ -595,6 +748,27 @@ class Downloads:
         return give_back
 
 
+# What an answer that was never sent was made from (Handed), put here by its finalizer and let go of by a thread of its own.
+# The collector runs a finalizer in whichever thread it runs, between any two steps of that thread's code, with whatever
+# lock that code holds; and every `done` takes a lock: the download places' (Downloads), a thread pool's and the one all
+# pools share (a download's file is closed in a pool, a served image's is handed to the readers), a served image's places.
+# Run there, a download's gave its place back between two steps of Downloads.take, and waited for the lock its own thread
+# held, the event loop and every request of the wall with it (the runner, 2026-11-17). A SimpleQueue's put takes no lock and
+# may run within another call of its own: made for this. (Not the event loop's call_soon_threadsafe: what a loop that ends
+# was handed is dropped, qKVM stopping or its listeners started again, and a served image's places outlive the loop.)
+_LEFT: queue.SimpleQueue[Callable[[], None]] = queue.SimpleQueue()
+_LETTING_GO = threading.Lock()  # taken for good by the first answer made, which starts the thread that lets go
+
+
+def _let_go_of_what_is_left() -> None:
+    while True:
+        done = _LEFT.get()
+        try:
+            done()
+        except Exception:
+            log.exception("what an answer that was never sent was made from could not be let go of")
+
+
 class Handed(StreamingResponse):
     """An answer that lets go of what it was made from once it is sent, or could not be, or is never sent at all.
 
@@ -610,7 +784,14 @@ class Handed(StreamingResponse):
         super().__init__(content, **how)
         self._done = done
         self._sent_while = sent_while
-        weakref.finalize(self, done)  # (an answer never sent: let go of when it is)
+        if _LETTING_GO.acquire(blocking=False):  # (here, never by a finalizer: a thread is started under threading's locks)
+            try:
+                threading.Thread(target=_let_go_of_what_is_left, name="qkvm-let-go", daemon=True).start()
+            except BaseException:
+                _LETTING_GO.release()  # (the next answer tries again)
+                done()
+                raise
+        self._left = weakref.finalize(self, _LEFT.put, done)  # (an answer never sent: let go of when it is collected, see _LEFT)
 
     async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
         try:
@@ -619,6 +800,7 @@ class Handed(StreamingResponse):
             await super().__call__(scope, receive, send)
         finally:
             self._done()
+            self._left.detach()  # (let go of: not again when it is collected)
 
 
 class CarriedThrough:
@@ -727,6 +909,7 @@ class TurnRefused(Exception):
 
 
 T = TypeVar("T")
+R = TypeVar("R", bound=Response)
 
 
 class Reads:
@@ -976,12 +1159,14 @@ class NotFollowed(Exception):
     """What answers at a plain JetKVM's HTTPS address is not that JetKVM (see the server's `onto_https`); its words say why."""
 
 
-def view(record: DeviceRecord, editing: bool = True) -> dict[str, Any]:
+def view(record: DeviceRecord, editing: bool = True, links: bool = True) -> dict[str, Any]:
     """What a browser may know about a device. Never the password.
 
     `editing`: for somebody who may change it. Whoever may only look, or act, is told what a tile shows,
-    and not how qKVM signs in to the device or how its certificate is checked.
+    and not how qKVM signs in to the device or how its certificate is checked. `links`: for somebody who may act on it (an
+    operator, an admin), its "Open in" links (open_in.py), where it has any: a viewer is not told where else it is opened.
     """
+    found = open_in.kept(record.open_in) if links else {}
     shown = {
         "id": record.id,
         "name": record.name,
@@ -993,6 +1178,8 @@ def view(record: DeviceRecord, editing: bool = True) -> dict[str, Any]:
         "group": record.group,
         # A PC with Intel AMT: which of its three views its tile is in (said to everybody: the tile says it).
         **({"amt_view": record.amt_view if record.amt_view in AMT_VIEWS else AMT_VIEWS[0]} if record.kind == "amt" else {}),
+        **({"open_in": found} if found else {}),  # (0.4.0; none set: not there, as before)
+        "target": target_of(record),  # (0.4.0) the machine it is at, for an action or a live line to name (target_of)
     }
     if not editing:
         return shown
@@ -1219,36 +1406,419 @@ def create_app(core: Core) -> FastAPI:
     acted_on: set[str] = set()  # ids of the devices something is being done to at this moment
     setting_up = asyncio.Lock()  # one first-run setup at a time: two at once would each make a vault key
     one_change = asyncio.Lock()  # see _CHANGES
-    alert_log: dict[str, Any] = {"sent": None, "error": None}  # how the last delivery went
+    # --- where the alerts go: the destinations (destinations.py), each delivered to by itself (alerts.Courier) ----------
+    last_told: dict[str, tuple[float | None, str | None]] = {}  # destination id -> (when an alert last arrived, what went wrong last)
+    not_opening: dict[str, Any] = {}  # destination id -> its sealed settings, of which it was said that they do not open
+    failing: set[str] = set()  # destinations whose last delivery failed: the activity log says when that begins and ends
 
-    not_opening: list[Any] = [None]  # the saved alert address of which it was last said that it does not open
+    def destination(destination_id: str) -> DestinationRecord | None:
+        return next((one for one in store.destinations if one.id == destination_id), None)
 
-    def webhook() -> str | None:
-        blob = store.alerts.webhook
-        if blob is None or not core.vault.unlocked:
+    def destination_secrets(record: DestinationRecord) -> dict[str, str] | None:
+        """A destination's secrets, opened. None where they do not open, or the saved passwords are locked."""
+        if record.secret is None or not core.vault.unlocked:
             return None
-        url = core.vault.read(blob, "alerts:webhook")
-        if url is None and not_opening[0] is not blob:
-            # An address is saved, and does not open any more: alerts go nowhere. Said, once for that
-            # address, in the log and where the page shows how the last alert went; with nothing said,
-            # the page showed alerts as set up, and a machine went down unannounced.
-            not_opening[0] = blob
-            alert_log["error"] = "The saved address does not open any more (the settings file was edited, or is damaged). Enter it again."
-            log.error("alerts go nowhere: the saved address does not open any more (the settings file was edited, or is damaged)")
-        return url
+        text = core.vault.read(record.secret, sealed_for(record.id))
+        opened: dict[str, str] | None = None
+        if text is not None and text.startswith("{"):
+            try:
+                said = json.loads(text)
+            except (ValueError, RecursionError):
+                said = None
+            if isinstance(said, dict) and all(isinstance(value, str) for value in said.values()):
+                opened = said
+        elif text is not None:
+            opened = {"url": text}  # (the one carried over from 0.3.2: its address, as 0.3.2 sealed it)
+        if opened is None and not_opening.get(record.id) is not record.secret:
+            # Saved, and does not open any more: alerts go nowhere there. Said, once for what is saved, in the log and where
+            # the page shows how the last alert went; with nothing said, the page showed alerts as set up, and a machine
+            # went down unannounced.
+            not_opening[record.id] = record.secret
+            last_told[record.id] = (last_told.get(record.id, (None, None))[0], DOES_NOT_OPEN)
+            log.error("alerts go nowhere at a destination: what is saved of it does not open any more (the settings file was edited, or is damaged)")
+        return opened
 
-    def alert_address() -> tuple[str, str] | None:
-        """Where alerts go right now and how that service wants to be spoken to; None: nowhere."""
-        url = webhook()
-        return None if url is None else (url, store.alerts.format)
+    def destination_target(destination_id: str) -> alerts.Target | str | None:
+        """What a destination is to be sent to as, at this moment: a sentence where it cannot be; None where it is gone."""
+        record = destination(destination_id)
+        if record is None:
+            return None
+        if record.kind not in destinations.KINDS:
+            return "It is of a kind this version of qKVM does not know"
+        if not core.vault.unlocked:
+            return "The saved passwords are locked: nothing is sent until somebody signs in"
+        opened = destination_secrets(record)
+        if opened is None:
+            return DOES_NOT_OPEN
+        try:
+            # (What is kept is checked again as it is used: a hand's edit of the settings file is said, not sent.)
+            config, opened, _ = destinations.check(record.kind, record.config, opened)
+        except ValueError as ex:
+            return f"Its settings are not usable: {ex}"
+        return alerts.Target(record.id, record.kind, config, opened, record.private, record.minimal, store.alerts.link)
 
-    def delivered(problem: str | None) -> None:
-        if problem is None:
-            alert_log["sent"], alert_log["error"] = time.time(), None
+    own_known: list[Any] = [None, frozenset()]  # when the wall's own addresses were last looked up, and what they were
+
+    async def own_addresses() -> egress.Own:
+        """The wall itself, which no alert is sent to (egress.judge): the addresses it listens on (for a wall that listens on
+        every address, this computer's), and its port there and on loopback. Looked up once a minute at the most."""
+        if own_known[0] is None or time.monotonic() - own_known[0] > 60:
+
+            def look() -> frozenset[str]:
+                # Where it listens, and every address of this computer's whatever it listens on (egress.this_computer),
+                # Tailscale's besides: this computer is reached only with a destination's switch (the second review, L5).
+                found = {address for address in core.addresses if address not in ("0.0.0.0", "::")}
+                found.update(address for address in (lan_ip(), tailscale_ip()) if address)
+                found |= egress.this_computer()
+                return frozenset(found)
+
+            own_known[:] = [time.monotonic(), await asyncio.to_thread(look)]
+        known: frozenset[str] = own_known[1]
+        # The ports the listeners were opened on, and the one it is to listen on (started with --port; or one changed in
+        # its settings, saved at once and listened on after a restart): never the saved one alone (the second review, M1).
+        return egress.Own(known, frozenset({*core.ports, core.port}))
+
+    def delivered(destination_id: str, delivery: alerts.Delivery) -> None:
+        """How a delivery went: shown with the destination; and in the activity log where a destination begins to fail,
+        and where it is delivered to again (once each: not a line for every alert that does not arrive). One withheld by
+        the wall's own rules (held_back) is in the delivery log alone: it is no failure of the destination's."""
+        if delivery.withheld:
+            return
+        sent = last_told.get(destination_id, (None, None))[0]
+        last_told[destination_id] = (delivery.at, None) if delivery.ok else (sent, delivery.said)
+        record = destination(destination_id)
+        if record is None or delivery.test:
+            return
+        called = record.name or destinations.KIND_NAMES.get(record.kind, record.kind)
+        if not delivery.ok and destination_id not in failing:
+            failing.add(destination_id)
+            core.audit.write("alert_not_delivered", "", destination=called, kind=record.kind, said=delivery.said, attempts=delivery.attempts)
+        elif delivery.ok and destination_id in failing:
+            failing.discard(destination_id)
+            core.audit.write("alert_delivered_again", "", destination=called, kind=record.kind)
+
+    # Destination id ("" for alerts as a whole) -> the courier's count of alerts handed over when it was last switched off:
+    # what was handed over before that goes no more, even where it is switched on again before its next try (the outside
+    # review of 0.4.0, bugs round 2, M3). In memory: what waits does not outlive a restart either.
+    switched_off: dict[str, int] = {}
+
+    def switched_since(destination_id: str, alert: alerts.Alert, which: str) -> bool:
+        """Whether `which` (a destination's id, or "" for alerts as a whole) was switched off after `alert` was handed to this
+        destination."""
+        handed = alert.handed.get(destination_id)
+        return handed is not None and handed <= switched_off.get(which, 0)
+
+    def alerts_switched_off() -> None:
+        """Alerts as a whole switched off, and saved so: what waits for a destination or a browser goes no more."""
+        switched_off[""] = courier.handed
+        pusher.cut()
+
+    # Destination id -> the courier's count when it was edited to send elsewhere (destinations.receiver): what was handed
+    # over before goes no more, to the new receiver or the old (the outside review of 0.4.0, bugs round 2, M6).
+    sent_elsewhere: dict[str, int] = {}
+
+    def started_anew(destination_id: str) -> None:
+        """A destination edited to send elsewhere (another address, chat, routing key or recipients), saved so: its new receiver
+        knows nothing of what the one before was told. What it knew of the machines, where a screen watch's start went, its
+        reminders, what quiet hours held for it, a backup's failure it was told and what is on its way are forgotten there;
+        what waited for it was dropped (sent_elsewhere). Saved where who is owed a backup's end changed."""
+        for kept in (on_way, reminded, quiet_held, quiet_ends, backup_owed, backup_going):
+            kept.pop(destination_id, None)
+        # Each machine's trouble as not told there (""): nothing known is no book at all, which tells every end, as 0.3.2 did.
+        told_there[destination_id] = dict.fromkeys((record.id for record in store.devices), "")
+        for watches in watch_told.values():
+            for watch in watches.values():
+                watch[1].discard(destination_id)
+        backup_sending.discard(destination_id)
+        if destination_id in store.backups.told:
+            told_so(destination_id, False)
+            told_changed()
+
+    def held_back(destination_id: str, alert: alerts.Alert) -> str | None:
+        """(alerts.Courier, before each attempt and right before it goes, from the event loop or a mail send's thread.) Why an
+        alert waiting for a destination may not go now: the destination switched off, or, but for the daily seal of the
+        activity log (which goes whatever the alerts' switch says), alerts switched off, now or since it was handed over
+        (switched_off); and a machine's end of a trouble that a switch dropped there (untold), or of a screen watch whose
+        start it dropped there (unwatched), or a backup's end where no failure is told there (failure_off_way); and a reminder
+        of a trouble the destination is not said to know any more (knows). What is held back is dropped: not sent, then or later
+        (the second outside review of 0.4.0, M4). A pause and quiet hours stop new alerts only, judged where an alert is
+        routed (tell, tell_backup, seal_to_destinations): what was handed to a destination before they began goes as it would
+        have, its retries bounded (alerts.RETRY_AFTER). (They held it once, and told it when they ended: three review rounds
+        found ways that lost or falsely told it, the fresh review of the fixes, N2, and the last look, M1 to M5.)"""
+        record = destination(destination_id)
+        if record is None:
+            return None  # (gone: said by destination_target)
+        if not record.enabled or switched_since(destination_id, alert, destination_id):
+            return "Not sent: the destination was switched off while it waited"
+        if (handed := alert.handed.get(destination_id)) is not None and handed <= sent_elsewhere.get(destination_id, 0):
+            return "Not sent: the destination was changed to send elsewhere while it waited"
+        if alert.event != "log_seal" and (not store.alerts.enabled or switched_since(destination_id, alert, "")):
+            return "Not sent: alerts were switched off while it waited"
+        if not alert.device_id and alert.event == "recovered" and destination_id not in store.backups.told:
+            return "Not sent: the failure it ends was not sent there, a switch dropped it"  # (a backup's end: failure_off_way)
+        if alert.device_id and any(each[0] is alert and each[2] for each in list(on_way.get(destination_id, {}).get(alert.device_id, ()))):
+            return "Not sent: the trouble it ends was not sent there, a switch dropped it"
+        if alert.device_id and not watch_ended_there(destination_id, alert):
+            return "Not sent: the trouble it ends was not sent there, a switch dropped it"  # (a screen watch's: M2)
+        if alert.device_id and alert.previous == alert.state and not knows(destination_id, alert.device_id):
+            # (A reminder: it says the machine is as it was. Put behind a trouble that a switch dropped since, or that is over.)
+            return "Not sent: a reminder of a trouble not known there, a switch dropped it or it is over"
+        return None
+
+    def done(destination_id: str, sent: list[alerts.Alert], ok: bool) -> None:
+        """(alerts.Courier.) What was delivered to a destination, or given up on."""
+        for alert in sent:
+            if not alert.device_id and alert.event == "recovered":
+                backup_end_settled(destination_id)
+            elif not alert.device_id and alert.event == "backup":
+                failure_off_way(destination_id, alert, told=True)
+            elif alert.device_id:
+                off_way(destination_id, alert)
+
+    def dropped(destination_id: str, stopped: list[alerts.Alert]) -> None:
+        """(alerts.Courier.) What a switch dropped of what waited for a destination: a backup's alert, by who is owed what; a
+        machine's change, out of what the destination knows of the machine (untold); a screen watch's start, out of where it
+        went (unwatched)."""
+        for alert in stopped:
+            if not alert.device_id and alert.event in ("backup", "recovered"):
+                backup_dropped(destination_id, alert)
+            elif alert.device_id:
+                untold(destination_id, alert)
+                unwatched(destination_id, alert)
+
+    courier = alerts.Courier(destination_target, own_addresses, delivered, held_back, done, dropped)
+    # A machine's changes on their way to a destination (destination id -> device id -> [[the alert as handed over, what the
+    # destination knew of the machine before it (told_there), whether it is to go no more], ...], in the order they were
+    # handed over): what a switch drops of them is taken back out of what the destination knows (untold), and forgotten
+    # once delivered or given up on (done).
+    on_way: dict[str, dict[str, list[list[Any]]]] = {}
+
+    def off_way(destination_id: str, alert: alerts.Alert) -> tuple[list[Any], list[Any] | None] | None:
+        """A machine's change no longer on its way to a destination, taken out of on_way: its place there, and that of the
+        change of the machine handed over next, if any. None where it had none (a screen watch's, a reminder)."""
+        ways = on_way.get(destination_id, {})
+        chain = ways.get(alert.device_id, [])
+        place = next((at for at, each in enumerate(chain) if each[0] is alert), None)
+        if place is None:
+            return None
+        way = chain.pop(place)
+        after = chain[place] if place < len(chain) else None
+        if not chain:
+            ways.pop(alert.device_id, None)
+            if not ways:
+                on_way.pop(destination_id, None)
+        return way, after
+
+    def untold(destination_id: str, alert: alerts.Alert) -> None:
+        """(dropped.) A machine's change a switch dropped on its way to a destination: what the destination knows of the
+        machine is what it knew before it, as where it was never handed over (destinations.noted, not told). Where that is no
+        trouble told there, nothing reminds it of this one, and an end of it that waits behind it goes no more (held_back).
+        (What it knows was written down as the change was handed over: a trouble dropped left it saying the trouble was told
+        there, and once switched on again it was reminded of it, and told the machine was back to normal, of a trouble it never
+        heard of. The final look at 0.4.0, M1.)"""
+        taken = off_way(destination_id, alert)
+        if taken is None or alert.event == "recovered" or alert.state not in TROUBLE:
+            return  # (an end dropped: it knows nothing of the machine from then on, as when the end was handed over)
+        (_, known, _), after = taken
+        before = destinations.noted(known, alert, told=False) or ""  # (of a trouble: the trouble told there before, or "")
+        if after is not None:
+            # Handed over after it, as though it had been told: what that one knew before is this. An end of it goes no more
+            # where nothing of the trouble was told there.
+            if after[1] == alert.state:
+                after[1] = before
+                after[2] = after[2] or (after[0].event == "recovered" and not before)
+            return
+        book = told_there.get(destination_id)
+        if book is not None and book.get(alert.device_id) == alert.state:
+            book[alert.device_id] = before
+            if not before:
+                reminded.get(destination_id, {}).pop(alert.device_id, None)
+
+    # Where a screen watch's start was handed over (device id -> watch -> [its start, the destinations it was handed to and
+    # not dropped at, its end once that came]): its end goes there alone, and a start a switch dropped takes with it there its
+    # end and its reminders. A start within a destination's quiet hours is not handed over there, and its end after them was
+    # told there all the same, as one dropped by a switch was (the narrow look at 0.4.0, M2). In memory: after a restart, the
+    # end of a watch that went off before it is told wherever it is heard, as before 0.4.0.
+    watch_told: dict[str, dict[str, list[Any]]] = {}
+    # A screen watch's end within the quiet hours of a destination its start went to (destination id -> the records of
+    # watch_told whose end it is owed): told when they, and a pause, are over, where that watch is still over then; a watch
+    # that goes off again before carries the destination over to its new record, which still knows the screen dark. (Lost
+    # there, the start stayed the last word of the trouble: the outside review of 0.4.0, bugs round 2, M5.) In memory.
+    quiet_ends: dict[str, list[list[Any]]] = {}
+
+    def unwatched(destination_id: str, alert: alerts.Alert) -> None:
+        """(dropped.) A screen watch's start a switch dropped on its way to a destination: its end goes no more there (held_back
+        drops one that waits behind it), nor its reminders, where the destination knows no other trouble of the machine."""
+        start = watch_told.get(alert.device_id, {}).get(alert.state)
+        if start is None or start[0] is not alert:
+            return
+        start[1].discard(destination_id)
+        if not knows(destination_id, alert.device_id):
+            reminded.get(destination_id, {}).pop(alert.device_id, None)
+
+    def watch_ended_there(destination_id: str, alert: alerts.Alert) -> bool:
+        """Of a screen watch's end on its way to a destination (an alert of no other kind is no such end: True): whether its
+        start went there, and was not dropped since."""
+        start = watch_told.get(alert.device_id, {}).get(alert.previous)
+        return start is None or start[2] is not alert or destination_id in start[1]
+
+    def knows(destination_id: str, device_id: str) -> bool:
+        """Whether a destination is said to know a trouble of a machine, which a reminder reminds it of: one told there
+        (told_there), or a screen watch's "no signal" that went there and is not over (watch_told). (The narrow look at
+        0.4.0, L4: untold() stopped the reminders still to come of a trouble a switch dropped, and not those already put
+        behind it; switched on again before their turn, they went.)"""
+        if told_there.get(destination_id, {}).get(device_id):
+            return True
+        start = watch_told.get(device_id, {}).get(screens.NO_SIGNAL)
+        return start is not None and start[2] is None and destination_id in start[1]
+
+    # A destination's quiet hours hold back what happens (destination id -> device id -> what it was when the first change
+    # was held), and what is not so any more when they end is told then, as after a pause. In memory: a restart within them
+    # forgets what was held. A screen watch that goes off within them is not told there.
+    quiet_held: dict[str, dict[str, str]] = {}
+    # What a destination with reminders was told is wrong (destination id -> device id -> (when first told, when last)).
+    reminded: dict[str, dict[str, tuple[float, float]]] = {}
+
+    def heard(one: DestinationRecord, alert: alerts.Alert, at: float | None = None) -> None:
+        """A destination was sent this alert: what to remind it of from now on, or no more."""
+        if not one.remind or not alert.device_id:
+            return
+        now = time.monotonic() if at is None else at
+        mine = reminded.setdefault(one.id, {})
+        if alert.state in TROUBLE and alert.event != "test":
+            first = mine.get(alert.device_id, (now, now))[0]
+            mine[alert.device_id] = (first, now)
         else:
-            alert_log["error"] = problem
+            mine.pop(alert.device_id, None)
 
-    outbox = alerts.Outbox(alert_address, delivered)
+    told_there = watcher.heard  # destination id -> device id -> the trouble last told there (alerts.Watcher.heard)
+
+    def deliver(one: DestinationRecord, alert: alerts.Alert, again: Callable[[str], alerts.Alert] | None, at: float | None = None) -> None:
+        """A machine's change, to one destination as fitted for it (destinations.fitted: by what it was told before), and
+        what it knows of the machine from now on."""
+        book = told_there.setdefault(one.id, {})
+        known = book.get(alert.device_id)
+        made = destinations.fitted(one, alert, known, again)
+        if made is not None:
+            on_way.setdefault(one.id, {}).setdefault(alert.device_id, []).append([made, known, False])
+            courier.put(one.id, made)
+            heard(one, made, at)
+        after = destinations.noted(known, alert, told=made is not None)
+        if after is None:
+            book.pop(alert.device_id, None)
+        else:
+            book[alert.device_id] = after
+
+    def tell(alert: alerts.Alert, record: DeviceRecord | None, change: bool = True, again: Callable[[str], alerts.Alert] | None = None) -> None:
+        """An alert, to each destination that asked to hear it about this machine. Never waits (alerts.Courier).
+        `change`: it is a machine's change of state (not a screen watch's), which quiet hours hold back and tell afterwards;
+        `again(previous)` describes it anew from another state, for a destination that was told another one last. A screen
+        watch's end goes where its start went (watch_told)."""
+        now = time.localtime()
+        watch: list[Any] | None = None  # (a screen watch's start or end: its record in watch_told; None for an end not known)
+        if not change and alert.event != "recovered":
+            watch = [alert, set(), None]
+            before = watch_told.setdefault(alert.device_id, {}).get(alert.state)
+            watch_told[alert.device_id][alert.state] = watch
+            for destination_id, owed in quiet_ends.items():
+                if any(each is before for each in owed):  # (told of the dark screen before, and not that it was over: it still knows it)
+                    owed[:] = [each for each in owed if each is not before]
+                    watch[1].add(destination_id)
+        elif not change and (watch := watch_told.get(alert.device_id, {}).get(alert.previous)) is not None:
+            watch[2] = alert  # (an end comes once: the next start makes a new record)
+        for one in store.destinations:
+            if not one.enabled or one.kind not in destinations.KINDS:
+                continue
+            if record is not None and not destinations.covers(one, record.id, record.group):
+                continue
+            if destinations.quiet(one, now):
+                if change and record is not None:
+                    quiet_held.setdefault(one.id, {}).setdefault(record.id, alert.previous)
+                elif watch is not None and watch[2] is alert and one.id in watch[1] and destinations.passes(one, alert):
+                    quiet_ends.setdefault(one.id, []).append(watch)  # (its start went there: its end is told when they end)
+                continue
+            if change and alert.device_id:
+                deliver(one, alert, again)
+            elif destinations.passes(one, alert) and (watch is None or watch[0] is alert or one.id in watch[1]):
+                courier.put(one.id, alert)
+                heard(one, alert)
+                if watch is not None and watch[0] is alert:
+                    watch[1].add(one.id)
+
+    def told_later(paused: bool) -> None:
+        """At each look: what quiet hours that ended held back, where it is not as it was; and the reminders that are due."""
+        if paused:
+            return
+        local, now = time.localtime(), time.monotonic()
+        for one in list(store.destinations):
+            if destinations.quiet(one, local) or not one.enabled or one.kind not in destinations.KINDS:
+                continue
+            for device_id, before in quiet_held.pop(one.id, {}).items():
+                live, record, state = manager.devices.get(device_id), store.device(device_id), watcher.state(device_id)
+                if live is None or record is None or not record.alerts or state is None or state == before:
+                    continue  # (what went wrong and was put right within them is nobody's news there)
+                alert = alert_for(device_id, live, before, state)
+                if alerts.wanted(alert, store.alerts) and destinations.covers(one, device_id, record.group):
+
+                    def anew(previous: str, live: Device = live, state: str = state, device_id: str = device_id) -> alerts.Alert:
+                        return alert_for(device_id, live, previous, state)
+
+                    deliver(one, alert, anew, now)
+            for watch in quiet_ends.pop(one.id, []):
+                end = watch[2]
+                live, record = manager.devices.get(end.device_id), store.device(end.device_id)
+                if live is None or record is None or not record.alerts or watch_told.get(end.device_id, {}).get(end.previous) is not watch:
+                    continue  # (off the wall, its alerts off, or a watch begun anew since: that one is told as it comes)
+                if one.id in watch[1] and store.alerts.recovered and destinations.passes(one, end) and destinations.covers(one, end.device_id, record.group):
+                    courier.put(one.id, end)  # (over still: the screen is back)
+                    heard(one, end, now)
+            for device_id, (first, last) in list(reminded.get(one.id, {}).items()):
+                if now - last < max(one.remind, 1) * REMINDER_MINUTE:
+                    continue
+                live, record, state = manager.devices.get(device_id), store.device(device_id), watcher.state(device_id)
+                if live is None or record is None or not record.alerts or state not in TROUBLE or not one.remind:
+                    reminded[one.id].pop(device_id, None)
+                    continue
+                alert = alert_for(device_id, live, state, state)
+                alert.title = f"Still: {alert.title}"
+                alert.text = f"{alert.text} For {alerts.lasted(now - first)} now.".strip()
+                if destinations.passes(one, alert) and destinations.covers(one, device_id, record.group):
+                    courier.put(one.id, alert)
+                reminded[one.id][device_id] = (first, now)
+
+    # The activity log's daily seal (chain.py): its head, to the destinations whose "Daily seal of the activity log" is ticked,
+    # through the alerts' own way out (the courier: its outbound rules, its retries, its delivery log), as a message that is no
+    # trouble. A seal is written for it (why "daily"), and what is sent is its number and head: no secret, nothing of what the
+    # log says. Kept there, a head shows a later rewrite of the log up to it, even by someone who holds the wall's key.
+    sealed_to: dict[str, float] = {}  # destination id -> monotonic time it was last sent a seal
+
+    async def log_seals() -> None:
+        await asyncio.sleep(LOG_SEAL_FIRST)
+        while True:
+            try:
+                await seal_to_destinations()
+            except Exception:  # a failed round must not be the last one
+                log.exception("the activity log's seal could not be sent to the alert destinations")
+            await asyncio.sleep(LOG_SEAL_LOOK)
+
+    async def seal_to_destinations() -> None:
+        now, local = time.monotonic(), time.localtime()
+        due = [
+            one for one in store.destinations
+            if one.log_seal and one.enabled and one.kind in destinations.KINDS and one.kind != "pagerduty"
+            and now - sealed_to.get(one.id, -LOG_SEAL_EVERY) >= LOG_SEAL_EVERY and not destinations.quiet(one, local)
+        ]  # fmt: skip
+        if not due or core.audit.key is None:
+            return
+        place = await asyncio.to_thread(core.audit.sealed, "daily")
+        if place is None:
+            return  # (not written: the disk refused it, and the log says so; tried again at the next look)
+        number, head = place
+        said = f"qKVM activity log seal: line {number} head {head.hex()}"
+        text = "Keep this message. With it, python -m qkvm.checklog --heads shows any later rewrite of the activity log up to this line."
+        for one in due:
+            courier.put(one.id, alerts.Alert("log_seal", "qKVM", "", "", "", said, text, event="log_seal"))
+            sealed_to[one.id] = now
 
     # --- alerts by Web Push (webpush.py): the wall's key, and the browsers each account has them told to ---------------
     push_opened: list[Any] = [None, None]  # the sealed key last opened, and what it opened as
@@ -1301,8 +1871,12 @@ def create_app(core: Core) -> FastAPI:
         core.audit.write("push_removed", "", account=account_named(record.user), browser=record.name, why="gone")
 
     def push_allowed(push_id: str, device_id: str | None) -> bool:
-        """Whether a browser may be told an alert about this machine now: its record there, its account there, not
-        suspended, and the machine one it may see (asked before each attempt: webpush.Pusher)."""
+        """Whether a browser may be told an alert about this machine now: alerts switched on, its record there, its account
+        there, not suspended, and the machine one it may see (asked before each attempt and right before it goes:
+        webpush.Pusher; what it says no to is dropped). A pause is not asked: it stops new alerts only (announce), and one
+        already on its way to a browser goes, as one on its way to a destination does (held_back)."""
+        if not store.alerts.enabled:
+            return False  # (the fresh review of the fixes, N3: one waiting to be tried again went out after they were switched off)
         record = next((one for one in store.pushes if one.id == push_id), None)
         user = store.user(record.user) if record is not None else None
         return user is not None and not user.suspended and (device_id is None or may_see(user, device_id))
@@ -1333,14 +1907,21 @@ def create_app(core: Core) -> FastAPI:
         """
         return 0 < store.alerts.paused_until - time.time() <= LONGEST_PAUSE * 60
 
-    def announce(device_id: str, device: Device, previous: str, state: str, paused: bool) -> None:
-        """Tell whoever is to be told that a device went from `previous` to `state`."""
-        record = store.device(device_id)
+    def alert_for(device_id: str, device: Device, previous: str, state: str) -> alerts.Alert:
+        """What is said of a device that went from `previous` to `state`, by what it shows now; with its link."""
         detail = str(((device._status or {}).get("error") or {}).get("message") or "")
         address = urlsplit(device.spec.base_url).netloc
         atx = (device._status or {}).get("atx")
         off = isinstance(atx, dict) and atx.get("enabled") is True and atx.get("power") is False  # (its power board says so)
-        alert = alerts.describe(device.spec.name, address, previous, state, detail, server=not device.picture, off=off)
+        code = str(((device._status or {}).get("error") or {}).get("code") or "")
+        alert = alerts.describe(device.spec.name, address, previous, state, detail, server=not device.picture, off=off, device_id=device_id, code=code)
+        alert.link = alerts.link_for(store.alerts.link, device_id)
+        return alert
+
+    def announce(device_id: str, device: Device, previous: str, state: str, paused: bool) -> None:
+        """Tell whoever is to be told that a device went from `previous` to `state`."""
+        record = store.device(device_id)
+        alert = alert_for(device_id, device, previous, state)
         if not alerts.wanted(alert, store.alerts) or (record is not None and not record.alerts):
             return
         if record is not None and device.picture and screens.minutes(record.no_signal_minutes) and (state == "no_signal" or (previous, state) == ("no_signal", "online")):
@@ -1350,11 +1931,13 @@ def create_app(core: Core) -> FastAPI:
             held.setdefault(device_id, previous)
             core.audit.write("alert", "", device=alert.device, device_id=device_id, state=alert.state, was=alert.previous, held=True)
             return
-        alert.link = alerts.link_for(store.alerts.link, device_id)
         core.audit.write("alert", "", device=alert.device, device_id=device_id, state=alert.state, was=alert.previous)
         log.info("alert: %s (%s -> %s)", alert.title, alert.previous, alert.state)
-        outbox.put(alert)  # delivered from there: the watching does not wait for somebody else's server
-        push_out(alert, device_id)  # ...nor for a push service
+        # Delivered from there: the watching does not wait for somebody else's server. Each destination is told as fitted for
+        # it (a machine told there as offline that answers again without a picture is no news there: destinations.fitted).
+        tell(alert, record, again=lambda before: alert_for(device_id, device, before, state))
+        if (previous, state) != ("offline", "no_signal"):
+            push_out(alert, device_id)  # ...nor for a push service (a browser was told it was offline: no picture lost)
 
     async def look() -> None:
         """One look at every KVM, for the changes worth telling someone about."""
@@ -1368,6 +1951,7 @@ def create_app(core: Core) -> FastAPI:
                 if live is not None and now is not None and now != before:
                     announce(device_id, live, before, now, paused=False)
             held.clear()
+        told_later(paused)
         for (device_id, device), state in zip(watched, states, strict=True):
             if manager.devices.get(device_id) is not device:
                 continue  # edited or removed while it was being looked at: what it said no longer counts
@@ -1396,7 +1980,7 @@ def create_app(core: Core) -> FastAPI:
             if live is None or record is None:
                 continue  # removed meanwhile
             address = urlsplit(live.spec.base_url).netloc
-            alert = alerts.describe_watch(live.spec.name, address, event.watch, event.minutes, event.back, event.lasted, kept=bool(event.stamp))
+            alert = alerts.describe_watch(live.spec.name, address, event.watch, event.minutes, event.back, event.lasted, kept=bool(event.stamp), device_id=event.device_id)
             if event.back and not store.alerts.recovered:
                 continue  # (what is over is told where the admin asked to hear what is back to normal)
             picture = {"picture": event.stamp, "picture_at": round(event.picture.at, 3)} if event.stamp and event.picture is not None else {}
@@ -1406,8 +1990,19 @@ def create_app(core: Core) -> FastAPI:
             )  # fmt: skip
             alert.link = alerts.link_for(store.alerts.link, event.device_id)
             log.info("alert: %s", alert.title)
-            outbox.put(alert)
+            tell(alert, record, change=False)
             push_out(alert, event.device_id)
+
+    async def book_written() -> None:
+        """What each machine is taken to be, and what each destination knows of it, written down where it changed, for the
+        start after this one: after each look, and whatever the switches say, as a switch that drops a trouble on its way
+        changes what its destination knows (untold). Written after a look alone, that was lost by a restart made while
+        alerts were switched off, and the trouble dropped came back as told there (the narrow look at 0.4.0, M1)."""
+        try:
+            if (text := watcher.to_write()) is not None:
+                await asyncio.to_thread(watcher.write, text)
+        except Exception:
+            log.exception("what the machines were last seen as could not be written down")
 
     async def watch() -> None:
         """Notice KVMs changing state, also while nobody has the wall open."""
@@ -1420,24 +2015,23 @@ def create_app(core: Core) -> FastAPI:
                     await screen_watch.sweep({record.id for record in store.devices})
                 except Exception:
                     log.exception("the pictures kept for screen alerts could not be looked through")
-                continue
-            try:
-                await look()
-                await watch_screens()
-                # What each machine is taken to be is written down when it changes, for the start after this one.
-                if (text := watcher.to_write()) is not None:
-                    await asyncio.to_thread(watcher.write, text)
-            except Exception:  # whatever goes wrong in one look must not end the watching
-                log.exception("the KVMs could not be checked for changes")
+            else:
+                try:
+                    await look()
+                    await watch_screens()
+                except Exception:  # whatever goes wrong in one look must not end the watching
+                    log.exception("the KVMs could not be checked for changes")
+            await book_written()
 
     def keep_unlocked() -> bool:
         """While alerts are on, or metrics are collected, the KVMs are watched after the last person signs out too.
 
         And always where qKVM has a key that opens the saved passwords at start (its own, or an unlock
         file's): what opens them is on this computer anyway, and forgetting them here would only mean
-        opening them again.
+        opening them again. And while backups are on: a run by the clock seals with the backup key, which
+        the vault keeps (backup.py), at an hour nobody is signed in.
         """
-        return store.alerts.enabled or bool(store.server.metrics_token) or core.unlock_secret is not None
+        return store.alerts.enabled or bool(store.server.metrics_token) or core.unlock_secret is not None or store.backups.enabled
 
     background: set[asyncio.Task[Any]] = set()  # things set going by a request that it does not wait for (or that outlive it, if it is cut off)
 
@@ -1496,6 +2090,24 @@ def create_app(core: Core) -> FastAPI:
                 moved_to = None
                 core.request_restart()
 
+    async def tailscale_certificate() -> None:
+        """Tailscale's certificate for this computer's name (--tls-tailscale, tailcert.py): asked for again when it is due, and
+        served from the next connection on where it is another. Nothing where it was not asked for."""
+        held = core.tailscale_cert
+        if held is None:
+            return
+        while True:
+            try:
+                wait = held.due()
+            except Exception:  # (when it is due is guarded as the ask is: an error there ended the asking for good before)
+                log.exception("when to ask for Tailscale's certificate again could not be worked out")
+                wait = tailcert.RETRY_MOST
+            await asyncio.sleep(wait)
+            try:
+                await held.renew()
+            except Exception:  # a failed ask must not be the last one
+                log.exception("Tailscale's certificate could not be asked for")
+
     async def housekeeping() -> None:
         while True:
             await asyncio.sleep(HOUSEKEEPING_EVERY)
@@ -1548,6 +2160,50 @@ def create_app(core: Core) -> FastAPI:
     indexed = core.activity
     activity_reads = Reads(ACTIVITY_READS_AT_ONCE, ACTIVITY_TURN_WAIT, "the activity log")
     downloads = Downloads(DOWNLOADS_AT_ONCE)
+    # A check of its chain (chain.py: the routes beside its download): the one under way and its walk, and the last one's result.
+    log_check: dict[str, Any] = {"task": None, "walk": None, "began": None, "by": "", "kept": None}
+    # Where its chain had come to, kept in the sealed settings at each seal (chain.py; H1 of the review of wave 2): told by the
+    # writer's thread, kept on the event loop, saved in turn. Never moved back: a seal told late changes nothing.
+    loop_of: list[asyncio.AbstractEventLoop] = []  # (the wall's event loop, from its start)
+
+    def keep_position(number: int, head: bytes) -> bool:
+        """(On the event loop.) Where the chain had come to, into the settings, where it is further on than they say; True if so."""
+        kept = position_of(store.activity_position)
+        if kept is not None and kept[0] >= number:
+            return False
+        said = {"n": number, "head": head.hex()}
+        if position_of(said) is None:
+            # Never one the settings would not read back (a number past 2**63): kept, the next start found them damaged, both
+            # copies, and the wall did not start (the re-review of wave 2, N1). The writer gives no such number now; this holds
+            # whatever comes.
+            log.error("the activity log's chain is at a line no settings keep (%d): its place is not kept", number)
+            return False
+        store.activity_position = said
+        return True
+
+    async def save_position() -> None:
+        try:
+            await save_in_turn()
+        except OSError as ex:
+            log.error("where the activity log's chain had come to could not be saved with the settings: %s", ex.strerror or ex)
+
+    def sealed_now(number: int, head: bytes) -> None:
+        if keep_position(number, head):
+            task = asyncio.create_task(save_position())
+            background.add(task)
+            task.add_done_callback(background.discard)
+
+    def sealed(why: str, number: int, head: bytes) -> None:
+        """(In the writer's thread.) A seal was written: its place kept, on the event loop."""
+        if not loop_of:
+            return
+        try:
+            loop_of[0].call_soon_threadsafe(sealed_now, number, head)
+        except RuntimeError:
+            pass  # (the loop has ended: the stop seal's place was kept by the lifespan itself)
+
+    core.audit.on_sealed = sealed
+    check_halt = threading.Event()  # (set as the wall stops: a check under way ends there)
 
     def account_named(user_id: str) -> str:
         """An account's name as its entries carry it, by its id (a token's with " (token)"); the id where it is gone."""
@@ -1567,13 +2223,598 @@ def create_app(core: Core) -> FastAPI:
             for who, unsaid in left_out.items():
                 audit.write("activity_left_out", "", user=account_named(who), of=of, unsaid=unsaid)
 
+    # --- backups of the whole wall to a folder (backup.py) -----------------------------------------------------------
+    # Made by the clock at the hour set, or by "Back up now"; one at a time. The backup key is opened from the vault for the
+    # run and handed to the worker thread alone; it is never written, logged or answered. A run that fails is said in the
+    # activity log, in Settings and to the destinations that ask for "backup"; the first run that succeeds after one that
+    # failed, to those that were told, as over.
+    backup_turn = asyncio.Lock()
+    backup_task: list[asyncio.Task[dict[str, Any]] | None] = [None]
+    clock_said: list[float] = [0.0]  # the moment due by the clock that was said not to have been started (one run was going)
+    stuck_said = [False]  # said that the clock begins none while a run cut off by its bound goes on (once, until it ends)
+    waiting_told = [0.0]  # the hour at which it was last told what runs cut off still wait for (once a day, at the hour)
+    # Destination id -> a backup's failure a pause or its quiet hours held back: told when they end where backups still fail,
+    # and not at all once they are made again. In memory: a restart within them forgets it (the next run that fails is told).
+    backup_owed: dict[str, alerts.Alert] = {}
+    backup_sending: set[str] = set()  # destinations a backup's end is on its way to: owed it (told) until it is delivered
+    # Destination id -> [the failures on their way there (as handed over), whether it was told of one before them and not
+    # since that backups are made again]: a failure a switch drops takes back what it put on the told list and no more (the
+    # outside review of 0.4.0, bugs round 2, M2: only the last hand-over was remembered, and two dropped left it owed an end).
+    backup_going: dict[str, list[Any]] = {}
+    # (Who was told that a backup failed, and not yet that one was made again, is kept with the backups' settings: told
+    # = store.backups.told, saved, so that it is told after a restart too: the outside review of 0.4.0, bugs round, M3.)
+
+    def told_so(destination_id: str, failed: bool) -> None:
+        told = store.backups.told
+        if failed and destination_id not in told:
+            told.append(destination_id)
+        elif not failed and destination_id in told:
+            told.remove(destination_id)
+
+    def backup_key() -> bytes:
+        """The backup key, opened from the vault for a run. BackupError where there is none, or it cannot be opened now."""
+        sealed = store.backups.secret
+        if sealed is None:
+            raise backup.BackupError("no_key", "No backup key has been made yet: make one in Settings > Backups (its recovery kit is shown once)")
+        if not core.vault.unlocked:
+            raise backup.BackupError("locked", "The saved passwords are locked, and the backup key with them: qKVM was started with --locked-start and nobody has signed in since")
+        text = core.vault.read(sealed, backup.SEALED_FOR)
+        try:
+            key = bytes.fromhex(text or "")
+        except ValueError:
+            key = b""
+        if len(key) != backup.KEY_BYTES:
+            raise backup.BackupError("no_key", "The saved backup key does not open (the settings file was edited, or is damaged): make a new key")
+        return key
+
+    def backup_failure(ex: BaseException) -> str:
+        """Why a run made no backup, in a sentence: never more of a file or a key than its name."""
+        if isinstance(ex, backup.BackupError):
+            return ex.message
+        if isinstance(ex, OSError):
+            where = f": {ex.filename}" if getattr(ex, "filename", None) else ""
+            return f"{ex.strerror or type(ex).__name__}{where}"
+        if isinstance(ex, MemoryError):
+            return "there was not enough memory for it"
+        if isinstance(ex, VaultLocked):
+            return "the saved passwords are locked just now"
+        return str(ex) or type(ex).__name__
+
+    def backup_alert(failed: bool, said: str) -> alerts.Alert:
+        if failed:
+            last = store.backups.last_good
+            before = f" The last backup made is from {time.strftime('%Y-%m-%d %H:%M', time.localtime(last))}." if last else " No backup has been made yet."
+            alert = alerts.Alert("backup", "qKVM", "", "backup_failed", "backup_ok", "Backup failed", f"No backup was made: {said}{before}", event="backup")
+        else:
+            alert = alerts.Alert("recovered", "qKVM", "", "backup_ok", "backup_failed", "Backups are made again", f"A backup was made: {said}.", event="recovered")
+        alert.link = store.alerts.link
+        return alert
+
+    def tell_backup(alert: alerts.Alert, only: set[str] | None = None) -> bool:
+        """A backup's alert, to each destination that asks for it (the one that it is over, to those told that it failed).
+        Nothing while alerts are off. A pause, or a destination's quiet hours, hold it as they hold a machine's change: a
+        failure is owed there (backup_owed) and told when they end where backups still fail (tell_owed); that it is over goes,
+        when they end, to whoever was told that it failed (the told list). True where it was handed to a destination at once.
+        `only`: to these destinations alone. (In the turn of changes, before the save that keeps who was told.)"""
+        if not store.alerts.enabled:
+            return False
+        failed, now, told, paused = alert.event == "backup", time.localtime(), False, pausing()
+        for one in store.destinations:
+            if only is not None and one.id not in only:
+                continue
+            if not failed and one.id not in store.backups.told:
+                backup_owed.pop(one.id, None)  # (what was held back and never told is over: nothing to tell there)
+                continue
+            if not failed and one.id in backup_sending:
+                continue  # (its end is on its way there already)
+            if not one.enabled or one.kind not in destinations.KINDS or not destinations.passes(one, alert):
+                if not failed:
+                    told_so(one.id, False)  # (nothing to close where it is not told: not owed for ever)
+                backup_owed.pop(one.id, None)
+                continue
+            if paused or destinations.quiet(one, now):
+                if failed:
+                    backup_owed[one.id] = alert
+                else:
+                    backup_owed.pop(one.id, None)  # (owed its end, on the told list: told when they end, tell_owed)
+                continue
+            backup_owed.pop(one.id, None)
+            backup_handed(one.id, alert)
+            told = True
+        if not failed:  # (and none owed to a destination that is no more)
+            there = {one.id for one in store.destinations}
+            store.backups.told[:] = [each for each in store.backups.told if each in there]
+        return told
+
+    def tell_owed() -> None:
+        """What a pause or quiet hours held back of the backups, told where they are over: a failure where backups still fail
+        (once they are made again, nothing: the last look, M2), and that backups are made again to whoever was told that they
+        failed (after a restart too: the told list is saved). (In the turn of changes, before the save that keeps who was
+        told.)"""
+        kept = store.backups
+        if kept.last_ok:
+            backup_owed.clear()  # (a failure held back is over: nobody's news)
+            if kept.told and (owed := set(kept.told) - backup_sending):
+                tell_backup(backup_alert(False, kept.last_name or "the last one"), only=owed)
+            return
+        # (Backups fail again: what is owed is a failure. Who was told of one before, and not yet that it was over, is owed
+        # its end still, of this one.)
+        now = time.localtime()
+        for destination_id, alert in list(backup_owed.items()):
+            one = destination(destination_id)
+            if one is None or not one.enabled or not store.alerts.enabled:
+                backup_owed.pop(destination_id, None)
+            elif not destinations.quiet(one, now) and not pausing():
+                backup_owed.pop(destination_id, None)
+                backup_handed(one.id, alert)
+
+    def backup_handed(destination_id: str, alert: alerts.Alert) -> None:
+        """A backup's alert handed to a destination: one that it failed, and it is owed the end from now on; one that it is
+        over, and it is owed it still until it is delivered (backup_end_settled): lost with a restart while it waited to be
+        tried again, the incident a failure opened stayed open (the fresh review of the fixes, N2)."""
+        courier.put(destination_id, alert)
+        if alert.event == "backup":
+            going = backup_going.setdefault(destination_id, [[], destination_id in store.backups.told])
+            going[0].append(alert)
+            told_so(destination_id, True)
+        else:
+            backup_sending.add(destination_id)
+
+    def backup_end_settled(destination_id: str) -> None:
+        """(done.) A backup's end delivered to a destination, or given up on: owed no more there, unless a failure was handed
+        to it since (that one is owed its end, once it is told there). Saved."""
+        backup_sending.discard(destination_id)
+        if (going := backup_going.get(destination_id)) is not None:
+            going[1] = False
+        elif destination_id in store.backups.told:
+            told_so(destination_id, False)
+            told_changed()
+
+    def failure_off_way(destination_id: str, alert: alerts.Alert, told: bool) -> None:
+        """(done, dropped.) A backup's failure no longer on its way to a destination: `told` there (delivered, or given up on),
+        or not (a switch dropped it). Once none is on its way, the destination is owed the end where one was told there,
+        before them or of them, and not since that backups are made again; else it is owed nothing. Saved."""
+        going = backup_going.get(destination_id)
+        if going is None or not any(each is alert for each in going[0]):
+            return
+        going[0] = [each for each in going[0] if each is not alert]
+        going[1] = going[1] or told
+        if going[0]:
+            return
+        del backup_going[destination_id]
+        if not going[1] and destination_id in store.backups.told:
+            told_so(destination_id, False)
+            told_changed()
+
+    def backup_dropped(destination_id: str, alert: alerts.Alert) -> None:
+        """(dropped.) A backup's alert dropped on its way to a destination, by a switch. Its end: still owed there where alerts
+        were switched off (told by the clock once they are on again), and owed nothing where the destination itself was. A
+        failure: not told, so it takes back what it put on the told list (failure_off_way)."""
+        one = destination(destination_id)
+        if alert.event == "recovered":
+            backup_sending.discard(destination_id)
+            if (one is None or not one.enabled or switched_since(destination_id, alert, destination_id)) and destination_id in store.backups.told:
+                told_so(destination_id, False)
+                told_changed()
+            return
+        failure_off_way(destination_id, alert, told=False)
+
+    def told_changed() -> None:
+        """Who is owed a backup's end changed outside the turn of changes: saved in its turn."""
+
+        async def save_told() -> None:
+            try:
+                await save_in_turn()
+            except OSError as ex:
+                log.error("who was told of the backups could not be saved with the settings: %s", ex.strerror or ex)
+
+        task = asyncio.create_task(save_told())
+        background.add(task)
+        task.add_done_callback(background.discard)
+
+    def backup_work(key: bytes, settings: dict[str, Any], data_key: bytes, folder: Path, keep: int, with_history: bool) -> tuple[backup.Made, int]:
+        """(A worker thread.) The history copied where asked for, the activity log's files opened, the backup made."""
+        # This run's copy of the history has a name of its own, held before the copy is made; what runs before left of theirs
+        # (stopped with the wall) is taken away, but never a copy a run still holds (one its hour cut off, waiting for its
+        # folder, or one begun after this one: core.backup_copies), judged as each is taken away, under the lock its name is
+        # held under. (The names held as it began were judged by: cut off between the two, a run went on to take away the copy
+        # of one begun after it, which failed. The outside review of 0.4.0, bugs round 2, M1.)
+        with core.backup_copies_lock:
+            number = time.time_ns()
+            while (copy := core.data_dir / backup.HISTORY_COPY.format(number)).name in core.backup_copies:
+                number += 1
+            core.backup_copies.add(copy.name)
+        try:
+            for entry in os.scandir(core.data_dir):  # (no lock held while the folder is looked through)
+                if backup.HISTORY_COPIES.fullmatch(entry.name) and entry.is_file(follow_symlinks=False):
+                    with core.backup_copies_lock, suppress(OSError):
+                        if entry.name not in core.backup_copies:
+                            Path(entry.path).unlink()
+            has_history = False
+            for attempt in range(3 if with_history else 0):
+                try:
+                    has_history = core.history.copy_to(copy)
+                    break
+                except history.NotReadable:
+                    if attempt == 2:
+                        raise
+                    copy.unlink(missing_ok=True)
+                    time.sleep(HISTORY_AGAIN)  # (a checkpoint of its own holds it for a moment: asked again, as a read of the page is)
+            with backup.log_files(core.audit) as logs:
+                made = backup.make(folder, key, settings=settings, data_key=data_key, logs=logs, history=copy if has_history else None, program=__version__, keep=keep)
+            return made, backup.others(folder, backup.key_id(key))
+        finally:
+            copy.unlink(missing_ok=True)
+            with core.backup_copies_lock:
+                core.backup_copies.discard(copy.name)
+
+    def folder_fit(folder: str) -> None:
+        """BackupError where backups cannot go to this folder, by how it is written (the disk is asked nothing)."""
+        if not folder or not Path(folder).is_absolute():
+            raise backup.BackupError("no_folder", "No folder is set for the backups")
+        if backup.spelled_inside(folder, core.data_dir):  # (as a save refuses it: backups there would go with it)
+            raise backup.BackupError("no_folder", "The backups' folder is in the data folder, and backups there would go with it: choose a folder elsewhere")
+
+    def of_now(run: backup.Run) -> bool:
+        """Whether a run was made for the backups as they are set up now (the folder they go to, the key they are sealed with):
+        only then is its end their last run, their latest backup and what the clock's next is counted from."""
+        kept = store.backups
+        return backup.place_of(run.folder) == backup.place_of(kept.folder) and run.key == kept.key_id
+
+    def not_finished(within: float) -> str:
+        return f"The backup did not finish within {alerts.lasted(within)}: its folder does not answer (a share whose server is gone?)"
+
+    async def back_up(by_the_clock: bool) -> dict[str, Any]:
+        """One run, start to end: what it made, or why it made none, kept in the settings and said."""
+        async with backup_turn:
+            how = "by the clock" if by_the_clock else "by hand"
+            began = time.time()
+            kept = store.backups
+            run = backup.Run(kept.folder, kept.key_id, how=how, began=began)  # (what it is for until it is taken with its settings, below)
+            made: tuple[backup.Made, int] | None = None
+            outcome: dict[str, Any]
+            try:
+                folder_fit(kept.folder)
+                backup_key()  # (none, or none that opens: said before a seal is written for nothing)
+                # A seal of the activity log first, waited for: the files taken after it hold it, and the settings taken after it
+                # hold every change it follows (their place of the chain), so that the restored log checks as it did, up to that
+                # line and past it.
+                place = await asyncio.to_thread(core.audit.sealed, "backup")
+                # Then, at one moment in the turn of changes (never one half made, which its save may yet take back): what the run
+                # is for, its key, and the settings it holds with the data key that opens them. A key made new while the seal was
+                # waited for is this run's key: nothing taken after a new kit was shown goes into a backup the kit before opens
+                # (the outside review of 0.4.0, H1). A change refused meanwhile is none of the run's. Work on the folder, which
+                # may never end, is outside the turn.
+                async with one_change:
+                    kept = store.backups
+                    run = backup.Run(kept.folder, kept.key_id, min(365, max(1, kept.keep)), kept.history, how, began)
+                    folder_fit(run.folder)
+                    key = backup_key()
+                    snapshot = store.snapshot()
+                    data_key = core.vault.held_key()
+                if place is not None:
+                    snapshot["activity_position"] = {"n": place[0], "head": place[1].hex()}
+                # On the folder's own threads, bounded: a folder that never answers holds a thread of those, and the run is said
+                # to have failed after BACKUP_STUCK all the same, alerted, and the next can begin. The bound is the run's own,
+                # kept with it by the program: listeners opened anew meanwhile say it once it has come (overdue_runs).
+                ended = await core.backup_runs.run(
+                    BACKUP_STUCK, backup_work, key, snapshot, data_key, Path(run.folder), run.keep, run.history,
+                    late=functools.partial(ended_late, run), folder=run.folder, for_run=run,
+                )
+            except backup.FolderTimeout:  # (the run's bound; a folder's own ETIMEDOUT is an OSError, said as the folder's below)
+                outcome = {"ok": False, "error": not_finished(BACKUP_STUCK)}
+            except backup.FolderHeld as ex:
+                # Its folder held by a run before, by this name or another for the same folder (found out on its thread): not
+                # begun, which is no failed run, and said so (Back up now answers it as busy; the clock says it once).
+                why = RUN_STILL_WAITING if ex.holder.cut_off else "A backup is being made into this folder just now"
+                audit.write("backup_not_started", "", why=why, how=how, folder=run.folder)
+                log.warning("a backup was not begun: %s", why)
+                return {"ok": False, "error": why, "held": True}
+            except (backup.BackupError, OSError, VaultLocked, history.NotReadable, MemoryError, ValueError) as ex:
+                outcome = {"ok": False, "error": backup_failure(ex)[:500]}
+            except Exception as ex:
+                # Of no kind foreseen: a failed run all the same, kept and said as every other (left to escape, it was kept
+                # nowhere, and the clock began another at every look). Said by its kind; its words, which may hold anything, go
+                # to the program's log alone.
+                log.exception("a backup could not be made")
+                outcome = {"ok": False, "error": f"an error inside qKVM ({type(ex).__name__}); the details are in its log"}
+            else:
+                made = ended
+                outcome = {"ok": True, "name": ended[0].name, "size": ended[0].size}
+            await run_ended(run, outcome, began, made)
+            return outcome
+
+    async def run_ended(run: backup.Run, outcome: dict[str, Any], began: float, made: tuple[backup.Made, int] | None) -> None:
+        """How a run ended, kept and said: in the activity log, with the folder it was made for, always; as Settings' last run,
+        their latest backup and what the clock's next run is counted from, and to the alert destinations, only where it was
+        made for the backups as they are set up now (the outside review of 0.4.0, M1: a run still writing into the folder
+        before was the new folder's latest, which Verify looked for there and did not find, and it moved the next run on)."""
+        told = False
+        async with one_change:
+            kept = store.backups
+            current = of_now(run)
+            was_ok = kept.last_ok
+            if current:
+                kept.last_at, kept.last_ok, kept.last_error = time.time(), outcome["ok"], outcome.get("error", "")
+                if made is not None:  # (the backup last made, its size and its folder: kept through runs that make none)
+                    kept.last_good, kept.others, kept.last_name, kept.last_size, kept.last_folder = began, made[1], made[0].name, made[0].size, run.folder
+                    if not was_ok:
+                        tell_backup(backup_alert(False, made[0].name))
+                else:
+                    told = tell_backup(backup_alert(True, outcome["error"]))
+                try:
+                    await save()  # (and who was told: store.backups.told)
+                except OSError as ex:
+                    log.error("how the last backup went could not be saved with the settings: %s", ex.strerror or ex)
+        other = {} if current else {"current": False}
+        if made is not None:
+            done = made[0]
+            audit.write(
+                "backup_made", "", file=done.name, size=done.size, devices=done.held.devices, history=done.held.history is not None, pruned=len(done.pruned),
+                how=run.how, folder=run.folder, **other,
+            )  # fmt: skip
+            if not current:
+                log.info("a backup was made in %s, which backups do not go to now (or with the key before): %s", run.folder, done.name)
+                return
+            log.info("a backup was made: %s (%d bytes)", done.name, done.size)
+        else:
+            audit.write("backup_failed", "", why=outcome["error"], told=told, how=run.how, folder=run.folder, **other)
+            if current:
+                log.error("no backup was made: %s", outcome["error"])
+            else:
+                log.warning("no backup was made in %s, which backups do not go to now (or with the key before): %s", run.folder, outcome["error"])
+
+    async def overdue_runs() -> None:
+        """Runs begun before the listeners were opened anew, whose bound has come meanwhile with their folders not answering
+        still: each said to have failed, once, and alerted, as its waiter would have (the outside review of 0.4.0, M2: the
+        bound went with the waiter, and a run on a share that never answered was never said failed). Each holds its folder
+        until its thread ends, and that end is kept then (ended_late)."""
+        for each in core.backup_runs.overdue():
+            await run_ended(each.for_run or backup.Run(each.folder), {"ok": False, "error": not_finished(each.within)}, each.since, None)
+
+    def ended_late(run: backup.Run, made: tuple[backup.Made, int] | None, failure: BaseException | None) -> None:
+        """(The run's thread, or the loop where its waiter was stopped.) A run nobody waited for any more (cut off by its hour, or
+        begun before the listeners were opened anew) has ended: handed to the program (core.backup_ended), and kept and said
+        by whichever listeners there are now, at once where they are open (core.backup_poke), or at the clock's next look. Never
+        to the event loop the run was begun on, which may have ended with its listeners."""
+        # Whether its hour had cut it off (its failure said then), or its waiter had only stopped (the listeners opened anew):
+        # asked while its place is still held (FolderThreads tells before it gives the place back, and none is cut off after).
+        cut = any(each.cut_off for each in core.backup_runs.working() if each.for_run is run)
+        core.backup_ended.append((run, made, failure, cut))
+        poke = core.backup_poke
+        if poke is not None:
+            try:
+                poke()
+            except RuntimeError:  # (that loop has ended this moment: the next listeners' clock takes it)
+                pass
+
+    ending = asyncio.Lock()  # (one keeps what runs ended with at a time: the clock looks at when the next is due only after)
+
+    async def ended_runs() -> None:
+        """What runs nobody waited for any more ended with, kept and said, in the order they ended (one at a time)."""
+        async with ending:
+            while core.backup_ended:
+                run, made, failure, cut = core.backup_ended.popleft()
+                try:
+                    await record_late(run, made, failure, cut)
+                except Exception:
+                    log.exception("how a backup ended could not be kept")
+
+    def background_task(work: Awaitable[None]) -> None:
+        task = asyncio.ensure_future(work)
+        background.add(task)
+        task.add_done_callback(background.discard)
+
+    async def record_late(run: backup.Run, made: tuple[backup.Made, int] | None, failure: BaseException | None, cut: bool) -> None:
+        if not cut:
+            # Never cut off (its waiter stopped as the listeners were opened anew, and it ended before its hour): its end is
+            # an end as every run's, kept and said by run_ended: Settings' last run and what the clock counts from, the
+            # alerts, "made" or "failed" (the fresh review of the fixes, N4: a failure was a line alone, Settings still saying
+            # the run before made a backup and nobody alerted; a backup made was not counted by the clock, which began another).
+            if made is not None:
+                outcome: dict[str, Any] = {"ok": True, "name": made[0].name, "size": made[0].size}
+            else:
+                known = (backup.BackupError, OSError, ValueError, MemoryError, VaultLocked, history.NotReadable)
+                outcome = {"ok": False, "error": (backup_failure(failure) if isinstance(failure, known) else f"an error inside qKVM ({type(failure).__name__}); the details are in its log")[:500]}
+            await run_ended(run, outcome, run.began or time.time(), made)
+            return
+        if made is None:
+            known = (backup.BackupError, OSError, ValueError, MemoryError, VaultLocked, history.NotReadable)
+            why = backup_failure(failure) if isinstance(failure, known) else f"an error inside qKVM ({type(failure).__name__}); the details are in its log"
+            audit.write("backup_ended_late", "", ok=False, why=why[:500], folder=run.folder)
+            log.warning("a backup cut off by its bound ended after all, without a backup: %s", why)
+            return
+        done, others = made
+        async with one_change:
+            kept = store.backups
+            was_ok = kept.last_ok
+            # The latest only of the backups as they are set up now (the folder they go to, and their key), and only where
+            # nothing made since is newer: a run cut off on a share that answers after the backups were moved made its backup
+            # there, not here (Verify would look for it here).
+            current = of_now(run)
+            here = current and done.made > kept.last_good
+            if here:
+                kept.last_ok, kept.last_error, kept.others = True, "", others
+                kept.last_name, kept.last_size, kept.last_good, kept.last_folder = done.name, done.size, done.made, run.folder
+                if not was_ok:
+                    tell_backup(backup_alert(False, done.name))
+                try:
+                    await save()  # (and who was told: store.backups.told)
+                except OSError as ex:
+                    log.error("how the last backup went could not be saved with the settings: %s", ex.strerror or ex)
+        audit.write(
+            "backup_ended_late", "", ok=True, file=done.name, size=done.size, devices=done.held.devices, pruned=len(done.pruned), folder=done.folder,
+            **({} if here else {"current": False} if not current else {"latest": False}),
+        )  # fmt: skip
+        if not here:
+            log.info("a backup cut off by its bound ended after all, in %s, and is not the latest of the backups as they are now: %s", done.folder, done.name)
+            return
+        log.info("a backup cut off by its bound ended after all: %s (%d bytes)", done.name, done.size)
+
+    def runs_waiting() -> list[backup.Working]:
+        """The runs their hour cut off that still wait for their folders (their threads go on until the folder answers): those
+        their waiter said so of, and those whose hour came after the listeners were opened anew (overdue_runs)."""
+        return [each for each in core.backup_runs.working() if each.cut_off]
+
+    def held_here() -> backup.Working | None:
+        """A run that holds the folder backups go to now (none more is begun into it meanwhile): one its hour cut off, still
+        waiting for it; or one under way that was begun before the listeners were opened anew, and is waited for by nobody. By
+        the folder's name, or by what it is on the disk where its threads have found that out (FolderThreads.holding: another
+        name for the same folder, a junction or a link, is that folder: the outside review of 0.4.0, bugs round, M6)."""
+        return core.backup_runs.holding(store.backups.folder) if store.backups.folder else None
+
+    def latest_here() -> bool:
+        """Whether the backup last made is in the folder backups go to now (one saved since has none yet: the outside review of
+        0.4.0, bugs round, M2), made with their key."""
+        kept = store.backups
+        return bool(kept.last_name) and backup.place_of(kept.last_folder) == backup.place_of(kept.folder) and backup.made_with(kept.last_name, kept.key_id)
+
+    def cut_off_run() -> bool:
+        """Whether a run its hour cut off still waits for the folder backups go to now."""
+        held = held_here()
+        return held is not None and held.cut_off
+
+    def tell_what_waits() -> None:
+        """Once a day, at the hour, while runs cut off still wait: an alert (and a line) of what waits, and that a restart
+        frees it. (The run's failure was told when it was cut off; this says that it still holds its thread.)"""
+        held = runs_waiting()
+        kept = store.backups
+        if not held or not kept.enabled:
+            return
+        now = time.time()
+        came = backup.next_run(kept.hour, now - 86400)  # (the last time the hour came)
+        if came > now or came == waiting_told[0] or not any(each.since < came for each in held):
+            return
+        waiting_told[0] = came
+        folders = [each.folder for each in held]
+        since = time.strftime("%Y-%m-%d %H:%M", time.localtime(min(each.since for each in held)))
+        said = (
+            f"A backup cut off after its hour is still waiting for {', '.join(folders)}, since {since}: it holds a thread of qKVM's "
+            "until that folder answers, and none is begun into it meanwhile. A restart of qKVM frees it."
+        )
+        alert = alerts.Alert("backup", "qKVM", "", "backup_failed", "backup_failed", "A backup is still waiting for its folder", said, event="backup")
+        alert.link = store.alerts.link
+        told = tell_backup(alert)
+        audit.write("backup_still_waiting", "", folders=folders, told=told)
+        log.warning("%s", said)
+
+    def backup_poker(loop: asyncio.AbstractEventLoop) -> Callable[[], None]:
+        """What hands a run's end to these listeners' loop, from any thread."""
+        def poke() -> None:
+            loop.call_soon_threadsafe(lambda: background_task(ended_runs()))
+
+        return poke
+
+    def start_backup(by_the_clock: bool) -> asyncio.Task[dict[str, Any]] | None:
+        """A run set going, never waited for by whoever set it going (it outlives a request that is cut off). None where one is
+        under way already."""
+        running = backup_task[0]
+        if running is not None and not running.done():
+            return None
+        task = asyncio.create_task(back_up(by_the_clock))
+        backup_task[0] = task
+        background.add(task)
+        task.add_done_callback(background.discard)
+        return task
+
+    def days_ahead(kept: Any, now: float) -> bool:
+        """Whether the times the clock's next run counts from were saved while the computer's clock was a day or more ahead:
+        the next run would be a day or more away, and every day until that time came round would have no backup."""
+        return backup.next_run(kept.hour, max(kept.last_at, kept.since)) > now + SCHEDULE_AHEAD
+
+    def next_backup() -> float | None:
+        kept = store.backups
+        if not kept.enabled:
+            return None
+        now = time.time()
+        if days_ahead(kept, now):  # (until the clock's next look sets them right: mend_times)
+            return backup.next_run(kept.hour, now)
+        return backup.next_run(kept.hour, max(kept.last_at, kept.since))
+
+    async def mend_times() -> None:
+        """Times of the backups saved while the computer's clock was a day or more ahead, and that clock set right since: set to
+        now, and said, so that the next run is the next time the hour comes, and not the day those times come round (the
+        outside review of 0.4.0, bugs round, M5: months without a backup by the clock, and nothing said)."""
+        kept, now = store.backups, time.time()
+        if not kept.enabled or not days_ahead(kept, now):
+            return
+        async with one_change:
+            kept, now = store.backups, time.time()
+            if not kept.enabled or not days_ahead(kept, now):
+                return
+            ahead = {name: getattr(kept, name) for name in ("last_at", "since", "last_good") if getattr(kept, name) > now}
+            for name in ahead:
+                setattr(kept, name, now)
+            try:
+                await save()
+            except OSError as ex:
+                log.error("the backups' times set right could not be saved with the settings: %s", ex.strerror or ex)
+        audit.write("backup_times_mended", "", now=now, **ahead)
+        log.warning("times of the backups were ahead of this computer's clock (%s), and are set to now: was its clock ahead, and set right since?", ", ".join(sorted(ahead)))
+
+    async def told_in_turn() -> None:
+        """What the clock tells of the backups (held back by quiet hours, owed after a restart, what still waits), in the turn of
+        changes, and who was told kept with the settings, saved."""
+        async with one_change:
+            before = list(store.backups.told)
+            tell_owed()
+            tell_what_waits()
+            if store.backups.told != before:
+                try:
+                    await save()
+                except OSError as ex:
+                    log.error("who was told of the backups could not be saved with the settings: %s", ex.strerror or ex)
+
+    async def backups_due() -> None:
+        """The clock: a run at the hour set, the first the next time it comes after they were switched on; one missed while the
+        wall was not running, at its next look. And what quiet hours held back of their alerts, when they are over."""
+        while True:
+            await asyncio.sleep(BACKUP_LOOK)
+            try:
+                await ended_runs()  # (and what the listeners before could not keep: they were closed meanwhile)
+                await overdue_runs()  # (and runs begun before them whose hour has come since)
+                await told_in_turn()
+                await mend_times()
+                due = next_backup()
+                if not cut_off_run():
+                    stuck_said[0] = False
+                # (Not while what a run ended with waits to be kept: its time is what the clock counts from. A run hands its end
+                # over before it lets go of its folder, so that none is begun beside it unkept: the fresh review of the fixes, N4.)
+                settling = bool(core.backup_ended) or ending.locked()
+                if due is not None and due <= time.time() and store.backups.secret is not None and not settling:
+                    if cut_off_run():
+                        # A run cut off by its bound goes on in its thread: none is begun beside it (they would share their
+                        # files). Said once; the clock's run follows once that one ends.
+                        if not stuck_said[0]:
+                            stuck_said[0] = True
+                            audit.write("backup_not_started", "", why=RUN_STILL_WAITING)
+                            log.warning("the backup due by the clock was not begun: %s", RUN_STILL_WAITING)
+                    elif (held_here() is not None or start_backup(by_the_clock=True) is None) and clock_said[0] != due:
+                        # A run is going (by hand, a moment before the hour): it counts as the clock's, which is said once.
+                        clock_said[0] = due
+                        audit.write("backup_not_started", "", why="a backup was being made already when the clock's was due: the one under way counts as this one")
+                        log.warning("the backup due by the clock was not started: one was being made already")
+            except Exception:  # a failed look must not be the last one
+                log.exception("whether a backup is due could not be looked at")
+
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         manager.load()
+        # The activity log's seal of a start (chain.py): the head of its chain as the wall begins to serve, written and sent on
+        # (syslog) in its turn; a run whose stop seal is missing shows in a check (a crash, a power cut, or its end cut off).
+        loop_of[:] = [asyncio.get_running_loop()]  # (the seals' places are kept on it: see keep_position)
+        # How runs nobody waited for any more ended reaches these listeners from now on (ended_late), and what came while there
+        # were none is kept now.
+        poke = backup_poker(loop_of[0])
+        core.backup_poke = poke
+        background_task(ended_runs())
+        core.audit.seal("start", version=__version__)
         kept.start()  # (once; the history outlives the listeners, as the rest of core does)
         indexed.start()  # (once, as the history: at the first start after an upgrade it is made from the text files there)
-        tasks = [asyncio.create_task(job()) for job in (housekeeping, watch, outbox.run, history_looks)]
+        tasks = [asyncio.create_task(job()) for job in (housekeeping, watch, history_looks, log_seals, backups_due, tailscale_certificate)]
         yield
+        if core.backup_poke is poke:
+            core.backup_poke = None  # (from here on a run's end waits for the next listeners: their clock keeps it)
         if release_check is not None:
             tasks.append(release_check)  # (a release check: nothing of it is owed)
         for task in tasks:
@@ -1587,16 +2828,29 @@ def create_app(core: Core) -> FastAPI:
         for task in list(background):
             task.cancel()
         await asyncio.gather(*tasks, *background, return_exceptions=True)
-        await outbox.close()
+        await courier.close()  # (what still waits for a destination is not sent: as at a restart of 0.3.2)
+        await book_written()  # (...and what a switch dropped of it since the last look is written down: untold, M1)
         await pusher.close()  # (what still waits for a browser is not sent: the push service keeps nothing of it either)
         await lines.close()  # (what a live line still has down on a machine is let go of before the machine's connection goes)
         await manager.close()
         said_left_out()
-        await asyncio.to_thread(core.audit.flush)  # what was done last is on disk before the program ends
+        # ...and its seal of the end, the last line of this run: the head the next start goes on from, on the disk and sent on.
+        check_halt.set()  # (a check of the log under way ends: it writes nothing)
+        stopped = await asyncio.to_thread(core.audit.sealed, "stop")
+        if stopped is not None:
+            # Kept before the program ends: the next start holds the files to it. Saved here, whichever code kept it in memory
+            # first: the writer's callback mostly does, and sets a save going that the end of the program does not wait for (one
+            # still waiting for its turn was let go of, and the place of the hour before stayed: the re-review of wave 2, N4).
+            keep_position(*stopped)
+            if position_of(store.activity_position) == stopped:
+                await save_position()
+        # What was done last is on disk before the program ends, and the activity log's writer ends (an entry after this, of
+        # the listeners opened anew, starts one again: see AuditLog.close).
+        await asyncio.to_thread(core.audit.close)
         # ...and the activity log's index lets go of its file, all of it brought into the file (what it had not taken in yet,
         # the next start takes in: the text files have it). Started again with the listeners, where they are opened anew.
         await asyncio.to_thread(indexed.stop)
-        await asyncio.to_thread(core.sessions.flush)  # ...and so is who signed out last
+        await asyncio.to_thread(core.sessions.close)  # ...and so is who signed out last, and its writer ends as well
         await asyncio.to_thread(kept.flush)  # ...and what the wall saw last, with when it last looked (history: W4)
         await asyncio.to_thread(screen_watch.close)  # ...and the video worker the screens were compared in goes
 
@@ -1613,7 +2867,7 @@ def create_app(core: Core) -> FastAPI:
         if not host_allowed(host, store.server.allowed_hosts):
             return PlainTextResponse(
                 f"Host {host!r} is not allowed. Use the IP address, or add this name to "
-                "allowed_hosts using the stopped-server --configure-server command (see the qKVM README).",
+                "allowed_hosts using the stopped-server --configure-server command (see the qKVM guide, GUIDE.md).",
                 status_code=400,
             )
         changing = request.method not in ("GET", "HEAD")
@@ -1721,6 +2975,18 @@ def create_app(core: Core) -> FastAPI:
         said = str(first.get("msg")).removeprefix("Value error, ")  # (the rule in this program's own words, where it has some)
         return fail(422, "invalid", f"{where}: {said}" if where else said)
 
+    @app.exception_handler(StarletteHTTPException)
+    async def not_served(request: Request, exc: StarletteHTTPException) -> Response:
+        # The router's own refusals, refused as every other is ({code, message}, as GUIDE.md's The API promises): an address
+        # nothing is served at, and one served by another method (with Allow, which says by which). They were the framework's
+        # {"detail": ...}, which a client that reads `code` (a newer one, asking an older wall for what it has not got) read
+        # nothing in. (Only an admin meets them: to anybody else what no rule lists is 403 not_allowed.)
+        if exc.status_code == 404:
+            return fail(404, "not_found", "There is nothing at this address")
+        if exc.status_code == 405:
+            return fail(405, "method_not_allowed", "This address is not asked for that way", **dict(exc.headers or {}))
+        return await http_exception_handler(request, exc)
+
     # --- pages ----------------------------------------------------------------
 
     def serve(name: str, request: Request) -> Response:
@@ -1739,7 +3005,8 @@ def create_app(core: Core) -> FastAPI:
 
     @app.get("/healthz")
     async def health() -> dict[str, Any]:
-        """For monitoring: answers without a login, and says no more than "running", and whether it is watching.
+        """For monitoring: answers without a login, and says no more than "running", whether it is watching, and whether
+        pictures can be made on this computer at all ("video").
 
         "locked": it has been restarted and nobody has signed in since, so it cannot reach a single device.
         Nothing is wrong with it, and nothing is being watched: whoever monitors it wants to hear of that.
@@ -1747,10 +3014,15 @@ def create_app(core: Core) -> FastAPI:
         # "page": the mark of the page's files as this program serves them (see page_mark).
         # "api": the versions of the API this program speaks, each under /api/<version>/. A program that
         # talks to a wall (a script, an app on a phone) asks here first, before it has anything to sign in with.
-        return {
+        said: dict[str, Any] = {
             "status": "ok", "version": __version__, "api": list(API_VERSIONS), "page": page_mark() if live_files else served,
             "locked": core.initialized and not core.vault.unlocked,
         }  # fmt: skip
+        if video.unavailable() is not None:
+            # "video": no video worker can start on this computer (the last that was to could not, and none has since), so
+            # tiles that need one show no picture. Said as that alone: why, the tiles say to those signed in, and the log.
+            said["video"] = "unavailable"
+        return said
 
     running: dict[str, Any] = {}  # what is running, found out once: the libraries do not change under a running program
 
@@ -1855,7 +3127,7 @@ def create_app(core: Core) -> FastAPI:
             # in the activity log; and whoever the proxy no longer vouches for is not signed in here either.
             named = sso_name(request, core.sso_header) if core.sso_header else None
             said = store.user_named(named) if named else None
-            if said is None or said.id != session.user:
+            if said is None or said.id != session.user or said.subject:
                 core.sessions.drop(token)
                 return None
             session.vouched = time.monotonic()  # (what a live line of this sign-in goes by: see live_standing)
@@ -1871,7 +3143,19 @@ def create_app(core: Core) -> FastAPI:
         if user is None or user.suspended:  # removed, or put on hold, while this browser was signed in
             core.sessions.drop(token)
             return None
+        if user.subject and not provider_holds(session, user):
+            core.sessions.drop(token)
+            return None
         return user
+
+    def provider_holds(session: Session, user: UserRecord) -> bool:
+        """Whether a sign-in of an identity provider's account still holds by the provider's settings: they are the wall's
+        provider's still (not switched off, not another one), and still what decided its role when it signed in (groups and
+        roles, who else, the domain, the groups claim, the scopes, the client). Its word is all such an account has.
+
+        (How long it lasts is the session's own: oidc.SIGNED_IN_FOR, whatever its use.)"""
+        settings = store.oidc
+        return settings.enabled and user.issuer == settings.issuer and session.granted == oidc.granted_by(settings)
 
     def asking(request: Request) -> tuple[UserRecord | None, TokenRecord | None]:
         """Who makes this request: a signed-in browser, or else a script by the token it sends (returned as well)."""
@@ -1890,11 +3174,12 @@ def create_app(core: Core) -> FastAPI:
         """Whether this account has to have two-factor sign-in here, and has not.
 
         `request`: asked of whoever is making it. Somebody the identity proxy signed in has had their
-        second step where they signed in: qKVM's own is for those who sign in with a password here.
+        second step where they signed in: qKVM's own is for those who sign in with a password here. So has an account of an
+        identity provider's (oidc.py), which nothing but its provider signs in.
         """
         level = store.server.require_totp
         # (The rule is about accounts. A token is made by an admin for one job, and has no phone.)
-        return user.totp is None and not is_token(user) and not by_sso(request) and level in RANK and RANK[user.role] >= RANK[level]
+        return user.totp is None and not is_token(user) and not user.subject and not by_sso(request) and level in RANK and RANK[user.role] >= RANK[level]
 
     def me(user: UserRecord, request: Request | None = None) -> dict[str, Any]:
         return {
@@ -2081,16 +3366,22 @@ def create_app(core: Core) -> FastAPI:
         return fail(429, "rate_limited", f"Too many attempts. Try again in {seconds} s.", **{"Retry-After": str(seconds)})
 
     def signed_in(request: Request, remember: bool, user: UserRecord, **extra: Any) -> JSONResponse:
-        token = core.sessions.create(client_ip(request), remember, user.id, mark=auth_mark(user))
+        token = new_session(request, remember, user)
+        return with_cookie(JSONResponse({"ok": True, "user": me(user, request), **extra}), request, token, remember)
+
+    def new_session(request: Request, remember: bool, user: UserRecord, lasts: float = 0.0, granted: str = "") -> str:
+        """A sign-in of this account, in the browser making this request: its token, for the cookie. `lasts`, `granted`: see
+        security.Session (a sign-in by an identity provider)."""
+        token = core.sessions.create(client_ip(request), remember, user.id, mark=auth_mark(user), lasts=lasts, granted=granted)
         manager.load()
         if core.unlock_secret is not None and store.unlock is None:
             # Not waited for by whoever is signing in: it takes as long as checking a password does.
             task = asyncio.create_task(fit_unlock_file())
             background.add(task)
             task.add_done_callback(background.discard)
-        return with_cookie(JSONResponse({"ok": True, "user": me(user, request), **extra}), request, token, remember)
+        return token
 
-    def with_cookie(response: JSONResponse, request: Request, token: str, remember: bool) -> JSONResponse:
+    def with_cookie(response: R, request: Request, token: str, remember: bool) -> R:
         response.set_cookie(
             COOKIE,
             token,
@@ -2112,7 +3403,7 @@ def create_app(core: Core) -> FastAPI:
             # name, if there is one that may. The page asks this first thing, and again when its session is gone.
             name = None if user is not None else sso_name(request, core.sso_header)
             known = store.user_named(name) if name else None
-            if known is not None and known.suspended:
+            if known is not None and (known.suspended or known.subject):  # (an identity provider's account is its provider's alone)
                 known = None
             sso = {"sso": {"on": True, "name": name, "known": known is not None}}
             if known is not None:
@@ -2382,6 +3673,10 @@ def create_app(core: Core) -> FastAPI:
             core.limiter.fail(ip, user.name if user else name)
             audit.write("recovery_failed", ip, user=user.name if user else "", **({} if user else {"no_such_account": True}))
             return fail(401, "bad_recovery", "The recovery key is not right" + (" for that user name" if len(store.users) > 1 else ""))
+        if user.subject:
+            # Never a password of the wall's own for an account of the identity provider's: its provider alone signs it in.
+            # (Said to whoever has the recovery key, and to nobody else: a wrong key is answered as for any account.)
+            return fail(409, "provider_account", "This account is signed in by your identity provider, and has no password here to set")
         opened = Vault()
         opened.adopt(key)
         try:
@@ -2651,6 +3946,7 @@ def create_app(core: Core) -> FastAPI:
             "created": user.created,
             "you": user.id == request.state.user.id,
             "sessions": signed_in_from.get(user.id, 0),
+            "provider": bool(user.subject),  # signed in by the identity provider (oidc.py): its role is its groups'
         }
 
     def check_user(body: UserIn, own: UserRecord | None) -> JSONResponse | None:
@@ -2673,8 +3969,13 @@ def create_app(core: Core) -> FastAPI:
         user.groups = [] if user.devices is None else tidy_groups(body.groups)
 
     def admins() -> int:
-        """Admins who can sign in. One that is suspended is not one to fall back on."""
-        return sum(1 for u in store.users if u.role == "admin" and not u.suspended)
+        """Admins who can sign in here. One that is suspended is not one to fall back on; nor is one only an identity
+        provider signs in (oidc.py), which is no way back in on the day the provider is down, or switched off."""
+        return sum(1 for u in store.users if u.role == "admin" and not u.suspended and not u.subject)
+
+    def the_last_admin(user: UserRecord) -> bool:
+        """Whether this account is the last admin who signs in here (`admins`): it is not removed, demoted or suspended."""
+        return user.role == "admin" and not user.suspended and not user.subject and admins() == 1
 
     @app.get("/api/v1/users")
     async def list_users(request: Request) -> dict[str, Any]:
@@ -2704,13 +4005,21 @@ def create_app(core: Core) -> FastAPI:
         if problem := check_user(body, user):
             return problem
         yourself = user.id == request.state.user.id
+        if user.subject and (body.password or body.role != user.role):
+            # An account of the identity provider's has no password here, ever; and its role is read from its groups at
+            # each sign-in, where one set here would be undone. (Its machines are the wall's to limit, and stay limited.)
+            return fail(409, "provider_account", "This account is signed in by your identity provider: it has no password here, and its role comes from its groups there. Suspend it to keep it out.")
         if body.role != user.role:
             if yourself:
                 return fail(409, "own_role", "You cannot change your own role; ask another admin")
-            if user.role == "admin" and not user.suspended and admins() == 1:
-                return fail(409, "last_admin", "This is the only admin; make someone else an admin first")
+            if the_last_admin(user):
+                return fail(409, "last_admin", "This is the only admin who signs in here; make someone else an admin first")
         if body.suspended and yourself:
             return fail(409, "yourself", "You cannot suspend the account you are signed in with")
+        if body.suspended and not user.suspended and the_last_admin(user):
+            # (Suspended by an admin of the identity provider's, the wall would have no admin left to sign in with the day the
+            # provider is down.)
+            return fail(409, "last_admin", "This is the only admin who signs in here; make someone else an admin first")
         if yourself and (body.password or body.totp_off):
             # Here nothing is asked for. A browser left open for a minute would be an account taken over for good.
             return fail(409, "own_account", "Change your own password and second step under Settings > Security, where your current password is asked for")
@@ -2768,8 +4077,8 @@ def create_app(core: Core) -> FastAPI:
             return fail(404, "not_found", "Unknown account")
         if user.id == request.state.user.id:
             return fail(409, "yourself", "You cannot remove the account you are signed in with")
-        if user.role == "admin" and not user.suspended and admins() == 1:
-            return fail(409, "last_admin", "This is the only admin")
+        if the_last_admin(user):
+            return fail(409, "last_admin", "This is the only admin who signs in here")
         place, pushes = store.users.index(user), store.pushes
         store.users.remove(user)
         store.pushes = [push for push in pushes if push.user != user.id]  # its browsers are told nothing more (Web Push)
@@ -2786,6 +4095,281 @@ def create_app(core: Core) -> FastAPI:
         core.sessions.drop_user(user.id)
         audit.write("user_removed", client_ip(request), account=user.name)
         return JSONResponse({"ok": True})
+
+    # --- signing in through an identity provider (oidc.py, 0.4.0) ---------------------------------------------------------
+    # The settings are an admin's (the client secret sealed by the vault, never handed back); the button, its press and the
+    # way back from the provider are anybody's. Nothing a provider or a browser sends signs anybody in until oidc.py has held
+    # it to every rule; an account the provider signs in is its provider's alone (no password here, its role its groups').
+
+    provider = oidc.Client(own_addresses)
+    signing_in = oidc.Starts()
+    tokens_checked = oidc.Verifier(provider)
+    oidc_said: dict[str, float] = {}  # when a way back that no sign-in here began was last written into the activity log
+
+    def oidc_view() -> dict[str, Any]:
+        settings = store.oidc
+        accounts = [user.id for user in store.users if user.subject]
+        counts = core.sessions.counts()
+        return {
+            "enabled": settings.enabled, "name": settings.name, "issuer": settings.issuer, "client_id": settings.client_id,
+            "has_secret": bool(settings.secret),  # (never the secret)
+            "scopes": settings.scopes, "groups_claim": settings.groups_claim,
+            "roles": [{"group": group, "role": role} for group, role in settings.roles.items()], "anyone": settings.anyone,
+            "domain": settings.domain, "private": settings.private, "redirect_uri": settings.redirect_uri, "callback": oidc.CALLBACK,
+            "offered": oidc.offered(settings), "accounts": len(accounts), "signed_in": sum(counts.get(each, 0) for each in accounts),
+            # Started with --locked-start: after a restart the button works only once somebody has signed in with a password.
+            "locked_start": core.unlock_secret is None,
+        }  # fmt: skip
+
+    def provider_sessions(keep: str | None = None) -> int:
+        """End every sign-in of every account of an identity provider's, but the browser holding `keep`. How many ended."""
+        return sum(core.sessions.drop_user(user.id, keep=keep) for user in store.users if user.subject)
+
+    @app.get("/api/v1/oidc")
+    async def get_oidc() -> dict[str, Any]:
+        return oidc_view()
+
+    @app.put("/api/v1/oidc")
+    async def set_oidc(body: OidcIn, request: Request) -> Response:
+        """Set up signing in through an identity provider. Switched on, the provider is asked what it is (and for its keys)
+        before anything is saved: a provider that cannot be asked, or calls itself otherwise, is said now, not at the first
+        person's sign-in."""
+        before = store.oidc
+        on = body.enabled
+        try:
+            issuer = oidc.issuer_url(body.issuer) if body.issuer.strip() else ""
+            client = oidc.client_id(body.client_id) if body.client_id.strip() else ""
+            given = oidc.client_secret(body.client_secret) if body.client_secret else ""
+            made = OidcSettings(
+                enabled=on, name=oidc.button_name(body.name), issuer=issuer, client_id=client, scopes=oidc.scopes_of(body.scopes),
+                groups_claim=oidc.groups_claim(body.groups_claim), roles=oidc.roles_of([(each.group, each.role) for each in body.roles]),
+                anyone=body.anyone, domain=oidc.email_domain(body.domain), private=body.private,
+                redirect_uri=oidc.redirect_uri(body.redirect_uri, request.headers.get("host", "")) if body.redirect_uri.strip() else "",
+            )  # fmt: skip
+        except ValueError as ex:
+            return fail(422, "invalid", str(ex))
+        if (wide := oidc.open_to_the_world(made)) is not None:  # (saved switched off or on: switched on later, it would be)
+            return fail(422, "invalid", wide)
+        # A secret left empty keeps the one saved, for the provider and the client it was entered for and no other: kept
+        # across a change of either, it would be handed to a provider it was never meant for at the next sign-in.
+        if given:
+            if not core.vault.unlocked:
+                return fail(409, "locked", "Sign in again first")
+            made.secret = core.vault.encrypt(given, oidc.SEALED_FOR)
+        elif before.secret and (issuer, client) == (before.issuer, before.client_id):
+            made.secret = before.secret
+        if on:
+            missing = [what for what, there in (("the issuer", issuer), ("the client ID", client), ("the client secret", made.secret), ("the redirect address", made.redirect_uri)) if not there]
+            if missing:
+                return fail(422, "invalid", f"To switch it on, enter {' and '.join(missing)}" + (" (again: it is sent only to the provider and client it was entered for)" if "the client secret" in missing and before.secret else ""))
+            if not made.roles and not made.anyone:
+                return fail(422, "invalid", "Nobody could sign in: give a group a role, or let anybody the provider signs in in, as a viewer at least")
+            # Asked of a client of its own: what a check of new settings finds is not what the wall's sign-ins go by.
+            checking = oidc.Client(own_addresses)
+            try:
+                found = await checking.provider(made)
+                await checking.keys(found, made)
+            except oidc.Refusal as ex:
+                return fail(502, "provider_refused", f"{ex.said}. Nothing was saved.")
+        async with one_change:
+            if refused := still_allowed(request):
+                return refused
+            if store.oidc is not before:
+                return fail(409, "changed", "These settings were changed meanwhile (in another tab, or by another admin). Nothing was saved: look again.")
+            store.oidc = made
+
+            def as_it_was() -> None:
+                store.oidc = before
+
+            if refused := await saved("Signing in through an identity provider", as_it_was):
+                return refused
+            provider.forget()
+            # Switched off, set to another provider, or anything changed that decides who gets what (groups and roles, who else,
+            # the domain, the groups claim, the scopes, the client): whoever the provider signed in is signed out now, the
+            # admin who saves it included where they are one, live views and all (provider_holds holds every request and every
+            # line to that as well). The button signs them in again, with the role the settings give them now.
+            if oidc.granted_by(made) != oidc.granted_by(before):
+                provider_sessions()
+        audit.write(
+            "oidc_changed", client_ip(request), enabled=on, issuer=issuer, client_id=client, roles=len(made.roles), anyone=made.anyone or None,
+            domain=made.domain or None, private=made.private, **({"secret": "replaced"} if given else {}),
+        )  # fmt: skip
+        return JSONResponse(oidc_view())
+
+    @app.post("/api/v1/oidc/logout")
+    async def oidc_everyone_out(request: Request) -> Response:
+        """Sign out every browser that the identity provider signed in, at once (somebody left a group: their sign-in that is
+        open keeps the role it had until it ends, and this ends it). The admin's own, where it is one, stays."""
+        # (Nothing to wait for on the disk: a sign-in by the provider is never written down to outlast a restart.)
+        ended = provider_sessions(keep=request.cookies.get(COOKIE))
+        audit.write("provider_signed_out", client_ip(request), sessions=ended)
+        return JSONResponse({"ok": True, "ended": ended})
+
+    @app.get("/api/v1/oidc/offer")
+    async def oidc_offer() -> dict[str, Any]:
+        """For the sign-in page: whether it offers a button for the identity provider, and what the button calls it."""
+        on = oidc.offered(store.oidc)
+        return {"on": on, "name": oidc.called(store.oidc) if on else ""}
+
+    @app.post("/api/v1/oidc/begin")
+    async def oidc_begin(request: Request) -> Response:
+        """The button: a sign-in under way, bound to this browser by a cookie, and where to send the browser to sign in."""
+        settings = store.oidc
+        if not oidc.offered(settings):
+            return fail(409, "not_offered", "Signing in through an identity provider is not set up on this wall")
+        back = urlsplit(settings.redirect_uri)
+        if not oidc.same_host(back.netloc, request.headers.get("host", "")):
+            # Its cookie would be set for this address, and the provider sends the browser back to that one, which has none.
+            at = f"{back.scheme}://{back.netloc}"
+            return JSONResponse({"code": "elsewhere", "message": f"Signing in with {oidc.called(settings)} works at {at}, the address it sends you back to. Open qKVM there.", "at": at}, status_code=409)
+        if not core.vault.unlocked:
+            return fail(503, "locked", "qKVM was restarted and nobody has signed in with a password since, so it cannot sign anybody in through the provider yet")
+        try:
+            found = await provider.provider(settings)
+        except oidc.Refusal as ex:
+            return fail(502, "provider_refused", ex.said)
+        made = signing_in.begin(settings, core.limiter.counted_as(client_ip(request)))
+        if made is None:
+            return fail(429, "busy", "Too many sign-ins are under way just now. Try again in a few minutes.", **{"Retry-After": "60"})
+        state, start, cookie = made
+        response = JSONResponse({"url": oidc.authorization_url(found, settings, state, start)})
+        # SameSite=Lax, and not Strict as the wall's own: the browser comes back by the provider's redirect, a navigation from
+        # another site, and a Strict cookie is not sent with that. HttpOnly, for its ten minutes; over HTTPS a __Host- cookie,
+        # which no page on a name beside the wall's can set (oidc.cookie_for), and otherwise one of the way back alone.
+        secure = is_secure(request)
+        name, path = oidc.cookie_for(secure)
+        response.set_cookie(name, cookie, max_age=int(oidc.STARTED_WITHIN), httponly=True, samesite="lax", secure=secure, path=path)
+        return response
+
+    def without_the_sign_ins_cookie(response: Response, request: Request) -> Response:
+        """`response`, taking the cookie of the sign-in that was under way out of the browser (it is used once)."""
+        secure = is_secure(request)
+        name, path = oidc.cookie_for(secure)
+        response.delete_cookie(name, path=path, secure=secure, httponly=True, samesite="lax")  # (a __Host- one goes only so)
+        return response
+
+    def oidc_refused(request: Request, refusal: oidc.Refusal, who: UserRecord | None = None, began: bool = True) -> Response:
+        """The way back to the sign-in page, with the word for why (in its address's fragment: never sent to any server);
+        and a line in the activity log (`began`: for a sign-in this wall began; for a way back that none here began, once a
+        minute at the most: anybody can send one)."""
+        now = time.monotonic()
+        if began or now - oidc_said.get("", float("-inf")) >= OIDC_REFUSALS_SAID:
+            if not began:
+                oidc_said[""] = now
+            audit.write("login_failed", client_ip(request), user=who.name if who is not None else "", provider=True, why=refusal.code, said=refusal.said[:300])
+        return without_the_sign_ins_cookie(RedirectResponse(f"/#signin={refusal.code}", status_code=303), request)
+
+    @app.get(oidc.CALLBACK)
+    async def oidc_back(request: Request) -> Response:
+        """The way back from the provider: the sign-in this browser began, finished, or refused with the reason."""
+        query = request.query_params
+        try:
+            # (By the one name it is set under for this wall's way of being served: over HTTPS a cookie of the plain name, which
+            # a page beside the wall's could have set, is not the browser's word.)
+            start = signing_in.take(query.get("state", ""), request.cookies.get(oidc.cookie_for(is_secure(request))[0]))
+        except oidc.Refusal as ex:
+            return oidc_refused(request, ex, began=False)
+        settings = store.oidc
+        who: UserRecord | None = None
+        try:
+            if not oidc.offered(settings) or start.mark != oidc.mark_of(settings):
+                raise oidc.Refusal("changed", "Signing in through the provider was changed while this sign-in was under way")
+            if "error" in query:
+                error = oidc.error_word(query.get("error", ""))
+                raise oidc.Refusal("provider_error", "The provider did not sign this person in" + (f" ({error})" if error else ""))
+            found = await provider.provider(settings)
+            said_issuer = query.get("iss")
+            if (said_issuer is not None and said_issuer != found.issuer) or (said_issuer is None and found.says_issuer):
+                # (RFC 9207: the browser comes back from another provider than this sign-in went to. A mix-up.)
+                raise oidc.Refusal("issuer", "The way back names another provider than the one this sign-in went to (iss)")
+            code = query.get("code", "")
+            if not oidc.a_code(code):
+                raise oidc.Refusal("provider_error", "The provider sent no code back")
+            if not core.vault.unlocked:
+                raise oidc.Refusal("locked", "The saved passwords are locked: the client secret cannot be opened")
+            secret = core.vault.read(settings.secret, oidc.SEALED_FOR) if settings.secret else None
+            if secret is None:
+                raise oidc.Refusal("secret", "The client secret does not open any more (the settings file was edited, or is damaged): enter it again")
+            answer = await provider.exchange(found, settings, secret, code, start.verifier)
+            claims = await tokens_checked.checked(answer.get("id_token"), found, settings, start.nonce)
+            subject = str(claims["sub"])
+            who = next((user for user in store.users if user.subject == subject and user.issuer == settings.issuer), None)
+            if refusal := oidc.domain_refusal(claims, settings):
+                raise refusal
+            groups = oidc.groups_in(claims, settings.groups_claim)
+            if groups is None and oidc.overage(claims, settings.groups_claim):
+                raise oidc.Refusal("group_overage", "The provider has too many groups of this person to put in the token, and says where to fetch them, which this program does not: have it send only the groups given to this application")
+            if groups is None:
+                info = await provider.userinfo(found, settings, answer.get("access_token"), subject)
+                groups = oidc.groups_in(info, settings.groups_claim)
+                if groups is None and oidc.overage(info, settings.groups_claim):
+                    raise oidc.Refusal("group_overage", "The provider has too many groups of this person to say, and says where to fetch them, which this program does not: have it send only the groups given to this application")
+            role = oidc.role_for(groups or [], settings)
+            if role is None:
+                raise oidc.Refusal("no_group", "This person is in no group that gives a role on this wall")
+            if who is not None and who.suspended:
+                raise oidc.Refusal("suspended", "This account is suspended on this wall")
+        except oidc.Refusal as ex:
+            return oidc_refused(request, ex, who)
+        ip = client_ip(request)
+        async with one_change:
+            # The provider was asked meanwhile, for seconds perhaps: asked again with nothing left to wait for.
+            # (And what decided the role is still what the role was worked out by: no account is written by a mapping gone.)
+            if not oidc.offered(store.oidc) or start.mark != oidc.mark_of(store.oidc) or oidc.granted_by(store.oidc) != oidc.granted_by(settings):
+                return oidc_refused(request, oidc.Refusal("changed", "Signing in through the provider was changed while this sign-in was under way"), who)
+            user = next((each for each in store.users if each.subject == subject and each.issuer == settings.issuer), None)
+            if user is not None and user.suspended:
+                return oidc_refused(request, oidc.Refusal("suspended", "This account is suspended on this wall"), user)
+            was = user.role if user is not None else None
+            if user is None:
+                user = UserRecord(id=new_user_id(), name=provider_account_name(claims, settings.issuer), role=role, created=time.time(), issuer=settings.issuer, subject=subject)
+                store.users.append(user)
+                made = user
+
+                def undo() -> None:
+                    store.users.remove(made)
+
+            else:
+                kept = user
+                user.role = role
+
+                def undo() -> None:
+                    kept.role = str(was)
+
+            if was != role and await saved("This sign-in", undo):
+                return oidc_refused(request, oidc.Refusal("not_saved", "The account could not be saved, so nobody was signed in"), user)
+        if was is None:
+            audit.write("user_added", ip, user=user.name, account=user.name, role=role, provider=True)
+        elif was != role:
+            audit.write("user_changed", ip, user=user.name, account=user.name, role=role, was=was, by="provider")
+        # Never kept over a restart, and a working day at the most however much it is used (oidc.SIGNED_IN_FOR): the role was
+        # read from the groups now. And over once the settings that decided it are not those any more (provider_holds).
+        token = new_session(request, False, user, lasts=oidc.SIGNED_IN_FOR, granted=oidc.granted_by(settings))
+        audit.write("login", ip, user=user.name, provider=True)
+        return without_the_sign_ins_cookie(with_cookie(RedirectResponse("/", status_code=303), request, token, False), request)
+
+    def new_user_id() -> str:
+        while (made := secrets.token_hex(4)) in {user.id for user in store.users}:
+            pass
+        return made
+
+    def provider_account_name(claims: dict[str, Any], issuer: str) -> str:
+        """What an account the provider signs in for the first time is called here: a name it would be called by (its
+        verified email, its user name at the provider, its name), as a name here is written, and one nobody has. Only a
+        label: the account is the provider's `sub` with its issuer, and a name taken already is never taken over."""
+        email = claims.get("email") if claims.get("email_verified") is True else None
+        base = ""
+        for said in (email, claims.get("preferred_username"), claims.get("name")):
+            if isinstance(said, str):
+                base = re.sub(r"[^A-Za-z0-9._@+-]", "", said.strip().replace(" ", ".")).lstrip("._@+-")[:64]
+                if base:
+                    break
+        base = base or "user"
+        mark = hashlib.sha256(f"{issuer} {claims['sub']}".encode()).hexdigest()
+        for name in (base, *(f"{base[: 63 - length]}-{mark[:length]}" for length in (6, 12, 24))):
+            if store.user_named(name) is None:
+                return name
+        return f"user-{mark[:32]}"
 
     # --- the wall ---------------------------------------------------------------
 
@@ -2812,7 +4396,8 @@ def create_app(core: Core) -> FastAPI:
             # many there are: the list of all pairs of a thousand tiles was a quarter of a gigabyte.)
             twins = [d for d in alike.get(marks[record.id] or "", []) if d is not record][:MOST_TWINS]
             same_as = [{"id": d.id, "name": d.name, "host": urlsplit(d.url).netloc} for d in twins]
-            devices.append({**view(record, editing=request.state.user.role == "admin"), "same_as": same_as, "can": abilities_of(record)})
+            role = request.state.user.role
+            devices.append({**view(record, editing=role == "admin", links=RANK[role] >= RANK["operator"]), "same_as": same_as, "can": abilities_of(record)})
         # "live": the form of the live connection this server speaks (live.py); a client that speaks another asks for none.
         return {"interval": store.server.interval, "live": live.FORM, "devices": devices}
 
@@ -2833,12 +4418,24 @@ def create_app(core: Core) -> FastAPI:
 
     @app.get("/api/v1/status")
     async def status(request: Request) -> Response:
-        ids = [device_id for device_id in manager.devices if allowed(request, device_id)]
-        results = await asyncio.gather(*(manager.devices[i].status() for i in ids))
+        # Each row with the machine it is of (`target`, as the wall's view of the tile says it), taken with the connection that
+        # is asked, before anything is waited for: a tile's record and its connection change together (an edit, one taken back),
+        # so a row answered after an edit put another machine under the tile says the one it was found at. Keyed by the tile's
+        # id alone, a page with the wall as it was took the other machine's ports under the old one's name (the outside review 6.2's narrow
+        # look, HIGH 6). (A connection whose record is gone already is of no tile: left out, as it will be at the next look.)
+        # (The records by id once: looked up by store.device(), which walks the list, once per tile, a status of 10,000 tiles took
+        # 1.6 s on the event loop, every 4 s for every page open: the last look at the hold round, M1.)
+        records = {record.id: record for record in store.devices}
+        asked = [(device_id, device, target_of(record)) for device_id, device in manager.devices.items()
+                 if allowed(request, device_id) and (record := records.get(device_id)) is not None]  # fmt: skip
+        results = await asyncio.gather(*(device.status() for _, device, _ in asked))
         # (How each of them is, as it was found while waiting: of those that whoever asked may still see.)
         if refused := still_allowed(request):
             return refused
-        return JSONResponse({device_id: result for device_id, result in zip(ids, results, strict=True) if still_shown(request, device_id) is None})
+        return JSONResponse({
+            device_id: {**result, "target": target} for (device_id, _, target), result in zip(asked, results, strict=True)
+            if still_shown(request, device_id) is None
+        })  # fmt: skip
 
     @app.get("/api/v1/devices/{device_id}/snapshot")
     async def snapshot(
@@ -2847,6 +4444,7 @@ def create_app(core: Core) -> FastAPI:
         w: int = Query(640, ge=1, le=16384),
         age: float | None = Query(None, ge=0, le=3600),
         big: bool = Query(False),
+        target: str | None = Query(None, max_length=64),  # (empty: none, as a read older than 0.4.0 took it)
     ) -> Response:
         """One frame, at least `w` pixels wide when the source has that many.
 
@@ -2854,10 +4452,15 @@ def create_app(core: Core) -> FastAPI:
         need one taken for it alone when another browser got one a moment ago. `big`: this is the
         enlarged (large) view of the machine, so a PC with Intel AMT holds a session open for it (and
         opens one before a power-on), where a tile that is only shown gets a still now and then.
+        `target`: the machine the picture is for (target_of), as the page has the tile: refused, nothing asked of either
+        machine (409 `machine_changed`), where an edit has put another under the tile since, whose screen a page with the
+        wall as it was showed under the old one's name (the fresh review of the HA round, L2). Left out: not asked.
         """
         device = manager.devices.get(device_id)
         if device is None or not allowed(request, device_id):
             return fail(404, "not_found", "Unknown device")
+        if refused := not_as_seen(target or None, device_id):
+            return refused
         try:
             frame = await device.snapshot(w, age, big=big)
         except KvmError as ex:
@@ -2899,7 +4502,7 @@ def create_app(core: Core) -> FastAPI:
         limit: int = Query(1000, ge=1, le=history.MOST_ROWS),
         every: int = Query(0, ge=0, le=86400),  # samples: averaged over spans of that many seconds; 0: as they were taken
     ) -> Response:
-        """What the history says of one machine, for the roles that may see it (see history.py and the README).
+        """What the history says of one machine, for the roles that may see it (see history.py and the guide).
 
         `summary`: when it was first and last heard from, and how much of the window it was watched and online.
         `states`, `samples`, `events`: the rows in the window, oldest first, a bounded page (`more` says if it was cut).
@@ -3423,6 +5026,7 @@ def create_app(core: Core) -> FastAPI:
             for record in places:
                 watcher.forget(record.id)
                 screen_watch.forget(record.id)  # (and the picture kept for an alert of its screen, at the next round)
+                watch_told.pop(record.id, None)
             kept.forget(*(record.id for record in places))  # their history goes with them (never dropped, however full the history's queue)
             for record in places:
                 audit.write("device_removed", ip, device=record.name, device_id=record.id, url=record.url, **together)
@@ -3442,10 +5046,12 @@ def create_app(core: Core) -> FastAPI:
         return None
 
     @app.get("/api/v1/devices/{device_id}/certificate")
-    async def certificate(device_id: str) -> Response:
+    async def certificate(device_id: str, target: str | None = Query(None, max_length=64)) -> Response:
         record = store.device(device_id)
         if record is None:
             return fail(404, "not_found", "Unknown device")
+        if refused := not_as_seen(target or None, device_id):  # (no certificate of the machine an edit put under the tile, under the old name)
+            return refused
         if refusal := left_alone(record):
             return refusal
         where = certificate_at(record)
@@ -3463,6 +5069,8 @@ def create_app(core: Core) -> FastAPI:
         record = store.device(device_id)
         if record is None:
             return fail(404, "not_found", "Unknown device")
+        if refused := not_as_seen(body.target, device_id):
+            return refused
         if refusal := left_alone(record):
             return refusal
         try:
@@ -3499,10 +5107,14 @@ def create_app(core: Core) -> FastAPI:
     # --- device actions ---------------------------------------------------------
 
     @app.get("/api/v1/devices/{device_id}/wol")
-    async def wol_targets(device_id: str, request: Request) -> Response:
+    async def wol_targets(device_id: str, request: Request, target: str | None = Query(None, max_length=64)) -> Response:
         device = manager.devices.get(device_id)
         if device is None or not allowed(request, device_id):
             return fail(404, "not_found", "Unknown device")
+        # (The computers the machine the menu was opened for wakes, not those of the one an edit put under the tile since. An
+        # empty `target` is none, as these reads older than 0.4.0 took whatever came along; what acts refuses an empty one.)
+        if refused := not_as_seen(target or None, device_id):
+            return refused
         try:
             targets = await device.wol_targets()
         except KvmError as ex:
@@ -3526,6 +5138,34 @@ def create_app(core: Core) -> FastAPI:
             return fail(409, "changed", f"\"{custom[2]}\" was changed or removed while this waited. Nothing was sent: look at it again.")
         return None
 
+    def inputs_listed(device: Device) -> bool:
+        """Whether the device's last look listed its inputs, two or more (its status's `ports`). Where it says `several_inputs`
+        without them (its switch did not answer that look, or had not said yet), how many it has is not known at the moment."""
+        ports = (device._status or {}).get("ports")
+        return isinstance(ports, dict) and isinstance(ports.get("list"), list) and len(ports["list"]) > 1
+
+    def inputs_unknown(name: str) -> KvmError:
+        """Keys or text sent as for a KVM of one input where the wall does not know at the moment how many inputs it has (the
+        review of Builder HB's round, L3: they were said to go to a KVM that "has several inputs" also then)."""
+        said = f"{name} has several inputs, or may have (qKVM does not know at the moment how many), and keys and text go to the computer on screen: this was sent as for a KVM of one input."
+        return KvmError("input_changed", f"{said} Nothing was sent: look at it again.", 409)
+
+    def not_as_seen(target: str | None, device_id: str) -> JSONResponse | None:
+        """Asked of an action and of a live line's pass before anything is sent: the request was made for the machine this
+        tile is at now (`target`, as its view gave it: target_of). Otherwise nothing is sent, and it is said why, in words that
+        send whoever asked to look again (the page does not send it again by itself). Left out, as by a script or a client
+        before 0.4.0: not asked, as before. (Asked once, at the start: a later edit of the tile puts another connection in the
+        device's place, which `waited_for` and the driver's own retirement find, RETIRED, as before.)"""
+        record = store.device(device_id)
+        if target is None or (record is not None and target == target_of(record)):
+            return None
+        name = record.name if record is not None else "This machine"
+        return fail(
+            409, "machine_changed",
+            f"{name} is not the machine you saw any more: its tile was pointed at another machine, or qKVM knows more of the machine "
+            "since. Nothing was sent: look at it again.",
+        )  # fmt: skip
+
     def keyboard_held(name: str, by: str, request: Request) -> JSONResponse:
         """What is said while somebody has a machine's keyboard and mouse over a live line: who, as the live line's own
         refusal says it (`by`), to whoever may act on the machine, an operator as an admin. In the sentence, for the page;
@@ -3541,6 +5181,10 @@ def create_app(core: Core) -> FastAPI:
         device = manager.devices.get(device_id)
         if device is None or not allowed(request, device_id):
             return fail(404, "not_found", "Unknown device")
+        if refused := not_as_seen(body.target, device_id):  # (confirmed for the machine before an edit put another in its place)
+            return refused
+        if body.one_input and body.input is not None:
+            return fail(422, "invalid", "Name the input on screen (input), or say the KVM has one (one_input): not both.")
         # What goes into the activity log: which action, never the text that was typed.
         detail: dict[str, Any] = {"device": device.spec.name, "device_id": device_id, "action": body.action}
         if body.batch:
@@ -3604,6 +5248,29 @@ def create_app(core: Core) -> FastAPI:
         except BaseException:
             acted_on.discard(device_id)  # (cut off before anything was sent)
             raise
+        # Keys and text for the computer on one input of a KVM with several: the driver asks the KVM which is on screen right
+        # before they go (INPUT_ASKED). A machine whose driver cannot has no input to name: refused unsent. (Power and the rest
+        # are the KVM's own, whichever is on screen. The outside review 6.2 re-checks, R2, H4 and H5.)
+        asked = body.input if action in KEYBOARD_ACTIONS else None
+        # (In the activity log, keys and text say the input they were for, as people count them, or that they were sent as for a
+        # KVM of one input: the supervised key test of 2026-11-23 found neither there.)
+        if asked is not None:
+            detail["input"] = asked + 1
+        elif body.one_input and action in KEYBOARD_ACTIONS:
+            detail["one_input"] = True
+        said: KvmError | None = None  # refused on what the wall knows of the machine's inputs, before anything went
+        if refusal is None and asked is not None and not device.reads_input:
+            said = input_refused(device.spec.name, asked, None, "it has no inputs to choose from")
+        # Sent as for a KVM of one input (`one_input`): refused where it has shown several; its switch is asked right before they
+        # go (INPUT_ASKED). A machine with no inputs to choose from is one of a single input. (The narrow look, HIGH 5.)
+        if body.one_input and action in KEYBOARD_ACTIONS and device.reads_input:
+            asked = ONE_INPUT
+            if refusal is None and said is None and device.several_inputs():
+                said = one_input_refused(device.spec.name) if inputs_listed(device) else inputs_unknown(device.spec.name)
+        if said is not None:
+            # (In the activity log as the KVM's own refusal of them is, in its words: it was tried, and nothing went.)
+            audit.write("action_failed", client_ip(request), error=said.message, **detail)
+            refusal = fail(said.status, said.code, said.message)
         if refusal is not None:
             acted_on.discard(device_id)
             return refusal
@@ -3613,7 +5280,7 @@ def create_app(core: Core) -> FastAPI:
             return still_allowed(request) is None and allowed(request, device_id)
 
         pressed_at = time.time()  # (what the history keeps of a power button: when it was pressed)
-        answered, sent = PRESS_ANSWERED.set(False), PRESS_SENT.set(None)
+        answered, sent, named = PRESS_ANSWERED.set(False), PRESS_SENT.set(None), INPUT_ASKED.set(asked)
         if body.watching and not body.batch:
             # The sender has its large or live view open (see Device.watched). Never an entry of a bulk run: that comes from
             # the selection, and forty PCs switched on together are not forty sessions opened first.
@@ -3657,6 +5324,7 @@ def create_app(core: Core) -> FastAPI:
         finally:
             PRESS_ANSWERED.reset(answered)
             PRESS_SENT.reset(sent)
+            INPUT_ASKED.reset(named)
             acted_on.discard(device_id)
         audit.write("action", client_ip(request), **detail)
         return JSONResponse({"ok": True, "note": note})
@@ -3672,7 +5340,7 @@ def create_app(core: Core) -> FastAPI:
             audit.write(event, client_ip(request), device=device, device_id=device_id, **detail, **({"unsaid": unsaid} if unsaid else {}))
 
     @app.post("/api/v1/devices/{device_id}/console")
-    async def open_console(device_id: str, request: Request) -> Response:
+    async def open_console(device_id: str, request: Request, target: str | None = Query(None, min_length=1, max_length=64)) -> Response:
         """Where to send a browser so that it lands in a server's own console, signed in.
 
         Only for a device whose controller hands out a pass for that, good for one use. Whoever gets
@@ -3684,6 +5352,10 @@ def create_app(core: Core) -> FastAPI:
             return fail(404, "not_found", "Unknown device")
         if is_token(request.state.user):
             return fail(403, "not_allowed", "A way into a console is for a person's browser, not for a token")
+        # `target`: the server the page showed (target_of), as for an action: no way into the console of the one an edit put
+        # under the tile meanwhile (409 `machine_changed`, nothing asked of it; the fresh review of the HA round, L1).
+        if refused := not_as_seen(target, device_id):
+            return refused
         # Not to a page on a name this wall is looked at under (another port of it): the browser would hand that page the
         # sign-in to this wall along with the pass. The page offers no link there and says why; nothing is asked of the device.
         # (A kind of device that hands out no way in at all says so below, as it did: `no_console`, and nothing is asked.)
@@ -3722,6 +5394,8 @@ def create_app(core: Core) -> FastAPI:
         device, record = manager.devices.get(device_id), store.device(device_id)
         if device is None or record is None or not allowed(request, device_id):
             return fail(404, "not_found", "Unknown device")
+        if refused := not_as_seen(body.target, device_id):  # (asked for the PC before an edit put another under the tile)
+            return refused
         if not isinstance(device, amt.AmtDevice):
             return fail(422, "invalid", "Only a PC with Intel AMT has a KVM to switch on from here")
         if device_id in acted_on:
@@ -3772,12 +5446,16 @@ def create_app(core: Core) -> FastAPI:
 
     uploads: dict[str, dict[str, Any]] = {}  # device id -> the upload under way to it: its name, who, since when, what carries it
 
-    def media_target(request: Request, device_id: str) -> tuple[Device, DeviceRecord, MediaOffer] | JSONResponse:
+    def media_target(request: Request, device_id: str, target: str | None = None) -> tuple[Device, DeviceRecord, MediaOffer] | JSONResponse:
         device, record = manager.devices.get(device_id), store.device(device_id)
         if device is None or record is None or not allowed(request, device_id):
             return fail(404, "not_found", "Unknown device")
         if is_token(request.state.user):
             return fail(403, "not_allowed", "Virtual media is for a person, not for a token")
+        # `target`: the machine the Media box was opened for (target_of): no list of the one an edit put under the tile since,
+        # whose `listed` the box's next change would carry there (409 `machine_changed`; the second fresh review of the HA round).
+        if refused := not_as_seen(target, device_id):
+            return refused
         offer = device.media_offer()  # (this machine's, as the last look at it found it)
         if offer is None:
             return fail(404, "no_virtual_media", f"{record.name} has no virtual media")
@@ -3843,9 +5521,9 @@ def create_app(core: Core) -> FastAPI:
         return {"name": up["name"], "size": carried.size, "sent": carried.sent, "by": up["by"], "at": up["at"]}
 
     @app.get("/api/v1/devices/{device_id}/media")
-    async def media_list(device_id: str, request: Request) -> Response:
+    async def media_list(device_id: str, request: Request, target: str | None = Query(None, max_length=64)) -> Response:
         """The images that can be mounted on this machine, what is mounted, and what its virtual media can do."""
-        found = media_target(request, device_id)
+        found = media_target(request, device_id, target or None)  # (empty: none, as for the other reads older than 0.4.0)
         if isinstance(found, JSONResponse):
             return found
         device, _, offer = found
@@ -4068,7 +5746,7 @@ def create_app(core: Core) -> FastAPI:
                     # (The tile was edited meanwhile. What the cut-off upload left is taken off by the client that took its place
                     # only where that client is for the same device: its address, its kind, its pinned certificate and its
                     # identity marks unchanged. Moved to another device, nothing is touched there: a partial image of the
-                    # same name on it is none of this upload's (the outside review of 0.3.0, Codex's M3).)
+                    # same name on it is none of this upload's (the outside review of 0.3.0, M3).)
                     same = [(spec.base_url, spec.kind, spec.cert_pem, spec.machine, spec.ident) for spec in (device.spec, other.spec)]
                     if same[0] == same[1]:
                         try:
@@ -4107,7 +5785,7 @@ def create_app(core: Core) -> FastAPI:
     def still_lent(lending: Lending) -> bool:
         """Whether what a mount lends is served still: not ended, and its tile on the wall at the address it had. A tile
         removed or moved to another address ends it there and then, a reading under way included (the outside review of
-        0.3.0, Codex's M2: a reading went on to its end after its tile was removed; only a new one found it gone)."""
+        0.3.0, M2: a reading went on to its end after its tile was removed; only a new one found it gone)."""
         if lending.ended:
             return False
         record = store.device(lending.device_id)
@@ -4161,7 +5839,7 @@ def create_app(core: Core) -> FastAPI:
                 log.info("%s: its controller asked for %s with a range that could not be read as asked (%s), and was refused", record.name, lending.name, asked or "none")
             return Response(status_code=416, headers={"Content-Range": f"bytes */{lending.image.size}", "Accept-Ranges": "bytes"})
         # Its place among MOST_AT_ONCE is taken here, before the first wait, by a HEAD as well: reads that come together are
-        # counted together (Codex's M1: it was taken after the file was open, and never by a HEAD: 32 at once were all
+        # counted together (its M1: it was taken after the file was open, and never by a HEAD: 32 at once were all
         # taken). It is given back once, on every road, by the reader thread that lets go of the file: never by this
         # loop, which a restart of the listeners ends first (the second round, R2-M1).
         if not lending.take(MOST_AT_ONCE):
@@ -4237,6 +5915,10 @@ def create_app(core: Core) -> FastAPI:
         if is_token(request.state.user):
             # (A token changes no setting of a tile, this one included: it looks and acts, as SECURITY.md says.)
             return fail(403, "not_allowed", "A token does not change how a tile is set. Change its view on the wall's page.")
+        # The machine it was chosen for first: a tile pointed from the PC at a KVM meanwhile is another machine (409
+        # `machine_changed`, which sends the page to fetch the wall again), not a KVM without views (the outside review 5, Low 1).
+        if refused := not_as_seen(body.target, device_id):  # (asked in the turn of changes: an edit of the tile waits for it, or it for the edit)
+            return refused
         if record.kind != "amt":
             return fail(422, "invalid", "Only a PC with Intel AMT has these views")
         was = record.amt_view if record.amt_view in AMT_VIEWS else AMT_VIEWS[0]
@@ -4259,6 +5941,41 @@ def create_app(core: Core) -> FastAPI:
             return refused
         audit.write("amt_view_changed", client_ip(request), device=record.name, device_id=device_id, view=body.view, was=was)
         return JSONResponse({"ok": True, "amt_view": body.view})
+
+    @app.put("/api/v1/devices/{device_id}/open-in")
+    async def set_open_in(device_id: str, body: OpenInIn, request: Request) -> Response:
+        """Where else a machine can be opened, from its tile's menu: its page on MeshCentral, its RustDesk ID, its Remote
+        Desktop host (open_in.py). An admin's (an admin may give a machine anything a tile is set with); all three at once,
+        one left out or empty is none of that kind. Plain links, kept with the tile and written down: nothing is fetched from
+        them, and no secret is taken for them. One change at a time (_CHANGES)."""
+        record = store.device(device_id)
+        if record is None or not allowed(request, device_id):
+            return fail(404, "not_found", "Unknown device")
+        if refused := not_as_seen(body.target, device_id):  # (links typed for the machine shown, not the one put in its place)
+            return refused
+        links: dict[str, str] = {}
+        for kind in open_in.KINDS:
+            try:
+                link = open_in.checked(kind, getattr(body, kind))
+            except ValueError as ex:
+                return fail(422, "invalid", f"{str(ex)[:1].upper()}{str(ex)[1:]}.")
+            if link:
+                links[kind] = link
+        was = open_in.kept(record.open_in)
+        if links == was:
+            return JSONResponse({"ok": True, "open_in": links})  # (nothing changes, and nothing is written down)
+        changed = dataclasses.replace(record, open_in=links)
+        at = store.devices.index(record)
+        store.devices[at] = changed  # (a new record in the old one's place: an edit under way notices)
+
+        def undo() -> None:
+            if store.devices[at] is changed:
+                store.devices[at] = record
+
+        if refused := await saved("Its Open in links", undo):
+            return refused
+        audit.write("open_in_changed", client_ip(request), device=record.name, device_id=device_id, open_in=links, **({"was": was} if was else {}))
+        return JSONResponse({"ok": True, "open_in": links})
 
     # --- the live line: one WebSocket per viewer, the picture down, keys and the mouse up (live.py) ---------------
     # The two calls of desktop/SPEC.md section 6.2: a pass, then the line that shows it. Everything behind them is in
@@ -4302,6 +6019,9 @@ def create_app(core: Core) -> FastAPI:
                 user = store.user(holder.user_id)
                 if user is None or user.suspended:
                     return "signed_out", False
+                if user.subject and not provider_holds(session, user):  # (and its keyboard and mouse are let go of with it)
+                    core.sessions.drop(holder.session)
+                    return "signed_out", False
                 if must_enroll(user) and not session.sso:
                     return "not_allowed", False
         if not core.vault.unlocked or device_id not in manager.devices or not may_see(user, device_id):
@@ -4326,13 +6046,19 @@ def create_app(core: Core) -> FastAPI:
     manager.retiring = lines.retiring  # (keys a line has down on a device are let go of before its connection is closed)
 
     @app.post("/api/v1/devices/{device_id}/live")
-    async def live_pass(device_id: str, request: Request) -> Response:
-        """A pass for one live line to this machine: good for half a minute, and for one use (live.py)."""
+    async def live_pass(
+        device_id: str, request: Request,
+        target: Annotated[str | None, Query(min_length=1, max_length=64)] = None,  # (as ActionIn's: the view that asks, since 0.4.0)
+    ) -> Response:
+        """A pass for one live line to this machine: good for half a minute, and for one use (live.py); for the connection to
+        it there is now, and no other (live.Pass.device): an edit of the tile before the line is opened ends the line there."""
         if not core.vault.unlocked:
             return fail(503, "locked", "qKVM was restarted and nobody has signed in since, so it cannot reach its devices.")
         device = manager.devices.get(device_id)
         if device is None or not allowed(request, device_id):
             return fail(404, "not_found", "Unknown device")
+        if refused := not_as_seen(target, device_id):
+            return refused
         if not lines.offers(device):
             return fail(404, "no_live", lines.why_no_live(device))
         user: UserRecord = request.state.user
@@ -4346,7 +6072,7 @@ def create_app(core: Core) -> FastAPI:
             token=None if sent is None else sent.id,
         )
         try:
-            ticket = lines.issue(device_id, holder)
+            ticket = lines.issue(device_id, holder, device)
         except KvmError as ex:  # (as many live pictures as one account may have: busy, and a pass runs out within half a minute)
             return fail(ex.status, ex.code, ex.message, **{"Retry-After": str(round(live.PASS_LASTS))})
         return JSONResponse({"v": live.FORM, "ticket": ticket})
@@ -4470,6 +6196,8 @@ def create_app(core: Core) -> FastAPI:
             "missing": core.missing,
             "bind_error": core.bind_error,
             "cert_fingerprint": core.cert_fingerprint if core.https else None,
+            # Tailscale's certificate for this computer's name (--tls-tailscale): which, until when, or why none. None: not asked for.
+            "tailscale_certificate": core.tailscale_cert.view() if core.tailscale_cert is not None and core.https else None,
             "overridden": core.bind_override is not None or core.port_override is not None,
             "version": __version__,
             "uptime": round(time.time() - core.started),
@@ -4541,7 +6269,7 @@ def create_app(core: Core) -> FastAPI:
                 return fail(422, "invalid", "The address is http:// or https://, a host and a port, and nothing after them, as https://192.168.1.10:8787")
             if not host_allowed(urlsplit(said).netloc, store.server.allowed_hosts):
                 # (A controller asks for the image by this name: refused as any request by a name qKVM is not told it has.)
-                return fail(422, "invalid", f"qKVM answers no request made to {urlsplit(said).hostname}: add that name to allowed_hosts first (see the README), or name the address by its number.")
+                return fail(422, "invalid", f"qKVM answers no request made to {urlsplit(said).hostname}: add that name to allowed_hosts first (see the qKVM guide, GUIDE.md), or name the address by its number.")
             address = said
         server = store.server
         before = (server.media_folder, server.media_address)
@@ -4554,6 +6282,170 @@ def create_app(core: Core) -> FastAPI:
             return refused
         audit.write("media_settings_changed", client_ip(request), folder=folder, address=address)
         return JSONResponse({"ok": True, "serving_at": core.served.base()})
+
+    # --- backups of the whole wall to a folder (backup.py): an admin's, as every setting is ---------------------------
+    # The key is made with the admin's password typed again (it opens every secret of the wall), shown once as its recovery
+    # kit, and never again: no answer holds it after that one, nor does any log, export or page.
+
+    @app.get("/api/v1/backups")
+    async def get_backups() -> dict[str, Any]:
+        """What is saved of the backups and how the last run went: never a look at the folder, which may not answer (a share
+        whose server is gone) and would hold whoever opens Settings."""
+        kept = store.backups
+        running = backup_task[0]
+        here = latest_here()
+        return {
+            "enabled": kept.enabled, "folder": kept.folder, "hour": kept.hour, "keep": kept.keep, "history": kept.history,
+            "key": {"id": kept.key_id, "made": kept.key_made} if kept.secret is not None else None,
+            "last": {
+                "at": kept.last_at, "ok": kept.last_ok, "name": kept.last_name, "size": kept.last_size, "error": kept.last_error, "good": kept.last_good,
+                "folder": kept.last_folder,  # (where the backup last made is: another folder than backups go to now, where saved since)
+            } if kept.last_at else None,
+            "next": next_backup(), "running": running is not None and not running.done(),
+            # (This key's, in this folder: after a new key, the last one made opens with the kit before, and after a new folder
+            # it is in the one before; none is made here yet.)
+            "latest": {"name": kept.last_name, "size": kept.last_size} if here else None,
+            "others": kept.others if backup.place_of(kept.last_folder) == backup.place_of(kept.folder) else 0,
+            # Runs their hour cut off that still wait for their folders, each holding a thread until it answers (a restart frees
+            # them): where and since when.
+            "waiting": [{"folder": each.folder, "since": each.since} for each in runs_waiting()],
+            # How long the wall gives Back up now before it answers that the run goes on, and Verify before it says the folder
+            # does not answer, in seconds: the page waits for each longer than that (the outside review of 0.4.0, bugs round, M7).
+            "waits": {"run": RUN_WAIT, "verify": VERIFY_WITHIN},
+        }  # fmt: skip
+
+    @app.put("/api/v1/backups")
+    async def put_backups(body: BackupsIn, request: Request) -> Response:
+        folder = body.folder.strip()
+        if folder and not Path(folder).is_absolute():
+            return fail(422, "invalid", "The folder is a whole path on the computer qKVM runs on, as /srv/qkvm-backups or D:\\qkvm-backups")
+        if folder:
+            # The data folder is refused by the folder's spelling at every save, which asks the disk nothing: the folder saved as
+            # well (a restored wall keeps the one its backups went to on the old computer, which may be where its data folder is
+            # now: the last look of wave 3). Then by where it lies (links, other names of one folder), on the look's own threads,
+            # bounded; not for the folder saved before, which may be on a share whose server is gone (no save, backups switched
+            # off among them, could be made until a restart: the re-review of wave 3, N2).
+            inside = backup.spelled_inside(folder, core.data_dir)
+            if not inside and folder != store.backups.folder:
+                try:
+                    inside = await core.backup_looks.run(FOLDER_WITHIN, unlock.lies_in, Path(folder) / "x", core.data_dir)
+                except backup.BackupError as ex:
+                    return fail(409, "busy", ex.message)  # (busy as busy: not the typed folder's doing)
+                except backup.FolderTimeout:
+                    return fail(504, "timeout", f"{folder} did not answer (a share whose server is gone?): nothing was saved")
+                except (OSError, RuntimeError) as ex:  # (RuntimeError: a link that leads to itself, as Python before 3.13 says it)
+                    # What cannot be looked at is not taken for somewhere else than the data folder: refused, and said.
+                    said = ex.strerror if isinstance(ex, OSError) and ex.strerror else type(ex).__name__
+                    return fail(422, "invalid", f"Where {folder} lies could not be looked at ({said}): nothing was saved")
+            if inside:
+                return fail(422, "invalid", "Backups in the data folder would go with it: choose a folder elsewhere (another disk, a share)")
+        if not 0 <= body.hour <= 23:
+            return fail(422, "invalid", "The hour is from 0 to 23")
+        if not 1 <= body.keep <= 365:
+            return fail(422, "invalid", "Keep from 1 to 365 backups")
+        if body.enabled and not folder:
+            return fail(422, "invalid", "Name the folder the backups go to")
+        if body.enabled and store.backups.secret is None:
+            return fail(409, "no_key", "Make the backup key first: its recovery kit is shown once, to print or to save")
+        kept = store.backups
+        before = dataclasses.replace(kept)
+        kept.enabled, kept.folder, kept.hour, kept.keep, kept.history = body.enabled, folder, body.hour, body.keep, body.history
+        if body.enabled and not before.enabled:
+            kept.since = time.time()  # (the first run by the clock is the next time the hour comes)
+
+        def as_it_was() -> None:
+            store.backups = before
+
+        if refused := await saved("The backup settings", as_it_was):
+            return refused
+        audit.write("backup_settings_changed", client_ip(request), enabled=body.enabled, folder=folder, hour=body.hour, keep=body.keep, history=body.history)
+        return JSONResponse({"ok": True, "next": next_backup()})
+
+    @app.post("/api/v1/backups/key")
+    async def make_backup_key(body: TotpBeginIn, request: Request) -> Response:
+        """A new backup key, its recovery kit in the answer: this once. Backups made before it open with the kit before."""
+        if refused := not_for_a_token(request):
+            return refused
+        user: UserRecord = request.state.user
+        checked = user.auth
+        if refused := await own_password(request, body.password):
+            return refused
+        key, made = backup.new_key(), time.time()
+        async with one_change:  # (the password checked beside every change; the turn for the change, asked again in it)
+            if refused := still_allowed(request) or changed_meanwhile(user, checked):
+                return refused
+            if not core.vault.unlocked:
+                return fail(503, "locked", "The saved passwords are locked just now. Sign in again and try once more.")
+            before = dataclasses.replace(store.backups)
+            kept = store.backups
+            kept.secret, kept.key_id, kept.key_made = core.vault.encrypt(key.hex(), backup.SEALED_FOR), backup.key_id(key), made
+
+            def keep_the_old_key() -> None:
+                store.backups = before
+
+            if refused := await saved("The new backup key", keep_the_old_key):
+                return refused  # (and its kit is shown to nobody: the key before it is still the key)
+        audit.write("backup_key_made", client_ip(request), key=backup.key_id(key), replaced=before.key_id or None)
+        said = {"kit": backup.kit(key, made), "key": backup.written(key), "id": backup.key_id(key), "made": made}
+        return JSONResponse(said, headers={"Cache-Control": "no-store"})
+
+    @app.post("/api/v1/backups/run")
+    async def run_backup(request: Request) -> Response:
+        """Back up now: a run as the clock's, waited for a while (RUN_WAIT) and then said to be still running. The run saves
+        how it went in the turn of changes itself, and goes on if this request is cut off."""
+        if not store.backups.folder:
+            return fail(409, "no_folder", "Name the folder the backups go to, and save, first")
+        if store.backups.secret is None:
+            return fail(409, "no_key", "Make the backup key first: its recovery kit is shown once, to print or to save")
+        if (held := held_here()) is not None:
+            # (A run holds this folder: one cut off, waiting for it; or one under way, begun before the listeners were opened anew.)
+            return fail(409, "busy", RUN_STILL_WAITING if held.cut_off else "A backup is being made just now")
+        task = start_backup(by_the_clock=False)
+        if task is None:
+            return fail(409, "busy", "A backup is being made just now")
+        done, _ = await asyncio.wait({task}, timeout=RUN_WAIT)
+        if not done:
+            return JSONResponse({"running": True})
+        if (said := task.result()).get("held"):  # (its folder held by a run before, by another name for it: not begun)
+            return fail(409, "busy", said["error"])
+        return JSONResponse(said)
+
+    @app.post("/api/v1/backups/verify")
+    async def verify_backup(request: Request) -> Response:
+        """Verify the latest: the newest backup in the folder read whole with the key, nothing restored; what it holds."""
+        kept = store.backups
+        if backup_turn.locked():
+            return fail(409, "busy", "A backup is being made just now")
+        try:
+            key = backup_key()
+        except backup.BackupError as ex:
+            return fail(503 if ex.code == "locked" else 409, ex.code, ex.message)
+        # The last backup this wall made, by the name it saved: not a look through the folder (another key's, a name later than
+        # now), and read on the folder's own threads, bounded.
+        if not kept.last_name or not kept.folder or not Path(kept.folder).is_absolute():
+            return fail(404, "no_backup", "There is no backup in the folder yet")
+        if not backup.made_with(kept.last_name, kept.key_id):
+            # (The last one made was made with the key before, which this key does not open: none of this key's yet.)
+            return fail(404, "no_backup", "No backup has been made with this key yet: the last one was made with the key before, and opens with its kit")
+        if not latest_here():
+            # (The last one made is in the folder backups went to before this one was saved: none is made here yet.)
+            return fail(404, "no_backup", f"No backup has been made in this folder yet: the last one made is in {kept.last_folder or 'another folder'}")
+        newest = Path(kept.folder) / kept.last_name
+        try:
+            held = await core.backup_reads.run(VERIFY_WITHIN, backup.verify, newest, key)
+        except backup.FolderTimeout:
+            return fail(504, "timeout", f"{newest.name}: the folder did not answer within {alerts.lasted(VERIFY_WITHIN)} (a share whose server is gone?)")
+        except FileNotFoundError:
+            return fail(404, "no_backup", f"{newest.name}, the last backup made, is no longer in the folder")
+        except backup.BackupError as ex:
+            if ex.code == "busy":
+                return fail(409, "busy", ex.message)
+            audit.write("backup_verified", client_ip(request), file=newest.name, ok=False, said=ex.message[:300])
+            return fail(422, ex.code, f"{newest.name}: {ex.message}")
+        except OSError as ex:
+            return fail(409, "unreadable", f"{newest.name} could not be read: {ex.strerror or ex}")
+        audit.write("backup_verified", client_ip(request), file=newest.name, ok=True, devices=held.devices, accounts=held.accounts)
+        return JSONResponse({"name": newest.name, **held.said()})
 
     # --- the wall as a file: to keep, or to take to another wall ------------------
 
@@ -4745,10 +6637,22 @@ def create_app(core: Core) -> FastAPI:
                 "alerts": None
                 if told is None
                 else {
-                    "enabled": told["enabled"], "address": bool(told["webhook"]), "host": urlsplit(told["webhook"]).hostname or "", "format": told["format"],
+                    # (Of the first destination in the file, as 0.3.2 said of its one address; and then each of them.)
+                    "enabled": told["enabled"], "address": bool(told["destinations"]), "host": (told["destinations"] or [{}])[0].get("host", ""),
+                    "format": exchange.format_of((told["destinations"] or [{"kind": "webhook", "config": {"format": "auto"}}])[0]),
                     "kinds": [kind for kind in ("offline", "no_signal", "problem", "recovered") if told[kind]],
+                    "destinations": [
+                        {"kind": one["kind"], "name": one["name"], "host": one["host"], "private": one["private"]} for one in told["destinations"] or []
+                    ],
                 },
                 "wall": content.wall,
+                # (0.4.0, where the file has it: signing in through an identity provider, its secret by whether it is there.)
+                **({} if content.signin is None else {"signin": {
+                    "enabled": content.signin["enabled"], "name": content.signin["name"], "issuer": content.signin["issuer"],
+                    "client_id": content.signin["client_id"], "password": bool(content.signin["client_secret"]),  # (the client secret's, by whether it is there)
+                    "roles": [{"group": group, "role": role} for group, role in content.signin["roles"].items()],
+                    "anyone": content.signin["anyone"], "domain": content.signin["domain"], "private": content.signin["private"],
+                }}),
                 "left_out": content.left_out[:200],
             }
         )
@@ -4777,7 +6681,8 @@ def create_app(core: Core) -> FastAPI:
             actions = actions if "actions" in take else []
             told = content.alerts if "alerts" in take else None
             wall = content.wall if "wall" in take else None
-            used = {device.id for device in store.devices} | {action.id for action in store.actions}
+            signin = content.signin if "signin" in take else None
+            used = {device.id for device in store.devices} | {action.id for action in store.actions} | {one.id for one in store.destinations}
 
             def new_id() -> str:
                 while (made := secrets.token_hex(4)) in used:
@@ -4792,7 +6697,7 @@ def create_app(core: Core) -> FastAPI:
                         id=new_id(), name=device.name, url=device.url, username=device.username, open_url=device.open_url, tls=device.tls,
                         cert_pem=device.cert_pem, kind=device.kind, group=device.group, ident=device.ident, alerts=device.alerts,
                         fingerbot_strength=device.fingerbot_strength, no_signal_minutes=device.no_signal_minutes,
-                        unchanged_minutes=device.unchanged_minutes, amt_view=device.amt_view,
+                        unchanged_minutes=device.unchanged_minutes, amt_view=device.amt_view, open_in=dict(device.open_in),
                     )  # fmt: skip
                     # The machine it was added for, which its driver checks before anything is sent to it (DeviceSpec.machine). Where
                     # the file has none, the first look takes it.
@@ -4806,12 +6711,17 @@ def create_app(core: Core) -> FastAPI:
                     made = ActionRecord(id=new_id(), name=action.name, kind=action.kind, keys=action.keys, enter=action.enter, danger=action.danger)
                     made.secret = core.vault.encrypt(action.text, f"action:{made.id}") if action.kind == "text" else None
                     saved_actions.append(made)
-                address = core.vault.encrypt(told["webhook"], "alerts:webhook") if told is not None and told["webhook"] else None
+                # The file's destinations take the place of this wall's; a file without any leaves this wall's as they are.
+                where = {device.url: device.id for device in [*store.devices, *added]}
+                places = [exchange.destination_record(one, new_id(), where, core.vault) for one in told["destinations"] or []] if told is not None else []
+                oidc_made = oidc_from_file(signin) if signin is not None else None
                 # Made before anything is touched: whatever goes wrong in the making leaves the wall as it was.
                 clients = [manager.client(record) for record in added]
             except VaultLocked:
                 return fail(503, "locked", "The saved passwords are locked just now. Sign in again and try once more.")
             before = (dataclasses.asdict(store.alerts), store.server.interval, store.server.update_check)
+            places_before = list(store.destinations)
+            oidc_before = store.oidc
 
             async def as_it_was() -> None:
                 for record in added:
@@ -4824,7 +6734,9 @@ def create_app(core: Core) -> FastAPI:
                         store.actions.remove(made)
                 for name, value in before[0].items():
                     setattr(store.alerts, name, value)
+                store.destinations = places_before
                 store.server.interval, store.server.update_check = before[1], before[2]
+                store.oidc = oidc_before
 
             try:
                 store.devices.extend(added)
@@ -4833,13 +6745,15 @@ def create_app(core: Core) -> FastAPI:
                     # What is set about alerts, and where they go. Not the link they carry, which is this
                     # wall's own address, nor a pause, which is a thing of the moment here.
                     settings = store.alerts
-                    settings.enabled, settings.format = told["enabled"], told["format"]
+                    settings.enabled = told["enabled"]
                     settings.offline, settings.no_signal, settings.problem, settings.recovered = told["offline"], told["no_signal"], told["problem"], told["recovered"]
-                    if address is not None:  # a file without one (a plain file) leaves the address this wall has
-                        settings.webhook = address
+                    if places:  # a file without any (a plain file) leaves the destinations this wall has
+                        store.destinations = places
                 if wall is not None:
                     store.server.interval = wall.get("interval", store.server.interval)
                     store.server.update_check = wall.get("update_check", store.server.update_check)
+                if oidc_made is not None:
+                    store.oidc = oidc_made
                 for client in clients:
                     await manager.adopt(client)
                 await save()
@@ -4849,16 +6763,50 @@ def create_app(core: Core) -> FastAPI:
             except BaseException:
                 await as_it_was()  # not half of a file: whatever it was that went wrong
                 raise
-            if told is not None:
-                alert_log["error"], not_opening[0] = None, None  # (one that still does not open is said again, at the next look)
+            if before[0]["enabled"] and not store.alerts.enabled:
+                alerts_switched_off()
+            if places:
+                for gone in places_before:
+                    courier.forget(gone.id)
+                    on_way.pop(gone.id, None)
+                    last_told.pop(gone.id, None)
+                    not_opening.pop(gone.id, None)
+                    failing.discard(gone.id)
+            if oidc_made is not None:
+                provider.forget()
+                provider_sessions()  # (taken in switched off: whoever the provider signed in here before is signed out)
         # Each device by name and address, as one that was typed in is written down; a file of hundreds, by their number.
         for record in added[:MOST_NAMED]:
             audit.write("device_added", client_ip(request), device=record.name, device_id=record.id, url=record.url, note="from a file")
+        taken_in = (("devices", added), ("actions", saved_actions), ("alerts", told is not None), ("wall", wall is not None), ("signin", oidc_made is not None))
         audit.write(
             "import_done", client_ip(request), devices=len(added), actions=len(saved_actions), encrypted=content.sealed,
-            parts=sorted(part for part, there in (("devices", added), ("actions", saved_actions), ("alerts", told is not None), ("wall", wall is not None)) if there),
+            parts=sorted(part for part, there in taken_in if there),
         )  # fmt: skip
-        return JSONResponse({"devices": len(added), "actions": len(saved_actions), "alerts": told is not None, "wall": wall is not None, "left_out": content.left_out[:200]})
+        if oidc_made is not None:
+            audit.write("oidc_changed", client_ip(request), enabled=False, issuer=oidc_made.issuer, client_id=oidc_made.client_id, note="from a file", **({"secret": "replaced"} if signin and signin["client_secret"] else {}))
+        said = {"devices": len(added), "actions": len(saved_actions), "alerts": told is not None, "wall": wall is not None, **({"signin": True} if oidc_made is not None else {})}
+        left_out = content.left_out[:200]
+        if signin is not None and signin["enabled"]:
+            left_out = [*left_out, "Sign-in settings: taken in switched off. Look at them under Settings > Accounts > Identity provider, at the address your team opens qKVM at, and switch them on there: the provider is asked then whether it is what they say."]
+        return JSONResponse({**said, "left_out": left_out})
+
+    def oidc_from_file(signin: dict[str, Any]) -> OidcSettings:
+        """Signing in through an identity provider as a file holds it (exchange._signin), as it is taken in on this wall:
+        switched off (a file never switches on a way into the wall: an admin does, in the page, where the provider is asked
+        what it is first), with this wall's own redirect address, and the client secret of the file, or else the one saved
+        here for that very provider and client and for no other. VaultLocked where a secret is to be sealed and cannot be."""
+        here = store.oidc
+        made = OidcSettings(
+            enabled=False, name=signin["name"], issuer=signin["issuer"], client_id=signin["client_id"], scopes=signin["scopes"],
+            groups_claim=signin["groups_claim"], roles=dict(signin["roles"]), anyone=signin["anyone"], domain=signin["domain"],
+            private=signin["private"], redirect_uri=here.redirect_uri,
+        )  # fmt: skip
+        if signin["client_secret"]:
+            made.secret = core.vault.encrypt(signin["client_secret"], oidc.SEALED_FOR)
+        elif here.secret and (made.issuer, made.client_id) == (here.issuer, here.client_id):
+            made.secret = here.secret
+        return made
 
     # --- updates ----------------------------------------------------------------
 
@@ -4962,13 +6910,29 @@ def create_app(core: Core) -> FastAPI:
 
     # --- finding KVMs ---------------------------------------------------------------
 
+    async def netbird_api() -> tuple[tailnet.NetbirdApi | None, str | None]:
+        """NetBird's management API with its token opened, for a search, where an admin set it up; or why it is not asked."""
+        settings = store.netbird
+        if not settings.url or not settings.secret:
+            return None, None
+        if not core.vault.unlocked:
+            return None, "NetBird's management API was not asked: the saved passwords are locked, and its token with them"
+        token = core.vault.read(settings.secret, tailnet.SEALED_FOR)
+        if token is None:
+            return None, "NetBird's management API was not asked: its saved token does not open any more (the settings file was edited, or is damaged). Enter it again under Settings > Network"
+        own = await own_addresses()
+        return tailnet.NetbirdApi(settings.url, token, settings.private, own.addresses, own.ports), None
+
     @app.post("/api/v1/discover")
     async def find_kvms() -> Response:
         """Look on this computer's own networks for KVMs that could be added."""
         if scanning.locked():
             return fail(409, "busy", "A search is already running")
         async with scanning:
-            result = await discover.scan()
+            netbird, unasked = await netbird_api()
+            result = await discover.scan(netbird)
+            if unasked is not None and await asyncio.to_thread(tailnet.netbird_command) is None:
+                result["notes"].append(unasked)
         on_wall = {urlsplit(d.url).hostname: d for d in store.devices}
         by_mark = {mark: d for d in store.devices if (mark := identity(d)) is not None}
         for entry in result["found"]:
@@ -4989,6 +6953,66 @@ def create_app(core: Core) -> FastAPI:
             entry["moved_from"] = urlsplit(same.url).netloc if gone and same is not None else None
         # From inside a container the network that can be looked through is the container's: said, not left to be wondered at.
         return JSONResponse({**result, "container": core.container})
+
+    # --- NetBird's management API (tailnet.py, 0.4.0) --------------------------------------------------------------------
+    # Asked for the machines of a NetBird network where NetBird's client is not on this computer (qKVM in a container beside
+    # NetBird's own). An admin's: the token sealed by the vault, never handed back, sent to the address it was entered for and
+    # to no other; settings that do not work are not saved.
+
+    async def netbird_view() -> dict[str, Any]:
+        settings = store.netbird
+        return {
+            "url": settings.url, "has_token": bool(settings.secret), "private": settings.private,  # (never the token)
+            # NetBird's client is on this computer: it is asked, and these settings are not needed.
+            "client": await asyncio.to_thread(tailnet.netbird_command) is not None,
+        }  # fmt: skip
+
+    @app.get("/api/v1/netbird")
+    async def get_netbird() -> dict[str, Any]:
+        return await netbird_view()
+
+    @app.put("/api/v1/netbird")
+    async def set_netbird(body: NetbirdIn, request: Request) -> Response:
+        before = store.netbird
+        try:
+            url = tailnet.management_url(body.url) if body.url.strip() else ""
+            given = tailnet.management_token(body.token) if body.token.strip() else ""
+        except ValueError as ex:
+            return fail(422, "invalid", str(ex))
+        made = NetbirdSettings(url=url, private=body.private)
+        found = 0
+        if url:
+            # A token left empty is the one saved, for the address it was entered for and no other: kept across a change of
+            # address, it would be handed to a server it was never meant for at the next search.
+            if not given and not (before.secret and url == before.url):
+                again = " again: it is sent only to the address it was entered for" if before.secret else ""
+                return fail(422, "invalid", f"Enter the token{again}")
+            if not core.vault.unlocked:
+                return fail(409, "locked", "Sign in again first")
+            token = given or core.vault.read(before.secret, tailnet.SEALED_FOR)
+            if token is None:
+                return fail(422, "invalid", "The saved token does not open any more (the settings file was edited, or is damaged): enter it again")
+            own = await own_addresses()
+            try:
+                found = len(await tailnet.netbird_by_api(tailnet.NetbirdApi(url, token, body.private, own.addresses, own.ports)))
+            except tailnet.Unasked as ex:
+                return fail(502, "provider_refused", f"{ex}. Nothing was saved.")
+            made.secret = core.vault.encrypt(given, tailnet.SEALED_FOR) if given else before.secret
+        async with one_change:
+            if refused := still_allowed(request):
+                return refused
+            if store.netbird is not before:
+                return fail(409, "changed", "These settings were changed meanwhile (in another tab, or by another admin). Nothing was saved: look again.")
+            store.netbird = made
+
+            def as_it_was() -> None:
+                store.netbird = before
+
+            if refused := await saved("NetBird's management API", as_it_was):
+                return refused
+        token_was = {"token": "replaced"} if given else {"token": "removed"} if before.secret and not made.secret else {}
+        audit.write("netbird_changed", client_ip(request), url=url or None, private=made.private, **token_was)
+        return JSONResponse({**await netbird_view(), "peers": found})
 
     @app.post("/api/v1/proxmox/guests")
     async def proxmox_guests(body: ProxmoxIn) -> Response:
@@ -5030,23 +7054,41 @@ def create_app(core: Core) -> FastAPI:
         return JSONResponse({"guests": listed, "containers": containers, "named": named})
 
     # --- alerts -------------------------------------------------------------------
+    # GET/PUT /api/v1/alerts and POST /api/v1/alerts/test keep the fields and the meaning they had in 0.3.2, when a wall had
+    # one address: they speak of the first destination. The kinds of change told (offline, no_signal, problem, recovered)
+    # are the wall's, as then: to every destination and every browser.
+
+    def first_destination() -> DestinationRecord | None:
+        return store.destinations[0] if store.destinations else None
+
+    def new_destination_id() -> str:
+        """An id for a new destination: no record of the wall has it."""
+        records: list[Any] = [*store.destinations, *store.devices, *store.actions, *store.users, *store.tokens]
+        used = {one.id for one in records}
+        while (made := secrets.token_hex(4)) in used:
+            pass
+        return made
 
     def alerts_view() -> dict[str, Any]:
-        settings = store.alerts
+        settings, first = store.alerts, first_destination()
+        sent, problem = last_told.get(first.id, (None, None)) if first is not None else (None, None)
+        # (One that is saved and does not open is none to send to. Whether it opens can only be said while the saved
+        # passwords are open; until then it is shown as it is saved.)
+        opens = first is not None and (not core.vault.unlocked or destination_secrets(first) is not None)
+        if first is not None and not opens:
+            problem = DOES_NOT_OPEN
         return {
             "enabled": settings.enabled,
-            # (One that is saved and does not open is none to send to. Whether it opens can only be said while
-            # the saved passwords are open; until then it is shown as it is saved.)
-            "has_webhook": settings.webhook is not None and (not core.vault.unlocked or webhook() is not None),
-            "format": settings.format,
+            "has_webhook": opens,
+            "format": exchange.format_of({"kind": first.kind, "config": first.config}) if first is not None else "auto",
             "offline": settings.offline,
             "no_signal": settings.no_signal,
             "problem": settings.problem,
             "recovered": settings.recovered,
             "link": settings.link,
             "paused_until": settings.paused_until if pausing() else None,
-            "last_sent": alert_log["sent"],
-            "last_error": alert_log["error"],
+            "last_sent": sent,
+            "last_error": problem,
         }
 
     @app.get("/api/v1/alerts")
@@ -5055,36 +7097,77 @@ def create_app(core: Core) -> FastAPI:
 
     @app.put("/api/v1/alerts")
     async def put_alerts(body: AlertsIn, request: Request) -> Response:
-        settings = store.alerts
-        # Everything is looked at before anything is changed: a form that is refused for one of its fields
-        # has changed none of them (an address in a refused form was put to use all the same).
-        webhook, link = settings.webhook, settings.link
-        if body.webhook.strip():
+        settings, first = store.alerts, first_destination()
+        given = body.model_fields_set
+        # Everything is looked at before anything is changed: a form that is refused for one of its fields has changed
+        # none of them (an address in a refused form was put to use all the same).
+        link, made, elsewhere = settings.link, None, False
+        speaks = first is not None and first.kind in exchange.URL_KINDS  # (an address of the first destination: what 0.3.2 had)
+        form = body.format if "format" in given or not speaks or first is None else exchange.format_of({"kind": first.kind, "config": first.config})
+        typed = body.webhook.strip()
+        if typed or (speaks and first is not None and "format" in given and form != exchange.format_of({"kind": first.kind, "config": first.config})):
+            kept = (destination_secrets(first) or {}) if speaks and first is not None else {}
+            kind = "webhook" if form in ("auto", "json") else form
+            if not typed and not kept:
+                return fail(422, "invalid", DOES_NOT_OPEN)
             try:
-                webhook = core.vault.encrypt(alerts.check_url(body.webhook), "alerts:webhook")
+                # (A token saved for the first destination goes only where it was saved for: typed again for another host.)
+                where = destinations.reached(first.kind, first.config, kept) if kept and first is not None else None
+                config, sealed, host = destinations.check(kind, {"url": egress.check_url(typed) if typed else "", "format": form}, kept, where)
             except ValueError as ex:
                 return fail(422, "invalid", str(ex))
-        elif body.forget_webhook:
-            webhook = None
+            made = dataclasses.replace(first) if speaks and first is not None else DestinationRecord(new_destination_id(), kind, created=time.time())
+            # (The first destination typed to another receiver: it starts with nothing known, as an edit of it does.)
+            elsewhere = speaks and first is not None and (not kept or destinations.receiver(first.kind, first.config, kept) != destinations.receiver(kind, config, sealed))
+            made.kind, made.config, made.host = kind, config, host
+            made.secret = core.vault.encrypt(json.dumps(sealed), sealed_for(made.id))
+        if body.private is not None and first is not None and made is None and not body.forget_webhook:
+            made = dataclasses.replace(first)
+        if made is not None and body.private is not None:
+            made.private = body.private
         if body.link is not None:
             try:
                 link = alerts.wall_link(body.link) if body.link.strip() else ""
             except ValueError:
                 return fail(422, "invalid", "The link in alerts has to be the address of this wall, starting with http:// or https://")
-        before = dataclasses.asdict(settings)
+        before, places = dataclasses.asdict(settings), list(store.destinations)
+        marked = dict(sent_elsewhere)
+        if elsewhere and made is not None:
+            sent_elsewhere[made.id] = courier.handed
 
         def as_it_was() -> None:
             for name, value in before.items():
                 setattr(settings, name, value)
+            store.destinations = places
+            sent_elsewhere.clear()
+            sent_elsewhere.update(marked)
 
-        settings.webhook, settings.link = webhook, link
-        settings.enabled, settings.format = body.enabled, body.format
+        gone: DestinationRecord | None = None
+        if made is not None and first is not None and made.id == first.id:
+            store.destinations = [made, *places[1:]]
+        elif made is not None:
+            store.destinations = [made, *places]
+        elif body.forget_webhook and first is not None:
+            gone, store.destinations = first, places[1:]
+        settings.link = link
+        settings.enabled = body.enabled
         settings.offline, settings.no_signal = body.offline, body.no_signal
         settings.problem, settings.recovered = body.problem, body.recovered
         # (An address that was to be forgotten and was not, for one: it would go on being sent to after a restart.)
         if refused := await saved("The alert settings", as_it_was):
             return refused
-        alert_log["error"], not_opening[0] = None, None  # (one that still does not open is said again, at the next look)
+        if elsewhere and made is not None:
+            started_anew(made.id)
+        if before["enabled"] and not settings.enabled:
+            alerts_switched_off()
+        for changed in (gone, made):
+            if changed is not None:
+                last_told.pop(changed.id, None)  # (one that still does not open is said again, at the next look)
+                not_opening.pop(changed.id, None)
+                failing.discard(changed.id)
+        if gone is not None:
+            courier.forget(gone.id)
+            on_way.pop(gone.id, None)
         audit.write("settings_changed", client_ip(request), alerts=body.enabled)
         return JSONResponse(alerts_view())
 
@@ -5101,20 +7184,190 @@ def create_app(core: Core) -> FastAPI:
             audit.write("alerts_resumed", client_ip(request))
         return JSONResponse(alerts_view())
 
+    def test_alert() -> alerts.Alert:
+        return alerts.Alert("test", "qKVM", "", "online", "online", "Test alert from qKVM", "If you can read this, alerts will reach you.", event="test")
+
     @app.post("/api/v1/alerts/test")
-    async def test_alert() -> Response:
-        target = alert_address()
-        if target is None:
+    async def test_first_destination() -> Response:
+        first = first_destination()
+        if first is None or destination_secrets(first) is None:
             return fail(409, "no_webhook", "Save an address to send alerts to first")
-        sample = alerts.Alert("test", "qKVM", "", "online", "online", "Test alert from qKVM", "If you can read this, alerts will reach you.")
-        sample.link = store.alerts.link
-        try:
-            await outbox.send(*target, sample)  # at once and one attempt: whoever pressed the button is waiting
-        except alerts.NotDelivered as ex:
-            delivered(str(ex))
-            return fail(502, "not_delivered", str(ex))
-        delivered(None)
+        done = await courier.test(first.id, test_alert())  # at once and one attempt: whoever pressed the button is waiting
+        if not done.ok:
+            return fail(502, "not_delivered", done.said)
         return JSONResponse(alerts_view())
+
+    # --- the destinations, each by itself (0.4.0) -------------------------------------------------------------------
+    # Every address, key, token and password stays in the vault: the page is shown the host alone, and what a destination
+    # has saved by whether it has it. A webhook's signing secret is shown once, when it is made.
+
+    def destination_view(record: DestinationRecord) -> dict[str, Any]:
+        sent, problem = last_told.get(record.id, (None, None))
+        opened = destination_secrets(record) if core.vault.unlocked else None
+        if core.vault.unlocked and opened is None:
+            problem = DOES_NOT_OPEN
+        host = record.host or (urlsplit(opened.get("url", "")).hostname or "" if opened is not None else "")
+        return {
+            "id": record.id, "kind": record.kind, "known": record.kind in destinations.KINDS, "name": record.name, "enabled": record.enabled,
+            "host": host, "config": dict(record.config), "private": record.private, "minimal": record.minimal, "events": list(record.events),
+            "least": record.least, "devices": record.devices, "groups": list(record.groups), "quiet_from": record.quiet_from,
+            "quiet_to": record.quiet_to, "quiet_days": list(record.quiet_days), "remind": record.remind, "created": record.created,
+            "log_seal": record.log_seal,
+            # What it has saved, by whether it has it: never what it is.
+            "has_token": bool(opened and opened.get("token")), "signed": bool(opened and opened.get("signing")),
+            "last_sent": sent, "last_error": problem, "failing": record.id in failing, "waiting": courier.waiting(record.id),
+        }  # fmt: skip
+
+    def destinations_view() -> dict[str, Any]:
+        return {
+            "destinations": [destination_view(record) for record in store.destinations],
+            "kinds": destinations.KIND_NAMES, "events": destinations.EVENT_NAMES, "levels": list(destinations.LEVELS),
+            "severity": destinations.SEVERITY, "remind": list(destinations.REMIND), "most": MOST_DESTINATIONS,
+        }  # fmt: skip
+
+    def destination_settings(body: DestinationIn, kept: dict[str, str], record: DestinationRecord | None = None) -> tuple[dict[str, Any], dict[str, str], str, dict[str, Any]]:
+        """What a form says a destination is: (what is kept in clear, its secrets, its host, the rest). ValueError. A secret
+        left empty is the one `record` has saved, where it is still reached where that was saved for (destinations.check)."""
+        said = body.model_dump()
+        where = destinations.reached(record.kind, record.config, kept) if record is not None and kept else None
+        config, sealed, host = destinations.check(body.kind, said, kept, where)
+        if body.kind == "webhook" and body.forget_signing:
+            sealed.pop("signing", None)
+        rest = destinations.settle(said)
+        if rest["devices"] is not None:
+            rest["devices"] = [device for device in rest["devices"] if store.device(device) is not None]  # (one gone meanwhile: left out)
+        return config, sealed, host, rest
+
+    @app.get("/api/v1/alerts/destinations")
+    async def list_destinations() -> dict[str, Any]:
+        return destinations_view()
+
+    @app.post("/api/v1/alerts/destinations")
+    async def add_destination(body: DestinationIn, request: Request) -> Response:
+        if len(store.destinations) >= MOST_DESTINATIONS:
+            return fail(409, "conflict", f"A wall has {MOST_DESTINATIONS} destinations at the most. Remove one first.")
+        try:
+            config, sealed, host, rest = destination_settings(body, {})
+        except ValueError as ex:
+            return fail(422, "invalid", str(ex))
+        signing = destinations.new_signing_secret() if body.kind == "webhook" and config.get("format") == "json" and not body.forget_signing else None
+        if signing is not None:
+            sealed["signing"] = signing
+        record = DestinationRecord(new_destination_id(), body.kind, host=host, config=config, created=time.time(), **rest)
+        record.secret = core.vault.encrypt(json.dumps(sealed), sealed_for(record.id))
+        store.destinations.append(record)
+        if refused := await saved("The destination", lambda: store.destinations.remove(record)):
+            return refused
+        called = record.name or destinations.KIND_NAMES[record.kind]
+        audit.write("destination_added", client_ip(request), destination=called, kind=record.kind, host=host)
+        # The webhook's signing secret, this once: whoever receives the alerts checks them with it.
+        return JSONResponse({"destination": destination_view(record), **({"signing_secret": signing} if signing else {})}, status_code=201)
+
+    @app.put("/api/v1/alerts/destinations/{destination_id}")
+    async def change_destination(destination_id: str, body: DestinationIn, request: Request) -> Response:
+        record = destination(destination_id)
+        if record is None:
+            return fail(404, "not_found", "No such destination")
+        if body.kind != record.kind:
+            return fail(422, "invalid", "A destination keeps its kind. Add one of the other kind, and remove this one.")
+        kept = destination_secrets(record)
+        try:
+            config, sealed, host, rest = destination_settings(body, kept or {}, record)
+        except ValueError as ex:
+            return fail(422, "invalid", str(ex))
+        changed = dataclasses.replace(record, host=host, config=config, **rest)
+        changed.secret = core.vault.encrypt(json.dumps(sealed), sealed_for(record.id))
+        place = store.destinations.index(record)
+        store.destinations[place] = changed
+        # Another receiver (destinations.receiver): what waits for it goes to neither, from the moment it is changed.
+        elsewhere = kept is None or destinations.receiver(record.kind, record.config, kept) != destinations.receiver(changed.kind, config, sealed)
+        marked = dict(sent_elsewhere)
+        if elsewhere:
+            sent_elsewhere[record.id] = courier.handed
+
+        def as_it_was() -> None:
+            if changed in store.destinations:
+                store.destinations[store.destinations.index(changed)] = record
+            sent_elsewhere.clear()
+            sent_elsewhere.update(marked)
+
+        if refused := await saved("The destination", as_it_was):
+            return refused
+        if elsewhere:
+            started_anew(record.id)
+        if record.enabled and not changed.enabled:
+            switched_off[record.id] = courier.handed  # (what waits for it goes no more, even switched on before its next try)
+        last_told.pop(record.id, None)  # (one that does not open is said again: it was entered again, or it was not)
+        not_opening.pop(record.id, None)
+        audit.write("destination_changed", client_ip(request), destination=changed.name or destinations.KIND_NAMES[changed.kind], kind=changed.kind, host=host)
+        return JSONResponse({"destination": destination_view(changed)})
+
+    @app.delete("/api/v1/alerts/destinations/{destination_id}")
+    async def remove_destination(destination_id: str, request: Request) -> Response:
+        record = destination(destination_id)
+        if record is None:
+            return fail(404, "not_found", "No such destination")
+        place = store.destinations.index(record)
+        store.destinations.remove(record)
+        if refused := await saved("Removing the destination", lambda: store.destinations.insert(place, record)):
+            return refused
+        courier.forget(record.id)  # (what waited for it goes with it)
+        for kept in (last_told, not_opening, tested_at, quiet_held, quiet_ends, reminded, told_there, sealed_to, backup_going, on_way):
+            kept.pop(record.id, None)
+        failing.discard(record.id)
+        backup_sending.discard(record.id)
+        audit.write("destination_removed", client_ip(request), destination=record.name or destinations.KIND_NAMES.get(record.kind, record.kind), kind=record.kind)
+        return JSONResponse(destinations_view())
+
+    tested_at: dict[str, float] = {}  # destination id -> when it was last sent a test
+
+    @app.post("/api/v1/alerts/destinations/{destination_id}/test")
+    async def test_destination(destination_id: str) -> Response:
+        """A test alert to one destination, at once and one attempt: whoever pressed the button is waiting. What its service
+        answered is said, with every secret taken out."""
+        record = destination(destination_id)
+        if record is None:
+            return fail(404, "not_found", "No such destination")
+        wait = TEST_EVERY - (time.monotonic() - tested_at.get(record.id, -TEST_EVERY))
+        if wait > 0:
+            return fail(429, "rate_limited", f"A test was sent a moment ago. Try again in {math.ceil(wait)} s.", **{"Retry-After": str(math.ceil(wait))})
+        tested_at[record.id] = time.monotonic()
+        done = await courier.test(record.id, test_alert())
+        if not done.ok:
+            return fail(502, "not_delivered", done.said)
+        return JSONResponse({"said": done.said, "destination": destination_view(record)})
+
+    @app.get("/api/v1/alerts/destinations/{destination_id}/log")
+    async def destination_log(destination_id: str) -> Response:
+        """How each delivery to a destination went, the latest first (kept in memory since the start: MOST_LOGGED)."""
+        if destination(destination_id) is None:
+            return fail(404, "not_found", "No such destination")
+        return JSONResponse({"deliveries": [dataclasses.asdict(each) for each in courier.log.get(destination_id, ())]})
+
+    @app.post("/api/v1/alerts/destinations/{destination_id}/secret")
+    async def new_signing_secret(destination_id: str, request: Request) -> Response:
+        """A new signing secret for a webhook (the old one stops working), shown this once."""
+        record = destination(destination_id)
+        if record is None:
+            return fail(404, "not_found", "No such destination")
+        if record.kind != "webhook":
+            return fail(422, "invalid", "Only a webhook is signed")
+        opened = destination_secrets(record)
+        if opened is None:
+            return fail(409, "conflict", DOES_NOT_OPEN)
+        signing = destinations.new_signing_secret()
+        changed = dataclasses.replace(record, config={**record.config, "format": "json"})
+        changed.secret = core.vault.encrypt(json.dumps({**opened, "signing": signing}), sealed_for(record.id))
+        store.destinations[store.destinations.index(record)] = changed
+
+        def as_it_was() -> None:
+            if changed in store.destinations:
+                store.destinations[store.destinations.index(changed)] = record
+
+        if refused := await saved("The new signing secret", as_it_was):
+            return refused
+        audit.write("destination_changed", client_ip(request), destination=changed.name or destinations.KIND_NAMES["webhook"], kind="webhook", what="signing secret")
+        return JSONResponse({"signing_secret": signing, "destination": destination_view(changed)})
 
     # --- alerts by Web Push: the browsers of each account (webpush.py) --------------------------------------------------
     # Any account may have the alerts told to its own browsers, of the machines it may see; an admin sees and may remove
@@ -5419,5 +7672,67 @@ def create_app(core: Core) -> FastAPI:
                 asyncio.get_running_loop().run_in_executor(None, pager.close)
             except RuntimeError:
                 pager.close()
+
+    # --- a check of the activity log's chain (chain.py), on the page ---------------------------------------------------
+    # It reads the whole record, the text files, in a worker thread (some seconds for 50 MB): one at a time for the whole
+    # wall, whoever asks; asked again while one runs, it is that one that is waited for, and how far it got is said. What it
+    # found is written into the log itself (log_checked: who checked, and what the head was), and kept for the page until
+    # the next. Stopped where the wall stops (check_halt): a long log does not hold the program's end.
+    def check_state() -> dict[str, Any]:
+        task, walk = log_check["task"], log_check["walk"]
+        if task is not None and not task.done():
+            return {"running": True, "began": log_check["began"], "by": log_check["by"], "entries": walk.verdict.entries if walk is not None else 0, "result": None}
+        kept = log_check["kept"]
+        return {"running": False, **(kept if kept is not None else {"result": None})}
+
+    def check_done(ip: str, by: str) -> Callable[[asyncio.Future[chain.Verdict]], None]:
+        def done(task: asyncio.Future[chain.Verdict]) -> None:
+            if task.cancelled() or isinstance(task.exception(), CheckHalted):
+                return
+            failed = task.exception()
+            if failed is not None:
+                log.error("the activity log could not be checked", exc_info=failed)
+                log_check["kept"] = {"at": time.time(), "by": by, "said": f"The activity log could not be checked: {type(failed).__name__} (the log of qKVM says more)", "result": None}
+                return
+            verdict = task.result()
+            log_check["kept"] = {"at": time.time(), "by": by, "said": verdict.summary(), "result": verdict.as_dict(MOST_PROBLEMS_SHOWN)}
+            first = verdict.problems[0] if verdict.problems else None
+            found = {"broken_at": first.line, "what": first.what} if first is not None and first.line is not None else {}
+            # (Lines taken in without proof are said with it: such a log is intact only where it is chained.)
+            unproved = {"unproved": verdict.unchained} if verdict.unchained else {}
+            audit.write(
+                chain.CHECKED, ip, intact=verdict.intact, lines=verdict.entries, problems=len(verdict.problems) + verdict.more, last=verdict.last,
+                head=verdict.head, **unproved, **found,
+            )  # fmt: skip
+
+        return done
+
+    @app.post("/api/v1/audit/check")
+    async def audit_check(request: Request) -> Response:
+        """Check the activity log's chain (an admin's): the answer once it is done, or after CHECK_WAIT, 202 with how far it got
+        (asked for again with GET until it is done)."""
+        if core.audit.key is None:
+            return fail(409, "no_chain", "This wall writes its activity log without the chain: its key could not be saved at the start (the log of qKVM says why). Start it again once that is put right.")
+        task = log_check["task"]
+        if task is None or task.done():
+            walk = chain.Walk(core.audit.key)
+            task = asyncio.ensure_future(asyncio.to_thread(core.audit.check, walk, check_halt))
+            log_check.update(task=task, walk=walk, began=time.time(), by=request.state.user.name)
+            task.add_done_callback(check_done(client_ip(request), request.state.user.name))
+        try:
+            async with asyncio.timeout(CHECK_WAIT):  # (never wait_for: see kvm.Listening.message)
+                await asyncio.shield(task)  # (the check itself goes on where this wait ends: asked for again with GET)
+        except TimeoutError:
+            return JSONResponse(check_state(), status_code=202)
+        except Exception:
+            pass  # (said in what is kept: check_done)
+        if refused := still_allowed(request):
+            return refused
+        return JSONResponse(check_state())
+
+    @app.get("/api/v1/audit/check")
+    async def audit_checked(request: Request) -> Response:
+        """The check under way (how far it got), or the last one's result (null where none was made since the wall started)."""
+        return JSONResponse(check_state())
 
     return app

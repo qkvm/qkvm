@@ -1,8 +1,9 @@
-"""The Media box's look asked again, as the outside review's fourth round (Codex, a LOW) found it: through a failure that
+"""The Media box's look asked again, as the outside review's fourth round (a LOW) found it: through a failure that
 went on it asked every five seconds, and a newer look that got no answer found the older one's turn taken and was never
 asked again. One look asked again, by the newest look's turn; and nothing a device or the wall says is markup.
 """
 import itertools
+import re
 import time
 from contextlib import contextmanager
 
@@ -16,6 +17,8 @@ from tests.fake_redfish import BmcState, FakeBmc
 from tests.test_in_a_browser import a_wall, looking, sign_in, tile, top
 from tests.test_push_in_a_browser import chromium  # noqa: F401
 from tests.test_virtual_media_on_a_server_in_a_browser import add_the_server, open_the_box
+
+MEDIA_LIST = re.compile(r".*/api/v1/devices/[^/]+/media(\?.*)?$")  # the box's look, which names its machine since 0.4.0 (?target=)
 
 
 @contextmanager
@@ -38,7 +41,7 @@ def test_persistent_failure_counts_retries_and_close_stops_requests(tmp_path, ch
             assert route.request.method == "GET"
             times.append(time.monotonic())
             route.fulfill(status=504, json={"code": "timeout", "message": f"miss {len(times)}"})
-        page.route("**/api/v1/devices/*/media", lookup)
+        page.route(MEDIA_LIST, lookup)
         box = open_the_box(page)
         said = box.locator(".media-said")
         expect(said).to_contain_text("miss 1.")
@@ -77,7 +80,7 @@ def test_newer_failed_look_owns_its_retry_and_keeps_text_and_unmount_safe(tmp_pa
                 route.fulfill(status=504, json={"code": "timeout", "message": f"miss {len(gets)} {marker}"})
             else:
                 route.fulfill(status=200, json=known)
-        page.route("**/api/v1/devices/*/media", lookup)
+        page.route(MEDIA_LIST, lookup)
         box = open_the_box(page)
         said = box.locator(".media-said")
         now = box.locator(".media-now")

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 import httpx
 import pytest
@@ -47,7 +48,7 @@ def test_the_enlarged_view_offers_no_console_on_the_walls_own_host_name(tmp_path
             sign_in(page, live)
             expect(tile(page, "A server")).to_have_attribute("data-state", "online", timeout=40_000)
             asked: list[str] = []
-            page.on("request", lambda request: asked.append(request.method) if request.url.endswith("/console") else None)
+            page.on("request", lambda request: asked.append(request.method) if urlsplit(request.url).path.endswith("/console") else None)
             tile(page, "A server").click()
             expect(page.locator("#focus-name")).to_have_text("A server")
             expect(page.locator("#focus-open")).to_be_hidden()
@@ -70,7 +71,7 @@ def test_the_enlarged_view_offers_no_console_on_the_walls_own_host_name(tmp_path
             opener = page.locator("#focus-open")
             expect(opener).to_be_visible()
             expect(opener).to_have_attribute("href", elsewhere)
-            with page.expect_response(lambda reply: reply.url.endswith("/console")) as answered:
+            with page.expect_response(lambda reply: urlsplit(reply.url).path.endswith("/console")) as answered:
                 opener.click()
             assert answered.value.status == 200
             assert answered.value.json()["url"].startswith(elsewhere) and len(server.state.passes) == 1
@@ -78,3 +79,42 @@ def test_the_enlarged_view_offers_no_console_on_the_walls_own_host_name(tmp_path
                 other.close()
     finally:
         server.stop()
+
+
+def test_the_enlarged_views_console_is_the_servers_it_shows_and_none_of_the_one_an_edit_put_in_its_place(tmp_path: Path, browser: Browser) -> None:  # noqa: F811
+    # (The fresh review of the HA round, L1.) The way into a server's console was asked by the tile's id alone: a page with the wall as
+    # it was got a signed-in way into the console of the server an admin had put under the tile meanwhile. It names the server
+    # it shows (`target`); refused (409 `machine_changed`), nothing is made out there, and the wall is fetched again.
+    server, other = FakeBmc().start(), FakeBmc().start()
+    try:
+        with a_wall(tmp_path, ("A server", server)) as (live, admin), looking(browser, live) as page:
+            shown = admin.get("/api/v1/wall").json()["devices"][0]
+            # (Reached by the browser under another name than the wall's, as above, so that its console is offered.)
+            assert admin.put(f"/api/v1/devices/{shown['id']}", json={"url": server.url, "open_url": server.url.replace("127.0.0.1", "localhost") + "/"}).status_code == 200
+            offers_its_console(admin, shown["id"])
+            sign_in(page, live)
+            expect(tile(page, "A server")).to_have_attribute("data-state", "online", timeout=40_000)
+            tile(page, "A server").click()
+            opener = page.locator("#focus-open")
+            expect(opener).to_be_visible()
+            target = page.evaluate(f"tiles.get('{shown['id']}').device.target")
+            fetched: list[object] = []
+            page.route("**/api/v1/wall", lambda route: fetched.append(route))  # (the wall as it was stays on the page until let through)
+            moved = admin.put(f"/api/v1/devices/{shown['id']}", json={"url": other.url, "username": "admin", "password": "secret", "open_url": other.url.replace("127.0.0.1", "localhost") + "/"})
+            assert moved.status_code == 200 and moved.json()["device"]["target"] != target, moved.text
+            offers_its_console(admin, shown["id"])
+            with page.expect_response(lambda reply: urlsplit(reply.url).path.endswith("/console")) as answered:
+                opener.click()
+            assert (answered.value.status, parse_qs(urlsplit(answered.value.url).query).get("target")) == (409, [target]), answered.value.url
+            page.wait_for_timeout(300)
+            assert other.state.passes == [] and server.state.passes == [] and len(page.context.pages) == 1
+            for _ in range(100):
+                if fetched:
+                    break
+                page.wait_for_timeout(100)
+            assert fetched, "the page never fetched the wall again"
+            for route in fetched:
+                route.continue_()  # type: ignore[attr-defined]
+    finally:
+        server.stop()
+        other.stop()

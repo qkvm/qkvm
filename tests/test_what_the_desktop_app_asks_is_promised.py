@@ -39,7 +39,7 @@ DESKTOP_ASKS: list[tuple[str, str, tuple[str, ...]]] = [
     ("POST", "/api/v1/devices/{id}/media/unmount", ()),
     ("POST", "/api/v1/devices/{id}/media/delete", ()),
     ("GET", "/api/v1/devices/{id}/media/upload", ()),
-    ("POST", "/api/v1/devices/{id}/media/upload", ("name", "machine")),
+    ("POST", "/api/v1/devices/{id}/media/upload", ("name", "machine", "listed")),  # (`listed` from Desktop 0.2.0)
     ("POST", "/api/v1/export", ()),
     ("POST", "/api/v1/import", ()),
     ("POST", "/api/v1/import/read", ()),

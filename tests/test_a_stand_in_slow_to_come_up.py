@@ -97,7 +97,7 @@ def test_a_stand_in_whose_thread_ended_for_want_of_socket_buffers_is_started_aga
         ServerThread("another", broken, lambda: False).start()
 
 
-# The outside review of 0.3.1 (Codex), L031-1: a stand-in started again for want of socket buffers was not waited for as it
+# The outside review of 0.3.1, L031-1: a stand-in started again for want of socket buffers was not waited for as it
 # stopped. (Its probe, as it wrote it: the stand-ins built without listeners, a server body whose cleanup is held.)
 @pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
 @pytest.mark.parametrize("fixture_kind", ["redfish", "vnc", "wall"])

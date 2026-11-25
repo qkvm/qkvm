@@ -5,6 +5,8 @@ from __future__ import annotations
 import contextlib
 import copy
 import errno
+import hashlib
+import hmac
 import ipaddress
 import json
 import logging
@@ -24,6 +26,7 @@ from pathlib import Path
 from typing import Any, BinaryIO
 from urllib.parse import urlsplit
 
+from . import chain
 from ._folders import open_private, private
 from .vault_storage import MAGIC, MigrationRequired, StorageCipher, UnsupportedFormat, create_key, key_path, read_key
 
@@ -80,11 +83,10 @@ class ServerSettings:
 
 @dataclass
 class AlertSettings:
-    """When to tell someone that a KVM changed state, and where."""
+    """When to tell someone that a KVM changed state. Where to: the destinations (DestinationRecord), and the browsers."""
 
     enabled: bool = False
-    webhook: dict[str, str] | None = None  # the address to post to, encrypted by the vault (it often holds a token)
-    format: str = "auto"  # how the service behind it wants to be spoken to: see alerts.FORMATS
+    # The kinds of change told at all, to every destination and every browser (as in 0.3.2); a destination narrows them.
     offline: bool = True  # a KVM stopped answering
     no_signal: bool = True  # the computer behind it went dark
     problem: bool = True  # login rejected, certificate changed
@@ -126,6 +128,17 @@ class DeviceRecord:
     # still now and then for its tile, a session while its enlarged or live view is open), "live" (a session held while its
     # tile is shown as well). An admin's or an operator's to change, by its own route. Kept, unused, for every other kind.
     amt_view: str = "stills"
+    # Where else the machine can be opened, by kind (open_in.KINDS: MeshCentral, RustDesk, Remote Desktop): plain links an
+    # admin gives it, by its own route, shown to its operators. Read through open_in.kept, which leaves out what is not one.
+    # (A record of 0.3.2 or before has none.)
+    open_in: dict[str, str] = field(default_factory=dict)
+    # Where it has shown several inputs (a KVM with a switch), the mark of the machine it showed them at (kvm.several_mark of its
+    # address, kind, check, certificate, machine and identity: what its `target` is made of); "" none. Holds only while the tile is
+    # at that machine, across restarts and locks: keys sent as for a KVM of one input are refused, and its input is asked, also
+    # while its switch is not up (a wall started again took it for one of a single input: the review of HB, M1). Written when it
+    # is first seen (DeviceManager._several), emptied by the change that points the tile at another machine
+    # (DeviceManager._install). (A record of 0.3.2 has none.)
+    several_inputs_at: str = ""
 
 
 FINGERBOT_STRENGTHS = ("firm", "light")  # (what fingerbot_strength may be; anything else in a file is taken as the first)
@@ -169,6 +182,66 @@ ROLES = ("admin", "operator", "viewer")  # most to least: everything / watch and
 
 
 @dataclass
+class OidcSettings:
+    """Signing in through an identity provider by OpenID Connect (oidc.py, 0.4.0). Off until an admin sets it up."""
+
+    enabled: bool = False
+    name: str = ""  # what the button on the sign-in page says after "Sign in with" ("": the provider's host)
+    issuer: str = ""  # https://..., exactly as the provider says it of itself
+    client_id: str = ""
+    secret: dict[str, str] | None = None  # the client secret, sealed by the vault for "oidc:client"; never handed back
+    scopes: str = "openid profile email"
+    groups_claim: str = "groups"  # the claim of the ID token (or of userinfo) that carries a person's groups; "": none is read
+    roles: dict[str, str] = field(default_factory=dict)  # a group's name, as the provider writes it -> the role it gives (ROLES)
+    anyone: str = ""  # "": only somebody in a group of `roles` signs in; a role: anybody else the provider signs in, as that
+    domain: str = ""  # "": any; an email domain everybody has to have, verified by the provider (Google, which sends no groups)
+    private: bool = False  # the provider may be at a private address (egress.PRIVATE): an admin's switch, off by default
+    # Where the provider sends a browser back to: this wall's own address as the admin saw it on the page, as they entered it
+    # at the provider. A sign-in is begun only from that address (the browser's cookie of it is there).
+    redirect_uri: str = ""
+
+
+@dataclass
+class BackupSettings:
+    """Backups of the whole wall to a folder (backup.py, 0.4.0): off until an admin switches them on, which takes a key."""
+
+    enabled: bool = False
+    folder: str = ""  # where they are written: a whole path on the computer qKVM runs on (a mounted share, a synced folder)
+    hour: int = 3  # the hour of the day they are made at, the wall's local time (0 to 23)
+    keep: int = 7  # how many are kept: the oldest beyond that go, once a new one is written and read back whole
+    history: bool = False  # the history (history.sqlite) as well: large, and not needed to bring the wall back
+    # The backup key (32 random bytes, in hex), sealed by the vault for backup.SEALED_FOR: kept here so that a run made by the
+    # clock seals a backup without anybody. Handed out once, as its recovery kit, when it is made; never again. None: none yet.
+    secret: dict[str, str] | None = None
+    key_id: str = ""  # what that key is known by (backup.key_id): in each backup's head and on its kit; no secret
+    key_made: float = 0.0
+    since: float = 0.0  # when they were switched on: the first run made by the clock is the first hour after that
+    last_at: float = 0.0  # the last run, made by the clock or by somebody: when it ended
+    last_ok: bool = True  # ...whether it made a backup (True where none ran yet: nothing has failed)
+    last_name: str = ""  # ...the file it made
+    last_size: int = 0
+    last_error: str = ""  # ...or why it made none, in a sentence
+    last_good: float = 0.0  # when the last backup that was made was made
+    last_folder: str = ""  # ...and the folder it is in: the latest only of that folder (another, saved since, has none yet)
+    # Backups of another key in the folder, as the last run found them (another wall's, or this wall's before its key was
+    # made new): never touched by this wall, and said in Settings (of the folder the last backup is in).
+    others: int = 0
+    # The alert destinations told that a backup failed, and not yet that one was made again: told so once one is, a restart
+    # between (an incident PagerDuty opened for the failure is closed by it).
+    told: list[str] = field(default_factory=list)
+
+
+@dataclass
+class NetbirdSettings:
+    """NetBird's management API, asked for the machines of a NetBird network where its client is not on this computer (qKVM
+    in a container beside NetBird's own; tailnet.py, 0.4.0). Off until an admin sets it up."""
+
+    url: str = ""  # https://api.netbird.io, or a self-hosted management's address (tailnet.management_url)
+    secret: dict[str, str] | None = None  # the token, sealed by the vault for "netbird:token"; never handed back, never exported
+    private: bool = False  # the management API may be at a private address (egress.PRIVATE): an admin's switch, off by default
+
+
+@dataclass
 class UserRecord:
     """Someone who may sign in."""
 
@@ -185,6 +258,11 @@ class UserRecord:
     totp_codes: list[str] = field(default_factory=list)  # what is kept of their unused one-time codes (totp.kept)
     totp_step: int = 0  # the time step of the last code of their app that was accepted: a code works once, a restart later too
     totp_changes: int = 0  # how often the second step was switched on or off: part of what a kept sign-in is good by (core.auth_mark)
+    # An account of an identity provider's (oidc.py): the provider (its issuer) and its own word for the person (`sub`),
+    # which together are who it is, whatever its name here. "" and "": an account of this wall's own. Such an account has
+    # no password here and never gets one; the provider signs it in, and its role is read from its groups at each sign-in.
+    issuer: str = ""
+    subject: str = ""
 
 
 @dataclass
@@ -215,6 +293,49 @@ class PushRecord:
     name: str = ""  # what browser it is, as the page said when it subscribed: "Chrome on Android"
     service: str = ""  # its push service's name (fcm.googleapis.com, web.push.apple.com), in clear for the list
     created: float = 0.0
+
+
+# What a destination may be told of (destinations.EVENTS, said in the guide), and how serious, from the least.
+# "backup": a backup of the wall that was not made (backup.py), and no machine's: told where it is asked for, as the others.
+ALERT_EVENTS = ("offline", "no_signal", "unchanged", "auth", "certificate", "fault", "problem", "backup", "recovered")
+ALERT_LEVELS = ("info", "warning", "error", "critical")
+# The id a 0.3.2 wall's one alert address is kept under as its first destination: its sealed address is opened for
+# "alerts:webhook", as 0.3.2 sealed it (`sealed_for`). No id this program gives has letters past f.
+FROM_0_3_2 = "webhook"
+
+
+def sealed_for(destination_id: str) -> str:
+    """What a destination's secrets are sealed for: its id, which no other record's sealed text is for."""
+    return "alerts:webhook" if destination_id == FROM_0_3_2 else f"destination:{destination_id}"
+
+
+@dataclass
+class DestinationRecord:
+    """A place the alerts go (destinations.py): a mail server, a chat, PagerDuty, a webhook."""
+
+    id: str
+    kind: str  # destinations.KINDS; one this version does not know (a later one's) is kept and sent nothing
+    name: str = ""  # what the admin calls it
+    enabled: bool = True
+    # Its secrets (an address with a token in it, a key, a password), as JSON sealed by the vault for `sealed_for(id)`. The
+    # one carried over from 0.3.2 holds its address as it was sealed then: the address alone, not in JSON.
+    secret: dict[str, str] | None = None
+    host: str = ""  # where it goes, in clear, for the list: the host only ("" for the one from 0.3.2 until it is saved again)
+    config: dict[str, Any] = field(default_factory=dict)  # what is not secret: a mail's sender and recipients, a chat's id
+    private: bool = False  # may be a private address (RFC 1918, fc00::/7, 100.64.0.0/10): an admin's switch, off by default
+    minimal: bool = False  # told the machine's name, what happened and the link, and nothing else
+    events: list[str] = field(default_factory=lambda: list(ALERT_EVENTS))  # what it is told of
+    least: str = "info"  # ...from this severity on (ALERT_LEVELS)
+    devices: list[str] | None = None  # ids of the machines it is told about; None: all of them, new ones too
+    groups: list[str] = field(default_factory=list)  # and the machines of these groups, whichever are in them on the day
+    quiet_from: int = -1  # its quiet hours, minutes of the day (the wall's local time); -1: none
+    quiet_to: int = -1
+    quiet_days: list[str] = field(default_factory=list)  # "mon".."sun"; none: every day
+    remind: int = 0  # minutes after which what is still wrong is told again; 0: never
+    created: float = 0.0
+    # Told the activity log's head once a day (0.4.0, chain.py: kept there, it shows a later rewrite of the log), quietly; never
+    # where it is PagerDuty, whose every event opens an incident.
+    log_seal: bool = False
 
 
 @dataclass
@@ -401,7 +522,7 @@ _HOLDS: dict[str, Callable[[Any], bool]] = {
 _EMPTY: dict[str, Callable[[], Any]] = {"str": str, "bool": bool, "int": int, "float": float, "list[str]": list, "dict[str, str]": dict, "dict[str, Any]": dict}
 # ...but for these, where empty is of no use and what is declared gives nothing away: how a device is
 # signed in to and talked to, how alerts are written, where the wall listens and how often it looks.
-_NEVER_EMPTY = frozenset({("DeviceRecord", "username"), ("DeviceRecord", "tls"), ("DeviceRecord", "kind"), ("AlertSettings", "format"), ("ServerSettings", "bind"), ("ServerSettings", "port"), ("ServerSettings", "interval")})  # fmt: skip
+_NEVER_EMPTY = frozenset({("DeviceRecord", "username"), ("DeviceRecord", "tls"), ("DeviceRecord", "kind"), ("DestinationRecord", "events"), ("DestinationRecord", "least"), ("ServerSettings", "bind"), ("ServerSettings", "port"), ("ServerSettings", "interval")})  # fmt: skip
 # ...and for what somebody may do, where nothing is the least there is.
 _LEAST = {("UserRecord", "role"): "viewer", ("TokenRecord", "role"): "viewer"}
 # ...and what each is called, for whoever edited the file and is told what was wrong with it.
@@ -461,6 +582,35 @@ def _as_declared(record: Any, what: str) -> None:
             raise ValueError(f"{what}: \"{each.name}\" has to be {' or '.join(_CALLED[kind] for kind in kinds if kind != 'None')}{', or null' if 'None' in kinds else ''}")
 
 
+def position_of(said: Any) -> tuple[int, bytes] | None:
+    """Where the activity log's chain had come to, as the settings keep it ({"n": ..., "head": 64 hex digits}): (number, head),
+    or None where it is not that."""
+    if not isinstance(said, dict) or set(said) != {"n", "head"}:
+        return None
+    number, head = said.get("n"), chain.hex_head(said.get("head"))
+    if not isinstance(number, int) or isinstance(number, bool) or not 0 < number < 2**63 or head is None:
+        return None
+    return number, head
+
+
+def _from_0_3_2(said: Any) -> list[DestinationRecord]:
+    """The destination a 0.3.2 wall's alert address is from now on: its first, sent to as before. That wall kept one
+    address (sealed, for "alerts:webhook") and how its service wanted to be spoken to; it is kept as it was sealed, so
+    nothing needs the saved passwords open to carry it over, and it may be a private address, as every address could
+    be then (a self-hosted ntfy on the network). This computer and link-local are refused all the same, as for any.
+    None where there was no address."""
+    if not isinstance(said, dict):
+        return []
+    blob = said.get("webhook")
+    if blob is None:
+        return []
+    if not (isinstance(blob, dict) and blob):
+        blob = {"damaged": str(blob)[:80]}  # (as _as_declared keeps what is no sealed text: it opens with no key)
+    form = said.get("format") if said.get("format") in _FORMATS_OF_0_3_2 else "auto"
+    kind = _FORMATS_OF_0_3_2[str(form)]
+    return [DestinationRecord(FROM_0_3_2, kind, secret=blob, config={"format": form} if kind == "webhook" else {}, private=True)]
+
+
 def _only_known(cls: type, data: dict[str, Any]) -> dict[str, Any]:
     known = {f.name for f in fields(cls)}
     return {key: value for key, value in data.items() if key in known}
@@ -468,7 +618,14 @@ def _only_known(cls: type, data: dict[str, Any]) -> dict[str, Any]:
 
 VERSION = 1  # of the settings file as this program writes it
 # The parts of the settings file this program knows of.
-_PARTS = ("version", "recovery", "recovery_created", "unlock", "server", "alerts", "users", "devices", "actions", "tokens", "pushes")
+_PARTS = (
+    "version", "recovery", "recovery_created", "unlock", "server", "alerts", "users", "devices", "actions", "tokens", "pushes", "destinations", "oidc",
+    "activity_key", "activity_position", "backups", "netbird",
+)  # fmt: skip
+_ACTIVITY_KEY = re.compile(r"[0-9a-f]{64}")
+# What 0.3.2 kept under "alerts" and 0.4.0 keeps as the first destination: carried over (Store._read), never carried along.
+_ALERTS_OF_0_3_2 = ("webhook", "format")
+_FORMATS_OF_0_3_2 = {"auto": "webhook", "json": "webhook", "ntfy": "ntfy", "slack": "slack", "discord": "discord"}
 
 
 def _not_known(cls: type, data: Any) -> dict[str, Any]:
@@ -485,14 +642,17 @@ def _beyond(data: dict[str, Any]) -> dict[str, Any]:
     one), and say nothing; updated again, the later version would find its settings gone.
     """
     by_id: dict[str, dict[str, dict[str, Any]]] = {}
-    for part, cls in (("users", UserRecord), ("devices", DeviceRecord), ("actions", ActionRecord), ("tokens", TokenRecord), ("pushes", PushRecord)):
+    for part, cls in (("users", UserRecord), ("devices", DeviceRecord), ("actions", ActionRecord), ("tokens", TokenRecord), ("pushes", PushRecord), ("destinations", DestinationRecord)):
         found = data.get(part)
         things: list[Any] = found if isinstance(found, list) else []
         by_id[part] = {str(thing["id"]): more for thing in things if isinstance(thing, dict) and "id" in thing and (more := _not_known(cls, thing))}
     return {
         "top": {key: value for key, value in data.items() if key not in _PARTS},
         "server": _not_known(ServerSettings, data.get("server")),
-        "alerts": _not_known(AlertSettings, data.get("alerts")),
+        "alerts": {key: value for key, value in _not_known(AlertSettings, data.get("alerts")).items() if key not in _ALERTS_OF_0_3_2},
+        "oidc": _not_known(OidcSettings, data.get("oidc")),
+        "backups": _not_known(BackupSettings, data.get("backups")),
+        "netbird": _not_known(NetbirdSettings, data.get("netbird")),
         "by_id": by_id,
     }
 
@@ -542,24 +702,7 @@ class Store:
             self.cipher = StorageCipher(read_key(selected) if existing or read_only or sealed_beside(path.parent) else create_key(selected))
             if encrypted and not read_only:
                 self.protected = True
-        self.server = ServerSettings()
-        self.users: list[UserRecord] = []
-        # Lets the recovery key unlock the vault, as a password would (vault.Vault.rewrap); None: no key was made.
-        self.recovery: dict[str, Any] | None = None
-        self.recovery_created = 0.0
-        # Lets the secret in the unlock file open the vault at start, in the same way (see unlock.py); None: not in use.
-        self.unlock: dict[str, Any] | None = None
-        self.devices: list[DeviceRecord] = []
-        self.actions: list[ActionRecord] = []
-        self.tokens: list[TokenRecord] = []
-        self.pushes: list[PushRecord] = []  # the browsers told the alerts by Web Push
-        self.alerts = AlertSettings()
-        self.recovered_from: Path | None = None  # set when the settings were read from the second copy: the damaged file, or None for one that was not there
-        self.restored = False  # ...and this says that they were
-        self.damage = ""  # ...and what was wrong with the file that was not used
-        self._version = VERSION
-        self._beyond = _beyond({})
-        self._writing = threading.Lock()  # one write at a time: they all go through the same temporary file
+        self._defaults()
         # With either of the two there, this is not a new wall. A start that was cut off between setting a damaged
         # file aside and writing the settings anew leaves only the second copy: taken for a first run, the wall
         # would be anybody's to set up, and the owner's settings would be written over at the second change.
@@ -567,6 +710,60 @@ class Store:
             self._load()
         if empty_left and not self.read_only:
             self._clear_empty(empty_left)
+        elif self.carried_over and not self.read_only and not self.restored:
+            self.save()  # (in the shape of this version from now on: a 0.3.2 wall's alert address as its first destination)
+
+    @classmethod
+    def of_document(cls, data: Any, path: Path) -> Store:
+        """Settings as a wall reads them from its file (`_take`), from a document held in memory: nothing is read or written,
+        and nothing can be. For a backup's settings (backup.py), checked whole before anything of them is restored, and read
+        for what they hold. ValueError (or another error of reading, as `_load` counts them) where a wall would not load them."""
+        store = cls.__new__(cls)
+        store.path, store.backup, store.backup_is_old = path, path.with_suffix(".bak"), False
+        store.read_only, store.protected, store.cipher, store.key_file = True, False, None, None
+        store._defaults()
+        if not isinstance(data, dict):
+            raise ValueError("not a settings file")
+        store._take(data)
+        return store
+
+    def _defaults(self) -> None:
+        """What a wall holds before anything is read: nothing (see `_take` for what a file gives)."""
+        self.server = ServerSettings()
+        self.users: list[UserRecord] = []
+        # Lets the recovery key unlock the vault, as a password would (vault.Vault.rewrap); None: no key was made.
+        self.recovery: dict[str, Any] | None = None
+        self.recovery_created = 0.0
+        # Lets the secret in the unlock file open the vault at start, in the same way (see unlock.py); None: not in use.
+        self.unlock: dict[str, Any] | None = None
+        # The activity log's key (0.4.0, chain.py): what signs each line of it, in hex; "" where none is made yet (a wall of
+        # 0.3.2: made at its first start of 0.4.0). Kept here, in the settings sealed with the vault key outside the data
+        # folder, and never in the activity log: rewriting the log so that it checks takes the vault as well.
+        self.activity_key = ""
+        # ...and where its chain had come to, the line and head of its last seal ({"n": ..., "head": hex}), kept here at each of
+        # them: the writer holds the files to it before its first line, so that a log edited while it was out of the wall's
+        # hands (its chain taken away, its end cut off) is not taken in as it is found. None: nothing kept yet.
+        self.activity_position: dict[str, Any] | None = None
+        self.devices: list[DeviceRecord] = []
+        self.actions: list[ActionRecord] = []
+        self.tokens: list[TokenRecord] = []
+        self.pushes: list[PushRecord] = []  # the browsers told the alerts by Web Push
+        self.destinations: list[DestinationRecord] = []  # where the alerts go; the first is the one GET/PUT /api/v1/alerts speak of
+        self.alerts = AlertSettings()
+        self.oidc = OidcSettings()  # signing in through an identity provider (oidc.py): off until an admin sets it up
+        self.backups = BackupSettings()  # backups of the whole wall to a folder (backup.py): off until an admin switches them on
+        self.netbird = NetbirdSettings()  # NetBird's management API, for "Find KVMs" (tailnet.py): off until an admin sets it up
+        self.recovered_from: Path | None = None  # set when the settings were read from the second copy: the damaged file, or None for one that was not there
+        self.restored = False  # ...and this says that they were
+        self.damage = ""  # ...and what was wrong with the file that was not used
+        self._version = VERSION
+        self._beyond = _beyond({})
+        self._writing = threading.Lock()  # one write at a time: they all go through the same temporary file
+        self.carried_over = False  # what an earlier version wrote was read in this version's shape: written so at the start
+        # The alert address of 0.3.2 as it was sealed then, written in 0.3.2's place as well for as long as the first destination
+        # is that address unchanged: a wall that goes back to 0.3.2 (an update that failed its trial, `qkvm --roll-back`)
+        # still finds it there, and does not go on with alerts on and nowhere to send them. None: there is none to keep.
+        self._for_0_3_2: dict[str, str] | None = None
 
     def _clear_empty(self, empty_left: list[Path]) -> None:
         """Take away what a power cut left of a write and holds nothing; write the second copy anew where that was it."""
@@ -605,6 +802,11 @@ class Store:
             data = json.loads(raw)
         if not isinstance(data, dict):
             raise ValueError("not a settings file")
+        self._take(data)
+
+    def _take(self, data: dict[str, Any]) -> None:
+        """Settings, from what a settings file holds (`_read`), as this version keeps them; ValueError (and the like: see
+        `_load`) where they cannot be used."""
         version = data.get("version")
         self._version = max(VERSION, version) if isinstance(version, int) and not isinstance(version, bool) else VERSION
         self._beyond = _beyond(data)
@@ -628,22 +830,55 @@ class Store:
             raise ValueError("when the recovery key was made is not a time")
         self.recovery_created = float(made)
         self.unlock = data.get("unlock") or None
+        activity_key = data.get("activity_key", "")
+        if activity_key != "" and not (isinstance(activity_key, str) and _ACTIVITY_KEY.fullmatch(activity_key)):
+            # (Made anew instead, every line before it would read as written by somebody else: the settings are damaged.)
+            raise ValueError("the activity log's key is not one this program makes")
+        self.activity_key = activity_key
+        position = data.get("activity_position")
+        if position is not None and position_of(position) is None:
+            raise ValueError("where the activity log's chain had come to is not said as this program says it")
+        self.activity_position = position
         self.devices = [DeviceRecord(**_only_known(DeviceRecord, d)) for d in data.get("devices", [])]
         self.actions = [ActionRecord(**_only_known(ActionRecord, a)) for a in data.get("actions", [])]
         self.tokens = [TokenRecord(**_only_known(TokenRecord, t)) for t in data.get("tokens", [])]
         self.pushes = [PushRecord(**_only_known(PushRecord, p)) for p in data.get("pushes", [])]
+        self.destinations = [DestinationRecord(**_only_known(DestinationRecord, d)) for d in data.get("destinations", [])]
         self.alerts = AlertSettings(**_only_known(AlertSettings, data.get("alerts", {})))
+        self.oidc = OidcSettings(**_only_known(OidcSettings, data.get("oidc", {})))  # (a file of 0.3.2 has none: off)
+        self.backups = BackupSettings(**_only_known(BackupSettings, data.get("backups", {})))  # (none before 0.4.0: off)
         _as_declared(self.server, "the settings under \"server\"")
         _as_declared(self.alerts, "the settings under \"alerts\"")
+        _as_declared(self.oidc, "the settings under \"oidc\"")
+        _as_declared(self.backups, "the settings under \"backups\"")
+        self.netbird = NetbirdSettings(**_only_known(NetbirdSettings, data.get("netbird", {})))  # (a file of 0.3.2 has none: off)
+        _as_declared(self.netbird, "the settings under \"netbird\"")
+        # What a group gives is a role, and somebody let in by the provider who is in no such group is given one or none:
+        # anything else written there by hand would be read at a sign-in as a role that is none.
+        if not all(isinstance(group, str) and role in ROLES for group, role in self.oidc.roles.items()):
+            raise ValueError(f"the settings under \"oidc\": every role in \"roles\" has to be one of {', '.join(ROLES)}")
+        if self.oidc.anyone not in ("", *ROLES):
+            raise ValueError(f"the settings under \"oidc\": \"anyone\" has to be empty or one of {', '.join(ROLES)}")
+        said_alerts: dict[str, Any] = data["alerts"] if isinstance(data.get("alerts"), dict) else {}
+        if "destinations" not in data:
+            self.destinations = _from_0_3_2(said_alerts)
+            self.carried_over = bool(self.destinations)
+        old_place = said_alerts.get("webhook")
+        first = self.destinations[0] if self.destinations else None
+        if isinstance(old_place, dict) and old_place and first is not None and first.id == FROM_0_3_2 and first.secret == old_place:
+            self._for_0_3_2 = copy.deepcopy(old_place)
         if not 1 <= self.server.port <= 65535:
             raise ValueError("the settings under \"server\": \"port\" has to be a number from 1 to 65535")
         # How often the wall looks is a number of seconds the form takes: from a fifth of one to a minute.
         # Written by hand as 0, every browser opened on "Paused"; as less than nothing, every browser asked
         # for pictures without a pause. Neither is a reason not to start: it is the nearest that makes sense.
         self.server.interval = min(60.0, max(0.2, float(self.server.interval)))
-        records: list[Any] = [*self.users, *self.devices, *self.actions, *self.tokens, *self.pushes]
+        records: list[Any] = [*self.users, *self.devices, *self.actions, *self.tokens, *self.pushes, *self.destinations]
         for number, record in enumerate(records):
-            kind = {UserRecord: "account", DeviceRecord: "device", ActionRecord: "saved action", TokenRecord: "token", PushRecord: "browser told the alerts"}[type(record)]
+            kind = {
+                UserRecord: "account", DeviceRecord: "device", ActionRecord: "saved action", TokenRecord: "token", PushRecord: "browser told the alerts",
+                DestinationRecord: "alert destination",
+            }[type(record)]  # fmt: skip
             what = f"the {kind} {record.id!r}" if isinstance(record.id, str) and _ID.fullmatch(record.id) else f"record {number + 1} (a {kind})"
             _as_declared(record, what)
             # And a few that are of the right kind and still no good: every look at the wall asks an
@@ -741,12 +976,27 @@ class Store:
             "recovery": copy.deepcopy(self.recovery),
             "recovery_created": self.recovery_created,
             "unlock": copy.deepcopy(self.unlock),
+            "activity_key": self.activity_key,
+            "activity_position": copy.deepcopy(self.activity_position),
             "devices": things("devices", self.devices),
             "actions": things("actions", self.actions),
             "tokens": things("tokens", self.tokens),
             "pushes": things("pushes", self.pushes),
-            "alerts": {**beyond["alerts"], **asdict(self.alerts)},
+            "destinations": things("destinations", self.destinations),
+            "alerts": {**beyond["alerts"], **asdict(self.alerts), **self._place_of_0_3_2()},
+            "oidc": {**beyond["oidc"], **asdict(self.oidc)},
+            "backups": {**beyond["backups"], **asdict(self.backups)},
+            "netbird": {**beyond["netbird"], **asdict(self.netbird)},
         }
+
+    def _place_of_0_3_2(self) -> dict[str, Any]:
+        """The alert address in the place 0.3.2 reads it from, with how its service is spoken to: while the first destination
+        is the address carried over from 0.3.2, unchanged (see _for_0_3_2). Nothing once it was changed or removed."""
+        first = self.destinations[0] if self.destinations else None
+        if self._for_0_3_2 is None or first is None or first.id != FROM_0_3_2 or first.secret != self._for_0_3_2:
+            return {}
+        form = (first.config.get("format") if first.config.get("format") in ("auto", "json") else "json") if first.kind == "webhook" else first.kind
+        return {"webhook": copy.deepcopy(self._for_0_3_2), "format": form if form in _FORMATS_OF_0_3_2 else "auto"}
 
     def save(self) -> None:
         self.write(self.snapshot())
@@ -1044,10 +1294,19 @@ def _finite(text: str) -> float:
 _DECODERS = threading.local()  # one reader of entries a thread, made once: json.loads with these hooks made one a line
 
 
+def _unique(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """An object of an entry, where a name comes once. Twice, a reader of JSON keeps the last, and whoever reads the line as
+    text (grep, a collector) may read the first: such a line is no entry (the review of wave 2, L4; as oidc._unique)."""
+    made = dict(pairs)
+    if len(made) != len(pairs):
+        raise ValueError("a name twice in one object")
+    return made
+
+
 def _decoder() -> json.JSONDecoder:
     decoder: json.JSONDecoder | None = getattr(_DECODERS, "decoder", None)
     if decoder is None:
-        decoder = _DECODERS.decoder = json.JSONDecoder(parse_constant=_no_number, parse_float=_finite)
+        decoder = _DECODERS.decoder = json.JSONDecoder(parse_constant=_no_number, parse_float=_finite, object_pairs_hook=_unique)
     return decoder
 
 
@@ -1295,6 +1554,113 @@ def lines_backwards(file: Any, end: int, block: int = 1 << 16) -> Iterator[bytes
         yield from reversed(lines)
 
 
+_BLOCK = 1 << 16  # bytes read at a time by the readers of the chain below
+
+
+def _back_with_places(file: Any, end: int) -> Iterator[tuple[int, bytes]]:
+    """The lines of an open file of the activity log up to byte `end`, the last first, each with where it begins: (place,
+    line). As lines_backwards, a line longer than LONGEST_LINE is handed on as (-1, b"") and its bytes are not kept."""
+    at, tail, long = end, b"", False  # (tail: the end of a line whose beginning lies further back, as far as it was read)
+    while at > 0:
+        start = max(0, at - _BLOCK)
+        file.seek(start)
+        data = file.read(at - start)
+        at = start
+        cut = data.rfind(b"\n")
+        if cut < 0:
+            if not long:
+                tail = data + tail
+                long = len(tail) > LONGEST_LINE
+                tail = b"" if long else tail
+            continue
+        first = data[cut + 1 :]
+        yield (-1, b"") if long or len(first) + len(tail) > LONGEST_LINE else (start + cut + 1, first + tail)
+        end_of = cut
+        while (cut := data.rfind(b"\n", 0, end_of)) >= 0:
+            line = data[cut + 1 : end_of]
+            yield (start + cut + 1, line) if len(line) <= LONGEST_LINE else (-1, b"")
+            end_of = cut
+        tail = data[:end_of]
+        long = len(tail) > LONGEST_LINE
+        tail = b"" if long else tail
+    yield (-1, b"") if long else (0, tail)
+
+
+def _forward(file: Any, start: int, end: int, newest: bool) -> Iterator[bytes]:
+    """The lines of an open file of the activity log from byte `start` to `end`, the first first, as AuditLog.entries reads
+    them: of the file being written (`newest`), not what follows its last line feed (a line still on its way); of an old one,
+    that too (it will never end). A line longer than LONGEST_LINE is handed on as b"", its bytes not kept."""
+    at, carry, long = start, b"", False
+    while at < end:
+        file.seek(at)
+        data = file.read(min(_BLOCK, end - at))
+        if not data:
+            break
+        at += len(data)
+        parts = data.split(b"\n")
+        for part in parts[:-1]:
+            yield b"" if long or len(carry) + len(part) > LONGEST_LINE else carry + part
+            carry, long = b"", False
+        if not long:
+            carry += parts[-1]
+            long = len(carry) > LONGEST_LINE
+            carry = b"" if long else carry
+    if not newest and (carry or long):
+        yield b"" if long else carry
+
+
+def _signed(entry: dict[str, Any], found: chain.Link, key: bytes | None) -> bool:
+    """Whether a chained line's signature checks with `key` (every line does where there is none to check it with)."""
+    return key is None or hmac.compare_digest(chain.signature(key, chain.link(found.prev, found.number, chain.digest(entry))), found.mac)
+
+
+def _last_chained(file: Any, end: int, key: bytes | None = None) -> tuple[int, dict[str, Any], chain.Link] | None:
+    """The last line of an open file of the activity log that has its place in the chain, its signature checking with `key`:
+    (where the line after it begins, its entry, its place). None where none has. (Read from the end: in a large file only as
+    far as it is wanted.) A line with a chain whose signature does not check is passed over: it is no place of the wall's
+    chain (made up, or changed: its number may be any, 2**63 - 1 say, and was taken for where the chain stands; the
+    re-review of wave 2, N1)."""
+    for place, line in _back_with_places(file, end):
+        if place >= 0 and b'"chain"' in line:
+            entry = entry_of(line)
+            found = chain.Link.of(entry) if entry is not None else None
+            if entry is not None and found is not None and found.number and _signed(entry, found, key):
+                return min(place + len(line) + 1, end), entry, found
+    return None
+
+
+def _time_of(line: str) -> float | None:
+    """The time a line given to the writer says, for a seal the writer writes before it (the genesis, a seal of lines without
+    the chain, a seal of pruning): such a seal says the moment of the line it comes with, not of when the writer got to it (a
+    look at a long log takes seconds, and the lines given meanwhile were then older than the seal written before them)."""
+    entry = entry_of(line.encode("utf-8"))
+    return float(entry["time"]) if entry is not None else None
+
+
+def _head_of(entry: dict[str, Any], found: chain.Link) -> tuple[int, bytes]:
+    """(number, head) after a chained line, as it stands."""
+    return found.number, chain.link(found.prev, found.number, chain.digest(entry))
+
+
+@dataclass
+class Sealing:
+    """A seal asked of the activity log's writer (AuditLog.seal): written in its turn, and then `done`, with `head` the place
+    of the seal in the chain, (number, head), where it was written."""
+
+    why: str
+    detail: dict[str, Any]
+    done: threading.Event = field(default_factory=threading.Event)
+    head: tuple[int, bytes] | None = None
+    at: float = field(default_factory=time.time)  # when it was asked for: its time, as an entry's is when it is given
+
+
+SEAL_EVERY = 3600.0  # seconds after a seal after which one is written again, where anything was written since
+
+
+class CheckHalted(Exception):
+    """A check of the activity log was stopped before its end (the wall stopping)."""
+
+
 DEFAULT_ACTIVITY_MB, LEAST_ACTIVITY_MB, MOST_ACTIVITY_MB = 50, 10, 100_000
 
 
@@ -1315,13 +1681,27 @@ class AuditLog:
     index the page searches (activity.py) is made from these files and from nothing else; neither is waited for.
 
     Kept: the file being written, and OLD_FILES before it, of max_bytes each (a tenth of `activity_mb`: 5 MB as it
-    comes, which is some nine months of a busy wall; the README has the numbers). Enough that what somebody did cannot
+    comes, which is some nine months of a busy wall; the guide has the numbers). Enough that what somebody did cannot
     be pushed out of the log by doing something harmless a few thousand times afterwards.
+
+    Given a `key` (the wall's, kept in its sealed settings), each line is chained and signed as it is written (chain.py),
+    by the writer alone and in its order: its number, the head before it and its signature are added at its end. Before
+    its first line the writer reads where the chain stands in the files (`_begin`), and seals what it finds without the
+    chain there; before the oldest file goes, it writes what goes and the head the rest goes on from; and it writes a seal
+    of its own every SEAL_EVERY where anything was written since, and where it is asked (`seal`: at the wall's start and
+    end, and for the daily seal of the alerts). Without a key, lines are written as before 0.4.0.
     """
 
     OLD_FILES = 9
 
-    def __init__(self, path: Path, max_bytes: int | None = None, forward: Callable[[str], None] | None = None) -> None:
+    def __init__(
+        self,
+        path: Path,
+        max_bytes: int | None = None,
+        forward: Callable[[str], None] | None = None,
+        key: bytes | None = None,
+        held: Callable[[], tuple[int, bytes] | None] | None = None,
+    ) -> None:
         self.path = path
         self.max_bytes = activity_file_bytes(DEFAULT_ACTIVITY_MB) if max_bytes is None else max_bytes
         self.forward = forward  # given each entry once it is written, for sending on (it must not wait for anything)
@@ -1336,31 +1716,126 @@ class AuditLog:
         self._unsaid = 0  # ...and how many of them the log itself does not yet say are missing
         self._unsaid_since: float | None = None  # ...since when (of this hole: there may have been one before)
         self._told = 0.0  # when the program's own log last said so
-        self._waiting: queue.Queue[str] = queue.Queue()
+        self._waiting: queue.Queue[str | Sealing | None] = queue.Queue()  # (None: the writer ends there, see close)
         self._writer: threading.Thread | None = None
         self._starting = threading.Lock()
+        self.key = key
+        # The writer's: where the chain stands, (number, head) of the last line of it in the file; None until it has looked
+        # (`_begin`), and again where a write may have been cut short (it looks again before the next).
+        self._chain: tuple[int, bytes] | None = None
+        self.head: tuple[int, bytes] | None = None  # the same, as last written, for whoever checks the log while it runs
+        self._chain_off = False  # the writer's: the chain failed for a slip of this program's own; this run writes without it
+        self._sealed_at = time.monotonic()  # the writer's: when it last wrote a seal of its own (SEAL_EVERY)
+        self._since_seal = False  # ...and whether anything was written since
+        self._let_go: str | None = None  # the writer's: the oldest file (its mark) a seal of pruning was written for
+        # Where the chain had come to as the wall keeps it outside the data folder (the line and head of its last seal, in the
+        # sealed settings): the files are held to it before the writer's first line (`_begin`). None: nothing is kept.
+        self.held = held
+        # Told the place of each seal once it is written (why, number, head), to keep it where `held` reads it. Called in the
+        # writer's thread: it must not wait for anything.
+        self.on_sealed: Callable[[str, int, bytes], None] | None = None
 
     def write(self, event: str, ip: str, **detail: Any) -> None:
-        self._waiting.put(json.dumps({"time": time.time(), "event": event, "ip": ip, **detail}) + "\n")
-        if self._writer is None:
-            with self._starting:
-                if self._writer is None:
-                    self._writer = threading.Thread(target=self._write_on, name="activity-log", daemon=True)
-                    self._writer.start()
+        if chain.FIELD in detail:
+            detail["chain_"] = detail.pop(chain.FIELD)  # (the chain's own field is the writer's alone)
+        line = json.dumps({"time": time.time(), "event": event, "ip": ip, **detail}) + "\n"
+        self._give(line)
+
+    def _give(self, item: str | Sealing) -> None:
+        with self._starting:  # (with the writer's end, see close: an entry is never left behind a writer that has ended)
+            self._waiting.put(item)
+            if self._writer is None:
+                self._writer = threading.Thread(target=self._write_on, name="activity-log", daemon=True)
+                self._writer.start()
+
+    def seal(self, why: str, **detail: Any) -> Sealing | None:
+        """A seal written in its turn, after what was given before it (None where the log has no key: no chain). Never waits."""
+        if self.key is None:
+            return None
+        sealing = Sealing(why, detail)
+        self._give(sealing)
+        return sealing
+
+    def sealed(self, why: str, within: float = 10.0, **detail: Any) -> tuple[int, bytes] | None:
+        """A seal, waited for (in a worker thread): its place in the chain, (number, head), or None where none was written."""
+        sealing = self.seal(why, **detail)
+        if sealing is None or not sealing.done.wait(within):
+            return None
+        return sealing.head
+
+    def close(self, within: float = 5.0) -> None:
+        """What was given is written, and the writer's thread ends: waited for `within` seconds at the most (a disk that
+        does not answer does not hold whoever closes it). An entry given after this starts one again, as the first did.
+
+        For a wall that ends (its listeners closed, and opened anew where the network settings changed): one ended in a
+        test went on waiting for an entry that never came, a thread for every wall, some 1,400 in one run of the tests."""
+        with self._starting:
+            writer = self._writer
+            if writer is None:
+                return
+            self._waiting.put(None)  # (after what was given before it)
+        writer.join(within)
 
     def _write_on(self) -> None:
+        self._chain = None  # (a writer of its own reads where the chain stands before its first line: see _begin)
         while True:
-            line = self._waiting.get()
             try:
-                self._append(line)
-                if self.on_written is not None:
-                    self.on_written()
-                if self.forward is not None:
-                    self.forward(line)
+                item = self._waiting.get(timeout=self._seal_due())
+            except queue.Empty:
+                self._seal_every()
+                continue
+            if item is None:
+                with self._starting:
+                    self._waiting.task_done()
+                    if self._waiting.empty():
+                        self._writer = None
+                        return
+                continue  # (given after the close and before its end was come to: written by this one, in its turn)
+            try:
+                self._put(item)
             except Exception:  # whatever goes wrong with one entry, the ones after it are written
                 pass
             finally:
+                if isinstance(item, Sealing):
+                    item.done.set()
                 self._waiting.task_done()
+            due = self._seal_due()
+            if due is not None and time.monotonic() - self._sealed_at >= SEAL_EVERY:
+                self._seal_every()  # (a wall that writes all the time is sealed as often: it never waits that long)
+
+    def _put(self, item: str | Sealing) -> None:
+        """One entry given, or a seal asked for: written, told, sent on."""
+        if isinstance(item, Sealing):
+            sealing: Sealing | None = item
+            detail = dict(item.detail)
+            if item.why == "start" and self.key is not None:
+                detail.setdefault("key", chain.key_id(self.key))  # (which key the run signs with: a check given another says so)
+            line = self._seal_line(item.why, at=item.at, **detail)
+        else:
+            sealing, line = None, item
+        written = self._append(line, sealing)
+        if self.on_written is not None:
+            self.on_written()
+        if self.forward is not None:
+            for each in written:
+                self.forward(each)
+
+    def _seal_due(self) -> float | None:
+        """Seconds the writer waits for an entry before it writes a seal of its own (None: for ever, without the chain)."""
+        if self.key is None or self._chain_off:
+            return None
+        return max(0.05, SEAL_EVERY - (time.monotonic() - self._sealed_at))
+
+    def _seal_every(self) -> None:
+        """A seal of the writer's own, every SEAL_EVERY where anything was written since the last. (Its time is counted from
+        the try: one the disk refuses is tried again in SEAL_EVERY, not at once and again.)"""
+        self._sealed_at = time.monotonic()
+        if not self._since_seal:
+            return
+        try:
+            self._put(Sealing("hourly", {}))
+        except Exception:
+            pass
 
     def _old(self, number: int) -> Path:
         return self.path.with_name(f"{self.path.name}.{number}")
@@ -1403,12 +1878,52 @@ class AuditLog:
         except OSError:
             return True  # (not there; or not to be read just now, and then whatever is written is written as it was)
 
-    def _append(self, line: str) -> None:
+    def _append(self, line: str, sealing: Sealing | None = None) -> list[str]:
+        """Write one line, and what has to come before it. Returns what was written, to be sent on (the line as it was given,
+        where it could not be written).
+
+        Where the chain fails for a slip of this program's own, the line is written all the same, without it, and so is
+        every line after it until qKVM starts again: the record comes first. (The next start seals what it finds without
+        the chain, and the check says so.)"""
+        chained = self.key is not None and not self._chain_off
         try:
-            if self.path.stat().st_size > self.max_bytes:
-                self._rotate()
+            return self._write_line(line, sealing, chained)
+        except OSError as ex:
+            self._refused(ex)
+            return [line]
+        except Exception:
+            if not chained:
+                raise
+            log.exception("the activity log's chain failed: its lines are written without it until qKVM starts again")
+            self._chain_off, self._chain = True, None
+        try:
+            return self._write_line(line, sealing, chained=False)
+        except OSError as ex:
+            self._refused(ex)
+            return [line]
+
+    def _write_line(self, line: str, sealing: Sealing | None, chained: bool) -> list[str]:
+        written: list[str] = []
+        if chained and self._chain is None:
+            begun = self._begin(_time_of(line))
+            if begun:
+                written += self._written(begun, chained=True, sync=True)
+        try:
+            full = self.path.stat().st_size > self.max_bytes
         except OSError:
-            pass  # not there yet, or held open by something else just now: written on, and moved aside another time
+            full = False  # not there yet, or held open by something else just now: written on, and moved aside another time
+        if full:
+            # The seal of what goes is written before anything goes. Where the disk refuses it, the line is refused with it, as any
+            # write: counted, said before the next line, and that one begins where a line ends. (Written on regardless, the line
+            # went in without the chain, the writer's place being unknown then, and onto what the refused seal left of a line:
+            # the review of wave 2, L3.) Where the oldest file cannot be read just now, nothing goes this time (None).
+            sealed = self._seal_pruning(_time_of(line)) if chained else []
+            if sealed is not None:
+                written += sealed
+                try:
+                    self._rotate()
+                except OSError:
+                    pass  # (held open by something else just now: moved aside another time)
         told = bool(self._unsaid and self.missing is not None)
         # A line the last run did not end (it was cut off in the middle of a write) is ended first. Written on, the next entry
         # was part of that line, and read as one with it it was no entry: the first thing done after a restart was missing
@@ -1416,33 +1931,295 @@ class AuditLog:
         # every entry: a second opening of the file for each slowed the writer, and under load what was asked to be read a
         # moment later was not written yet). A line feed is added; nothing that is there is changed.
         mended = "" if self._ends or self._ended() else "\n"
+        lines = []
+        if told and self.missing is not None:
+            # It can be written again. The hole is written into it first: what is known of it here
+            # is gone with the next restart, and the log would then read as if nothing were missing.
+            gap = {"time": time.time(), "event": "log_gap", "ip": "", "count": self._unsaid, "since": self._unsaid_since or self.missing["since"], "why": self.missing["why"]}
+            lines.append(json.dumps(gap) + "\n")
+        lines.append(line)
+        written += self._written(lines, chained=chained, mended=mended, sync=sealing is not None)
+        if told:
+            self._unsaid, self._unsaid_since = 0, None
+        if sealing is not None and chained:
+            sealing.head = self._chain
+        return written
+
+    def _written(self, lines: list[str], *, chained: bool, mended: str = "", sync: bool = False) -> list[str]:
+        """Lines written, in one go, each stamped with its place in the chain where `chained` (a line that is no entry, as
+        entry_of reads it, is written as it is: nothing reads it as one). `sync`: on the disk before this returns (a seal,
+        whose head goes outward). The writer's place in the chain moves on only once they are on their way: where the disk
+        refuses, it is read again from the files before the next line (`_append`)."""
+        out: list[str] = []
+        place = self._chain if chained else None
+        sealed_last: bool | None = None
+        seals: list[tuple[str, int, bytes]] = []
+        for line in lines:
+            entry = entry_of(line.encode("utf-8")) if place is not None else None
+            if place is None or entry is None or self.key is None:
+                out.append(line)
+                continue
+            stamped, head = chain.stamp(line, entry, place[0] + 1, place[1], self.key)
+            place = (place[0] + 1, head)
+            out.append(stamped)
+            sealed_last = entry.get("event") == chain.SEALED
+            if sealed_last:
+                seals.append((str(entry.get("why")), *place))
         try:
             with private(self.path, "a", encoding="utf-8") as fh:
                 if mended:
                     fh.write(mended)
-                if told and self.missing is not None:
-                    # It can be written again. The hole is written into it first: what is known of it here
-                    # is gone with the next restart, and the log would then read as if nothing were missing.
-                    gap = {"time": time.time(), "event": "log_gap", "ip": "", "count": self._unsaid, "since": self._unsaid_since or self.missing["since"], "why": self.missing["why"]}
-                    fh.write(json.dumps(gap) + "\n")
-                fh.write(line)
+                fh.write("".join(out))
+                if sync:
+                    fh.flush()
+                    os.fsync(fh.fileno())
             # (Only now is it on its way to the disk: a full one refuses at the end, when the file is closed.)
-            self._ends = True
-            if told:
-                self._unsaid, self._unsaid_since = 0, None
-        except OSError as ex:
-            # A full disk must not take the wall down, nor keep anybody from pressing what has to be pressed.
-            # But then things are done of which no record is kept, and that at least is said: in the program's
-            # own log, and to whoever opens the activity log (see `missing`).
-            now = time.time()
-            why = ex.strerror or type(ex).__name__
-            self._ends = False  # (a write the disk refused may have left part of a line: looked at before the next)
-            self.missing = {"count": (self.missing or {}).get("count", 0) + 1, "since": (self.missing or {}).get("since", now), "why": why}
-            self._unsaid += 1
-            self._unsaid_since = self._unsaid_since or now
-            if now - self._told > 60:
-                self._told = now
-                log.error("the activity log could not be written (%s): %d of its entries are missing since this started", why, self.missing["count"])
+        except OSError:
+            self._chain = None  # (part of it may be there: where the chain stands is read again before the next line)
+            raise
+        self._ends = True
+        if place is not None:
+            self._chain = self.head = place
+        if sealed_last is not None:
+            self._since_seal = not sealed_last
+            if sealed_last:
+                self._sealed_at = time.monotonic()
+        told = self.on_sealed
+        for why, number, head in seals:
+            try:
+                if told is not None:
+                    told(why, number, head)
+            except Exception:  # (keeping it is somebody else's; the log goes on)
+                log.exception("where the activity log's chain had come to could not be handed on to be kept")
+        return out
+
+    def _refused(self, ex: OSError) -> None:
+        # A full disk must not take the wall down, nor keep anybody from pressing what has to be pressed.
+        # But then things are done of which no record is kept, and that at least is said: in the program's
+        # own log, and to whoever opens the activity log (see `missing`).
+        now = time.time()
+        why = ex.strerror or type(ex).__name__
+        self._ends = False  # (a write the disk refused may have left part of a line: looked at before the next)
+        self.missing = {"count": (self.missing or {}).get("count", 0) + 1, "since": (self.missing or {}).get("since", now), "why": why}
+        self._unsaid += 1
+        self._unsaid_since = self._unsaid_since or now
+        if now - self._told > 60:
+            self._told = now
+            log.error("the activity log could not be written (%s): %d of its entries are missing since this started", why, self.missing["count"])
+
+    def _opened(self) -> list[tuple[Path, BinaryIO]]:
+        """The files there are, the newest first, opened at once to be read (open_shared). One that cannot be opened is passed
+        over, as a reading of the log passes it over (entries)."""
+        opened: list[tuple[Path, BinaryIO]] = []
+        for path in self.files():
+            try:
+                opened.append((path, open_shared(path)))
+            except OSError:
+                continue
+        return opened
+
+    def _seal_line(self, why: str, at: float | None = None, **detail: Any) -> str:
+        """A seal as a line: its time `at` (when it was asked for, or that of the line it is written before), else now."""
+        return json.dumps({"time": time.time() if at is None else at, "event": chain.SEALED, "ip": "", "why": why, **detail}) + "\n"
+
+    def _begin(self, at: float | None = None) -> list[str]:
+        """(The writer's, before its first line.) Where the chain stands in the files: its last line, read from the end. Lines
+        without the chain after it (an earlier version ran in between, or somebody put them in) are taken in as they are and
+        sealed ("unchained": how many; their head is in the seal's link). Where no line has the chain (the first start of
+        0.4.0, or a new log), every line there is is taken in, from the oldest file's first, and sealed ("genesis": how many,
+        and the head after each file, so that the oldest can go as the log lets it go). Returns that seal, to be written
+        first; nothing where the chain goes on from its last line.
+
+        The file being written is ended first where it does not end with a line feed (as `_append` ends it): a line a power
+        cut left without its end is read as what it will be once it is ended, and its number is never given twice."""
+        if not self._ends and not self._ended():
+            with private(self.path, "a", encoding="utf-8") as fh:
+                fh.write("\n")
+        self._ends = True
+        assert self.key is not None
+        # Where the chain had come to: as this writer last wrote it, else as the wall keeps it in its sealed settings.
+        held = self.head if self.head is not None else (self.held() if self.held is not None else None)
+        opened = self._opened()
+        try:
+            for index, (path, file) in enumerate(opened):
+                end = file.seek(0, os.SEEK_END)
+                found = _last_chained(file, end, self.key)
+                if found is None:
+                    continue
+                after, entry, place = found
+                number, head = _head_of(entry, place)
+                rest = [(file, after, path == self.path)] + [(newer, 0, name == self.path) for name, newer in reversed(opened[:index])]
+                lines = list(self._entries_of(rest))
+                wrong = [] if held is None else self._held_to(opened[index:], number, head, held, self.key)
+                made_up = sum(chain.FIELD in one for one in lines)
+                if made_up:
+                    wrong.append(f"{made_up} {'line' if made_up == 1 else 'lines'} after line {number} carry a chain the wall did not sign (made up, or changed)")
+                stopped = entry.get("event") == chain.SEALED and entry.get("why") == "stop"
+                seals = sum(one.get("event") == chain.SEALED for one in lines)
+                if lines and not stopped:
+                    wrong.append(f"{len(lines)} lines without the chain after line {number}, where the wall did not stop")
+                elif seals:
+                    wrong.append(f"{seals} of the {len(lines)} lines without the chain after line {number} are seals of the chain with their chain taken away")
+                if not lines and not wrong:
+                    self._chain = self.head = (number, head)
+                    return []
+                after_them, head = chain.virtual(head, number + 1, (chain.digest(one) for one in lines))
+                self._chain = (after_them - 1, head)
+                if wrong:
+                    return [self._broken(at, len(lines), wrong, held)]
+                return [self._seal_line("unchained", at=at, count=len(lines), key=chain.key_id(self.key))]
+            number, head, cuts, seals, made_up = 1, chain.ZERO, [], 0, 0
+            for path, file in reversed(opened):
+                before = number
+                for entry in self._entries_of([(file, 0, path == self.path)]):
+                    head = chain.link(head, number, chain.digest(entry))
+                    number += 1
+                    seals += entry.get("event") == chain.SEALED
+                    made_up += chain.FIELD in entry
+                if number > before:
+                    cuts.append([number - 1, head.hex()])
+            self._chain = (number - 1, head)
+            wrong = []
+            if made_up:
+                wrong.append(f"{made_up} of the lines found carry a chain the wall did not sign (made up, or changed)")
+            if held is not None:
+                wrong.append(f"no line of the log has the chain, and the wall had written it up to line {held[0]}: its chain was taken away, or the log replaced")
+            if seals:
+                wrong.append(f"{seals} of the lines found are seals of the chain with their chain taken away")
+            if wrong:
+                return [self._broken(at, number - 1, wrong, held)]
+            return [self._seal_line("genesis", at=at, before=number - 1, files=cuts, key=chain.key_id(self.key))]
+        finally:
+            for _, file in opened:
+                file.close()
+
+    def _broken(self, at: float | None, count: int, wrong: list[str], held: tuple[int, bytes] | None) -> str:
+        """The seal of what the writer found wrong before its first line (a problem in every check), with the lines without the
+        chain it takes in so that what comes after it is checked as before."""
+        assert self.key is not None
+        log.error("the activity log is not as the wall left it: %s", "; ".join(wrong))
+        kept = {"held": [held[0], held[1].hex()]} if held is not None else {}
+        return self._seal_line("broken", at=at, count=count, said="; ".join(wrong)[:1000], key=chain.key_id(self.key), **kept)
+
+    @staticmethod
+    def _held_to(opened: list[tuple[Path, BinaryIO]], number: int, head: bytes, held: tuple[int, bytes], key: bytes | None = None) -> list[str]:
+        """What is wrong with the files where the chain had come to `held` (number, head), their last chained line being
+        `number` with `head`: nothing, where that line is there as it was written. `opened`: the file of that last line, and the
+        older ones, the newest first."""
+        wanted, kept = held
+        if number < wanted:
+            return [f"the chain ends at line {number}, and the wall had written it up to line {wanted}: lines were cut off its end, or their chain taken away"]
+        if number == wanted:
+            return [] if head == kept else [f"line {wanted} is not the line the wall wrote there: it was changed, or the log written anew from there on"]
+        for _, file in opened:
+            for place, line in _back_with_places(file, file.seek(0, os.SEEK_END)):
+                if place < 0 or b'"chain"' not in line or (entry := entry_of(line)) is None or (found := chain.Link.of(entry)) is None or not found.number:
+                    continue
+                if not _signed(entry, found, key):  # (a line the wall did not sign is not its line, whatever its number)
+                    continue
+                if found.number == wanted:
+                    if _head_of(entry, found)[1] == kept:
+                        return []
+                    return [f"line {wanted} is not the line the wall wrote there: it was changed, or the log written anew from there on"]
+                if found.number < wanted:
+                    return [f"line {wanted}, which the wall wrote, is not in the log"]
+        return [f"line {wanted}, which the wall wrote, is not in the log"]
+
+    @staticmethod
+    def _entries_of(parts: list[tuple[BinaryIO, int, bool]]) -> Iterator[dict[str, Any]]:
+        """The entries of open files from a place in each, the first first: (file, from, whether it is the file being written)."""
+        for file, start, newest in parts:
+            end = file.seek(0, os.SEEK_END)
+            for line in _forward(file, start, end, newest):
+                entry = entry_of(line) if line else None
+                if entry is not None:
+                    yield entry
+
+    def _seal_pruning(self, at: float | None = None) -> list[str] | None:
+        """(The writer's, before the files move on.) Where the oldest file is about to go (every old one is there: see
+        _rotate), a seal of what goes, written into the full file before it: the last line it holds and the head after it
+        ("to", "head"), or, of a file from before the chain, how many lines it holds ("let_go"), which the genesis seal says
+        the head after. Written once a file (a rotation whose last step failed is tried again at the next line). None where
+        the oldest file cannot be read just now: nothing is to go this time. OSError where the disk refuses the seal."""
+        if any(not self._old(number).exists() for number in range(1, self.OLD_FILES + 1)):
+            return []
+        oldest = self._old(self.OLD_FILES)
+        try:
+            found = self._what_goes(oldest)
+        except OSError:
+            return None
+        if found is None:
+            return []
+        mark, detail = found
+        written = self._written([self._seal_line("pruned", at=at, **detail)], chained=True, sync=True)
+        self._let_go = mark
+        return written
+
+    def _what_goes(self, oldest: Path) -> tuple[str, dict[str, Any]] | None:
+        """What the seal of the oldest file says, with the file's mark; None where one was written for it already."""
+        with open_shared(oldest) as file:
+            end = file.seek(0, os.SEEK_END)
+            file.seek(0)
+            mark = f"{end}:{hashlib.sha256(file.read(4096)).hexdigest()}"
+            if mark == self._let_go:
+                return None
+            found = _last_chained(file, end, self.key)
+            if found is not None:
+                after, entry, place = found
+                number, head = _head_of(entry, place)
+                digests = [chain.digest(one) for one in self._entries_of([(file, after, False)])]
+                if digests:
+                    after_them, head = chain.virtual(head, number + 1, digests)
+                    number = after_them - 1
+                detail: dict[str, Any] = {"file": oldest.name, "to": number, "head": head.hex()}
+            else:
+                detail = {"file": oldest.name, "let_go": sum(1 for _ in self._entries_of([(file, 0, False)])), "to": None, "head": None}
+        return mark, detail
+
+    def oldest_first(self) -> Generator[dict[str, Any], None, None]:
+        """Every entry of the files, the oldest first, as `entries` reads them (the files as they are when this begins, all
+        opened at once, again where the writer moved them on meanwhile; of the file being written only lines that have
+        ended): what a check of the chain reads."""
+        opened: list[tuple[Path, BinaryIO]] = []
+        for attempt in range(5):
+            began = self.rotations
+            opened = self._opened()
+            if (began % 2 == 0 and self.rotations == began) or attempt == 4:
+                break
+            for _, file in opened:
+                file.close()
+            time.sleep(0.01)
+        try:
+            for path, file in reversed(opened):
+                try:
+                    yield from self._entries_of([(file, 0, path == self.path)])
+                except OSError:
+                    continue  # (gone bad while it was read: what is after it is read all the same)
+        finally:
+            for _, file in opened:
+                file.close()
+
+    def check(self, walk: chain.Walk, halt: threading.Event | None = None) -> chain.Verdict:
+        """Check the chain of the files as they are (in a worker thread: it reads them all), as the whole log: against the
+        wall's own head as well, as its writer last wrote it, and the place its sealed settings keep (`held`), whatever order
+        the lines are in (the outside review of 0.4.0, M3: after a start over a log cut back and turned round, the check said
+        lines out of their order and nothing of where the wall had come to). `walk` is made by whoever asks (its key, the heads
+        kept outside), and may be looked at while this runs (how far it is: walk.verdict.entries). CheckHalted where `halt`
+        is set meanwhile."""
+        self.flush()
+        if walk.own is None and self.head is not None:
+            walk.own = self.head
+        if walk.kept is None and self.held is not None:
+            walk.kept = self.held()
+        reading = self.oldest_first()
+        try:
+            for count, entry in enumerate(reading):
+                if halt is not None and count % 1000 == 0 and halt.is_set():
+                    raise CheckHalted("the check of the activity log was stopped: qKVM is stopping")
+                walk.take(entry)
+        finally:
+            reading.close()
+        return walk.end()
 
     def flush(self, within: float = 5.0) -> None:
         """Wait until what has been given so far is written, though not for ever."""

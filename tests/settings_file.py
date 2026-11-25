@@ -10,6 +10,7 @@ import json
 from pathlib import Path
 import re
 import sys
+import time
 from typing import Any
 
 from qkvm.vault_storage import MAGIC, StorageCipher, key_path, read_key
@@ -17,8 +18,22 @@ from qkvm.vault_storage import MAGIC, StorageCipher, key_path, read_key
 _SETTINGS = re.compile(r"qkvm\.(?:json|bak|tmp|bak\.new|damaged-.*\.json)\Z")
 
 
+def file_bytes(path: Path) -> bytes:
+    """The file's bytes. On Windows a file that the wall is replacing at that very moment refuses its reader (access
+    denied): looked at again for up to two seconds then, as the wall's own saving waits for a reader (store's
+    _replace_settings). (A test that read the settings of a wall just started so failed on GitHub's Windows runner, 3.12.)"""
+    deadline = time.monotonic() + 2.0
+    while True:
+        try:
+            return path.read_bytes()
+        except PermissionError:
+            if sys.platform != "win32" or time.monotonic() > deadline:
+                raise
+            time.sleep(0.02)
+
+
 def settings_text(path: Path, encoding: str = "utf-8", errors: str | None = None) -> str:
-    raw = path.read_bytes()
+    raw = file_bytes(path)
     if raw.startswith(MAGIC):
         raw = StorageCipher(read_key(key_path(path.parent))).open(raw)
     return raw.decode(encoding, errors or "strict")

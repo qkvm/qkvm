@@ -15,7 +15,7 @@ import sqlite3
 import threading
 import time
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -435,7 +435,10 @@ def test_a_read_that_takes_too_long_is_given_up(kept: History, monkeypatch: pyte
     t0 = time.time() - 3600
     for second in range(0, 3000):
         kept.observe("dev", ONLINE if second % 2 else OFFLINE, now=t0 + second)
-    kept.flush()
+    # (On a busy runner the writer took more than flush's usual 5 s for these: the read saw a part of them, was done in
+    # fewer steps than the progress handler's 10,000, and was never cut off. Each is written before it is read.)
+    kept.flush(within=60)
+    assert kept._waiting.unfinished_tasks == 0 and kept.dropped == 0, "the 3000 looks were not all written within 60 s"
     monkeypatch.setattr(history, "READ_PATIENCE", -1.0)  # out of patience before it begins
     with pytest.raises(history.NotReadable, match="took too long"):
         kept.read("dev", "summary", t0, t0 + 3000)
@@ -446,7 +449,8 @@ def test_a_read_that_takes_too_long_is_given_up(kept: History, monkeypatch: pyte
 def test_a_read_is_bounded_and_asks_for_known_things_only(kept: History) -> None:
     for second in range(0, 400):
         kept.observe("dev", ONLINE if second % 2 else OFFLINE, now=time.time() - 1000 + second)
-    kept.flush()
+    kept.flush(within=60)
+    assert kept._waiting.unfinished_tasks == 0 and kept.dropped == 0, "the 400 looks were not all written within 60 s"
     page = kept.read("dev", "states", 0, 1e11, limit=100)
     assert len(page["rows"]) == 100 and page["more"] is True
     whole = kept.read("dev", "states", 0, 1e11, limit=10**9)  # (a limit past MOST_ROWS is MOST_ROWS; the stalled-disk test above meets that cut)
@@ -878,45 +882,68 @@ def test_a_checkpoint_turned_away_by_another_is_tried_at_the_next_look_and_one_h
     # Two refusals that SQLite tells apart by its row: another connection's checkpoint holds the file's checkpoint lock,
     # (1, -1, -1) at once, and it is gone in a moment; a read holds the -wal file, (1, n, m) after the whole wait, and
     # may stay. The first is tried again at the next look, the second in a minute (or once the -wal file has doubled).
+    #
+    # The test made both at once, another connection checkpointing over and over beside the read, and looked until it had
+    # seen each: which of the two held the file at a look was a race, and on GitHub's slow Windows runners (3.11 and 3.13,
+    # 2026-11-16) the wall's looks never once fell between the other's checkpoints in 20 s ({'next look'}); on one core of
+    # Linux they always did ({'a minute'}). Now one at a time: the other's one checkpoint, seen to hold the checkpoint lock
+    # before the wall looks; then, once it has ended, the read alone.
     monkeypatch.setattr(history, "CHECKPOINT_PATIENCE", 0.2)
     kept = History(tmp_path / history.FILE, limits=lambda: (365, 10))
     kept._open()  # (the writer's connection, opened here: this test is the only thread that uses it)
     conn = kept._conn
     assert conn is not None
-    with conn:
-        conn.execute("INSERT INTO states (device, t, state, code) VALUES ('w', 1, 'online', '')")
-    reader = sqlite3.connect(tmp_path / history.FILE)
-    reader.execute("BEGIN")
-    reader.execute("SELECT COUNT(*) FROM states").fetchall()  # (a read that holds what it began with)
-    with conn:
-        conn.execute("INSERT INTO states (device, t, state, code) VALUES ('w', 2, 'offline', '')")  # (and something after it)
-    done = threading.Event()
 
-    def another() -> None:  # (a checkpoint of another connection, which waits for the read, holding the checkpoint lock)
-        other = sqlite3.connect(tmp_path / history.FILE, timeout=2.0)
-        while not done.is_set():
-            other.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
-        other.close()
+    def a_read_held_up_behind(t: int) -> sqlite3.Connection:
+        with conn:
+            conn.execute("INSERT INTO states (device, t, state, code) VALUES ('w', ?, 'online', '')", (t,))
+        reader = sqlite3.connect(tmp_path / history.FILE)
+        reader.execute("BEGIN")
+        reader.execute("SELECT COUNT(*) FROM states").fetchall()  # (a read that holds what it began with)
+        with conn:
+            conn.execute("INSERT INTO states (device, t, state, code) VALUES ('w', ?, 'offline', '')", (t + 1,))  # (and something after it)
+        return reader
+
+    def outcome() -> str:
+        assert not kept._checkpoint()
+        return "next look" if kept._wal_again <= time.monotonic() else "a minute" if kept._wal_again >= time.monotonic() + 50 else "?"
+
+    def checkpoint_lock_held() -> bool:
+        # (SQLite turns a checkpoint away at once, with no wait, while another connection holds its lock: (1, -1, -1). One
+        # that got the lock ends at once too, PASSIVE: it waits for nothing.)
+        with closing(sqlite3.connect(tmp_path / history.FILE)) as probe:
+            return bool(probe.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone() == (1, -1, -1))
+
+    reader = a_read_held_up_behind(1)
+    ended: list[tuple[int, int, int]] = []
+
+    def another() -> None:  # (one checkpoint of another connection, which waits for the read, holding the checkpoint lock)
+        with closing(sqlite3.connect(tmp_path / history.FILE, timeout=60.0)) as other:
+            while not ended:
+                said = other.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+                if said != (1, -1, -1):  # (turned away by the probe's moment with the lock: tried again)
+                    ended.append(said)
 
     other = threading.Thread(target=another, daemon=True)
     other.start()
-    outcomes: set[str] = set()
     try:
-        # (Which of the two holds the file at a look is a race between this thread and the other connection's: as many
-        # looks as 20 s hold, until each has been seen, rather than a hundred, which missed one now and then, on 0.2.0 too.)
-        until = time.monotonic() + 20
-        while time.monotonic() < until:
-            assert not kept._checkpoint()
-            outcomes.add("next look" if kept._wal_again <= time.monotonic() else "a minute" if kept._wal_again >= time.monotonic() + 50 else "?")
-            if {"next look", "a minute"} <= outcomes:
-                break
+        wait_until(checkpoint_lock_held, "the other connection's checkpoint never held the lock", timeout=20)
+        first = outcome()
+        assert other.is_alive() and not ended  # (it held the lock all the while)
+        reader.rollback()  # the read ends, and the other's checkpoint with it
+        other.join(30)
+        assert ended and not other.is_alive(), "the other connection's checkpoint did not end with the read"
+        reader.close()
+        reader = a_read_held_up_behind(3)  # then a read alone holds the file
+        second = outcome()
     finally:
-        done.set()
-        other.join(10)
         reader.rollback()
         reader.close()
+        if other.is_alive():
+            ended.append((0, 0, 0))
+        other.join(70)
         kept._close()
-    assert outcomes == {"next look", "a minute"}, outcomes
+    assert (first, second) == ("next look", "a minute")
 
 
 def test_a_checkpoint_that_fails_with_an_error_is_not_tried_at_every_batch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

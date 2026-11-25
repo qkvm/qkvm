@@ -26,7 +26,7 @@ import httpx
 import pytest
 
 import qkvm
-from tests.test_wall import closed_port
+from tests.test_wall import port_to_listen_on
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "starter-0.2.0"
 PACKAGE = Path(qkvm.__file__).resolve().parent  # this tree's package: the update
@@ -125,7 +125,7 @@ def test_an_update_from_0_2_0_to_this_code_starts_and_is_proven(tmp_path: Path) 
         for path in [update.parent, update, *update.rglob("*")]:
             path.chmod(0o700 if path.is_dir() else 0o600)
     (data / "updates" / "current.json").write_text(json.dumps({"version": "9.9.9", "previous": None, "previous_proven": False}), encoding="utf-8")
-    port = closed_port()
+    port = port_to_listen_on()
     environment = {**os.environ, "PYTHONPATH": str(FIXTURE), "PYTHONDONTWRITEBYTECODE": "1"}  # (the copy pip installed: 0.2.0's starter)
     environment.pop("QKVM_CHILD", None)
     said = tmp_path / "starter.txt"
@@ -136,12 +136,20 @@ def test_an_update_from_0_2_0_to_this_code_starts_and_is_proven(tmp_path: Path) 
         )  # fmt: skip
     try:
         deadline = time.monotonic() + 120  # (0.2.0's starter calls an update proven after it stayed up for thirty seconds)
+        pointer = data / "updates" / "current.json"
+        seen: tuple[int, int] | None = None
+        noted: dict[str, object] = {}
         while True:
-            pointer = data / "updates" / "current.json"
-            noted = json.loads(pointer.read_text(encoding="utf-8")) if pointer.exists() else {}
+            # Looked at in its folder's list, and read only when that shows it changed. Windows cannot replace a file
+            # that is open, and 0.2.0's starter writes "proven" by one replace and lets an error pass: read every half
+            # second, the file was open at that moment on a slow machine, and the update stayed on trial.
+            listed = [(entry.stat().st_size, entry.stat().st_mtime_ns) for entry in os.scandir(pointer.parent) if entry.name == pointer.name]
+            if listed and listed[0] != seen:
+                seen = listed[0]
+                noted = json.loads(pointer.read_text(encoding="utf-8"))
             if noted.get("proven") is True:
                 break
-            if starter.poll() is not None or time.monotonic() > deadline or not pointer.exists():
+            if starter.poll() is not None or time.monotonic() > deadline or not listed:
                 pytest.fail(f"the update did not start under 0.2.0's starter; current.json: {noted or '(gone)'}; it said:\n{said.read_text(encoding='utf-8')[-3000:]}")
             time.sleep(0.5)
         assert noted["version"] == "9.9.9"

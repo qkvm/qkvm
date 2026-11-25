@@ -225,7 +225,7 @@ def test_a_file_cannot_reach_what_is_not_a_device_an_action_or_those_settings(tm
     assert [d["url"] for d in after["devices"]] == [nowhere(14)], [d["url"] for d in after["devices"]]
     assert all(len(d["id"]) == 8 and d["id"] != "deadbeef" and d["ident"] == "" and d["secret"] is None and set(d) == set(before_keys) for d in after["devices"])
     assert [(a["name"], a["changed"], a["secret"]) for a in after["actions"]] == [("a", 0, None)] and after["actions"][0]["id"] != "11112222"
-    assert after["alerts"]["paused_until"] == 0.0 and after["alerts"]["webhook"] is None and after["alerts"]["link"] == ""
+    assert after["alerts"]["paused_until"] == 0.0 and after["destinations"] == [] and "webhook" not in after["alerts"] and after["alerts"]["link"] == ""
 
 
 def test_who_is_refused_each_of_the_three(tmp_path: Path, fake: FakeKvm) -> None:

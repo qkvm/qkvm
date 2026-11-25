@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import socket
+import ssl
 import threading
 import time
 from collections.abc import Iterator
@@ -20,15 +21,18 @@ from typing import Any
 
 import httpx
 import pytest
+from cryptography.hazmat.primitives import serialization
 
 from qkvm import amt, discover, exchange, kvm, update, vault, vncdevice
 from qkvm.amt import AmtDevice, Challenge, answer_to, body_of, challenge_from, family_of, fields_of, int_of, own_number
 from qkvm.kvm import DeviceSpec, KvmError
+from tests.test_discover import searched
 from tests.conftest import SCALE, TICK
+from tests import fake_amt, fake_kvm
 from tests.fake_amt import GUID, AmtState, FakeAmt
 from tests.scripted_device import Scripted
 from tests.test_redfish import status_of
-from tests.test_wall import PASSWORD, add, closed_port, snap, wait_until, wall
+from tests.test_wall import PASSWORD, add, an_authority, closed_port, issued_by, snap, wait_until, wall
 from tests.settings_file import settings_text, settings_while_saved, write_settings_text
 
 S = 60.0  # for the tests that watch a tile for "minutes": every wait is a sixtieth of what it is
@@ -60,6 +64,19 @@ def a_pc(machine: FakeAmt, password: str = "secret") -> AmtDevice:
     return AmtDevice(DeviceSpec(id="ab12", name="PC", base_url=machine.url, username="admin", password=password, kind="amt"))
 
 
+def said_of(client: Any, device: str, said: Any) -> dict[str, Any]:
+    """The device's status once `said(status)` holds of it (read in the background: not the first answer after a press)."""
+    found: dict[str, Any] = {}
+
+    def there() -> bool:
+        found.clear()
+        found.update(client.get("/api/v1/status").json()[device])
+        return bool(said(found))
+
+    wait_until(there, "the status never said it")
+    return found
+
+
 def asked(machine: FakeAmt, what: str, of: str) -> int:
     return sum(1 for question, short in machine.state.requests if question == what and short == of)
 
@@ -89,6 +106,7 @@ def test_an_amt_pc_is_recognised_from_its_address_and_shows_how_it_is(tmp_path: 
             "power": 2, "control": "admin", "kvm": "enabled", "consent": False, "make": "Example Computers", "model": "Office Desk 7",
             "serial": "PC0000000001", "bios": "XB0Z07A (0.07)", "plain": True, "listener": True, "session_timeout": 0,
             "view": "stills",  # (its tile's view: a new tile's, tests/test_amt_views.py)
+            "shutdown": None,  # (no shutdown of the wall's late: test_a_shutdown_that_has_not_come_about_in_time_...)
         }  # fmt: skip
         assert server["no_screen"] is None  # (nothing stands against its screen)
         # Its screen, through its KVM: the first picture asked for opens a session, and the picture comes.
@@ -215,6 +233,64 @@ def test_a_power_cut_waiting_for_a_kvm_session_to_end_is_not_said_done_of_a_pc_b
     assert pc.state.actions == []
 
 
+@pytest.mark.parametrize("says", [2, 12])
+def test_a_shutdown_is_said_until_the_pc_is_off_and_a_power_cut_meanwhile_is_answered_with_it(tmp_path: Path, pc: FakeAmt, says: int) -> None:
+    # (Five real engines on 2026-11-17, D1-d.) Shut down: the engine took it at once, Windows was off about 80 s later, and
+    # meanwhile the tile said nothing of it; Hold power was refused "This machine does not offer off (8) from the state it is
+    # in". What the engine said of the PC's power meanwhile was not noted: on (2), or a state of its own (12 here), which is
+    # the one that refusal comes from. The tile says "Shutting down" until the PC is seen off, and Hold power says why not.
+    pc.state.graceful_takes, pc.state.graceful_says = 600.0, says  # (until the operating system is done: below)
+    with wall(tmp_path) as client:
+        device = add(client, pc.url)
+        act = f"/api/v1/devices/{device}/actions"
+        assert client.post(act, json={"action": "power_off"}).status_code == 200
+        status = said_of(client, device, lambda status: status["server"]["power"] == "Shutting down")
+        assert status["state"] == "online" and status["atx"]["power"] is not False
+        assert status["server"]["amt"]["shutdown"] is None  # (not late)
+        again = client.post(act, json={"action": "power_off"})
+        assert again.status_code == 200 and again.json()["note"] == "already shutting down"
+        cut = client.post(act, json={"action": "atx_power_long"})
+        assert (cut.status_code, cut.json()["code"]) == (502, "action_failed"), cut.json()
+        assert cut.json()["message"].startswith("Nothing was sent: a shutdown is under way"), cut.json()
+        assert pc.state.actions == [12]
+        pc.state.shutting_until, pc.state.power_later, pc.state.power = float("-inf"), None, 8  # (the operating system is done)
+        status = status_of(client, device, state="no_signal")
+        assert status["server"]["power"] == "Off" and status["server"]["amt"]["shutdown"] is None
+
+
+def test_a_power_cut_the_engine_offers_during_a_shutdown_is_sent(tmp_path: Path, pc: FakeAmt) -> None:
+    pc.state.graceful_takes, pc.state.withheld_while_shutting = 30.0, ()  # (an engine that offers the cut meanwhile)
+    with wall(tmp_path) as client:
+        device = add(client, pc.url)
+        act = f"/api/v1/devices/{device}/actions"
+        assert client.post(act, json={"action": "power_off"}).status_code == 200
+        said_of(client, device, lambda status: status["server"]["power"] == "Shutting down")
+        assert client.post(act, json={"action": "atx_power_long"}).status_code == 200
+        assert pc.state.actions == [12, 8]
+        status = status_of(client, device, state="no_signal")
+        assert status["server"]["power"] == "Off"
+
+
+def test_a_shutdown_that_has_not_come_about_in_time_is_said_and_the_power_cut_is_the_way(tmp_path: Path, pc: FakeAmt, monkeypatch: pytest.MonkeyPatch) -> None:
+    # The operating system did not take it (Intel's management service missing there, say), or is slow at it (updates).
+    monkeypatch.setattr(amt, "SHUTDOWN_LATE", 0.5)
+    pc.state.drops = [12]  # (taken, and nothing comes of it)
+    with wall(tmp_path) as client:
+        device = add(client, pc.url)
+        act = f"/api/v1/devices/{device}/actions"
+        assert client.post(act, json={"action": "power_off"}).status_code == 200
+        said_of(client, device, lambda status: status["server"]["power"] == "Shutting down")
+        status = said_of(client, device, lambda status: status["server"]["amt"]["shutdown"] == amt.SHUTDOWN_LATE_WORDS)
+        assert status["state"] == "online" and status["server"]["power"] == "Shutting down"
+        assert "Hold power" in amt.SHUTDOWN_LATE_WORDS
+        # Late: pressed again, it is asked again (it may not have been taken); and the power cut goes where it is offered.
+        assert client.post(act, json={"action": "power_off"}).json().get("note") is None
+        assert client.post(act, json={"action": "atx_power_long"}).status_code == 200
+        assert pc.state.actions == [12, 12, 8]
+        status = status_of(client, device, state="no_signal")
+        assert status["server"]["power"] == "Off" and status["server"]["amt"]["shutdown"] is None
+
+
 def test_a_shutdown_the_machine_does_not_offer_is_not_replaced_by_a_power_cut(tmp_path: Path, pc: FakeAmt) -> None:
     pc.state.offered = [2, 5, 8, 10]  # no agent in the operating system to ask: "shut down nicely" is not on offer
     with wall(tmp_path) as client:
@@ -283,6 +359,8 @@ def test_the_tile_says_whether_the_kvm_could_be_used_and_how_the_pc_was_set_up(t
             assert status["screen"] is True and status["server"]["no_screen"] is None
             return
         assert status["screen"] is False and status["server"]["no_screen"].endswith(f"({words}, over plain HTTP)")
+        if kvm == "absent":  # (vPro Essentials: a clear state, its panel and not a black tile)
+            assert status["server"]["no_screen"].startswith("No remote screen on this PC: its Intel AMT has no KVM (vPro Essentials).")
         assert "screen" not in status["can"] and "live" not in status["can"]
         # No session is opened where the screen is not to be had: not even to find out.
         refused = client.get(snap(device))
@@ -327,11 +405,13 @@ def test_a_wrong_password_is_refused_and_not_offered_again_and_again(tmp_path: P
         device = add(client, pc.url)
         status_of(client, device, state="online")
         pc.state.password = "changed on the machine"
-        status = status_of(client, device, state="auth")
-        assert status["error"]["code"] == "auth_failed"
+        # (A no to the password it took: first said as the engine refusing this wall for a while, which Intel AMT does after
+        # failed sign-ins; a no after that wait is the verdict: test_the_password_changed_on_the_machine_is_noticed_...)
+        status = status_of(client, device, state="error")
+        assert status["error"]["code"] == "no_sign_in" and "refuses sign-ins from qKVM" in status["error"]["message"]
         tries = pc.state.logins
         for _ in range(5):
-            status_of(client, device, state="auth")
+            status_of(client, device, state="error")
         assert pc.state.logins == tries  # it is left alone for a while, whatever the tile is asked meanwhile
         # The password typed again is tried at once, and the tile is well again.
         pc.state.password = "secret"
@@ -378,34 +458,200 @@ def test_a_nonce_that_ran_out_is_answered_again_and_is_no_verdict_on_the_passwor
             pc.state.nonces.clear()
             assert (await device._read_status())["state"] == "online"
             assert pc.state.rejections == 0 and kvm.REJECTED.times(kvm.REJECTED.what("login", device.spec)) == 0
-            # Whereas a no to a nonce the engine handed out just now is a no.
+            # Whereas a no to a nonce the engine handed out just now is a no: to the password it took, said first as the
+            # engine refusing this wall for a while (no verdict yet: see the next test), and nothing sent meanwhile.
             pc.state.password = "changed on the machine"
-            assert (await device._read_status())["state"] == "auth"
-            assert kvm.REJECTED.times(kvm.REJECTED.what("login", device.spec)) == 1
+            said = await device._read_status()
+            assert said["state"] == "error" and said["error"]["code"] == "no_sign_in"
+            offered = kvm.REJECTED.what("login", device.spec)
+            assert kvm.REJECTED.times(offered) == 0 and kvm.REJECTED.wait_left(offered) > amt.REFUSING_WAIT - 5
         finally:
             await device.close()
 
     asyncio.run(run())
 
 
-def test_the_password_changed_on_the_machine_is_noticed_in_the_middle_of_a_look_and_then_paced(pc: FakeAmt) -> None:
+def test_the_password_changed_on_the_machine_is_noticed_in_the_middle_of_a_look_and_then_paced(pc: FakeAmt, monkeypatch: pytest.MonkeyPatch) -> None:
+    # A no in the middle of a look to the password the engine took: once more with the question that was under way, once as
+    # a sign-in with the fresh challenge, and no more. That is said as the engine refusing this wall for a while (Intel AMT
+    # refuses an address after failed sign-ins, whatever the password: see amt.REFUSING_WAIT), and nothing is sent for that
+    # wait. A no after the wait is tried once more a little later (amt.LAST_TRY: a real engine still refused after the wait,
+    # and let the wall in 75 s later); a no then is the verdict on the password, and the ladder every device's rejected
+    # password waits begins: a minute first, as for every driver (the engine was left quiet past its own refusal).
+    monkeypatch.setattr(amt, "REFUSING_WAIT", 0.5)
+    monkeypatch.setattr(amt, "LAST_TRY", 0.5)
+
     async def run() -> None:
         device = a_pc(pc)
+        offered = kvm.REJECTED.what("login", device.spec)
         try:
             assert (await device._read_status())["state"] == "online"
             pc.state.password = "changed on the machine"
             said = await device._read_status()
-            assert said["state"] == "auth"
-            # Once more with the question that was under way, once as a sign-in: a no, and the ladder begins.
+            assert said["state"] == "error" and said["error"]["code"] == "no_sign_in", said
+            assert "refuses sign-ins from qKVM" in said["error"]["message"] and "username" not in said["error"]["message"]
+            assert pc.state.rejections == 2 and kvm.REJECTED.times(offered) == 0
+            for _ in range(5):
+                assert (await device._read_status())["error"]["code"] == "no_sign_in"
             assert pc.state.rejections == 2
+            await asyncio.sleep(0.6)  # (the wait is over)
+            said = await device._read_status()
+            assert said["error"]["code"] == "no_sign_in" and "tries once more" in said["error"]["message"], said
+            assert pc.state.rejections == 3  # (one try: no second for a password refused since it was taken)
+            assert kvm.REJECTED.times(offered) == 0 and kvm.REJECTED.wait_left(offered) <= amt.LAST_TRY + TICK
+            await asyncio.sleep(0.6)  # (its last try is due)
+            said = await device._read_status()
+            assert said["state"] == "auth" and said["error"]["message"] == kvm.NO_SAID, said
+            assert pc.state.rejections == 4
+            assert kvm.REJECTED.times(offered) == 1 and 50 <= kvm.REJECTED.wait_left(offered) <= kvm.LOGIN_BACKOFF + TICK
             for _ in range(5):
                 assert (await device._read_status())["state"] == "auth"
-            assert pc.state.rejections == 2
-            assert kvm.REJECTED.times(kvm.REJECTED.what("login", device.spec)) == 1
+            assert pc.state.rejections == 4
         finally:
             await device.close()
 
     asyncio.run(run())
+
+
+def test_a_plain_no_to_a_password_the_engine_took_is_answered_once_more_with_the_fresh_challenge(pc: FakeAmt) -> None:
+    # (Five real engines on 2026-11-17, D1-a.) An engine that another client used at the same time answered the Digest
+    # answer of a password it had taken all evening with a plain 401 (no stale="true"). The wall said "Login rejected", the
+    # power button "Nothing was sent", and it was left alone; its next try was let in. A plain no to a password the engine
+    # took before is answered once more with the fresh challenge now, and the button goes.
+    pc.state.forgets_without_saying = True
+
+    async def run() -> None:
+        first = a_pc(pc)
+        try:
+            assert (await first._read_status())["state"] == "online"  # (the engine took the password)
+        finally:
+            await first.close()
+        device = a_pc(pc)  # a connection made anew (an edit, the saved passwords opened again): it signs in first
+        offered = kvm.REJECTED.what("login", device.spec)
+        try:
+            pc.state.cut_in = 1  # another client asks just before the sign-in's answer, and the engine forgets its nonce
+            await device.act("atx_reset")
+            assert pc.state.actions == [10] and pc.state.stale_sent == 1
+            assert device._login_error is None and kvm.REJECTED.times(offered) == 0
+        finally:
+            await device.close()
+        # A password that is wrong now costs one more try, never more; and one the engine never took is judged at its first
+        # no, as ever (test_a_wrong_password_is_refused_and_not_offered_again_and_again).
+        pc.state.password = "changed on the machine"
+        again = a_pc(pc)
+        try:
+            signed = pc.state.logins
+            with pytest.raises(KvmError) as refused:
+                await again._login()
+            assert isinstance(refused.value, amt.Refusing) and pc.state.logins - signed == 2
+        finally:
+            await again.close()
+
+    asyncio.run(run())
+
+
+def test_an_engine_that_refuses_this_wall_for_a_while_is_said_so_and_left_quiet_until_it_lets_go(pc: FakeAmt, monkeypatch: pytest.MonkeyPatch) -> None:
+    # (D1-b.) After its first refusal every try from the trial wall got a 401, while a wall at another address was let in
+    # with the same password, and a quarter of an hour without a try lifted it: Intel AMT refusing an address after failed
+    # sign-ins, and each try holding it up. The tile said "check the username and password", and the wall tried again a
+    # minute later and five after that, which kept the engine refusing. Now the tile says what it is, and the wall is quiet
+    # for longer than a real engine was seen to hold it.
+    assert amt.REFUSING_WAIT >= 15 * 60
+    monkeypatch.setattr(amt, "REFUSING_WAIT", 1.2)
+    monkeypatch.setattr(kvm, "STILL_THERE_EVERY", 0.0)  # (asked at every look whether it is there: no password, no knock)
+    pc.state.forgets_without_saying = True
+    pc.state.block_after, pc.state.block_quiet = 2, 1.0  # (the stand-in's quarter of an hour)
+
+    async def run() -> None:
+        device = a_pc(pc)
+        try:
+            assert (await device._read_status())["state"] == "online"
+            pc.state.cut_in = 2  # two plain noes in a row (the look's question, then once more): the engine refuses this address
+            said = await device._read_status()
+            assert said["state"] == "error" and said["error"]["code"] == "no_sign_in", said
+            assert "refuses sign-ins from qKVM" in said["error"]["message"] and "username" not in said["error"]["message"]
+            assert pc.state.blocked_at
+            signed = pc.state.logins
+            began = time.monotonic()
+            while time.monotonic() - began < 0.9:  # looked at as a tile is, and its buttons pressed: nothing goes
+                assert (await device._read_status())["error"]["code"] == "no_sign_in"
+                with pytest.raises(KvmError) as refused:
+                    await device.act("atx_reset")
+                assert refused.value.message.startswith("Nothing was sent") and "refuses sign-ins" in refused.value.message
+                await asyncio.sleep(0.05)
+            assert pc.state.logins == signed and pc.state.blocked_refusals == 0 and pc.state.actions == []
+            # The wait over: the engine has let go, as it was left quiet longer than it holds that, and the PC is there.
+            deadline = time.monotonic() + 10
+            while (await device._read_status())["state"] != "online":
+                assert time.monotonic() < deadline, "the engine never let it in again"
+                await asyncio.sleep(0.05)
+            assert pc.state.blocked_refusals == 0 and kvm.REJECTED.times(kvm.REJECTED.what("login", device.spec)) == 0
+        finally:
+            await device.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("password", ["the one it took", "changed on the machine"])
+def test_a_refusal_after_the_quiet_is_tried_once_more_before_the_password_is_taken_for_wrong(pc: FakeAmt, monkeypatch: pytest.MonkeyPatch, password: str) -> None:
+    # (The soak of 0.4.0, 2026-11-17.) After its sixteen minutes of quiet for an engine refusing this wall, the next sign-in
+    # was refused still, taken for a wrong password ("Login rejected", and alerted), and the engine let the wall in 75 s
+    # later. A refusal after the quiet is tried once more after amt.LAST_TRY, said as the engine refusing still; refused
+    # then too, the password is taken for wrong. (The stand-in lets go when the test says so, after that first refusal.)
+    assert amt.LAST_TRY >= 75
+    monkeypatch.setattr(amt, "REFUSING_WAIT", 0.5)
+    monkeypatch.setattr(amt, "LAST_TRY", 0.5)
+    monkeypatch.setattr(kvm, "STILL_THERE_EVERY", 0.0)
+    pc.state.forgets_without_saying = True
+    pc.state.block_after, pc.state.block_quiet = 2, 600.0  # (it holds the block until the test lets go)
+
+    async def run() -> None:
+        device = a_pc(pc)
+        offered = kvm.REJECTED.what("login", device.spec)
+        try:
+            assert (await device._read_status())["state"] == "online"
+            pc.state.cut_in = 2  # (two plain noes in a row: the engine refuses this address)
+            assert (await device._read_status())["error"]["code"] == "no_sign_in"
+            if password != "the one it took":
+                pc.state.password = password
+            deadline = time.monotonic() + 10
+            while pc.state.blocked_refusals == 0:  # (the quiet over: tried, and refused by the block still)
+                said = await device._read_status()
+                assert time.monotonic() < deadline, "it was never tried after the quiet"
+                await asyncio.sleep(0.05)
+            said = await device._read_status()
+            assert said["state"] == "error" and said["error"]["code"] == "no_sign_in", said
+            assert "tries once more" in said["error"]["message"] and kvm.REJECTED.times(offered) == 0
+            assert 0 < kvm.REJECTED.wait_left(offered) <= amt.LAST_TRY + TICK
+            pc.state.block_quiet = 0.0  # (the engine lets go: the next sign-in is judged by its password)
+            rejected, seen = pc.state.rejections, []
+            while (state := (await device._read_status())["state"]) not in ("online", "auth"):
+                seen.append(state)
+                assert time.monotonic() < deadline + 10, "it was never tried once more"
+                await asyncio.sleep(0.05)
+            assert set(seen) <= {"error"}, seen  # (said as the engine refusing until its last try)
+            if password == "the one it took":
+                assert state == "online" and pc.state.rejections == rejected and kvm.REJECTED.times(offered) == 0
+            else:
+                # (Its last try, refused: the verdict, "Login rejected", waited out as every device's.)
+                assert state == "auth" and pc.state.rejections == rejected + 1 and kvm.REJECTED.times(offered) == 1
+        finally:
+            await device.close()
+
+    asyncio.run(run())
+
+
+def test_the_stand_in_holds_its_refusal_of_an_address_while_it_is_tried_and_lets_go_after_a_quiet_time() -> None:
+    state = AmtState(block_after=2, block_quiet=1.0)
+    fake_amt.refused(state, "192.0.2.1")
+    assert not fake_amt.blocked(state, "192.0.2.1")
+    fake_amt.refused(state, "192.0.2.1")
+    assert fake_amt.blocked(state, "192.0.2.1") and not fake_amt.blocked(state, "192.0.2.2")  # (that address alone)
+    for _ in range(3):
+        time.sleep(0.4)
+        assert fake_amt.blocked(state, "192.0.2.1")  # each try starts the quiet again
+    time.sleep(1.1)
+    assert not fake_amt.blocked(state, "192.0.2.1") and state.blocked_refusals == 4
 
 
 def test_a_user_name_that_cannot_stand_in_a_header_is_not_sent(pc: FakeAmt) -> None:
@@ -715,6 +961,44 @@ def test_over_tls_the_certificate_is_remembered_and_an_impostor_gets_no_password
         original.stop()
 
 
+def test_an_engine_whose_certificate_an_authority_this_computer_trusts_signed_is_checked_on_both_ports(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # An engine set up with a certificate of the company's own authority (remote configuration gives it one): checked against
+    # the authorities this computer trusts, on its WS-Management port and its redirection port alike, and nothing remembered;
+    # an engine whose certificate another authority signed, or itself, gets nothing of the password.
+    authority = an_authority()
+    trusted = ssl.create_default_context(cadata=authority[1].public_bytes(serialization.Encoding.PEM).decode())
+
+    async def this_computer_trusts() -> ssl.SSLContext:
+        return trusted
+
+    monkeypatch.setattr(kvm, "system_context", this_computer_trusts)
+    monkeypatch.setattr(amt, "system_context", this_computer_trusts)
+    monkeypatch.setattr(fake_amt, "make_device_certificate", lambda directory: issued_by(authority, directory))
+    state = AmtState()
+    engine = FakeAmt(state, tls_dir=tmp_path / "cert-a").start()
+    try:
+        with wall(tmp_path / "data") as client:
+            device = add(client, engine.url)
+            listed = client.get("/api/v1/wall").json()["devices"][0]
+            assert (listed["tls"], listed["fingerprint"]) == ("system", None)
+            status = status_of(client, device, state="online")
+            assert status["server"]["amt"]["plain"] is False and status["server"]["no_screen"] is None
+            wait_until(lambda: client.get(snap(device)).status_code == 200, "no picture over TLS", 15)
+            assert state.kvm_sessions == 1
+            engine.stop()
+            monkeypatch.setattr(fake_amt, "make_device_certificate", fake_kvm.make_device_certificate)
+            impostor = FakeAmt(AmtState(), port=engine.port, tls_dir=tmp_path / "cert-b").start()  # (its own certificate)
+            try:
+                status = status_of(client, device, state="error")
+                assert status["error"]["code"] in ("cert_invalid", "cert_mismatch"), status
+                assert client.get(snap(device)).status_code != 200
+                assert impostor.state.logins == 0 and impostor.state.redirection_logins == 0
+            finally:
+                impostor.stop()
+    finally:
+        engine.stop()
+
+
 def test_a_bare_address_is_asked_on_the_ports_an_engine_listens_on(tmp_path: Path, pc: FakeAmt, monkeypatch: pytest.MonkeyPatch) -> None:
     # Typed without a port, as somebody types the address of a PC: the two ports every engine listens on are asked.
     monkeypatch.setattr(amt, "PORTS", (("https", closed_port()), ("http", pc.port)))  # (nothing listens on the TLS one)
@@ -755,7 +1039,7 @@ def test_a_bare_address_whose_tls_port_is_only_slow_is_not_taken_the_plain_way(p
 
 def test_found_on_the_network(tmp_path: Path, pc: FakeAmt, monkeypatch: pytest.MonkeyPatch) -> None:
     nowhere = "http://127.0.0.1:9"
-    monkeypatch.setattr(discover, "targets", lambda: ([discover.Target("127.0.0.1", nowhere, nowhere, "desk")], ["test network"]))
+    monkeypatch.setattr(discover, "targets", searched([discover.Target("127.0.0.1", nowhere, nowhere, "desk")], ["test network"]))
     monkeypatch.setattr(discover, "AMT_PORTS", (("https", closed_port()), ("http", pc.port)))
     with wall(tmp_path) as admin:
         found = admin.post("/api/v1/discover").json()["found"]
@@ -1744,7 +2028,7 @@ def test_found_on_the_network_at_its_plain_address_only_where_nothing_listens_on
     from tests.fake_kvm import FakeKvm
 
     nowhere = "http://127.0.0.1:9"
-    monkeypatch.setattr(discover, "targets", lambda: ([discover.Target("127.0.0.1", nowhere, nowhere, "desk")], ["test network"]))
+    monkeypatch.setattr(discover, "targets", searched([discover.Target("127.0.0.1", nowhere, nowhere, "desk")], ["test network"]))
     slow = socket.socket()
     slow.bind(("127.0.0.1", 0))
     slow.listen(16)  # (never accepted; room for the scan and for the bare connection that asks whether anything listens)

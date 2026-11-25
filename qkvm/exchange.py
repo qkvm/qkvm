@@ -11,7 +11,7 @@ One format, written two ways:
 
 Accounts, tokens, two-factor keys and the recovery key are in neither. Each of them is locked to the key
 of the wall it was made on, and could be carried to another only by carrying that key, which is every
-secret of the first wall. A whole wall, accounts and all, is a copy of its data folder (see the README).
+secret of the first wall. A whole wall, accounts and all, is a copy of its data folder (see the guide, GUIDE.md).
 
 What is read back is somebody's file and not this program's own. Every entry is checked as if it had
 been typed into the page; what does not pass is left out, and said. Nothing in a file can make a wall do
@@ -34,10 +34,10 @@ from cryptography import x509
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives import serialization
 
-from . import alerts, screens
+from . import alerts, destinations, egress, oidc, open_in, screens
 from .amt import at_its_port
 from .kvm import KEYS, MAX_TEXT, POWER_KEY_REFUSED, names_the_power_key
-from .store import AMT_VIEWS, FINGERBOT_STRENGTHS, Store, as_a_line, device_url, jetkvm_machine_from_before, machine_from_before
+from .store import AMT_VIEWS, FINGERBOT_STRENGTHS, ROLES, DestinationRecord, Store, as_a_line, device_url, jetkvm_machine_from_before, machine_from_before, sealed_for
 from .store import KINDS as STORE_KINDS
 from .vault import Vault, VaultLocked
 from .proxmox import address_of as proxmox_address
@@ -57,7 +57,7 @@ MIN_PASSPHRASE = 10  # as for an account's password
 SEALED_FOR = f"export {VERSION}"  # what the content is sealed for: it is not a device's password, and opens as nothing else
 KINDS = STORE_KINDS  # (an entry of another kind is refused: a later version's file is not for this one)
 TLS = ("pinned", "system", "insecure")
-PARTS = ("devices", "actions", "alerts", "wall")
+PARTS = ("devices", "actions", "alerts", "wall", "signin")
 # What a device says it is (server.IDENT), as a driver gives it. Not the marks this program makes itself:
 # "own:..." is somebody's decision on the wall it was made on (carried as `keep_both`), "cert:..." is worked
 # out of the certificate.
@@ -92,6 +92,7 @@ class Device:
     no_signal_minutes: int = 0  # its screen watched (screens.py): minutes with no signal before an alert; 0: not watched
     unchanged_minutes: int = 0  # ...and minutes with a screen that looks the same
     amt_view: str = "stills"  # a PC with Intel AMT: which of its three views its tile is in (store.AMT_VIEWS)
+    open_in: dict[str, str] = field(default_factory=dict)  # where else it is opened (open_in.py), each checked; 0.4.0
 
 
 @dataclass(frozen=True)
@@ -110,8 +111,14 @@ class Content:
 
     devices: list[Device] | None = None
     actions: list[Action] | None = None
-    alerts: dict[str, Any] | None = None  # as store.AlertSettings without what is a wall's own (its link, a pause); "webhook": the address in clear, where the file has one
+    # As store.AlertSettings without what is a wall's own (its link, a pause), and "destinations": each as checked
+    # (destinations.check and settle), its secrets in clear; None where the file has none (a plain file).
+    alerts: dict[str, Any] | None = None
     wall: dict[str, Any] | None = None  # "interval", "update_check"
+    # Signing in through an identity provider (0.4.0), as store.OidcSettings without what is a wall's own (the address the
+    # provider sends a browser back to), each field as checked (`_signin`); its client secret in clear where the file has
+    # one (an encrypted file).
+    signin: dict[str, Any] | None = None
     left_out: list[str] = field(default_factory=list)  # entries that did not pass, each in a sentence
     sealed: bool = False  # it was encrypted
     made: float = 0.0
@@ -123,7 +130,8 @@ class Content:
         return (
             any(device.password for device in self.devices or [])
             or any(action.text for action in self.actions or [])
-            or bool((self.alerts or {}).get("webhook"))
+            or bool((self.alerts or {}).get("destinations"))
+            or bool((self.signin or {}).get("client_secret"))
         )
 
 
@@ -210,6 +218,8 @@ def gather(store: Store, vault: Vault, what: set[str], secrets: bool, not_opened
                 # (Written also where none is known, "": a file without the field is one of 0.1.x, whose server's number is
                 # taken from what it kept as the server's, see store.machine_from_before.)
                 "machine": device.machine if _IDENT.fullmatch(device.machine) else "",
+                # (0.4.0. Only where it has any: a file of a wall without them is as before. Each as it is shown, checked again.)
+                **({"open_in": links} if (links := open_in.kept(device.open_in)) else {}),
             }
             for device in store.devices
         ]
@@ -231,16 +241,47 @@ def gather(store: Store, vault: Vault, what: set[str], secrets: bool, not_opened
         told = store.alerts
         parts["alerts"] = {
             "enabled": told.enabled,
-            "format": told.format,
             "offline": told.offline,
             "no_signal": told.no_signal,
             "problem": told.problem,
             "recovered": told.recovered,
             # (Not the link an alert carries: that is the address of the wall it comes from, and no setting to take along.)
-            **({"webhook": opened(told.webhook, "alerts:webhook", "the address alerts go to")} if secrets else {}),
         }
+        if secrets:
+            # Where the alerts go: only in an encrypted file. Each with its secrets in clear (an address with a token in it, a
+            # key, a password); the machines it is told about by their addresses, which the wall that takes it knows them by.
+            urls = {device.id: device.url for device in store.devices}
+            listed = []
+            for one in store.destinations:
+                called = f"the alert destination {one.name or destinations.KIND_NAMES.get(one.kind, one.kind)}"
+                text = opened(one.secret, sealed_for(one.id), called, one.kind in destinations.KINDS)
+                if not text:
+                    continue
+                kept = opened_secrets(text)
+                if kept is None:
+                    if not_opened is not None:
+                        not_opened.append(called)
+                    continue
+                listed.append({
+                    "kind": one.kind, "name": one.name, "enabled": one.enabled, "private": one.private, "minimal": one.minimal,
+                    "events": list(one.events), "least": one.least,
+                    "devices": None if one.devices is None else [urls[device] for device in one.devices if device in urls],
+                    "groups": list(one.groups), "quiet_from": one.quiet_from, "quiet_to": one.quiet_to, "quiet_days": list(one.quiet_days),
+                    "remind": one.remind, "config": dict(one.config), "secrets": kept,
+                })  # fmt: skip
+            parts["alerts"]["destinations"] = listed
     if "wall" in what:
         parts["wall"] = {"interval": store.server.interval, "update_check": store.server.update_check}
+    if "signin" in what and store.oidc.issuer:  # (a wall that never set one up has nothing to say: taken in, it would say "none")
+        signin = store.oidc
+        parts["signin"] = {
+            "enabled": signin.enabled, "name": signin.name, "issuer": signin.issuer, "client_id": signin.client_id, "scopes": signin.scopes,
+            "groups_claim": signin.groups_claim, "roles": [{"group": group, "role": role} for group, role in signin.roles.items()],
+            "anyone": signin.anyone, "domain": signin.domain, "private": signin.private,
+            # (Not the redirect address: it is the address of the wall the file comes from. And the client secret only in an
+            # encrypted file, as every secret.)
+            **({"client_secret": opened(signin.secret, oidc.SEALED_FOR, "the identity provider's client secret")} if secrets and signin.secret else {}),
+        }  # fmt: skip
     return parts
 
 
@@ -342,6 +383,8 @@ def unpack(text: str, passphrase: str) -> Content:
         content.alerts = _alerts(said["alerts"], content.left_out)
     if "wall" in said:
         content.wall = _wall(said["wall"], content.left_out)
+    if "signin" in said:
+        content.signin = _signin(said["signin"], content.left_out)
     return content
 
 
@@ -537,6 +580,7 @@ def _devices(said: Any, left_out: list[str]) -> list[Device]:
                 machine = machine_from_before(kind, ident, machine)
             # (And a JetKVM's, from a file of 0.2.0 or before, which kept none for a JetKVM: its number, as at an upgrade.)
             machine = jetkvm_machine_from_before(kind, ident, machine)
+            links = _links(entry.get("open_in"))
             device = Device(
                 name=name or urlsplit(url).netloc[:80],  # (no longer than a name may be, as the form names one that is added without a name)
                 url=url,
@@ -554,6 +598,7 @@ def _devices(said: Any, left_out: list[str]) -> list[Device]:
                 fingerbot_strength=strength,
                 **watches,
                 amt_view=view if kind == "amt" else AMT_VIEWS[0],
+                open_in=links,
             )
         except ValueError as ex:
             left_out.append(f"Device {number}: {ex}")
@@ -563,6 +608,25 @@ def _devices(said: Any, left_out: list[str]) -> list[Device]:
             continue
         found[device.url] = device
     return list(found.values())
+
+
+def _links(said: Any) -> dict[str, str]:
+    """A machine's "Open in" links as a file holds them (0.4.0; none in a file of a version before): each checked as the
+    page's form checks it (open_in.checked). ValueError, in words, where one is not a link, or not of a kind this version
+    knows: the machine is left out, as for anything else of it that is not what it says."""
+    if said is None:
+        return {}
+    if not isinstance(said, dict) or not set(said) <= set(open_in.KINDS):
+        raise ValueError("its Open in links are not said in a way this version knows")
+    links = {}
+    for kind in open_in.KINDS:
+        try:
+            link = open_in.checked(kind, said.get(kind, ""))
+        except ValueError as ex:
+            raise ValueError(f"its Open in links: {ex}") from None
+        if link:
+            links[kind] = link
+    return links
 
 
 def _actions(said: Any, left_out: list[str]) -> list[Action]:
@@ -599,25 +663,98 @@ def _actions(said: Any, left_out: list[str]) -> list[Action]:
     return found
 
 
+URL_KINDS = ("webhook", "ntfy", "slack", "discord")  # the kinds 0.3.2's one address could be: what its "format" speaks of
+
+
+def format_of(one: dict[str, Any]) -> str:
+    """The "format" of 0.3.2 a destination (its "kind" and "config") is: how its service is spoken to. A kind 0.3.2 did not
+    have is said by its own name."""
+    if one.get("kind") == "webhook":
+        return "auto" if (one.get("config") or {}).get("format") == "auto" else "json"
+    return str(one.get("kind"))
+
+
+def opened_secrets(text: str) -> dict[str, str] | None:
+    """A destination's secrets as they open from the vault: JSON, or the bare address of the one carried over from 0.3.2."""
+    if not text.startswith("{"):
+        return {"url": text}
+    try:
+        said = json.loads(text)
+    except (ValueError, RecursionError):
+        return None
+    if not isinstance(said, dict) or not all(isinstance(value, str) for value in said.values()):
+        return None
+    return said
+
+
+def destination_record(one: dict[str, Any], made_id: str, where: dict[str, str], vault: Vault) -> DestinationRecord:
+    """A destination of a file, as this wall keeps it: its secrets sealed, its machines by this wall's ids (by their
+    addresses: one this wall does not have is left out)."""
+    record = DestinationRecord(
+        made_id, one["kind"], name=one["name"], enabled=one["enabled"], host=one["host"], config=dict(one["config"]), private=one["private"],
+        minimal=one["minimal"], events=list(one["events"]), least=one["least"], groups=list(one["groups"]), quiet_from=one["quiet_from"],
+        quiet_to=one["quiet_to"], quiet_days=list(one["quiet_days"]), remind=one["remind"], created=time.time(),
+    )  # fmt: skip
+    record.devices = None if one["devices"] is None else [where[url] for url in one["devices"] if url in where]
+    record.secret = vault.encrypt(json.dumps(one["secrets"]), sealed_for(made_id))
+    return record
+
+
+MOST_DESTINATIONS = 50  # destinations taken from one file
+
+
+def _destination(entry: Any) -> dict[str, Any]:
+    """A destination as a file of 0.4.0 or later writes it, checked as a form's is. ValueError with what is wrong."""
+    if not isinstance(entry, dict):
+        raise ValueError("it is not a destination")
+    config: dict[str, Any] = entry["config"] if isinstance(entry.get("config"), dict) else {}
+    secrets: dict[str, Any] = entry["secrets"] if isinstance(entry.get("secrets"), dict) else {}
+    kind = entry.get("kind")
+    said = {**config, **{name: value for name, value in secrets.items() if name != "signing"}}
+    checked, kept, host = destinations.check(str(kind), said, {})
+    signing = secrets.get("signing")
+    if kind == "webhook" and isinstance(signing, str) and destinations.SIGNING.fullmatch(signing):
+        kept["signing"] = signing
+    devices = entry.get("devices")
+    if devices is not None:
+        if not isinstance(devices, list):
+            raise ValueError("its machines are not a list")
+        devices = [device_url(url) for url in devices[:10_000] if isinstance(url, str)]
+    return {"kind": kind, "config": checked, "secrets": kept, "host": host, **destinations.settle({**entry, "devices": devices})}
+
+
 def _alerts(said: Any, left_out: list[str]) -> dict[str, Any] | None:
     if not isinstance(said, dict):
         left_out.append("The alert settings are not settings")
         return None
     told: dict[str, Any] = {
         "enabled": _flag(said.get("enabled"), False),
-        "format": said.get("format") if said.get("format") in alerts.FORMATS else "auto",
         "offline": _flag(said.get("offline"), True),
         "no_signal": _flag(said.get("no_signal"), True),
         "problem": _flag(said.get("problem"), True),
         "recovered": _flag(said.get("recovered"), True),
-        "webhook": "",
+        "destinations": None,
     }
-    value = said.get("webhook", "")
-    if value:
+    listed = said.get("destinations")
+    if isinstance(listed, list):
+        found = []
+        for number, entry in enumerate(listed[:MOST_DESTINATIONS], 1):
+            try:
+                found.append(_destination(entry))
+            except (ValueError, TypeError) as ex:
+                left_out.append(f"Alert destination {number}: {ex}")
+        told["destinations"] = found or None
+    elif said.get("webhook"):
+        # A file of 0.3.2: its one address, and how its service was spoken to. Taken as a 0.3.2 wall's own is carried
+        # over (store._from_0_3_2): its first destination, which may be a private address as every address could be then.
+        value = said["webhook"]
+        form = said.get("format") if said.get("format") in alerts.FORMATS else "auto"
+        kind = "webhook" if form in ("auto", "json") else str(form)
         try:
             if not isinstance(value, str):
                 raise ValueError
-            told["webhook"] = alerts.check_url(value)
+            config, kept, host = destinations.check(kind, {"url": egress.check_url(value), "format": form}, {})
+            told["destinations"] = [{"kind": kind, "config": config, "secrets": kept, "host": host, **destinations.settle({"private": True})}]
         except ValueError:
             left_out.append("Alert settings: the address alerts go to is not a web address")
     return told
@@ -636,3 +773,37 @@ def _wall(said: Any, left_out: list[str]) -> dict[str, Any] | None:
     if isinstance(said.get("update_check"), bool):
         told["update_check"] = said["update_check"]
     return told
+
+
+def _signin(said: Any, left_out: list[str]) -> dict[str, Any] | None:
+    """Signing in through an identity provider, as a file holds it: every field as the page's form would have it checked
+    (oidc.py), or the part left out, and said, as a whole (half of a provider's settings is none)."""
+    if not isinstance(said, dict):
+        left_out.append("The sign-in settings are not settings")
+        return None
+    try:
+        roles = said.get("roles", [])
+        if not isinstance(roles, list) or not all(isinstance(each, dict) and isinstance(each.get("group"), str) and isinstance(each.get("role"), str) for each in roles):
+            raise ValueError("the groups and their roles are not a list of them")
+        anyone = said.get("anyone", "")
+        if anyone not in ("", *ROLES):
+            raise ValueError("who else may sign in is no role")
+        texts = {name: said.get(name, "") for name in ("name", "issuer", "client_id", "client_secret", "domain")}
+        if not all(isinstance(value, str) for value in texts.values()) or not isinstance(said.get("scopes", ""), str) or not isinstance(said.get("groups_claim", ""), str):
+            raise ValueError("a field that is a text is not one")
+        return {
+            "enabled": _flag(said.get("enabled"), False),
+            "name": oidc.button_name(texts["name"]),
+            "issuer": oidc.issuer_url(texts["issuer"]) if texts["issuer"].strip() else "",
+            "client_id": oidc.client_id(texts["client_id"]) if texts["client_id"].strip() else "",
+            "client_secret": oidc.client_secret(texts["client_secret"]) if texts["client_secret"] else "",
+            "scopes": oidc.scopes_of(said.get("scopes") or "openid profile email"),
+            "groups_claim": oidc.groups_claim(said.get("groups_claim", "groups")),
+            "roles": oidc.roles_of([(each["group"], each["role"]) for each in roles[:100]]),
+            "anyone": anyone,
+            "domain": oidc.email_domain(texts["domain"]),
+            "private": _flag(said.get("private"), False),
+        }
+    except ValueError as ex:
+        left_out.append(f"Sign-in settings: {str(ex)[:1].lower()}{str(ex)[1:200]}")
+        return None

@@ -36,6 +36,7 @@ import importlib.util
 import ipaddress
 import json
 import logging
+import math
 import re
 import socket
 import struct
@@ -87,6 +88,7 @@ from .kvm import (
     bounded,
     can_do,
     flag,
+    no_video,
     number,
     other_way,
     plain,
@@ -191,6 +193,10 @@ UNWATCHED = 300.0
 # Which JetKVM answers at a tile's address (see JetKvmDevice._same_jetkvm): while another one does, it is asked again this
 # often, and not at every look.
 SAME_JETKVM_EVERY = 60.0
+# After a video connection offered came to nothing, a tile on screen offers the next by itself this long after (see
+# JetKvmDevice._note_offer), and twice as long after each that comes to nothing in a row, up to the second figure.
+OFFER_AGAIN_FIRST = 5.0
+OFFER_AGAIN_MOST = 120.0
 # A mount or an unmount that binds its USB device anew (a change between CD-ROM and disk) takes it a second and more: it
 # is waited for this long. And the id of an upload, as it hands one out ("upload_" and a UUID).
 MOUNT_WITHIN = 30.0
@@ -224,6 +230,9 @@ def not_set_up() -> KvmError:
 
 
 IN_USE = KvmError("in_use", "Someone is using this JetKVM's own console. It shows its picture to one viewer at a time.", 409)
+# What a key, a text, a button or a mount is told where no connection came about while this computer's video worker for it
+# was slow to start: nothing was sent to the JetKVM (see `_connected`; an action says it as not done, `_not_sent`).
+NO_CONNECTION_YET = KvmError("timeout", "No connection to the JetKVM came about in time, and nothing was sent to it", 504)
 
 def _dark_pixel() -> bytes:
     """A 1x1 dark PNG, sent while the JetKVM has no video signal (the tile covers it with "No signal").
@@ -467,8 +476,9 @@ class _Session:
         self.frame_at = 0.0
         self.video: dict[str, Any] = {}
         # When the JetKVM last said its input came back after it had said there was none (`_video_said`): a picture of the
-        # screen is waited for from then on (PICTURE_AFTER_SIGNAL), not taken for one that stopped (FRAME_STALE).
-        self.signal_at = 0.0
+        # screen is waited for from then on (PICTURE_AFTER_SIGNAL), not taken for one that stopped (FRAME_STALE). Before
+        # every picture while it has not said so (a picture stamped as it said so is from before: `_from_before`).
+        self.signal_at = float("-inf")
         self.ready_said: bool | None = None  # (the last `ready` it said as a boolean: what a change is told by)
         self.video_events = 0  # `videoInputState` events heard on this connection (an answer asked before one is older)
         self.usb: str | None = None
@@ -525,7 +535,17 @@ class _Session:
         self.echoes_due: deque[tuple[tuple[int, tuple[int, ...]], asyncio.Future[None]]] = deque()
         self.layout: str | None = None  # the keyboard layout the JetKVM says its computer uses, once asked (`_layout`)
         self.had_down = False  # something of ours was down, or may have been, when this connection ended
-        self.offered = False  # the offer of this video connection went out (it takes the JetKVM's one viewer)
+        self.offered = False  # the offer of this video connection went out...
+        # ...and the JetKVM refused it in so many words ({"error": ...}): that took nothing from anybody. Any other offer that
+        # went out may have taken its one viewer from whoever had it (a JetKVM tells the viewer it had that somebody else has
+        # it, and answers, once it has taken an offer): one it answered, one whose answer came too late or could not be read,
+        # one whose signalling closed after it went.
+        self.refused = False
+        self.video_starting = False  # its video worker is being started: nothing is asked of the JetKVM before that is done
+        self.video_started_at: float | None = None  # ...and when it had started (time.monotonic())
+        # What was said of it while its video worker was slow to start, or what that start ended in where it ran past its own
+        # time: no word of the JetKVM's (see `_read_status`).
+        self.not_yet: KvmError | None = None
 
     @property
     def live(self) -> bool:
@@ -541,6 +561,26 @@ def _video_said(session: _Session, video: dict[str, Any]) -> None:
     if ready is not None:  # (an answer that does not say it, or says it in another kind, changes nothing of it)
         session.ready_said = ready
     session.video = video
+
+
+def _from_before(session: _Session, at: float) -> bool:
+    """Whether a picture stamped `at` (time.monotonic()) is from before the JetKVM last said its screen was back. A picture
+    stamped in the same tick of the clock as that counts as from before: on a clock of coarse ticks (Windows before Python
+    3.13: 15.6 ms) the last picture before a screen that was dark for less than a tick bore the moment it came back, and
+    was taken for that screen. Erring early, as `video._stamping` errs: a picture of the screen may wait for the next one,
+    and none from before passes for it."""
+    return session.signal_at >= at
+
+
+def _picture_overdue(session: _Session) -> bool:
+    """Whether this connection's picture is overdue (see `_hold`): the first one of the screen PICTURE_AFTER_SIGNAL after the
+    JetKVM said it was back, the first one at all PICTURE_AFTER_SIGNAL after the connection opened, the next FRAME_STALE
+    after the last."""
+    if _from_before(session, session.frame_at):
+        return time.monotonic() - session.signal_at > PICTURE_AFTER_SIGNAL
+    if session.frame is None:
+        return session.ready.is_set() and time.monotonic() - session.ready_at > PICTURE_AFTER_SIGNAL
+    return time.monotonic() - session.frame_at > FRAME_STALE
 
 
 class JetKvmDevice(Device):
@@ -562,9 +602,15 @@ class JetKvmDevice(Device):
         self._task: asyncio.Task[None] | None = None
         self._displaced = False  # someone took the picture; wait to be asked back
         self._told: str | None = None  # what a connection last showed it to be: with a picture, without, not letting us in
-        # The last video connection offered came to nothing (see `_came_to_nothing`): what a tile says, and offers no other,
-        # until a person asks for the JetKVM (`_connected`'s `asked`) and a connection comes about.
+        # The last video connection offered came to nothing (see `_note_offer`): what a tile says, and offers no other before
+        # `_offer_again_at` (a person who asks for the JetKVM does: `_connected`'s `asked`), until a connection comes about;
+        # and how many came to nothing in a row (the pause before the next grows with them).
         self._offer_failed: KvmError | None = None
+        self._offer_again_at = 0.0
+        self._offers_failed = 0
+        # An offer the JetKVM may have taken (any it did not refuse: `_Session.refused`) came to nothing since a connection last
+        # came about: a tile makes one more at the most by itself (see `_note_offer`).
+        self._taken_and_failed = False
         self._retry_at = 0.0
         self._wanted_at = 0.0
         self._encode_locks = {size: asyncio.Lock() for size in (*TIERS, FULL)}
@@ -596,6 +642,11 @@ class JetKvmDevice(Device):
             # (And what its connections leave down, the one it is closing as it is retired included, is let go of on
             # this one's first: shared, since that one ends only after this one has taken its place.)
             self._leftover = retired._leftover
+            if retired.spec.base_url == self.spec.base_url:
+                # What its offers came to, and when its tile may offer again by itself: an edit (a new name) gave a tile that
+                # waits to be opened two more offers that take the JetKVM's viewer (the review of the hold round, L2).
+                self._offer_failed, self._offers_failed = retired._offer_failed, retired._offers_failed
+                self._taken_and_failed, self._offer_again_at = retired._taken_and_failed, retired._offer_again_at
 
     async def close(self) -> None:
         self._closed = True
@@ -992,7 +1043,8 @@ class JetKvmDevice(Device):
         """The live session, connecting first if need be. Raises KvmError when there is none to be had.
 
         `urgent`: a key, a text or a button. `asked`: a person asks for the JetKVM's picture (its live view). Either offers a
-        connection where the last one offered came to nothing; a tile's look does not (see `_note_offer`)."""
+        connection where the last one offered came to nothing; a look at the status does not, nor does a tile's picture
+        (it offers by itself once its pause is over: see `snapshot` and `_note_offer`)."""
         if self._displaced:
             raise IN_USE.with_traceback(None)
         if not _LOOKING_FOR_ALERTS.get():
@@ -1001,6 +1053,7 @@ class JetKvmDevice(Device):
         if session is not None and session.live and not session.taken:
             return session
         if self._offer_failed is not None and not (urgent or asked):
+            # (A tile's picture offers again once the pause is over, not a look at its status: see `_note_offer`.)
             raise self._offer_failed.with_traceback(None)
         if urgent:
             self._down_error = None
@@ -1026,7 +1079,16 @@ class JetKvmDevice(Device):
         session = self._start()
         waits = [asyncio.ensure_future(session.ready.wait()), asyncio.ensure_future(session.done.wait())]
         try:
-            await asyncio.wait(waits, timeout=CONNECT_TIMEOUT, return_when=asyncio.FIRST_COMPLETED)
+            until = time.monotonic() + CONNECT_TIMEOUT
+            while True:
+                await asyncio.wait(waits, timeout=max(0.0, until - time.monotonic()), return_when=asyncio.FIRST_COMPLETED)
+                started = session.video_started_at
+                if session.ready.is_set() or session.done.is_set() or started is None or started + CONNECT_TIMEOUT <= until:
+                    break
+                # Its video worker took part of that time, before anything was asked of the JetKVM: the JetKVM is given the
+                # whole of it, counted from when the worker had started. (Found for 0.4.0: a worker that started a moment
+                # before the wait ran out left the JetKVM "taking too long to connect", and said "offline".)
+                until = started + CONNECT_TIMEOUT
         finally:
             for wait in waits:
                 wait.cancel()
@@ -1039,10 +1101,20 @@ class JetKvmDevice(Device):
             # `_note_offer`), and the look says what every look after it says. Said as how that connection ended ("timeout"),
             # it was "offline" of a JetKVM that answers, between looks that said it has a problem (0.2.2, a loaded runner).
             raise self._offer_failed.with_traceback(None)
+        if session.video_starting and not session.done.is_set():
+            # Its video worker is still being started (a computer under load: seconds), and nothing has been asked of the
+            # JetKVM yet: not a JetKVM taking too long to connect, which said "offline" of one that is there (see
+            # `_read_status`). The connection goes on being made, and whoever asks next waits for it again.
+            session.not_yet = KvmError("no_stream", "Video is slow to start on this computer: its video worker is still starting", 503)
         # (`session.lost`: it closed the channel it is asked over a moment ago, and the connection is on its
         # way out. That is the device having dropped out, and nothing was sent: said as "taking too long",
         # the page showed a key press as one that "may have been done".)
-        raise (session.error or session.lost or KvmError("timeout", "The JetKVM is taking too long to connect", 504)).with_traceback(None)
+        error = session.not_yet if session.video_starting and not session.done.is_set() else session.error or session.lost
+        if urgent and error is not None and error is session.not_yet:
+            # A key, a text, a button or a mount answers for itself, not in the words of the video: no connection came about,
+            # and nothing of it went out (said "Video is slow to start", a power press was not said to be not done).
+            raise NO_CONNECTION_YET.with_traceback(None)
+        raise (error or KvmError("timeout", "The JetKVM is taking too long to connect", 504)).with_traceback(None)
 
     async def _run(self, session: _Session) -> None:
         try:
@@ -1120,19 +1192,52 @@ class JetKvmDevice(Device):
 
     def _note_offer(self, session: _Session) -> None:
         """Where the offer of this connection went out and it never came about (UDP blocked between the two, ICE failing, no
-        answer): note it, so that a tile offers no other (see `_connected` and `snapshot`). Each offer takes the JetKVM's one
-        viewer from whoever has it, its own page included, and over a connection that never opened the wall never hears that
-        somebody else had it: a tile on screen offered one at every round of its back-off, about every half minute, for as
-        long as it was shown (the desktop's item 9; its rule of 2026-10-31, kept here as well). What a person asks for offers
-        again: the enlarged view, the live view, a key or a button, "Show here". A connection that came about clears it."""
+        answer, a computer too busy to make it in time): note it, so that a tile offers no other before a pause (see
+        `_connected` and `snapshot`), or none by itself at all.
+
+        An offer the JetKVM takes takes its one viewer from whoever has it, its own page included, and over a connection that
+        never opened the wall never hears that somebody else had it: a tile on screen offered one at every round of its
+        back-off, about every half minute, for as long as it was shown (the desktop's item 9). Then it offered none until a
+        person asked (its rule of 2026-10-31), and a tile that a busy computer had seen come to nothing once stayed red for
+        good (the owner, for 0.4.0: it comes back by itself). So a tile tells the two apart. An offer the JetKVM refused in so
+        many words took nothing from anybody: a tile on screen offers again after OFFER_AGAIN_FIRST, and after each that comes to
+        nothing in a row twice as long, up to OFFER_AGAIN_MOST. Any other may have taken the viewer: its answer came and the
+        connection never came up (UDP blocked between the two, say, which every offer would meet again), or it came after
+        CONNECT_TIMEOUT (a slow JetKVM, a starved wall), or could not be read, or the signalling closed after the offer went
+        (the review of the hold round, M1). After such a one a tile makes one more by itself, after its pause; where that one
+        comes to nothing too, whichever way, the tile says why and makes none by itself (as before 0.4.0). Only a tile's
+        picture ends the pause, not a look at its status (`snapshot`): the page asks every tile's status, shown or not, and
+        so may a script. Never where somebody else is known to have the viewer (`_displaced`), and never for the alerts or
+        the history, whose looks make no connection. What a person asks for offers again at once: the enlarged view, the live
+        view, a key or a button, "Show here". A connection that came about clears all of it."""
         error = session.error
         if session.offered and not session.ready.is_set() and error is not None and not self._closed and not self._displaced:
-            self._offer_failed = KvmError(
-                error.code,
-                f"No video connection to the JetKVM came about ({error.message}). Its tile does not offer another by itself, "
-                "as each takes the JetKVM's one viewer from whoever has it: open it large to try again",
-                error.status,
-            )
+            self._offers_failed += 1
+            pause = min(OFFER_AGAIN_MOST, OFFER_AGAIN_FIRST * 2 ** min(self._offers_failed - 1, 10))
+            # (Not before the waits this end set are over, either: a try made then is held back by them, and says what they say.)
+            self._offer_again_at = max(time.monotonic() + pause, self._down_until, self._retry_at)
+            why = error.message
+            if self._taken_and_failed:
+                # (The one more after an offer the JetKVM took, or one a person asked for since: no other by itself.)
+                self._offer_again_at = math.inf
+                said = (
+                    f"No video connection to the JetKVM came about ({why}), again after it may have taken an offer. Its tile does "
+                    "not offer another by itself, as the JetKVM gives its one viewer to each offer it takes, away from whoever has "
+                    "it: open it large to try again"
+                )
+            elif not session.refused:
+                self._taken_and_failed = True
+                said = (
+                    f"No video connection to the JetKVM came about after it may have taken the offer ({why}). Its tile tries once "
+                    "more by itself, as the JetKVM gives its one viewer to each offer it takes, away from whoever has it: open it "
+                    "large to try now"
+                )
+            else:
+                said = (
+                    f"No video connection to the JetKVM came about ({why}). Its tile tries again by itself, less often each time "
+                    f"(every {OFFER_AGAIN_MOST / 60:g} minutes at the longest): open it large to try now"
+                )
+            self._offer_failed = KvmError(error.code, said, error.status)
 
     async def _hold(self, session: _Session) -> None:
         """Connect as the JetKVM's own page would, then stay for as long as the wall is watched."""
@@ -1145,15 +1250,24 @@ class JetKvmDevice(Device):
         # and the library warns about every one of them. That is how video starts, not something to report.
         logging.getLogger("aiortc.codecs.h264").setLevel(logging.ERROR)
 
-        from .video import BoundedDecoderQueue, VideoError, Worker, install_aiortc_boundary
+        from .video import BoundedDecoderQueue, VideoError, VideoUnavailable, Worker, install_aiortc_boundary
 
         try:
             install_aiortc_boundary()
             # Establish isolation before negotiating video, so startup cannot fill
             # the bounded decoder queue while the first frames arrive.
+            session.video_starting = True
             session.video_worker = await asyncio.to_thread(Worker)
+            session.video_started_at = time.monotonic()
+        except VideoUnavailable as unable:  # no video worker can start on this computer: said as that, and why
+            if not unable.lasting:  # (or only not yet: see `_read_status`)
+                session.not_yet = no_video(unable)
+                raise session.not_yet from None
+            raise no_video(unable) from None
         except (VideoError, OSError):
             raise KvmError("no_stream", "Secure video processing is unavailable", 503) from None
+        finally:
+            session.video_starting = False
         ws = await self._signalling()
         try:
             # No STUN or TURN servers: the wall and the KVM talk directly, and nobody else needs to know.
@@ -1190,7 +1304,7 @@ class JetKvmDevice(Device):
             await ws.send(json.dumps({"type": "offer", "data": {"sd": _pack(offer)}}))
             session.offered = True
             heard = Listening(ws, 2**20)
-            answer, candidates = await _await_answer(heard)
+            answer, candidates = await _await_answer(heard, session)
             # Only the addresses it is reached at here are tried (see allowed_candidate), whether they come with the answer
             # or after it.
             allowed = await self._candidate_addresses()
@@ -1226,12 +1340,7 @@ class JetKvmDevice(Device):
                 # (And where no picture has come on this connection at all, its first one is waited for PICTURE_AFTER_SIGNAL from
                 # the connection's opening, as after a screen that came back: a connection opened with a signal that never sent
                 # one waited until nobody had watched for five minutes, its tile saying "Waiting for the first picture".)
-                if session.signal_at > session.frame_at:
-                    stalled = time.monotonic() - session.signal_at > PICTURE_AFTER_SIGNAL
-                elif session.frame is None:
-                    stalled = session.ready.is_set() and time.monotonic() - session.ready_at > PICTURE_AFTER_SIGNAL
-                else:
-                    stalled = time.monotonic() - session.frame_at > FRAME_STALE
+                stalled = _picture_overdue(session)
                 if stalled and session.frame is not None and getattr(session.decoding, "awaiting_key_frame", False):
                     # Its video comes, and is let go of up to a key frame it does not send when asked: not a JetKVM that stopped
                     # sending video, nor one that is down. Made anew: a new connection begins with one (the review's P1). After
@@ -1380,10 +1489,13 @@ class JetKvmDevice(Device):
                     # next receive instead of marking that picture as current.
                     continue
                 received_at = getattr(frame, "received_at", time.monotonic())
-                if received_at < session.signal_at:
+                if _from_before(session, received_at):
                     # Decoding can finish after a signal change even when this
-                    # receive starts after it. Queue time belongs to the parent,
-                    # so the worker cannot make an old frame look current.
+                    # receive starts after it. The time is the parent's, when the
+                    # picture's first packet came (not when the WebRTC library let
+                    # it go, at the next picture's first packet: video._stamping),
+                    # so neither can make an old frame look current. (Nor a frame
+                    # stamped in the same tick of the clock: `_from_before`.)
                     continue
                 session.frame = frame
                 session.frame_at = received_at
@@ -1505,7 +1617,8 @@ class JetKvmDevice(Device):
         """The channel the JetKVM is asked over is open: the connection is up, and which way keys go is found out."""
         session.ready_at = time.monotonic()
         session.ready.set()
-        self._offer_failed = None  # (a connection came about: a tile asks again as ever, where this one ends)
+        # (A connection came about: a tile asks again as ever, where this one ends.)
+        self._offer_failed, self._offers_failed, self._taken_and_failed = None, 0, False
         session.watchers.append(asyncio.create_task(self._choose_road(session)))
 
     async def _choose_road(self, session: _Session) -> None:
@@ -2087,9 +2200,9 @@ class JetKvmDevice(Device):
         if self._displaced:
             return "busy"  # there, and somebody else has its picture: nothing to tell anybody
         if self._offer_failed is not None:
-            # There, and the last video connection offered came to nothing (a tile offers no other: see `_note_offer`): the
-            # problem its tile shows. Said "online", the alerts said nothing of it, and the history, which keeps what each
-            # look at the tile says beside what this says, went from the one to the other at every look.
+            # There, and the last video connection offered came to nothing (a tile offers no other for a while: see
+            # `_note_offer`): the problem its tile shows. Said "online", the alerts said nothing of it, and the history, which
+            # keeps what each look at the tile says beside what this says, went from the one to the other at every look.
             return "error"
         # There, and that is all it says without a connection. What the last connection showed (no picture,
         # a password it would not take) is taken to be so still: calling it "online" in between would report
@@ -2116,9 +2229,9 @@ class JetKvmDevice(Device):
             raise IN_USE.with_traceback(None)
         session = self._session
         if session is None or not session.live:
-            if self._offer_failed is not None and not big:
-                # (The last connection offered came to nothing: a tile offers no other, its enlarged view does. See
-                # `_note_offer`.)
+            if self._offer_failed is not None and not big and time.monotonic() < self._offer_again_at:
+                # (The last connection offered came to nothing: a tile offers another once its pause is over, its enlarged
+                # view at once. See `_note_offer`.)
                 raise self._offer_failed.with_traceback(None)
             # Connecting takes a second or two; the tile asks again rather than wait here.
             self._check_backoff()
@@ -2126,14 +2239,14 @@ class JetKvmDevice(Device):
             if refused is not None:
                 raise refused.with_traceback(None)
             self._start()
-            raise KvmError("no_stream", "Connecting to the JetKVM", 503)
+            raise KvmError("no_stream", "Connecting to the JetKVM again" if self._offer_failed is not None else "Connecting to the JetKVM", 503)
         frame = session.frame
         no_signal = session.ready_said is False
         if no_signal and (frame is None or time.monotonic() - session.frame_at > FRAME_STALE):
             return Snapshot(_BLANK, "image/png", False, time.monotonic())
         if frame is None:
             raise KvmError("no_stream", "Waiting for the first picture", 503)
-        if not no_signal and (time.monotonic() - session.frame_at > FRAME_STALE or session.signal_at > session.frame_at):
+        if not no_signal and (time.monotonic() - session.frame_at > FRAME_STALE or _from_before(session, session.frame_at)):
             # What is in hand is not the screen any more: too old, or from before the JetKVM said its screen was back.
             raise KvmError("no_stream", "Waiting for the JetKVM's video", 503)
         size = tier_for(width)
@@ -2385,12 +2498,12 @@ class JetKvmDevice(Device):
         """Whether the JetKVM has said its screen is back since `at` (a frame's time, time.monotonic()): a picture made of a
         frame from before is not the screen, whatever came after it (the live line's last picture, see live.JetSource)."""
         session = self._session
-        return session is not None and session.signal_at > at
+        return session is not None and _from_before(session, at)
 
     def picture_awaited(self) -> bool:
         """Whether the JetKVM has said its screen is back since the last picture of it: what is in hand is from before."""
         session = self._session
-        return session is not None and session.signal_at > session.frame_at
+        return session is not None and _from_before(session, session.frame_at)
 
     async def input_ready(self) -> object:
         """Keys and the mouse can be sent: the connection is up, or is made now. KvmError where none is to be had.
@@ -2880,9 +2993,20 @@ class JetKvmDevice(Device):
         except KvmError as ex:
             if ex is RETIRED or self._closed:
                 return self._status or {"state": "connecting", "error": RETIRED.as_dict(), "kind": self.kind}
+            failed = self._session
+            if failed is not None and ex is failed.not_yet:
+                # Its video worker is slow to start ("not yet": a computer under load; see kvm.no_video), still being
+                # started as the wait for the connection ran out or past its own start's time, and nothing was asked of
+                # the JetKVM: nothing was heard of it either way. Said "offline" (the code of how the wait or the connection
+                # ended), the tile and its live line said so of a JetKVM that is there, its history went offline and back
+                # between the looks the alerts take, which found it there, and a look that says so asks after a while whether
+                # it answers the other way. What was known stands, or "connecting" where nothing was. (Found for 0.4.0 on
+                # the Windows test VM running 16 test files at a time, where a worker took up to 16 s to start.)
+                return self._status or {"state": "connecting", "error": ex.as_dict(), "kind": self.kind}
             there = False
-            # The last video connection offered came to nothing, and a tile offers no other (see `_note_offer`). Said "offline"
-            # (the code of how it ended) while the JetKVM answered, the look the alerts and the history take said "online".
+            # The last video connection offered came to nothing, and a tile offers no other for a while (see `_note_offer`).
+            # Said "offline" (the code of how it ended) while the JetKVM answered, the look the alerts and the history take
+            # said "online".
             offer_failed = ex is self._offer_failed
             if offer_failed or ex.code in ("auth_failed", "no_password", "not_set_up", "no_sign_in", "bad_response"):
                 gone = await self._gone_meanwhile("/device/status")
@@ -2891,7 +3015,7 @@ class JetKvmDevice(Device):
                 state = "busy"
             elif ex.code in ("auth_failed", "no_password", "not_set_up"):
                 state = "auth"
-            elif ex.code in ("cert_mismatch", "cert_invalid", "missing_driver", "no_sign_in", "another_machine") or (there and (ex.code == "bad_response" or offer_failed)):
+            elif ex.code in ("cert_mismatch", "cert_invalid", "missing_driver", "no_video", "no_sign_in", "another_machine") or (there and (ex.code == "bad_response" or offer_failed)):
                 state = "error"
             else:
                 state = "offline"
@@ -3177,8 +3301,9 @@ def _parse(raw: Any) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
-async def _await_answer(heard: Listening) -> tuple[str, list[str]]:
-    """The device's answer to our offer, and the network addresses it sends right after."""
+async def _await_answer(heard: Listening, session: _Session) -> tuple[str, list[str]]:
+    """The device's answer to our offer, and the network addresses it sends right after. Where it refuses the offer in
+    so many words, `session.refused` says so."""
     answer: str | None = None
     candidates: list[str] = []
     deadline = time.monotonic() + CONNECT_TIMEOUT
@@ -3207,6 +3332,7 @@ async def _await_answer(heard: Listening) -> tuple[str, list[str]]:
             return answer, candidates
         kind = message.get("type")
         if kind is None and message.get("error"):
+            session.refused = answer is None  # (an error after its answer is no refusal of the offer: it took it)
             raise KvmError("bad_response", f"The JetKVM refused the request for video: {plain(message['error'], 200) or 'no reason given'}")
         if kind == "answer":
             try:

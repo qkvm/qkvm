@@ -1,5 +1,5 @@
 """A server's mount kept through a look that learns more of the same server, as the outside review's third round
-(Codex) found it ended: the look adopted the server's numbers (none at first, or its computer's alone, then its
+found it ended: the look adopted the server's numbers (none at first, or its computer's alone, then its
 controller's too), the saved record changed, and the wall took it for another controller. Learning more of the same
 controller keeps a mount; another controller ends it (tests/test_a_mount_after_its_tile_was_given_another_controller.py).
 """

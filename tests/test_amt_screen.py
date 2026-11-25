@@ -100,6 +100,14 @@ async def settled_status(device: AmtDevice, state: str, within: float = 10.0) ->
         await asyncio.sleep(0.05)
 
 
+async def no_screen_said(device: AmtDevice, said: str | None, within: float = 10.0) -> None:
+    """Wait until a look says this of the PC's screen (`server.no_screen`; the first `status()` may be from before)."""
+    deadline = time.monotonic() + within
+    while (found := (await device.status()).get("server", {}).get("no_screen")) != said:
+        assert time.monotonic() < deadline, f"its screen was said to be {found!r}"
+        await asyncio.sleep(0.05)
+
+
 @contextlib.asynccontextmanager
 async def kept_live(device: AmtDevice) -> AsyncIterator[None]:
     """A background view that keeps the tile live and polls its picture, as the enlarged view's live line does: a session
@@ -409,8 +417,8 @@ def test_a_session_that_is_recorded_begins_all_the_same() -> None:
 @pytest.mark.parametrize(
     ("control", "consent", "said"),
     [
-        (1, False, "Needs the code shown on the PC for every session: in client control mode"),  # consent is mandatory there
-        (2, True, "Needs the code shown on the PC for every session, which a wall cannot type"),
+        (1, False, "Client control mode: Intel AMT shows a six-digit code on the PC's own screen"),  # consent is mandatory there
+        (2, True, "User consent is on: Intel AMT shows a six-digit code on the PC's own screen"),
     ],
 )
 def test_no_session_is_opened_where_the_pc_would_ask_for_its_code(tmp_path: Path, pc: FakeAmt, control: int, consent: bool, said: str) -> None:
@@ -419,6 +427,9 @@ def test_no_session_is_opened_where_the_pc_would_ask_for_its_code(tmp_path: Path
         device = client.post("/api/v1/devices", json={"url": pc.url, "password": "secret"}).json()["device"]["id"]
         status = status_of(client, device, state="online")
         assert status["screen"] is False and status["server"]["no_screen"].startswith(said)
+        # (And what to do: set the PC up so, or let somebody at the PC read the code out to a tool that asks for it.)
+        assert "admin control mode" in status["server"]["no_screen"] or "User Consent to None" in status["server"]["no_screen"]
+        assert "somebody at the PC reads it out" in status["server"]["no_screen"]
         assert [word for word in status["can"] if word in ("screen", "keys", "text", "live", "control")] == []
         refused = client.get(snap(device))
         assert (refused.status_code, refused.json()["code"]) == (404, "no_picture") and refused.json()["message"].startswith(said)
@@ -1149,28 +1160,33 @@ def test_a_look_that_sees_the_pc_come_on_asks_for_a_still(pc: FakeAmt) -> None:
     asyncio.run(run())
 
 
-def test_a_power_change_makes_the_shown_tile_take_a_fresh_still(pc: FakeAmt, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_a_power_change_makes_the_shown_tile_take_a_fresh_still(pc: FakeAmt, monkeypatch: pytest.MonkeyPatch, a_video_worker_first: None) -> None:
     monkeypatch.setattr(amt.AmtScreen, "STILL_EVERY", 1000.0)  # (so only a power change, not the clock, brings the next one)
-
+    # (Each still takes a session, and a video worker of its own for its picture: seconds on a busy computer, and one whose
+    # start ran past its own time came to nothing, and was taken again after a pause: the Windows test VM running 16 test
+    # files at a time needed up to two sessions and 36 s for the first still, and more than the five seconds this gave the
+    # second. Each is waited for until it is stored, and its session closed; what is counted is the sessions between.)
     async def run() -> None:
         device = a_pc(pc)
         try:
             await device.status()
-            await picture_of(device)  # the first still
+            await picture_of(device, within=120)  # the first still (room only)
             deadline = time.monotonic() + 3
             while pc.state.redirection_open:
                 assert time.monotonic() < deadline
                 await asyncio.sleep(0.02)
+            sessions = pc.state.kvm_sessions
             for _ in range(10):  # not due again for a long time: the cached still, no new session
                 await device.snapshot(640)
                 await asyncio.sleep(0.03)
-            assert pc.state.kvm_sessions == 1
+            assert pc.state.kvm_sessions == sessions
             device._screen.want_still()  # a power change was seen
-            await device.snapshot(640)
-            deadline = time.monotonic() + 5
-            while pc.state.kvm_sessions < 2 or pc.state.redirection_open:
+            deadline = time.monotonic() + 120  # (room only)
+            while device._screen._refresh_still or pc.state.redirection_open:
                 assert time.monotonic() < deadline, f"{pc.state.kvm_sessions} sessions"
+                await device.snapshot(640)  # (asked for as a tile asks: the first still's session may still be put away)
                 await asyncio.sleep(0.03)
+            assert pc.state.kvm_sessions > sessions
         finally:
             await device.close()
 
@@ -1295,15 +1311,20 @@ def test_a_handshake_that_goes_wrong_is_said_on_the_tile_and_not_tried_at_every_
         assert REJECTED.times(REJECTED.what("login", DeviceSpec("x", "x", pc.url, "admin", "secret"))) == 0
 
 
-def test_a_kvm_that_another_viewer_has_is_said_so_and_asked_again_later(tmp_path: Path, pc: FakeAmt) -> None:
-    pc.state.start_status = 2  # (what a real engine answered while another viewer had its KVM)
+@pytest.mark.parametrize("how", ["in_use", "reset"])
+def test_a_kvm_that_another_viewer_has_is_said_so_and_asked_again_later(tmp_path: Path, pc: FakeAmt, how: str) -> None:
+    # An engine answered the start of a session with IN_USE while another viewer had its KVM; five on AMT 16.1 (2026-11-17)
+    # reset the connection instead, and the tile waited for a picture ("Waiting for the PC's screen") or, after three, said
+    # "the connection to the server ended (ConnectionResetError)". Either is said as what it is, as a JetKVM's tile says it.
+    pc.state.second_session, pc.state.kvm_open = how, 1  # (another viewer's session, counted in)
     with wall(tmp_path) as client:
         device = client.post("/api/v1/devices", json={"url": pc.url, "password": "secret"}).json()["device"]["id"]
         status_of(client, device, screen=True)
-        looked_at_once_it_came(client, device, lambda: pc.state.redirections >= 1, 1.0)
+        seen = looked_at_once_it_came(client, device, lambda: pc.state.redirections >= 1, 1.0)
         assert pc.state.redirections == 1 and pc.state.redirection_logins == 0  # not asked at every look; and no password sent
+        assert seen[-1] == (409, "in_use"), seen[-3:]  # (the picture asked for says it, not "waiting")
         status = status_of(client, device, state="online", screen=False)
-        assert status["server"]["no_screen"] == "The PC's screen is not shown: another viewer has its KVM: the engine gives one session at a time"
+        assert status["server"]["no_screen"] == amt.IN_USE_WORDS
 
 
 def test_rfb_that_asks_for_vnc_authentication_after_the_handshake_is_sent_nothing_of_the_password(tmp_path: Path, pc: FakeAmt) -> None:
@@ -1338,10 +1359,14 @@ def test_a_password_the_redirection_port_refuses_is_a_no_and_is_offered_less_and
         device = client.post("/api/v1/devices", json={"url": pc.url, "password": "secret"}).json()["device"]["id"]
         status_of(client, device, screen=True)
         looked_at_once_it_came(client, device, lambda: pc.state.redirection_rejections >= 1, 1.5)
-        assert (pc.state.redirection_logins, pc.state.redirection_rejections) == (1, 1)  # a minute before the next, then five
-        assert REJECTED.times(REJECTED.what("login", DeviceSpec("x", "x", pc.url, "admin", "secret"))) == 1
+        assert (pc.state.redirection_logins, pc.state.redirection_rejections) == (1, 1)
+        # The engine took that password on its other port: a no here is judged as one there (Intel AMT refuses an address
+        # after failed sign-ins on both ports, whatever the password), said as the engine refusing this wall for a while,
+        # and not offered again on either port for that wait (amt.REFUSING_WAIT; a no after it is the verdict).
+        offered = REJECTED.what("login", DeviceSpec("x", "x", pc.url, "admin", "secret"))
+        assert REJECTED.times(offered) == 0 and REJECTED.wait_left(offered) > amt.REFUSING_WAIT - 5
         status = status_of(client, device, screen=False)
-        assert status["server"]["no_screen"].startswith("Its redirection port does not take the saved password")
+        assert status["server"]["no_screen"] == amt.refusing_words()
 
 
 def test_a_no_heard_on_the_other_port_while_the_challenge_comes_stops_the_answer(pc: FakeAmt) -> None:
@@ -1844,6 +1869,68 @@ def test_a_device_changed_while_the_power_command_waits_is_said_to_have_been_sen
     asyncio.run(run())
 
 
+def test_a_pc_whose_kvm_another_viewer_holds_is_said_so_asked_seldom_and_shown_once_it_is_free(pc: FakeAmt, monkeypatch: pytest.MonkeyPatch) -> None:
+    # (2026-11-17, D1-c.) The office wall had a PC's large view open; this wall's stills of it got 503 "Waiting for the
+    # PC's screen" for as long as that lasted: the engine reset each of its sessions. It is said as another viewer having
+    # the KVM; the port is not tried at every look meanwhile; and once the engine says its KVM is idle, the screen comes.
+    monkeypatch.setattr(vncdevice, "BAD_HOLD", 2.5)  # (fifteen seconds before the port is tried again, here two and a half)
+    monkeypatch.setattr(amt, "BAD_HOLD", 2.5)
+    pc.state.second_session = "reset"
+
+    async def run() -> None:
+        other = a_pc(pc)  # another wall, with the PC's large view open
+        device = a_pc(pc)
+        try:
+            await other.status()
+            async with kept_live(other):
+                deadline = time.monotonic() + 15
+                while pc.state.kvm_open == 0:
+                    assert time.monotonic() < deadline, "the other viewer got no session"
+                    await asyncio.sleep(0.05)
+                await settled_status(device, "online")
+                said: KvmError | None = None
+                deadline = time.monotonic() + 15
+                while said is None:  # this wall's tile, only shown: its still
+                    try:
+                        await device.snapshot(640)
+                    except KvmError as ex:
+                        if ex.code != "no_stream":
+                            said = ex
+                    assert time.monotonic() < deadline, "it never said that another viewer has the KVM"
+                    await asyncio.sleep(0.05)
+                assert (said.code, said.status, said.message) == ("in_use", 409, amt.IN_USE_WORDS)
+                await no_screen_said(device, amt.IN_USE_WORDS)
+                assert pc.state.sessions_refused == 1 and pc.state.redirection_logins == 1  # (the other's; none of this wall's)
+                # Looked at, and enlarged, for a while: the port is not tried again meanwhile.
+                began = time.monotonic()
+                while time.monotonic() - began < 1.5:
+                    device._screen.live_seen()
+                    with contextlib.suppress(KvmError):
+                        await device.snapshot(640, big=True)
+                    assert (await device.status())["server"]["no_screen"] == amt.IN_USE_WORDS
+                    await asyncio.sleep(0.05)
+                assert pc.state.sessions_refused == 1
+            await other.close()  # (its session ends)
+            # The engine says its KVM is idle again at a look, and the screen comes once the first wait is over.
+            deadline = time.monotonic() + 15
+            while True:
+                await device.status()
+                device._screen.live_seen()
+                try:
+                    await device.snapshot(4000)
+                    break
+                except KvmError as ex:
+                    if ex.code not in ("no_stream", "in_use") or time.monotonic() > deadline:
+                        raise
+                await asyncio.sleep(0.05)
+            await no_screen_said(device, None)
+        finally:
+            await other.close()
+            await device.close()
+
+    asyncio.run(run())
+
+
 def test_another_viewer_holding_the_kvm_is_asked_after_every_fifteen_seconds(pc: FakeAmt) -> None:
     # (The reviewer's F9.) The refusal hold doubles to four minutes for a server that sends what is not taken; for another
     # viewer's session, which costs the engine nothing to say, the tile (and a live line, and keys) asks again every 15 s.
@@ -1963,6 +2050,26 @@ def test_the_live_lines_keys_and_pointer_become_rfb_events() -> None:
     ]  # fmt: skip
 
 
+def test_the_stand_in_counts_only_what_asks_its_redirection_port_for_a_session(pc: FakeAmt) -> None:
+    # (The Linux runner, fourteen test files at once, 2026-11-17: "assert 4 == 0" of a wall that opened no session.) What
+    # the stand-in counted were connections to its port, whoever made them: another test's device pointed at a port taken
+    # for closed (tests/test_wall.closed_port), or at its own stand-in that had stopped, reached this one where the system
+    # handed it that port meanwhile, and was counted as this wall's session, tried again and again. Counted now is what asks
+    # the port for a session, as every client of a redirection port does first; the rest is somebody else's.
+    port = pc.port + 2
+    with socket.create_connection(("127.0.0.1", port), timeout=5) as a_viewer:  # (a VNC viewer: it waits for a greeting)
+        with socket.create_connection(("127.0.0.1", port), timeout=5) as a_browser:
+            a_browser.sendall(b"GET / HTTP/1.1" + bytes((13, 10, 13, 10)))
+            time.sleep(0.5)
+            assert (pc.state.redirections, pc.state.redirection_open) == (0, 0)
+        a_viewer.close()
+    with socket.create_connection(("127.0.0.1", port), timeout=5) as a_client:  # (what the wall sends first: the start)
+        a_client.sendall(amt.START_KVM)
+        assert a_client.recv(1) == bytes((amt.STARTED,))
+        assert (pc.state.redirections, pc.state.redirection_open) == (1, 1)
+    wait_until(lambda: pc.state.redirection_open == 0, "the connection was never seen to end")
+
+
 def test_the_stand_in_finds_its_two_ports_also_where_the_system_hands_out_the_last_ones(monkeypatch: pytest.MonkeyPatch) -> None:
     # (Seen once in a run of the tests: the system handed the stand-in port 65534 or 65535, the port two above it is no port,
     # and binding it raised OverflowError, which the search for two free ports did not take for a port that is taken.)
@@ -2040,6 +2147,9 @@ def test_the_session_goes_to_the_engine_that_said_which_pc_it_is_where_its_name_
             wait_until(lambda: client.get(snap(device)).status_code == 200, "no picture came", 20)
             reply = client.post(f"/api/v1/devices/{device}/actions", json={"action": "keys", "keys": "KeyQ"})
             assert reply.status_code == 200, reply.text
+            # (The reply says the keys were sent; the fake PC's own thread notes them a moment later. On a loaded runner that
+            # moment came after a look made right away: no keys yet. So this waits for them, as the other key tests do.)
+            wait_until(lambda: len(a.state.screen.keys) >= 2, f"the PC got {a.state.screen.keys}", 20)
             assert (other.redirections, other.redirection_logins, other.kvm_sessions, other.screen.keys) == (0, 0, 0, []), "the other PC was reached"
             assert a.state.kvm_sessions >= 1 and len(a.state.screen.keys) == 2
     finally:

@@ -1,5 +1,5 @@
 """A server's mount when its tile is changed to another kind at the same address, and a replaced driver's late word, as the
-outside review's fourth round (Codex, R4-M2 and a LOW) found them: the old controller still read the image after the
+outside review's fourth round (R4-M2 and a LOW) found them: the old controller still read the image after the
 tile became a kvmd KVM; and a number or a certificate a replaced driver saw was saved to the record that took its place.
 """
 import asyncio
@@ -51,13 +51,13 @@ def test_prior_driver_callback_updates_new_record(tmp_path, monkeypatch, which):
         record.url="https://127.0.0.1:18457"
         manager=managers[-1]
         old=manager.client(record, "secret")
-        manager._install(old)
+        manager._install(old, record)
         current = replace(record, name="replacement")
         core.store.devices[core.store.devices.index(record)]=current
         new=manager.client(current, "secret")
         if which == "number":
             await old.on_known("", "server:" + "a"*32)
-        manager._install(new)
+        manager._install(new, current)
         if which == "pin":
             await old.on_pin("synthetic previous-driver pin")
         await asyncio.gather(*manager._saving)

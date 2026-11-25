@@ -171,9 +171,9 @@ def test_an_alert_address_that_was_refused_with_the_rest_of_the_form_is_not_in_u
         shown = admin.get("/api/v1/alerts").json()
         print("refused as a whole:", answer.status_code, answer.json()["message"], "| has_webhook now:", shown["has_webhook"])
         assert admin.post("/api/v1/tokens", json={"name": "a script"}).status_code == 201  # something unrelated is saved
-    on_disk = json.loads(settings_text(data / "qkvm.json", encoding="utf-8"))["alerts"]["webhook"]
-    print("an address is saved in qkvm.json:", on_disk is not None)
-    assert on_disk is None, "the address from the refused form is saved, and is where alerts go once they are switched on"
+    on_disk = json.loads(settings_text(data / "qkvm.json", encoding="utf-8"))["destinations"]  # (0.4.0: where an address is kept)
+    print("an address is saved in qkvm.json:", bool(on_disk))
+    assert on_disk == [], "the address from the refused form is saved, and is where alerts go once they are switched on"
 
 
 @pytest.mark.skipif(__import__("sys").platform != "win32", reason="how Windows shares an open file")
@@ -247,7 +247,7 @@ def test_reset_password_leaves_nothing_of_the_accounts_or_the_saved_passwords_in
         left = json.loads(settings_text(data / name, encoding="utf-8"))
         assert not left["users"] and left["recovery"] is None and left["unlock"] is None, name
         assert [d["id"] for d in left["devices"]] == [device] and all(d["secret"] is None for d in left["devices"]), name
-        assert left["alerts"]["webhook"] is None, name  # (encrypted for the accounts as well: it would go nowhere)
+        assert left["destinations"] == [] and "webhook" not in left["alerts"], name  # (encrypted for the accounts as well: they would go nowhere)
     assert not any(Vault.open(found, (data / "unlock.key").read_text(encoding="ascii").strip()) for found in [left["unlock"]] if found)
     # And the accounts are not one unreadable settings file away from being back:
     write_settings_text(data / "qkvm.json", "", encoding="utf-8")

@@ -51,6 +51,9 @@ def test_a_kvm_whose_mouse_moves_by_steps_is_handed_the_pointer_by_a_click(tmp_p
             page.keyboard.press("c")
             expect(page.locator("#focus-control")).to_have_attribute("aria-pressed", "true")
             expect(page.locator("#focus-keys-note")).to_contain_text("moves by steps only: click the picture to hand it the pointer")
+            # ...and where that is set, for whoever would rather point straight at the picture (a real Comet on GL.iNet's newer
+            # firmware had it so, 2026-11-16, and nobody had chosen it on the wall).
+            expect(page.locator("#focus-keys-note")).to_contain_text("(Esc gives it back), or set its mouse to absolute on the KVM's own page.")
             expect(page.locator("#focus-relative")).to_be_enabled()
             middle = on_the_picture(page)
             page.mouse.move(*middle)

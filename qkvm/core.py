@@ -10,6 +10,7 @@ import logging
 import os
 import re
 import secrets
+import threading
 import time
 from collections import deque
 from collections.abc import Awaitable, Callable, Iterable
@@ -18,18 +19,19 @@ from typing import Any
 from urllib.parse import urlsplit
 
 
-from . import activity, unlock
+from . import activity, backup, chain, unlock
 from ._folders import own_folder
 from .alerts import Watcher
 from .forward import Syslog
 from .history import FILE as HISTORY_FILE
 from .history import History
-from .kvm import Device, DeviceSpec, KvmDevice, KvmError, Snapshot, saved_mark
+from .kvm import Device, DeviceSpec, KvmDevice, KvmError, Snapshot, saved_mark, several_mark
 from .netbind import TAILSCALE_NET, lan_ip, tailscale_ip
 from .screens import ScreenWatch
 from .security import Limiter, Sessions, proxy_networks
 from .served import Served, address_of, same_address
-from .store import AMT_VIEWS, FINGERBOT_STRENGTHS, KINDS, AuditLog, DeviceRecord, Store, UserRecord, activity_file_bytes
+from .store import AMT_VIEWS, FINGERBOT_STRENGTHS, KINDS, AuditLog, DeviceRecord, Store, UserRecord, activity_file_bytes, position_of
+from .tailcert import TailscaleCert
 from .tlscert import certificate_fingerprint, ensure_certificate
 from ._libraries import FILES
 from .update import GITHUB_API, Updater
@@ -37,6 +39,18 @@ from .vault import NoMemory, Vault
 
 log = logging.getLogger("qkvm")
 RESTART = 75  # exit status that makes `python -m qkvm` start the wall again (see __main__.py)
+
+
+# What is said where a backup is not begun because one its bound cut off is still waiting for its folder.
+RUN_STILL_WAITING = (
+    "A backup cut off after its hour is still waiting for this folder (a share whose server is gone?): no other is begun into it "
+    "until that one ends. A restart of qKVM frees it; backups into another folder go on meanwhile"
+)
+# ...and where as many as may wait are waiting, each for a folder of its own.
+RUNS_ALL_WAITING = (
+    "Backups cut off after their hour are waiting for folders that do not answer, as many as qKVM lets wait: no other is begun "
+    "until one of them ends. A restart of qKVM frees them"
+)
 
 
 class Core:
@@ -53,6 +67,7 @@ class Core:
         allow_from: Iterable[str] = (),
         https: bool = False,
         tls_files: tuple[Path, Path] | None = None,
+        tailscale_cert: bool = False,
         unlock_secret: str | None = None,
         sso_header: str | None = None,
         audit_syslog: str | None = None,
@@ -67,8 +82,11 @@ class Core:
         # The only addresses that are answered at all, if any were named (see security.client_allowed).
         self.allowed_clients = proxy_networks(allow_from)
         # HTTPS because it was said at start, whatever the settings say; and with whose certificate.
-        self.https_forced = https or tls_files is not None
+        self.https_forced = https or tls_files is not None or tailscale_cert
         self.tls_files = tls_files  # (certificate, key) of the owner's own, instead of one made here
+        # Tailscale's certificate for this computer's name in its tailnet, served for that name beside the wall's own (tailcert.py,
+        # --tls-tailscale). None: not asked for.
+        self.tailscale_cert = TailscaleCert(data_dir / "tls") if tailscale_cert else None
         # Proxies in front of qKVM that are believed about who is calling (see security.client_ip).
         self.trusted_proxies = proxy_networks(trusted_proxies)
         # What opens the saved passwords without anybody signing in, so that qKVM carries on by itself after a
@@ -96,10 +114,23 @@ class Core:
         self.data_dir = data_dir
         self.started = time.time()
         # The activity log, and where a copy of each entry is sent as it is written (--audit-syslog); ValueError for no such place.
+        # Each line chained and signed with the log's key (chain.py), kept in the sealed settings and made at the first start of
+        # 0.4.0. Where it cannot be saved, it is not used: lines signed with a key that is gone at the next start would read as
+        # written by somebody else; without one they are written as before, and taken in at a start that has one.
+        if not self.store.activity_key:
+            try:
+                self.store.activity_key = chain.new_key().hex()
+                self.store.save()
+            except OSError as ex:
+                self.store.activity_key = ""
+                log.error("the activity log's key could not be saved (%s): its lines are written without the chain until it can be", ex.strerror or ex)
         self.audit = AuditLog(
             data_dir / "audit.log",
             max_bytes=activity_file_bytes(self.store.server.activity_mb),
             forward=Syslog(audit_syslog).send if audit_syslog is not None else None,
+            key=bytes.fromhex(self.store.activity_key) if self.store.activity_key else None,
+            # (Where its chain had come to, as the sealed settings keep it: the writer holds the files to it at its first line.)
+            held=lambda: position_of(self.store.activity_position),
         )
         # ...and its index for the page's filters and search (see activity.py), made from those files and from nothing else,
         # told by the log's writer that there is more and never waited for; its thread is started with the wall.
@@ -133,6 +164,25 @@ class Core:
         self.watcher = Watcher(data_dir / "watch.json")
         # Its screens watched (screens.py): which of those alerts stand, kept over a restart; the pictures that set them off.
         self.screens = ScreenWatch(data_dir)
+        # The threads the backups' folder is worked on (backup.FolderThreads): kept with the program, so that one a folder that
+        # does not answer holds is still counted after the listeners are opened anew. A run's own: one, so that no run is ever
+        # begun beside one its bound cut off and whose thread goes on (it would share its files: the re-review of wave 3, N1).
+        # (Three at the most, one a folder: a run cut off on a share that never answers holds that share alone.)
+        self.backup_runs = backup.FolderThreads(3, RUNS_ALL_WAITING, same_folder=RUN_STILL_WAITING)
+        # The copies of the history runs are making or reading (backup.HISTORY_COPY), by name: what a run before left is taken
+        # away, and never one a run still holds (one its hour cut off, waiting for its folder).
+        self.backup_copies: set[str] = set()
+        self.backup_copies_lock = threading.Lock()
+        # How runs that nobody waited for any more ended (cut off by their hour, or begun before the listeners were opened anew):
+        # what each was made for (backup.Run), what it made or how it failed, and whether its hour had cut it off, handed over
+        # from their threads, kept by whichever listeners there are (`backup_poke`, set by them as they open), or at the
+        # clock's next look.
+        self.backup_ended: deque[tuple[backup.Run, Any, BaseException | None, bool]] = deque()
+        self.backup_poke: Callable[[], None] | None = None
+        # ...and each other kind of work its own, so that none starves another (the re-review of wave 3, N2): Verify, one;
+        # the look at where a folder typed in Settings lies, two.
+        self.backup_reads = backup.FolderThreads(1, "Another Verify is reading a backup, or waiting for the folder (a share whose server is gone?): try again once it is done")
+        self.backup_looks = backup.FolderThreads(2, "A look at where a folder lies is still waiting for one that does not answer (a share whose server is gone?): try again in a moment")
         # What the wall saw of each machine, kept for a while (see history.py): opened by its own thread once the wall serves.
         self.history = History(data_dir / HISTORY_FILE, limits=lambda: (self.store.server.history_days, self.store.server.history_mb))
         # Where qKVM was started with --setup-code: printed where it runs, and asked of whoever sets the first
@@ -143,6 +193,7 @@ class Core:
         self.port_override = port_override
         self.listening: list[str] = []  # URLs being served right now
         self.addresses: list[str] = []  # the addresses the listeners were opened on
+        self.ports: list[int] = []  # ...and the ports: what an alert is never sent to on this computer (egress.Own)
         self.missing: list[str] = []  # bind names that had no address at startup
         self.bind_error: str | None = None
         self.cert_fingerprint: str | None = None if tls_files is None else certificate_fingerprint(tls_files[0])
@@ -355,15 +406,21 @@ class Core:
         self.store.tokens = []  # nobody is left who made them
         for device in self.store.devices:
             device.secret = None
-        # Saved "type text" actions were encrypted with it as well, and so was the address alerts go to: left
-        # in, alerts would be shown as set up and go nowhere.
+        # Saved "type text" actions were encrypted with it as well, and so were the places alerts go to (their addresses,
+        # keys and passwords): left in, alerts would be shown as set up and go nowhere.
         self.store.actions = [action for action in self.store.actions if action.kind != "text"]
-        self.store.alerts.webhook = None
+        self.store.destinations = []
         # ...and the browsers told the alerts by Web Push, whose accounts are gone, with the wall's key they subscribed to.
         self.store.pushes = []
         self.store.alerts.push_key = None
         # Whoever had the token that reads the measurements was given it by an account that is gone.
         self.store.server.metrics_token = ""
+        # ...and the backup key was sealed with the key that is erased: it opens nothing any more. Backups stop until an admin
+        # makes a new key (backups made before open with the kit they were made with, as ever).
+        backups = self.store.backups
+        backups.secret, backups.key_id, backups.key_made, backups.enabled = None, "", 0.0, False
+        # ...and NetBird's token was sealed with the key that goes now: where its API is, is kept, and the token is typed again.
+        self.store.netbird.secret = None
         self.store.save()  # (the second copy of the settings is renewed with it)
         return self.store.clear_out()  # and nothing of this is left in the folder in a file of another name
 
@@ -466,6 +523,16 @@ class UnknownKind(Device):
         return {"state": "error", "error": {"code": said.code, "message": said.message}}
 
 
+def several_mark_of_spec(spec: DeviceSpec) -> str:
+    """The machine a client is at, as the mark DeviceRecord.several_inputs_at is kept by (kvm.several_mark)."""
+    return several_mark(spec.base_url, spec.kind, spec.tls, spec.cert_pem, spec.machine, spec.ident)
+
+
+def several_mark_of(record: DeviceRecord) -> str:
+    """The machine a tile is at, as the mark DeviceRecord.several_inputs_at is kept by (kvm.several_mark)."""
+    return several_mark(record.url, record.kind, record.tls, record.cert_pem, record.machine, record.ident)
+
+
 class DeviceManager:
     """Live clients for the saved devices. They exist only while the vault is unlocked."""
 
@@ -507,6 +574,7 @@ class DeviceManager:
             ident=record.ident,
             fingerbot_strength=record.fingerbot_strength if record.fingerbot_strength in FINGERBOT_STRENGTHS else FINGERBOT_STRENGTHS[0],
             amt_view=record.amt_view if record.amt_view in AMT_VIEWS else AMT_VIEWS[0],
+            several_at=record.several_inputs_at,
         )
 
     async def _known(self, device_id: str, url: str, was: str, mark: str, current: Callable[[], bool] | None = None) -> None:
@@ -546,6 +614,27 @@ class DeviceManager:
         self._saving.add(saving)
         saving.add_done_callback(self._saving.discard)
 
+    def _several(self, device_id: str, url: str, mark: str, kept: bool, current: Callable[[], bool]) -> None:
+        """A KVM has shown several inputs where its tile's record does not say so of the machine it is at (DeviceSpec.several_at):
+        kept with the record from now on, across restarts and locks, and saved in its turn among the changes as a first
+        certificate is, not waited for (the driver is in the middle of a look). Only for the record of the machine the driver
+        talks to: a driver replaced meanwhile, or a record pointed at another machine since, has nothing said of it. Not
+        `kept`: let go of, its switch having said long enough that there is none (kvm.NO_SWITCH_LETS_GO)."""
+        if not current():
+            return
+        record = self.core.store.device(device_id)
+        if record is None or record.url != url:
+            return
+        if kept and (record.several_inputs_at == mark or several_mark_of(record) != mark):
+            return
+        if not kept and record.several_inputs_at != mark:
+            return
+        record.several_inputs_at = mark if kept else ""
+        what = "that it has several inputs" if kept else "that its several inputs were let go of"
+        saving = asyncio.ensure_future(self._save_certificate(record.name, what))
+        self._saving.add(saving)
+        saving.add_done_callback(self._saving.discard)
+
     async def _save_certificate(self, name: str, what: str = "its certificate") -> None:
         try:
             await self.save()
@@ -565,7 +654,8 @@ class DeviceManager:
         """
         return driver_for(record.kind)(self.spec(record, password))
 
-    def _install(self, device: Device) -> None:
+    def _install(self, device: Device, record: DeviceRecord | None) -> None:
+        """Make `device` the live client of its tile, whose record is `record` (None: none saved)."""
         device_id, url = device.spec.id, device.spec.base_url
 
         def current() -> bool:
@@ -575,8 +665,17 @@ class DeviceManager:
         device.on_move = lambda to: self._moved(device_id, url, to)
         device.on_status = lambda status: self._observed(device_id, status)
         device.on_known = lambda was, mark: self._known(device_id, url, was, mark, current)
+        device.on_several = lambda mark, kept: self._several(device_id, url, mark, kept, current)
         device.served = self.core.served
         self.devices[device_id] = device
+        # What the tile's record kept of the inputs of the machine it was at, where it is at another by now: emptied (an edit that
+        # pointed it elsewhere: the review of HB, M1), or kept for what it is at now where the client carried it over (a
+        # certificate trusted anew at the same address and kind: the narrow re-review of HB's second round, L1). Written with the
+        # change that did so.
+        if record is not None and record.several_inputs_at and record.several_inputs_at != (now := several_mark_of(record)):
+            carried = isinstance(device, KvmDevice) and device.has_shown_several()
+            record.several_inputs_at = now if carried else ""
+            device.spec.several_at = record.several_inputs_at
 
     def _observed(self, device_id: str, status: dict[str, Any]) -> None:
         if self.observed is not None and self.devices.get(device_id) is not None:
@@ -588,14 +687,18 @@ class DeviceManager:
             return
         for record in self.core.store.devices:
             if record.id not in self.devices:
-                self._install(self.client(record))
+                self._install(self.client(record), record)  # (its record given: not looked up in the list again, per tile)
 
     async def adopt(self, device: Device) -> None:
         """Make `device` the live client for its id, retiring the one it replaces."""
         retired = self.devices.get(device.spec.id)
         if retired is not None and type(retired) is type(device) and retired.spec.base_url == device.spec.base_url:
             device.takes_over(retired)
-        self._install(device)  # first, so that the KVM is never missing from the wall in between
+        if isinstance(retired, KvmDevice) and several_mark_of_spec(retired.spec) != several_mark_of_spec(device.spec):
+            # (Pointed at another machine: what the one before showed of its inputs goes, and a tile added at its address starts
+            # afresh. The narrow re-review of HB's third round, L1.)
+            retired.forget_several()
+        self._install(device, self.core.store.device(device.spec.id))  # first, so that the KVM is never missing from the wall in between
         if retired is not None:
             await self._retire(retired)
 
@@ -645,11 +748,17 @@ class DeviceManager:
     async def remove(self, device_id: str) -> None:
         device = self.devices.pop(device_id, None)
         if device is not None:
+            if isinstance(device, KvmDevice):
+                device.forget_several()  # (its tile removed: a tile added at its address starts afresh)
             await self._retire(device)
 
     def take(self, device_ids: Iterable[str]) -> list[Device]:
         """Take the live clients of these off the wall, all at once, to be closed together (retire_all)."""
-        return [device for device in (self.devices.pop(device_id, None) for device_id in device_ids) if device is not None]
+        taken = [device for device in (self.devices.pop(device_id, None) for device_id in device_ids) if device is not None]
+        for device in taken:
+            if isinstance(device, KvmDevice):
+                device.forget_several()  # (removed: a tile added at its address starts afresh)
+        return taken
 
     async def retire_all(self, devices: Iterable[Device]) -> None:
         """Close clients that `take` took, side by side, as at the end. (One after the other, each sign-out and each live

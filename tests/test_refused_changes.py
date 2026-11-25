@@ -24,7 +24,7 @@ from qkvm.vault import Vault
 from tests.fake_kvm import FakeKvm
 from tests.test_unlock import fits
 from tests.test_users import OTHER, account, browser, visitor
-from tests.test_wall import CSRF, PASSWORD, add, closed_port, wait_until, wall
+from tests.test_wall import add, closed_port, CSRF, PASSWORD, port_to_listen_on, wait_until, wall
 from tests.settings_file import settings_text, write_settings_text
 
 
@@ -173,7 +173,7 @@ def test_an_installed_update_is_not_taken_back_because_the_certificate_could_not
     (data / "tls").write_text("", encoding="utf-8")
     before = signal.getsignal(signal.SIGTERM)
     try:
-        status = starter.supervise(["--data-dir", str(data), "--https", "--bind", "local", "--port", str(closed_port())])
+        status = starter.supervise(["--data-dir", str(data), "--https", "--bind", "local", "--port", str(port_to_listen_on())])
     finally:
         signal.signal(signal.SIGTERM, before)
     said = capfd.readouterr().err

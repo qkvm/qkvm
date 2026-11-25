@@ -31,7 +31,7 @@ import pytest
 from qkvm import cli, kvm
 from qkvm.kvm import DeviceSpec, KvmDevice
 from tests.test_device_limits import GUID, OddDevice, frame
-from tests.test_wall import closed_port
+from tests.test_wall import port_to_listen_on
 
 
 def reset(conn: socket.socket) -> None:
@@ -369,7 +369,7 @@ def test_requests_from_nobody_are_a_line_of_each_kind_and_not_a_line_each(tmp_pa
     # send those, signed in or not: six hundred of them were nine hundred lines in two seconds, in the log
     # (whose history is kept to a size, and was gone in minutes at that rate) and on the terminal (which is
     # kept to none). The program itself, started as it is started.
-    port, data = closed_port(), tmp_path / "data"
+    port, data = port_to_listen_on(), tmp_path / "data"
     env = {**os.environ, "PYTHONPATH": str(Path(cli.__file__).resolve().parent.parent)}
     env.pop("QKVM_CHILD", None)
     program, where = [sys.executable, "-P", "-m", "qkvm"], ["--data-dir", str(data)]

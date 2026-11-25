@@ -45,7 +45,13 @@ def test_a_tag_makes_the_draft_and_a_publication_publishes_it() -> None:
         assert not (waits_for(every, name) & DRAFT_STAGE), "a publication is another run: it can wait for no job of the tag's run"
     text = RELEASE.read_text(encoding="utf-8")
     assert "TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || github.ref_name }}" in text
-    assert re.search(r"^concurrency:\n  group: release-\$\{\{ github\.event\.release\.tag_name \|\| github\.ref_name \}\}\n  cancel-in-progress: false\n", text, flags=re.M)
+    # (One group for a tag's run and its publication, which neither cancels; only a rehearsal's push cancels, its own branch's
+    # older run: tests/test_a_superseded_rehearsal_is_cancelled.py.)
+    assert re.search(
+        r"^concurrency:\n  group: release-\$\{\{ github\.event\.release\.tag_name \|\| github\.ref_name \}\}\n"
+        r"  cancel-in-progress: \$\{\{ github\.event_name == 'push' && startsWith\(github\.ref, 'refs/heads/release-'\) \}\}\n",
+        text, flags=re.M,
+    )  # fmt: skip
 
 
 def test_no_file_is_changed_on_a_release_after_it_is_published() -> None:

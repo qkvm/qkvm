@@ -21,13 +21,13 @@ from pathlib import Path
 import pytest
 
 from qkvm import cli
-from tests.test_wall import closed_port
+from tests.test_wall import port_to_listen_on
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="a stop is a SIGTERM on Linux and macOS; on Windows the program is stopped otherwise")
 @pytest.mark.parametrize("told", ["the starter", "the wall itself"])
 def test_a_wall_stopped_by_sigterm_writes_that_it_stopped(tmp_path: Path, told: str) -> None:
-    port, data = closed_port(), tmp_path / "data"
+    port, data = port_to_listen_on(), tmp_path / "data"
     env = {**os.environ, "PYTHONPATH": str(Path(cli.__file__).resolve().parent.parent), "HOME": str(tmp_path)}
     env.pop("QKVM_CHILD", None)
     module = "qkvm" if told == "the starter" else "qkvm.cli"  # (the starter passes it on to the wall it started)

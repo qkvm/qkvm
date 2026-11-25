@@ -50,7 +50,7 @@ def test_the_lock_is_signed_with_the_packages() -> None:
     signed = next(index for index, step in enumerate(signing) if "-m qkvm.release publish" in step)
     assert held < signed
     assert '(cd release && sha256sum -- "qkvm-${TAG#v}-libraries.json" >> SHA256SUMS)' in signing[held]
-    # SHA256SUMS stays far under the 64,000 bytes every version since 0.1.0 reads of it: four lines.
+    # SHA256SUMS stays far under the 64,000 bytes every version since 0.1.0 reads of it: five lines.
     assert "sums = await self._download(client, release.sums_url, 64_000)" in (APP / "qkvm" / "update.py").read_text(encoding="utf-8")
 
 

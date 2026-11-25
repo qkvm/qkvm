@@ -20,6 +20,7 @@ from qkvm import alerts, ami, discover, kvm, redfish, update, vault
 from qkvm import server as server_module
 from qkvm.redfish import link, locator, named
 from tests import fake_redfish
+from tests.test_discover import searched
 from tests.aspeed_frames import Frame
 from tests.fake_kvm import FakeKvm
 from tests.fake_redfish import BmcState, FakeBmc
@@ -1161,7 +1162,7 @@ def test_alerts_call_a_server_what_it_is() -> None:
 
 def test_servers_are_found_on_the_network(tmp_path: Path, bmc: FakeBmc, monkeypatch: pytest.MonkeyPatch) -> None:
     wanted = [discover.Target("127.0.0.1", bmc.url, "http://127.0.0.1:9")]
-    monkeypatch.setattr(discover, "targets", lambda: (wanted, ["test network"]))
+    monkeypatch.setattr(discover, "targets", searched(wanted, ["test network"]))
     with wall(tmp_path) as client:
         found = client.post("/api/v1/discover").json()["found"]
         assert [(entry["kind"], entry["url"], entry["known"]) for entry in found] == [("redfish", bmc.url, False)]
@@ -1412,24 +1413,43 @@ def test_the_newer_kind_of_locator_light_and_none_at_all(tmp_path: Path, bmc: Fa
 def test_a_moment_of_the_controller_s_does_not_change_what_the_tile_says(tmp_path: Path, bmc: FakeBmc, monkeypatch: pytest.MonkeyPatch) -> None:
     # A real controller, with nothing wrong with it or its server, answered errors for twenty-odd seconds
     # at a stretch while the server shut down. On the wall that was "Problem", twice, and nearly an alert.
-    monkeypatch.setattr(redfish, "HICCUP", 5.0)
+    #
+    # The moment lasts until the test has seen what it is about, not for a second by the clock: a look is made when the
+    # status is asked (or by the history, once a minute), and on a slow machine (GitHub's Windows runner, 2026-11-16) the
+    # last look made in a moment of one second came back after the half second the test went on asking, and nothing asked
+    # again. HICCUP is a minute so that no machine is too slow for the moment to be over within it (that a moment which
+    # outlasts HICCUP is said is the next test's).
+    monkeypatch.setattr(redfish, "HICCUP", 60.0)
     monkeypatch.setattr(redfish, "RETRY_LOOK", 0.1)
-    monkeypatch.setattr(redfish, "LOOK_EVERY", 30)
+    monkeypatch.setattr(redfish, "LOOK_EVERY", 0.2)
+    computer = "GET /redfish/v1/Systems/Self"  # (read first at every look: one refused is one failed look)
     with wall(tmp_path) as client:
         device = add(client, bmc.url)
         before = status_of(client, device, state="online")
-        monkeypatch.setattr(redfish, "LOOK_EVERY", 0.2)
-        asked = len(bmc.state.requests)
-        bmc.state.unwell_until = time.monotonic() + 1.0
         seen = set()
-        while time.monotonic() < bmc.state.unwell_until + 0.6:
-            status = client.get("/api/v1/status").json()[device]
-            seen.add(status["state"])
-            assert status["server"] == before["server"]  # what was known a moment ago, not a blank
-            time.sleep(0.05)
+
+        def asked_and(condition: Any) -> Any:
+            def told() -> bool:
+                status = client.get("/api/v1/status").json()[device]
+                seen.add(status["state"])
+                assert status["server"] == before["server"]  # what was known a moment ago, not a blank
+                return bool(condition())
+
+            return told
+
+        bmc.state.unwell_until = float("inf")
+        wait_until(asked_and(lambda: computer in bmc.state.refused), "the server was not looked at in the controller's moment")
+        # A server is looked at every 30 s from now on, as when nothing is wrong: the looks that follow are those that come
+        # soon after a failed one.
+        monkeypatch.setattr(redfish, "LOOK_EVERY", 30)
+        failed = bmc.state.refused.count(computer)
+        wait_until(asked_and(lambda: bmc.state.refused.count(computer) >= failed + 2), "a failed look was not followed soon by another")
+        asked = len(bmc.state.requests)
+        bmc.state.unwell_until = 0.0
+        # Once it answered, things went on as usual.
+        wait_until(asked_and(lambda: len(bmc.state.requests) > asked), "the server was not looked at again after the controller's moment")
         assert seen == {"online"}
-        # It was asked again soon after each failed look, and once it answered, things went on as usual.
-        wait_until(lambda: len(bmc.state.requests) > asked, "the server was not looked at again after the controller's moment")
+        monkeypatch.setattr(redfish, "LOOK_EVERY", 0.2)
         bmc.state.power = "Off"
         status_of(client, device, state="no_signal")
 
@@ -2066,6 +2086,15 @@ def test_a_picture_that_cannot_be_made_this_moment_is_asked_for_again_and_is_no_
     assert len(made) >= 2
 
 
+def test_a_servers_screen_whose_picture_cannot_be_made_on_this_computer_says_why(tmp_path: Path, with_screen: FakeBmc) -> None:
+    # Where no video worker could start (qKVM run as a Windows service, before 0.4.0), the tile said "The server's screen
+    # changed while its picture was being made", and nothing else, for good. It says why now, as the worker said it.
+    from tests.test_video_isolation import NO_VIDEO, video_that_cannot_start, what_the_tile_says
+
+    with video_that_cannot_start(tmp_path / "video"), wall(tmp_path / "wall") as client:
+        assert what_the_tile_says(client, add(client, with_screen.url)) == NO_VIDEO
+
+
 def test_reading_the_screen_does_not_take_the_threads_that_sign_people_in(tmp_path: Path, with_screen: FakeBmc, monkeypatch: pytest.MonkeyPatch) -> None:
     # A frame is read in a thread, and it was one of the threads that check passwords and write the settings:
     # a few controllers with much to read, and nobody was signed in until they were through.
@@ -2307,24 +2336,29 @@ def test_what_a_controller_sends_on_a_line_while_nothing_is_asked_ends_that_line
 SLOW_SYSTEM, SLOW_ROOT = "4c4c4544-0042-3510-8054-b9c04f4a3532", "1a2b3c4d-5e6f-4a1b-8c2d-3e4f5a6b7c8d"
 
 
-def test_a_console_that_ends_on_a_slow_controller_neither_freezes_the_picture_nor_holds_the_next(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_a_console_that_ends_on_a_slow_controller_neither_freezes_the_picture_nor_holds_the_next(monkeypatch: pytest.MonkeyPatch, a_video_worker_first: None) -> None:
     # (The second review's M3, 0.2.1; probe review-bmc/probes/p4_slow_board_console.py, here at a seventh of its times.) The
     # owner's slow board shows its root in 12 to 20 seconds. At a console's end its web page was signed out of on a line made
     # anew, its root read first, and the console waited for that: meanwhile the ended console's last frame was handed out as
     # the screen, and no new console opened; then the next console read the root again, after the question which server
     # answers. Now a console that ended is no picture at once, the sign-out goes on by itself, and the next console's root is
     # read alongside the question: one root read stands between two consoles, and no frozen picture.
+    # (Each console makes its pictures in a video worker of its own, started at its first picture: on a busy computer seconds,
+    # longer than a console lasts here. Such a picture, asked for while its console was open, came after the console had
+    # ended, and the whole wait for it was counted as a frozen picture: 4.0 to 13.5 s on the Windows test VM running 16 test
+    # files at a time. A frozen picture is one asked for after its console had ended at the controller, as the defect handed
+    # out; and the process's first worker, which builds the bundle every later one starts from, is made before: see conftest.)
     root, lasts, run = 2.0, 3.0, 16.0
     monkeypatch.setattr(redfish, "LOOK_EVERY", 1000.0)  # (no looks between: the console's own roads only)
     monkeypatch.setattr(redfish, "CONSOLE_SETTLED", 1.0)  # (a session that ran its time, as a real one after half an hour)
     mark = str(redfish.own_number({"UUID": SLOW_SYSTEM})) + str(redfish.controller_number({"UUID": SLOW_ROOT}))
     bmc = FakeBmc(BmcState(own_console=True, screen=a_screen(), uuid=SLOW_SYSTEM, root_uuid=SLOW_ROOT, session_lasts=lasts)).start()
 
-    async def scene() -> tuple[float, float, float, int]:
+    async def scene() -> tuple[float, float, float, int, float]:
         device = redfish.RedfishDevice(kvm.DeviceSpec(id="ab12", name="db-01", base_url=bmc.url, username="admin", password="secret", kind="redfish", machine=mark))
         try:
             assert (await device.status())["state"] == "online"
-            for _ in range(200):  # (the first console, its root still quick: its picture once, the encoder made ready)
+            for _ in range(200):  # (the first console, its root still quick: its picture once)
                 with contextlib.suppress(kvm.KvmError):
                     await device.snapshot(640)
                     break
@@ -2333,34 +2367,41 @@ def test_a_console_that_ends_on_a_slow_controller_neither_freezes_the_picture_no
             logins = bmc.state.web_logins
             began = last = time.monotonic()
             shown = frozen = gap = longest = 0.0
-            while time.monotonic() - began < run:
+            # (For the time, and on until two more consoles have been opened: on the test VM one console's first picture
+            # took 13 s of the 16, and one console was all the time saw.)
+            while time.monotonic() - began < run or bmc.state.web_logins - logins < 2:
+                assert time.monotonic() - began < 120, "no two consoles in two minutes"  # (room only)
+                open_when_asked = bmc.state.watching > 0  # (a console open at the controller as the picture is asked for)
                 try:
                     await device.snapshot(640)
-                    open_at_the_controller = bmc.state.watching > 0
-                    outcome = "shown" if open_at_the_controller else "frozen"
+                    outcome = "shown" if open_when_asked else "frozen"
                 except kvm.KvmError:
-                    outcome = "gap"
+                    # (No picture, a console open at the controller from the asking to the answer: its first frame on its
+                    # way, or its picture's worker slow to start, once 15 s on the test VM. Not time between two consoles.)
+                    outcome = "waited" if open_when_asked and bmc.state.watching > 0 else "gap"
                 now = time.monotonic()
                 step, last = now - last, now  # (the interval this call ends: what it returned)
                 if outcome == "gap":
                     gap += step
                     longest = max(longest, gap)
+                elif outcome == "waited":
+                    pass
                 else:
                     gap = 0.0
                     if outcome == "frozen":
-                        frozen += step  # (a picture handed out while no console is open at the controller)
+                        frozen += step  # (a picture handed out of a console that had ended at the controller)
                     else:
                         shown += step
                 await asyncio.sleep(0.1)
-            return shown, frozen, longest, bmc.state.web_logins - logins
+            return shown, frozen, longest, bmc.state.web_logins - logins, time.monotonic() - began
         finally:
             await device.close()
 
     try:
-        shown, frozen, longest, logins = asyncio.run(scene())
+        shown, frozen, longest, logins, ran = asyncio.run(scene())
         assert frozen < 0.5, f"the picture of a console that had ended was shown for {frozen:.1f} s"
         assert longest < root + 1.2, f"{longest:.1f} s without a picture between two consoles (one root read is {root} s)"
-        assert logins >= 2 and shown > run * lasts / (lasts + root + 1.0), (logins, round(shown, 1))
+        assert logins >= 2 and shown > ran * lasts / (lasts + root + 1.0), (logins, round(shown, 1), round(ran, 1))
     finally:
         bmc.stop()
 
@@ -3154,3 +3195,37 @@ def test_no_number_of_clients_asking_for_the_status_has_a_device_looked_at_more_
     finally:
         bmc.stop()
         fake.stop()
+
+
+def test_the_video_worker_of_a_console_whose_tile_nobody_looks_at_is_let_rest(monkeypatch: pytest.MonkeyPatch) -> None:
+    # (The pattern the soak farm found for VNC servers.) A server's console kept open for a live view, which makes its pictures
+    # in a worker of its own, or for keys, kept the worker its tile's pictures had been made in (some 35 MB) all that while.
+    # Once nobody has looked at the tile for WORKER_REST, the wall's housekeeping lets it rest; the next picture starts one.
+    from qkvm import video
+
+    monkeypatch.setattr(redfish, "WORKER_REST", 0.5)
+    screen = video.RGBFrame(16, 16, bytes(16 * 16 * 3))
+
+    async def run() -> None:
+        device = redfish.RedfishDevice(kvm.DeviceSpec(id="ab12", name="Server", base_url="http://127.0.0.1:9", username="admin", password="secret", kind="redfish"))
+        console = device._console = redfish._Console()
+        try:
+            await asyncio.to_thread(video.encode_jpeg, screen, None, 2, console.video_encoder)  # (a tile's picture)
+            device._pictured_at = time.monotonic()
+            worker = console.video_encoder._worker
+            assert worker is not None and console.video_encoder.running
+            device.tidy()  # (looked at a moment ago: kept)
+            await asyncio.sleep(0.6)
+            assert console.video_encoder._worker is worker and worker._process is not None
+            device.tidy()  # (nobody has looked at the tile since: let rest)
+            until = time.monotonic() + 15
+            while worker._process is not None or console.video_encoder.running:
+                assert time.monotonic() < until, "the console's video worker still runs"
+                await asyncio.sleep(0.05)
+            data = await asyncio.to_thread(video.encode_jpeg, screen, None, 2, console.video_encoder)  # (the next picture)
+            assert data[:2] == b"\xff\xd8" and console.video_encoder.running and console.video_encoder._worker is not worker
+        finally:
+            await asyncio.to_thread(console.video_encoder.close)
+            await device.close()
+
+    asyncio.run(run())

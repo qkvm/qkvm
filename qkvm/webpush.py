@@ -33,7 +33,7 @@ from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import SplitResult, unquote, unquote_plus, urlsplit
 
 import httpx
 from cryptography.exceptions import InvalidTag
@@ -43,6 +43,7 @@ from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
+from . import egress
 from .kvm import public_context
 from .security import PRIVATE_SUFFIXES
 
@@ -71,7 +72,7 @@ _REASON = re.compile(rb'"reason"\s*:\s*"([A-Za-z]{1,40})"')
 _TOP = re.compile(r"[a-z][a-z0-9-]*")  # the last part of a name on the internet: letters (or xn--), never a number
 # The well-known NAT64 prefix (RFC 6052), whose IPv4 is its last 32 bits. The local-use one (64:ff9b:1::/48, RFC 8215)
 # is refused outright: where its IPv4 sits is its translator's to choose (/48 to /96), and read as /96 a private one
-# passed for public (the outside review of 0.3.0, Codex's M5).
+# passed for public (the outside review of 0.3.0, M5).
 _NAT64 = (ipaddress.ip_network("64:ff9b::/96"),)
 _LOCAL_NAT64 = ipaddress.ip_network("64:ff9b:1::/48")
 
@@ -244,6 +245,22 @@ def check_endpoint(url: Any) -> str:
     return str(url)
 
 
+def private_parts(parts: SplitResult, sent: bytes = b"") -> list[str]:
+    """What of a browser's address at its push service lets anybody send there, as a push service's reason may say it
+    back: its path, and each value of its query (a field without "=", whole), each as it is written, as it went (`sent`, the
+    path and query of the request as httpx wrote them) and decoded. The names in the query are no secret, and a reason that
+    holds one stays readable. (The path alone was given: the outside review of 0.4.0, round 6.2, M7.)"""
+    found: list[str] = []
+    sent_path, _, sent_query = sent.decode("ascii", "replace").partition("?")
+    for path, query in ((parts.path, parts.query), (sent_path, sent_query)):
+        found += [path, unquote(path)]
+        for each in query.split("&"):
+            name, equals, value = each.partition("=")
+            given = value if equals else name
+            found += [given, unquote_plus(given)]
+    return [piece for piece in dict.fromkeys(found) if piece]
+
+
 def check(endpoint: Any, p256dh: Any, auth: Any) -> Subscription:
     """A browser's subscription as the page hands it in, or ValueError with a sentence fit for showing."""
     endpoint = check_endpoint(endpoint)
@@ -347,15 +364,21 @@ class Pusher:
     ) -> None:
         self._key = key
         self._gone = gone
-        # `allowed`: whether a browser may be told an alert about a machine (its id, or None) at this moment: asked before
-        # every attempt, not only when it is put in
+        # `allowed`: whether a browser may be told an alert about a machine (its id, or None) at this moment (alerts switched
+        # on, its account there and not suspended, the machine one it may see): asked before every attempt and once more
+        # right before it goes, not only when it is put in. What it says no to is dropped. (A pause is not asked: it stops
+        # new alerts only, and one already on its way goes.)
         self.allowed = allowed
-        self._waiting: dict[str, deque[tuple[Target, bytes, str, str | None]]] = {}
+        self._waiting: dict[str, deque[tuple[Target, bytes, str, str | None, int]]] = {}
         self._workers: dict[str, asyncio.Task[None]] = {}
         self._dropping: set[str] = set()  # browsers whose oldest alert gave way, and it was said, since they last had none waiting
         self._at_once = asyncio.Semaphore(AT_ONCE)
         self._client: httpx.AsyncClient | None = None
         self.told: dict[str, tuple[float | None, str | None]] = {}  # push id -> (when an alert last arrived, what went wrong last), in memory
+        # Alerts put in so far, and how many of them had been when alerts were last switched off (cut): those go no more, even
+        # where alerts are switched on again before their next try (the outside review of 0.4.0, bugs round 2, M3).
+        self._put = 0
+        self._cut = 0
 
     def put(self, target: Target, said: bytes, how_soon: str = "high", about: str | None = None) -> None:
         """Have `said` sent to this browser, after what waits for it already (`about`: the machine it is about). Never waits
@@ -366,9 +389,14 @@ class Pusher:
             if target.id not in self._dropping:  # (said once for a run of them: a line for each would be a flood)
                 self._dropping.add(target.id)
                 log.warning("alerts for a browser gave way, too many were waiting for its push service (%s)", target.subscription.host)
-        waiting.append((target, said, how_soon, about))
+        self._put += 1
+        waiting.append((target, said, how_soon, about, self._put))
         if target.id not in self._workers:
             self._workers[target.id] = asyncio.create_task(self._work(target.id))
+
+    def cut(self) -> None:
+        """Alerts switched off: what was put in until now is sent no more, whatever the switch says at its next try."""
+        self._cut = self._put
 
     def waiting(self, push_id: str) -> int:
         """How many alerts wait for this browser, the one being sent included."""
@@ -387,9 +415,9 @@ class Pusher:
         waiting = self._waiting[push_id]
         try:
             while waiting:
-                target, said, how_soon, about = waiting.popleft()
+                target, said, how_soon, about, number = waiting.popleft()
                 try:
-                    await self._deliver(target, said, how_soon, about)
+                    await self._deliver(target, said, how_soon, about, number)
                 except Exception:  # whatever goes wrong with one alert must not be the end of this browser's others
                     log.exception("an alert could not be sent to a browser (%s)", target.subscription.host)
         finally:
@@ -399,14 +427,20 @@ class Pusher:
                 del self._workers[push_id]
             self._dropping.discard(push_id)
 
-    async def _deliver(self, target: Target, said: bytes, how_soon: str, about: str | None = None) -> None:
+    async def _deliver(self, target: Target, said: bytes, how_soon: str, about: str | None = None, number: int | None = None) -> None:
+        def may() -> bool:
+            # (`number`: its place among what was put in. Put in before alerts were last switched off, it goes no more.)
+            return (number is None or number > self._cut) and (self.allowed is None or self.allowed(target.id, about))
+
         for pause in (*RETRY_AFTER, None):
             # Asked again before each attempt: an account suspended, or a machine no longer its, since it was put in (the
-            # outside review of 0.3.0, Codex's L1: one waiting to be tried again went out after the account was suspended).
-            if self.allowed is not None and not self.allowed(target.id, about):
+            # outside review of 0.3.0, L1: one waiting to be tried again went out after the account was suspended);
+            # alerts switched off, now or since it was put in (the fresh review of the fixes, N3; the outside review of
+            # 0.4.0, bugs round 2, M3).
+            if not may():
                 return
             try:
-                sent = await self.send(target, said, how_soon, still=lambda: self.allowed is None or self.allowed(target.id, about))
+                sent = await self.send(target, said, how_soon, still=may)
             except NotDelivered as ex:
                 self.told[target.id] = (self.told.get(target.id, (None, None))[0], str(ex))
                 if ex.gone:
@@ -467,6 +501,11 @@ class Pusher:
                         reason = await _reason(reply) if reply.status_code >= 300 else ""
                     finally:
                         await reply.aclose()
+                    # (Never a word that holds what the request carried, whole or in part: the signed token, or the
+                    # browser's address at its push service, whose path and query are what lets anybody send to it. The
+                    # outside review of 0.4.0, L1, for every outbound request; the query since the outside review's round 6.2, M7.)
+                    if egress.hidden(reason, [headers["Authorization"], *private_parts(parts, request.url.raw_path)]) != reason:
+                        reason = ""
             except NotPublic as ex:
                 raise NotDelivered(str(ex), again=False) from ex
             except (httpx.HTTPError, httpx.InvalidURL, TimeoutError, OSError) as ex:

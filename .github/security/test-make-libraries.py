@@ -110,6 +110,33 @@ class TheLock(unittest.TestCase):
         self.assertEqual(asked, [[], ["linuxonly", "old"]])
 
 
+class TheEnvironments(unittest.TestCase):
+    def test_each_target_is_installed_for_the_sbom_from_the_downloaded_wheels_by_hash_and_nothing_else(self):
+        # (0.4.0: the SBOM is read from these. Real pip does it in tests/test_every_release_lists_what_it_brings_in.py.)
+        ran = []
+        real, MAKE.subprocess.run = MAKE.subprocess.run, lambda command, check: ran.append(command)
+        try:
+            with tempfile.TemporaryDirectory() as folder:
+                work = Path(folder)
+                wheel = work / "qkvm-9.9.9-py3-none-any.whl"
+                wheel.write_bytes(b"the wheel")
+                locked = work / "cp312-win-amd64.txt"
+                locked.write_text("h11==0.16.0 --hash=sha256:" + "a" * 64 + "\n", encoding="utf-8")
+                MAKE.installed("cp312-win-amd64", wheel, work, locked, work / "into")
+                asked = (work / "environment-cp312-win-amd64.txt").read_text(encoding="utf-8")
+        finally:
+            MAKE.subprocess.run = real
+        [command] = ran
+        self.assertEqual(command[1:4], ["-m", "pip", "install"])
+        for pair in (["--target", str(work / "into")], ["--find-links", str(work)], ["--only-binary", ":all:"], ["--python-version", "3.12"], ["--abi", "cp312"], ["--platform", "win_amd64"], ["--implementation", "cp"]):
+            at = command.index(pair[0])
+            self.assertEqual(command[at : at + 2], pair)
+        for flag in ("--no-index", "--require-hashes", "--no-deps", "--no-compile", "--no-cache-dir"):
+            self.assertIn(flag, command)
+        self.assertEqual(command[-2:], ["-r", str(work / "environment-cp312-win-amd64.txt")])
+        self.assertEqual(asked.splitlines(), ["h11==0.16.0 --hash=sha256:" + "a" * 64, f"qkvm @ {wheel.resolve().as_uri()} --hash=sha256:{hashlib.sha256(b'the wheel').hexdigest()}"])
+
+
 WHEEL = Path("qkvm-9.9.9-py3-none-any.whl")
 
 

@@ -32,6 +32,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from ._folders import open_private
 from .store import Gate, into_wal, sqlite_open
 
 log = logging.getLogger("qkvm")
@@ -1013,6 +1014,38 @@ class History:
             return self._read_let_in(device_id, what, since, until, limit, every, now)
         finally:
             self._gate.left()  # (its connection closed: a checkpoint waits for it no longer)
+
+    def copy_to(self, target: Path) -> bool:
+        """A copy of the history as it stands, for a backup (backup.py): by SQLite's online backup, in one step and so in one
+        read of the file (never the bytes of a file that is being written), into `target`, a file made new for it, its owner's
+        alone. False where there is no history yet. For a worker thread. NotReadable where the file cannot be read just now.
+
+        Let in at the gate as the wall's own reads are (see `read`): a checkpoint under way is waited for, and one that begins
+        meanwhile waits for this, within its patience, and then gives up its turn rather than the copy (the gate says how)."""
+        if not self.path.exists():
+            return False
+        if not self._gate.passed(time.monotonic() + READ_WAIT):
+            raise NotReadable("The history is busy just now. Try again in a moment.")
+        try:
+            try:
+                source = sqlite_open(self.path, read=True, timeout=WRITE_PATIENCE)
+            except sqlite3.Error as ex:
+                raise NotReadable(f"The history could not be read ({_short(str(ex), 80)})") from None
+            try:
+                os.close(open_private(target, os.O_RDWR | os.O_CREAT | os.O_EXCL))
+                copy = sqlite3.connect(target)
+                try:
+                    copy.execute("PRAGMA journal_mode = OFF")  # (a copy made anew: nothing beside it, no rollback journal)
+                    source.backup(copy)
+                except sqlite3.Error as ex:
+                    raise NotReadable(f"The history could not be copied ({_short(str(ex), 80)})") from None
+                finally:
+                    copy.close()
+            finally:
+                source.close()
+        finally:
+            self._gate.left()
+        return True
 
     def _read_let_in(self, device_id: str, what: str, since: float, until: float, limit: int, every: int, now: float) -> dict[str, Any]:
         """`read`, once it is let in at the gate."""

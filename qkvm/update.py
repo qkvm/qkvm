@@ -77,7 +77,7 @@ DEFAULT_REPO = "qkvm/qkvm"
 RELEASE_KEYS: tuple[str, ...] = ("R9V9vqrwqFnxx4j6mf0ZSG7Af5PTFILqZd1Qc6F1JpI=",)
 
 PACKAGE = "qkvm"
-# What updates a copy that runs in a container, as the README says it: with compose, and without (then the container is
+# What updates a copy that runs in a container, as the guide says it: with compose, and without (then the container is
 # removed and run again). Said by the server, not written into the page: the page is the demo's too, which names no image.
 IMAGE_COMMANDS = ("docker compose pull && docker compose up -d", "docker pull qkvm/qkvm")
 MAX_WHEEL = 30_000_000  # bytes; the real thing is well under one megabyte
@@ -565,7 +565,7 @@ class Updater:
         if hashlib.sha256(wheel).hexdigest() != _checksum_for(sums, release.wheel_name):
             raise UpdateError("The download does not match its checksum")
         # Whether it has a list of libraries is the checksums' to say, which are signed, not its list of assets, which is
-        # not (the outside review of 0.3.0, Codex's M4: one left out of the assets was taken without it).
+        # not (the outside review of 0.3.0, M4: one left out of the assets was taken without it).
         try:
             listed: str | None = _checksum_for(sums, release.lock_name)
         except UpdateError:

@@ -2,22 +2,306 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Iterator
+import contextlib
 import ctypes
+import importlib
+import importlib.metadata
 import importlib.util
 import io
 import json
 import os
 from pathlib import Path
+import re
 import socket
 import subprocess
 import sys
 import threading
+import time
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 from qkvm import _video_worker, video
+
+# What `import av` failed with in every video worker on a Windows computer where qKVM ran as a service or over SSH, until
+# 0.4.0 (user32.dll could not connect to the desktop the worker was started on: see the tests of that below).
+CANNOT_LOAD = "DLL load failed while importing _core: A dynamic link library (DLL) initialization routine failed."
+CANNOT_START = f"the video worker could not load its libraries: ImportError: {CANNOT_LOAD}"
+
+
+@contextlib.contextmanager
+def video_that_cannot_start(tmp_path: Path) -> Iterator[None]:
+    """Meanwhile every video worker is a real one, started as ever, whose libraries do not load: its `av` is a stand-in
+    that fails to import with CANNOT_LOAD (on Windows in a runtime bundle of its own, taken away after)."""
+    site = tmp_path / "unloadable"
+    (site / "av").mkdir(parents=True)
+    (site / "av.libs").mkdir()
+    (site / "av" / "__init__.py").write_text(f"raise ImportError({CANNOT_LOAD!r})\n", encoding="utf-8")
+    real = video.importlib
+    found = SimpleNamespace(origin=str(site / "av" / "__init__.py"))
+    video.importlib = SimpleNamespace(util=SimpleNamespace(find_spec=lambda name: found), metadata=importlib.metadata, import_module=importlib.import_module)  # type: ignore[assignment]
+    windows: Any = None
+    kept = None
+    if sys.platform == "win32":
+        from qkvm import _video_windows as windows
+
+        kept, windows._bundle = windows._bundle, None
+    try:
+        yield
+    finally:
+        video.importlib = real
+        if windows is not None:
+            if windows._bundle is not None:
+                video._let_go_of_runtime(windows._bundle)  # (the file that marks it held while this run uses it, first)
+            try:
+                windows.cleanup_runtime()
+            except OSError:
+                pass  # (a file still held by a worker that is ending: left in the temporary folder)
+            windows._bundle = kept
+
+
+NO_VIDEO = {"status": 503, "code": "no_video", "message": f"Video cannot start on this computer: {CANNOT_START}"}
+
+
+def what_the_tile_says(client: Any, device: str, within: float = 30.0) -> dict[str, Any]:
+    """A tile's picture asked for until it is refused with more than "not yet" (no_stream), or `within` seconds have gone:
+    the last answer, as status, code and message."""
+    import time
+
+    deadline = time.monotonic() + within
+    while True:
+        reply = client.get(f"/api/v1/devices/{device}/snapshot")
+        said = reply.json() if reply.headers.get("content-type", "").startswith("application/json") else {}
+        answer = {"status": reply.status_code, "code": said.get("code"), "message": said.get("message")}
+        if (reply.status_code != 200 and answer["code"] != "no_stream") or time.monotonic() > deadline:
+            return answer
+        time.sleep(0.1)
+
+
+def test_healthz_says_while_video_cannot_start_on_this_computer_and_not_why(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Monitoring heard nothing of a wall that could make no picture. GET /healthz says "video": "unavailable" while the
+    last worker that was to start could not, to anybody, as it says the rest; why, it says to nobody (that is in the tiles
+    of those signed in, and in the log)."""
+    from tests.test_wall import wall
+
+    monkeypatch.setattr(video.log, "error", lambda *a, **k: None)
+    monkeypatch.setattr(video, "_unavailable", None, raising=False)
+    with wall(tmp_path / "wall", sign_in=False) as client:
+        assert "video" not in client.get("/healthz").json()  # (nothing known against it)
+        with video_that_cannot_start(tmp_path / "video"):
+            with pytest.raises(video.VideoError):
+                video.Worker()
+            told = client.get("/healthz").json()
+        assert told["status"] == "ok" and told["video"] == "unavailable", told
+        assert CANNOT_LOAD not in json.dumps(told)
+        video.Worker().close()  # one starts: nothing against it any more
+        assert "video" not in client.get("/healthz").json()
+
+
+def test_a_worker_that_cannot_load_its_libraries_says_why_and_the_wall_says_it_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Where its libraries did not load, a worker ended without a word: what it would have said went to NUL, the tiles
+    said "connecting" or blamed the device, and the log that a worker "stopped mid-session or could not be started". It
+    says now, in one line and before it has read anything a device sent, what stopped it; the wall raises that, keeps it
+    for /healthz (video.unavailable()), and logs it once however many tries meet it, until a worker starts again."""
+    errors: list[str] = []
+    monkeypatch.setattr(video.log, "error", lambda message, *values: errors.append(message % values))
+    monkeypatch.setattr(video, "_unavailable", None, raising=False)
+    with video_that_cannot_start(tmp_path):
+        said = []
+        for _ in range(3):
+            with pytest.raises(video.VideoError) as raised:
+                video.Worker()
+            said.append(str(raised.value))
+        assert said == [CANNOT_START] * 3, said
+        assert video.unavailable() == CANNOT_START
+        assert errors == [f"Video cannot start on this computer: {CANNOT_START}"]
+    monkeypatch.setattr(video, "_unavailable", CANNOT_START)
+    video.Worker().close()  # one whose libraries load: video is no longer said to be unavailable
+    assert video.unavailable() is None
+
+
+def test_a_session_whose_worker_cannot_start_keeps_saying_why_while_it_waits_to_try_again(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Between two tries a session said only that its worker was "recovering": a tile that asked then lost the reason."""
+    monkeypatch.setattr(video.log, "error", lambda *a, **k: None)
+    monkeypatch.setattr(video, "_unavailable", None, raising=False)
+    with video_that_cannot_start(tmp_path):
+        session = video.VideoSession()
+        try:
+            for _ in range(3):  # the first starts a worker; the others come within the pause before the next start
+                with pytest.raises(video.VideoError) as raised:
+                    session.request(1, 16, 16, data=b"")
+                assert str(raised.value) == CANNOT_START
+        finally:
+            session.close()
+
+
+class StandInProcess:
+    """A worker process as Worker sees it, whose output is `answer`, and that ends with `code` when waited for."""
+
+    def __init__(self, answer: bytes, code: int = 1) -> None:
+        self.reads: list[int] = []
+        self.stdin = io.BytesIO()
+        self.stdout = self.Output(answer, self.reads)
+        self.code, self.returncode, self.pid = code, None, 0
+
+    class Output(io.BytesIO):
+        def __init__(self, answer: bytes, reads: list[int]) -> None:
+            super().__init__(answer)
+            self.reads = reads
+
+        def read(self, size: int | None = -1) -> bytes:
+            self.reads.append(-1 if size is None else size)
+            return super().read(size)
+
+    def kill(self) -> None:
+        pass
+
+    def wait(self, timeout: float | None = None) -> int:
+        self.returncode = self.code
+        return self.code
+
+
+def started_with(monkeypatch: pytest.MonkeyPatch, process: StandInProcess) -> None:
+    """Worker() starts `process` (as it starts one on Linux), whatever this computer is."""
+    monkeypatch.setattr(video, "sys", SimpleNamespace(platform="linux", executable=sys.executable, modules=sys.modules))
+    monkeypatch.setattr(video, "subprocess", SimpleNamespace(Popen=lambda *a, **k: process, PIPE=subprocess.PIPE, DEVNULL=subprocess.DEVNULL, TimeoutExpired=subprocess.TimeoutExpired))
+    monkeypatch.setattr(video.log, "error", lambda *a, **k: None)
+    monkeypatch.setattr(video, "_unavailable", None, raising=False)
+
+
+def starting(text: bytes) -> bytes:
+    return video.HEADER.pack(video.MAGIC, 254, 0, 0, 0, 0, len(text)) + text
+
+
+@pytest.mark.parametrize("answer, said", [
+    (starting(b"could not load its libraries: ImportError: " + CANNOT_LOAD.encode()), CANNOT_START),
+    # One printable line of ASCII, whatever was sent: no line breaks, control characters or other bytes go further.
+    (starting(b"could not\r\nstart:\tits \x1b[2Jself-test \xc3\xa9failed\x00 "), "the video worker could not start: its [2Jself-test ??failed"),
+    # Said with nothing, or nothing at all: that it stopped, and how it ended.
+    (starting(b""), "the video worker stopped before it was ready, with exit code 1"),
+    (b"", "the video worker stopped before it was ready, with exit code 0xC0000142"),
+], ids=["said", "said_with_what_is_not_text", "said_nothing", "silent"])
+def test_what_a_worker_says_of_its_start_is_one_plain_line(monkeypatch: pytest.MonkeyPatch, answer: bytes, said: str) -> None:
+    process = StandInProcess(answer, 0xC0000142 if not answer else 1)
+    started_with(monkeypatch, process)
+    with pytest.raises(video.VideoError) as raised:
+        video.Worker()
+    assert str(raised.value) == said
+
+
+class SilentProcess(StandInProcess):
+    """A worker that says nothing until it is ended: one slow to start (a computer under load), or one that hangs."""
+
+    def __init__(self) -> None:
+        super().__init__(b"")
+        self.ended = threading.Event()
+        ended = self.ended
+
+        class Output(io.BytesIO):
+            def read(self, size: int | None = -1) -> bytes:
+                ended.wait(30)
+                return b""
+
+        self.stdout = Output()
+
+    def kill(self) -> None:
+        self.ended.set()
+
+
+def test_a_start_that_only_took_too_long_is_not_taken_for_video_that_cannot_start(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A worker that did not answer within START_WITHIN was taken, at once, for video that cannot start on this computer:
+    /healthz said "unavailable", the tiles no_video, the log an error, until a worker started. Under load (sixteen test
+    files at once on the coordinator's VM) a start can take that long, and the next one go through. One that times out is
+    "not yet" now (no_stream: the session tries again after its pause); only SLOW_STARTS of them in a row, with no worker
+    started in between, say that video cannot start. Any worker that starts begins the count again."""
+    errors: list[str] = []
+    started_with(monkeypatch, SilentProcess())
+    monkeypatch.setattr(video.log, "error", lambda message, *values: errors.append(message % values))
+    monkeypatch.setattr(video, "START_WITHIN", 0.2)
+    monkeypatch.setattr(video, "_slow_starts", 0, raising=False)
+    from qkvm import kvm
+
+    def a_start() -> Any:
+        monkeypatch.setattr(video.subprocess, "Popen", lambda *a, **k: SilentProcess())
+        with pytest.raises(video.VideoError) as raised:
+            video.Worker()
+        return raised.value
+
+    slow = "the video worker did not answer within 0.2 seconds"
+    for _ in range(video.SLOW_STARTS - 1):
+        unable = a_start()
+        assert str(unable) == slow and kvm.no_video(unable).as_dict() == {"code": "no_stream", "message": f"Video is slow to start on this computer: {slow}"}
+        assert video.unavailable() is None and errors == []
+    unable = a_start()  # one more in a row: so it is
+    assert kvm.no_video(unable).as_dict() == {"code": "no_video", "message": f"Video cannot start on this computer: {slow}"}
+    assert video.unavailable() == slow and errors == [f"Video cannot start on this computer: {slow}"]
+    # A worker that starts ends it, and the count begins again.
+    monkeypatch.setattr(video.subprocess, "Popen", lambda *a, **k: StandInProcess(video.HEADER.pack(video.MAGIC, 0, 0, 0, 1, 0, 0)))
+    video.Worker().close()
+    assert video.unavailable() is None
+    assert kvm.no_video(a_start()).code == "no_stream"
+
+
+def test_a_start_ended_by_its_deadline_is_told_by_the_deadline_not_by_the_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Whether a start ran out of time was told by reading the clock again after it ended; the deadline's timer can fire a
+    few milliseconds before that clock says START_WITHIN has gone (a review saw it 1 time in 60), and the start was then
+    taken for a worker that "stopped before it was ready": lasting at once. The deadline itself says so now. Here the
+    clock says no time went by at all, as one read a few milliseconds early does."""
+    started_with(monkeypatch, SilentProcess())
+    monkeypatch.setattr(video.subprocess, "Popen", lambda *a, **k: SilentProcess())
+    monkeypatch.setattr(video, "START_WITHIN", 0.2)
+    monkeypatch.setattr(video, "_slow_starts", 0, raising=False)
+    monkeypatch.setattr(video, "time", SimpleNamespace(monotonic=lambda: 1000.0))
+    with pytest.raises(video.VideoUnavailable) as raised:
+        video.Worker()
+    assert str(raised.value) == "the video worker did not answer within 0.2 seconds" and not raised.value.lasting
+
+
+def test_starts_that_take_too_long_at_the_same_time_count_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Three tiles whose workers start at once on a busy computer, each too slow this one time, were counted as three in a
+    row: video "cannot start on this computer", though a worker had started just before them. A timeout counts only where
+    its start began after the last worker that started and after the timeout counted before it ended."""
+    errors: list[str] = []
+    started_with(monkeypatch, StandInProcess(video.HEADER.pack(video.MAGIC, 0, 0, 0, 1, 0, 0)))
+    monkeypatch.setattr(video.log, "error", lambda message, *values: errors.append(message % values))
+    monkeypatch.setattr(video, "START_WITHIN", 0.3)
+    monkeypatch.setattr(video, "_slow_starts", 0, raising=False)
+    started = video.Worker()  # one tile's worker starts
+    monkeypatch.setattr(video.subprocess, "Popen", lambda *a, **k: SilentProcess())
+    said: list[bool] = []
+
+    def start() -> None:
+        try:
+            video.Worker().close()
+        except video.VideoUnavailable as unable:
+            said.append(unable.lasting)
+
+    threads = [threading.Thread(target=start) for _ in range(video.SLOW_STARTS)]  # as many tiles at once, each slow
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    started.close()
+    assert said == [False] * video.SLOW_STARTS and video.unavailable() is None and errors == []
+
+
+def test_what_a_worker_says_of_its_start_is_bounded_and_said_only_at_its_start(monkeypatch: pytest.MonkeyPatch) -> None:
+    # More than a line's worth is not read at all: the worker is taken to have stopped.
+    process = StandInProcess(starting(b"x" * 513))
+    started_with(monkeypatch, process)
+    with pytest.raises(video.VideoError) as raised:
+        video.Worker()
+    assert str(raised.value) == "the video worker stopped before it was ready, with exit code 1"
+    assert process.reads == [video.HEADER.size]
+    # Once started, a worker has nothing more to say of its start: that answer to a request is refused, and ends it.
+    process = StandInProcess(video.HEADER.pack(video.MAGIC, 0, 0, 0, 1, 0, 0) + starting(b"could not start"))
+    started_with(monkeypatch, process)
+    worker = video.Worker()
+    with pytest.raises(video.VideoError, match="failed, timed out, or returned invalid data"):
+        worker.request(1, 16, 16, data=b"\xff\xd8")
+    assert worker._process is None
 
 
 def test_real_sandboxes_are_separate_and_closed_sessions_cannot_restart() -> None:
@@ -349,7 +633,7 @@ def test_kernel_boundary_cannot_reach_credentials_or_parent(tmp_path: Path, monk
     source = Path(_video_worker.__file__).read_text(encoding="utf-8").replace('if __name__ == "__main__":\n    main()', '')
     source += f"\nCANARY={str(canary)!r}\nPARENT={os.getpid()}\nADDRESS={ctypes.addressof(secret)}\nPORT={listener.getsockname()[1]}\n"
     source += '''
-import socket, subprocess, json, errno, encodings.idna
+import ctypes, socket, subprocess, json, errno, encodings.idna
 results = {}
 if sys.platform == "win32":
     windows_lockdown()
@@ -385,6 +669,13 @@ if sys.platform == "win32":
         results[label] = not handle and ctypes.get_last_error() == 5
         if handle:
             kernel.CloseHandle(ctypes.c_void_p(handle))
+    # On a desktop made for it alone, not on the one qKVM was started from (the user's own, in a signed-in session).
+    user = ctypes.WinDLL("user32", use_last_error=True)
+    user.GetThreadDesktop.restype = ctypes.c_void_p
+    user.GetUserObjectInformationW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong)]
+    named, size = ctypes.create_unicode_buffer(256), ctypes.c_ulong()
+    user.GetUserObjectInformationW(user.GetThreadDesktop(kernel.GetCurrentThreadId()), 2, named, ctypes.sizeof(named), ctypes.byref(size))
+    results["own_desktop"] = named.value.startswith("qkvm-video-")
 else:
     libc = ctypes.CDLL(None, use_errno=True)
     class Iovec(ctypes.Structure):
@@ -783,6 +1074,25 @@ def test_workers_are_spread_over_qkvms_processors() -> None:
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="the Windows worker's job")
+def test_each_qkvm_on_a_computer_begins_its_workers_at_a_pair_of_its_own_choosing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Each qKVM process ranks the pairs among its own workers only, and ties went to the lowest: the first worker of every
+    qKVM on one computer was put on processors 0 and 1 (where Windows takes most interrupts too), each beside the
+    others' while pairs stood free. Each process now begins at a pair drawn at random when it starts, and goes on from
+    there among equally free pairs (the ranking is the same: fewest workers, then not a suspect or avoided pair)."""
+    from qkvm import _video_windows as windows
+
+    monkeypatch.setattr(windows, "own_processors", lambda: list(range(16)))  # 8 pairs
+    monkeypatch.setattr(windows, "_pair_load", {}, raising=False)
+    monkeypatch.setattr(windows, "_first_pair", 8 * 1000 + 5, raising=False)  # (begins at pair 5 of 8)
+    assert [windows.next_processors()[0] for _ in range(9)] == [5, 6, 7, 0, 1, 2, 3, 4, 5]
+    # Drawn anew in each process: twelve processes do not all begin at one pair.
+    app = str(Path(video.__file__).resolve().parent.parent)
+    drawn = {subprocess.run([sys.executable, "-c", "from qkvm import _video_windows as w; print(w._first_pair)"], cwd=app,
+                            env={**os.environ, "PYTHONPATH": app}, capture_output=True, check=True).stdout.strip() for _ in range(12)}
+    assert len(drawn) == 12, drawn
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="the Windows worker's job")
 def test_a_new_worker_takes_the_pair_with_the_fewest_live_workers(monkeypatch: pytest.MonkeyPatch) -> None:
     """The placement follows which workers are alive, not a count that only ever grows: a pair that falls empty is
     taken before any pair is shared. Before, the Nth worker's pair was N mod pairs, so with 16 processors the 9th
@@ -792,6 +1102,7 @@ def test_a_new_worker_takes_the_pair_with_the_fewest_live_workers(monkeypatch: p
 
     monkeypatch.setattr(windows, "own_processors", lambda: list(range(16)))  # 8 pairs
     monkeypatch.setattr(windows, "_pair_load", {}, raising=False)
+    monkeypatch.setattr(windows, "_first_pair", 0, raising=False)  # (ties to the lowest pair)
     placed = [windows.next_processors()[0] for _ in range(8)]
     assert sorted(placed) == list(range(8)), placed  # one worker on each pair, none shared
     windows.release_processors(3)  # the worker on pair 3 ends
@@ -815,6 +1126,7 @@ def test_a_worker_restarted_after_a_death_is_not_put_back_beside_what_stalled_it
     monkeypatch.setattr(windows, "time", SimpleNamespace(monotonic=lambda: clock[0]), raising=False)
     monkeypatch.setattr(windows, "own_processors", lambda: list(range(16)))  # 8 pairs
     monkeypatch.setattr(windows, "_pair_load", {})
+    monkeypatch.setattr(windows, "_first_pair", 0, raising=False)  # (ties to the lowest pair)
     monkeypatch.setattr(windows, "_suspect", {}, raising=False)
     for _ in range(16):
         windows.next_processors()  # two workers on every pair
@@ -826,6 +1138,7 @@ def test_a_worker_restarted_after_a_death_is_not_put_back_beside_what_stalled_it
     assert windows.next_processors()[0] == 3
     # A death that was no stall (a picture that killed the worker): its pair loses ties only.
     monkeypatch.setattr(windows, "_pair_load", {})
+    monkeypatch.setattr(windows, "_first_pair", 0, raising=False)  # (ties to the lowest pair)
     for _ in range(8):
         windows.next_processors()  # one on each pair
     assert windows.next_processors(avoid=0)[0] == 1  # pair 0 not yet given back: as free as pair 1, so pair 1
@@ -843,6 +1156,7 @@ def test_an_empty_pair_is_used_first_even_when_its_worker_missed_its_deadline(mo
 
     monkeypatch.setattr(windows, "own_processors", lambda: list(range(8)))  # 4 pairs
     monkeypatch.setattr(windows, "_pair_load", {})
+    monkeypatch.setattr(windows, "_first_pair", 0, raising=False)  # (ties to the lowest pair)
     monkeypatch.setattr(windows, "_suspect", {})
     assert [windows.next_processors()[0] for _ in range(4)] == [0, 1, 2, 3]  # one worker on each pair
     windows.mark_stalled(2)  # the worker on pair 2 missed its deadline (a slow frame, or one that ended itself)
@@ -936,7 +1250,7 @@ def test_a_windows_worker_made_to_spin_is_held_to_its_processors(tmp_path: Path,
 
     source = Path(_video_worker.__file__).read_text(encoding="utf-8").replace('if __name__ == "__main__":\n    main()', '')
     source += '''
-import threading
+import ctypes, threading
 windows_lockdown()
 kernel = ctypes.WinDLL("kernel32", use_last_error=True)
 kernel.GetCurrentProcess.restype = ctypes.c_void_p
@@ -1074,6 +1388,371 @@ def test_a_workers_pipe_ends_are_inheritable_only_inside_its_own_creation(monkey
     assert not left
 
 
+FROM_ANOTHER_DESKTOP = r'''
+import ctypes, json, sys, traceback
+from ctypes import wintypes as wt
+from pathlib import Path
+
+result = {}
+try:
+    user = ctypes.WinDLL("user32", use_last_error=True)
+    advapi = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    user.GetProcessWindowStation.restype = ctypes.c_void_p
+    user.GetThreadDesktop.restype = ctypes.c_void_p
+    user.GetUserObjectInformationW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, wt.DWORD, ctypes.POINTER(wt.DWORD)]
+    advapi.GetSecurityInfo.argtypes = [ctypes.c_void_p, ctypes.c_int, wt.DWORD, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+    advapi.GetSecurityInfo.restype = wt.DWORD
+    advapi.ConvertSecurityDescriptorToStringSecurityDescriptorW.argtypes = [ctypes.c_void_p, wt.DWORD, wt.DWORD, ctypes.POINTER(wt.LPWSTR), ctypes.c_void_p]
+
+    def name(handle):
+        buffer, size = ctypes.create_unicode_buffer(256), wt.DWORD()
+        assert user.GetUserObjectInformationW(handle, 2, buffer, ctypes.sizeof(buffer), ctypes.byref(size))
+        return buffer.value
+
+    def dacl(handle):
+        descriptor, text = ctypes.c_void_p(), wt.LPWSTR()
+        assert not advapi.GetSecurityInfo(handle, 7, 4, None, None, None, None, ctypes.byref(descriptor))
+        assert advapi.ConvertSecurityDescriptorToStringSecurityDescriptorW(descriptor, 1, 4, ctypes.byref(text), None)
+        return text.value
+
+    station = user.GetProcessWindowStation()
+    result["on"] = name(station) + "\\" + name(user.GetThreadDesktop(kernel.GetCurrentThreadId()))
+    result["before"] = dacl(station)
+    from qkvm import _video_windows as windows, video
+
+    worker = video.Worker()
+    try:
+        own = worker._process._sid  # (its SID's copy, where the station was given an entry for it)
+        result["own"] = None if own is None else windows.sid_text(own)
+        result["during"] = dacl(station)
+    finally:
+        worker.close()
+    result["after"] = dacl(station)
+    result["started"] = True
+except BaseException:
+    result["error"] = traceback.format_exc()
+Path(sys.argv[1]).write_text(json.dumps(result), encoding="utf-8")
+'''
+
+
+def _windows_api() -> SimpleNamespace:
+    """user32, advapi32 and kernel32 with the argument types the tests below call them with."""
+    from ctypes import wintypes as wt
+
+    P = ctypes.c_void_p
+    windll: Any = ctypes
+    user, advapi, kernel = (windll.WinDLL(name, use_last_error=True) for name in ("user32", "advapi32", "kernel32"))
+    user.CreateWindowStationW.argtypes = [wt.LPCWSTR, wt.DWORD, wt.DWORD, P]
+    user.CreateWindowStationW.restype = P
+    user.CreateDesktopW.argtypes = [wt.LPCWSTR, P, P, wt.DWORD, wt.DWORD, P]
+    user.CreateDesktopW.restype = P
+    user.GetProcessWindowStation.restype = P
+    user.SetProcessWindowStation.argtypes = [P]
+    user.CloseWindowStation.argtypes = [P]
+    user.CloseDesktop.argtypes = [P]
+    user.GetUserObjectInformationW.argtypes = [P, ctypes.c_int, P, wt.DWORD, ctypes.POINTER(wt.DWORD)]
+    advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [wt.LPCWSTR, wt.DWORD, ctypes.POINTER(P), P]
+    advapi.OpenProcessToken.argtypes = [P, wt.DWORD, ctypes.POINTER(P)]
+    advapi.GetTokenInformation.argtypes = [P, ctypes.c_int, P, wt.DWORD, ctypes.POINTER(wt.DWORD)]
+    advapi.ConvertSidToStringSidW.argtypes = [P, ctypes.POINTER(wt.LPWSTR)]
+    advapi.GetSecurityInfo.argtypes = [P, ctypes.c_int, wt.DWORD, P, P, P, P, ctypes.POINTER(P)]
+    advapi.GetSecurityInfo.restype = wt.DWORD
+    advapi.ConvertSecurityDescriptorToStringSecurityDescriptorW.argtypes = [P, wt.DWORD, wt.DWORD, ctypes.POINTER(wt.LPWSTR), P]
+    kernel.GetCurrentProcess.restype = P
+    kernel.CloseHandle.argtypes = [P]
+    kernel.LocalFree.argtypes = [P]
+    kernel.WaitForSingleObject.argtypes = [P, wt.DWORD]
+    kernel.WaitForSingleObject.restype = wt.DWORD
+    kernel.TerminateProcess.argtypes = [P, wt.UINT]
+    kernel.GetExitCodeProcess.argtypes = [P, ctypes.POINTER(wt.DWORD)]
+    return SimpleNamespace(user=user, advapi=advapi, kernel=kernel)
+
+
+def _user_sid(api: SimpleNamespace) -> str:
+    from ctypes import wintypes as wt
+
+    token, size = ctypes.c_void_p(), wt.DWORD()
+    assert api.advapi.OpenProcessToken(api.kernel.GetCurrentProcess(), 8, ctypes.byref(token))
+    try:
+        api.advapi.GetTokenInformation(token, 1, None, 0, ctypes.byref(size))  # TokenUser
+        data = ctypes.create_string_buffer(size.value)
+        assert api.advapi.GetTokenInformation(token, 1, data, size, ctypes.byref(size))
+        text = wt.LPWSTR()
+        assert api.advapi.ConvertSidToStringSidW(ctypes.cast(data, ctypes.POINTER(ctypes.c_void_p))[0], ctypes.byref(text))
+        try:
+            return str(text.value)
+        finally:
+            api.kernel.LocalFree(text)
+    finally:
+        api.kernel.CloseHandle(token)
+
+
+def _only_for(api: SimpleNamespace, sid: str, more: str = "") -> Any:
+    """Security attributes (not inherited) whose DACL lets in SYSTEM and this user, and no AppContainer: as Windows makes
+    the window station and desktop of a logon session that is not the interactive one (a service, an SSH session).
+    `more`: entries after those (SDDL)."""
+    from ctypes import wintypes as wt
+
+    descriptor = ctypes.c_void_p()
+    assert api.advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW(f"D:P(A;;GA;;;SY)(A;;GA;;;{sid}){more}", 1, ctypes.byref(descriptor), None)
+
+    class Attributes(ctypes.Structure):
+        _fields_ = [("length", wt.DWORD), ("descriptor", ctypes.c_void_p), ("inherit", wt.BOOL)]
+
+    return Attributes(ctypes.sizeof(Attributes), descriptor, False)
+
+
+def _name(api: SimpleNamespace, handle: int) -> str:
+    from ctypes import wintypes as wt
+
+    buffer, size = ctypes.create_unicode_buffer(256), wt.DWORD()
+    assert api.user.GetUserObjectInformationW(handle, 2, buffer, ctypes.sizeof(buffer), ctypes.byref(size))  # UOI_NAME
+    return str(buffer.value)
+
+
+def _run_on_desktop(api: SimpleNamespace, desktop: str, script: Path, result: Path) -> None:
+    """Run this Python on `script` with `result` as its argument, started on `desktop` (station\\desktop), as a process
+    started there by Windows is (a service's, an SSH session's): the Python standard library cannot name a desktop."""
+    from ctypes import wintypes as wt
+
+    P = ctypes.c_void_p
+
+    class Startup(ctypes.Structure):
+        _fields_ = [("cb", wt.DWORD), ("reserved", wt.LPWSTR), ("desktop", wt.LPWSTR), ("title", wt.LPWSTR),
+                    ("x", wt.DWORD), ("y", wt.DWORD), ("width", wt.DWORD), ("height", wt.DWORD),
+                    ("chars_x", wt.DWORD), ("chars_y", wt.DWORD), ("fill", wt.DWORD), ("flags", wt.DWORD),
+                    ("show", wt.WORD), ("reserved_size", wt.WORD), ("reserved_bytes", P),
+                    ("stdin", P), ("stdout", P), ("stderr", P)]
+
+    class Information(ctypes.Structure):
+        _fields_ = [("process", P), ("thread", P), ("pid", wt.DWORD), ("tid", wt.DWORD)]
+
+    create = api.kernel.CreateProcessW
+    create.argtypes = [wt.LPCWSTR, wt.LPWSTR, P, P, wt.BOOL, wt.DWORD, P, wt.LPCWSTR, ctypes.POINTER(Startup), ctypes.POINTER(Information)]
+    named = ctypes.create_unicode_buffer(desktop)
+    startup = Startup()
+    startup.cb = ctypes.sizeof(startup)
+    startup.desktop = ctypes.cast(named, wt.LPWSTR)
+    information = Information()
+    command = ctypes.create_unicode_buffer(subprocess.list2cmdline([sys.executable, str(script), str(result)]))
+    app = str(Path(video.__file__).resolve().parent.parent)
+    # No handle inherited; no console (none is needed: the answer comes in the file); this environment, PYTHONPATH with it.
+    assert create(None, command, None, None, False, 0x08000000, None, app, ctypes.byref(startup), ctypes.byref(information)), ctypes.get_last_error()
+    try:
+        if api.kernel.WaitForSingleObject(information.process, 180_000) != 0:
+            api.kernel.TerminateProcess(information.process, 1)
+            raise AssertionError("the Python started on the other desktop did not end within 180 s")
+    finally:
+        api.kernel.CloseHandle(information.thread)
+        api.kernel.CloseHandle(information.process)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows window stations and desktops")
+@pytest.mark.parametrize("made", ["desktop", "station"])
+def test_a_worker_starts_where_qkvms_desktop_lets_no_app_container_in(made: str, tmp_path: Path) -> None:
+    """Windows lets every AppContainer onto the interactive window station and its desktop (WinSta0\\Default), and onto no
+    other: not the station and desktop of a service or of an SSH session, where qKVM runs as a service or a test runner
+    runs it. A worker started there inherited them, its user32.dll could not connect, and every library that needs it
+    failed to load (`import ctypes`, `import av`: "A dynamic link library (DLL) initialization routine failed"): no
+    picture at all. Here qKVM is started on such a desktop: one made beside the current one (`desktop`), and one on a
+    window station made for it (`station`, as a service's is). Its worker starts, on a desktop made for that worker, and
+    the window station's DACL is as it was once the worker has ended."""
+    api = _windows_api()
+    sid = _user_sid(api)
+    station = desktop = None
+    previous = api.user.GetProcessWindowStation()
+    try:
+        if made == "station":
+            attributes = _only_for(api, sid)
+            # Unnamed: the one of this logon session, where none exists yet (a process on WinSta0). Only an administrator
+            # may name one. Either is made new (CWF_CREATE_ONLY), never one that is there already with another DACL.
+            for name in (None, "qkvm-test-" + os.urandom(8).hex()):
+                station = api.user.CreateWindowStationW(name, 1, 0x000F037F, ctypes.byref(attributes))
+                if station:
+                    break
+            if not station:
+                pytest.skip(f"no window station can be made new here (error {ctypes.get_last_error()})")
+            assert api.user.SetProcessWindowStation(station)
+        try:
+            desktop = api.user.CreateDesktopW("qkvm-test-" + os.urandom(8).hex(), None, None, 0, 0x000F01FF, ctypes.byref(_only_for(api, sid)))
+            assert desktop, ctypes.get_last_error()
+            where = _name(api, station or previous) + "\\" + _name(api, desktop)
+        finally:
+            assert api.user.SetProcessWindowStation(previous)
+        script, result = tmp_path / "from_another_desktop.py", tmp_path / "result.json"
+        script.write_text(FROM_ANOTHER_DESKTOP, encoding="utf-8")
+        _run_on_desktop(api, where, script, result)
+        said = json.loads(result.read_text(encoding="utf-8"))
+        assert said.get("on") == where, said
+        assert said.get("started") is True, said.get("error", said)
+        # While it ran, a station that lets no AppContainer in had an entry for that worker's SID (an AppContainer's: S-1-15-2
+        # and seven numbers), with READ_CONTROL and WINSTA_ACCESSGLOBALATOMS and nothing else; once it ended, none.
+        own = said["own"]
+        if own is None:
+            assert made == "desktop" and said["during"] == said["before"], said  # (a station that lets every AppContainer in)
+        else:
+            assert re.fullmatch(r"S-1-15-2(?:-\d+){7}", own) and f"(A;;WPRC;;;{own})" in said["during"], said
+            assert own not in said["after"], said
+        if made == "station":
+            # A station of the test's own, nothing else on it: one entry more, at the end, and then as it was.
+            assert said["during"] == said["before"] + f"(A;;WPRC;;;{own})" and said["after"] == said["before"], said
+        # (Beside the current desktop, its station may be shared: a service's with the account's other services, an SSH
+        # session's with what else runs in it, a test runner's other qKVMs among them, whose workers have entries of their
+        # own meanwhile. Whether two qKVMs' changes of one DACL leave each other's be: see the test below.)
+    finally:
+        if desktop:
+            api.user.CloseDesktop(desktop)
+        if station:
+            api.user.CloseWindowStation(station)
+
+
+TWO_AT_ONCE = r'''
+import ctypes, json, os, sys
+from ctypes import wintypes as wt
+from qkvm import _video_windows as windows
+
+name, rounds = sys.argv[1], int(sys.argv[2])
+open_desktop = windows.api(windows.user, "OpenDesktopW", [wt.LPCWSTR, wt.DWORD, wt.BOOL, wt.DWORD], ctypes.c_void_p)
+handle = windows.checked(open_desktop(name, 0, False, 0x00060000))  # READ_CONTROL | WRITE_DAC
+
+
+def present():
+    acl, _ = windows._dacl(handle)
+    buffer = ctypes.create_string_buffer(acl, len(acl))
+    return {windows.sid_text(entry) for _, _, _, _, entry in windows._entries(buffer, int.from_bytes(acl[4:6], "little"))}
+
+
+said = {"lost": 0, "left": 0, "failed": []}
+for _ in range(rounds):
+    text = "S-1-15-2-" + "-".join(str(int.from_bytes(os.urandom(4), "little")) for _ in range(7))
+    sid = ctypes.c_void_p()
+    windows.checked(windows.string_to_sid(text, ctypes.byref(sid)))
+    try:
+        windows.grant_station(handle, sid)
+        said["lost"] += text not in present()  # (written over before its worker could have used it)
+        windows.revoke_station(handle, sid)
+        said["left"] += text in present()  # (brought back by the other's change: left for the life of the station)
+    except OSError as error:
+        said["failed"].append(str(error))
+    finally:
+        windows.local_free(sid)
+print(json.dumps(said))
+'''
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows window stations")
+def test_two_qkvms_changing_one_window_stations_dacl_at_once_lose_nothing_and_leave_nothing(tmp_path: Path) -> None:
+    """qKVMs of one account share a window station where they run as services, and a test runner's processes over one SSH
+    session share theirs; each gives its workers' AppContainers entries in the station's DACL and takes them out again
+    (grant_station, revoke_station), and Windows writes a DACL only whole: read, changed, written back. Each qKVM kept its
+    own changes one at a time, and not the other's: an entry was written over before its worker could use it, one taken out
+    came back with the other's next change and was left for the life of the station (on the coordinator's VM, an entry for
+    an AppContainer whose worker had ended), and a read in the middle of a change failed (ERROR_INSUFFICIENT_BUFFER). Two
+    processes here change one DACL as fast as they can. A desktop stands in for the station: a window object too, whose
+    DACL is changed in the same way, and one any account may make (only an administrator may make a station new)."""
+    from ctypes import wintypes as wt
+
+    api = _windows_api()
+    desktop = api.user.CreateDesktopW("qkvm-test-" + os.urandom(8).hex(), None, None, 0, 0x000F01FF, ctypes.byref(_only_for(api, _user_sid(api))))
+    assert desktop, ctypes.get_last_error()
+
+    def dacl() -> str:
+        descriptor, text = ctypes.c_void_p(), wt.LPWSTR()
+        assert not api.advapi.GetSecurityInfo(desktop, 7, 4, None, None, None, None, ctypes.byref(descriptor))
+        assert api.advapi.ConvertSecurityDescriptorToStringSecurityDescriptorW(descriptor, 1, 4, ctypes.byref(text), None)
+        try:
+            return str(text.value)
+        finally:
+            api.kernel.LocalFree(text)
+            api.kernel.LocalFree(descriptor)
+
+    try:
+        before = dacl()
+        script = tmp_path / "two_at_once.py"
+        script.write_text(TWO_AT_ONCE, encoding="utf-8")
+        app = str(Path(video.__file__).resolve().parent.parent)
+        children = [subprocess.Popen([sys.executable, str(script), _name(api, desktop), "300"], cwd=app, env={**os.environ, "PYTHONPATH": app},
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE) for _ in range(2)]
+        said = [child.communicate(timeout=300) for child in children]
+        assert all(child.returncode == 0 for child in children), said
+        assert [json.loads(out) for out, _ in said] == [{"lost": 0, "left": 0, "failed": []}] * 2, said
+        assert dacl() == before
+    finally:
+        api.user.CloseDesktop(desktop)
+
+
+HOLDER = r'''
+import ctypes, sys
+from ctypes import wintypes as wt
+kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+kernel.CreateMutexW.restype = ctypes.c_void_p
+kernel.CreateMutexW.argtypes = [ctypes.c_void_p, wt.BOOL, wt.LPCWSTR]
+held = [kernel.CreateMutexW(None, True, name) for name in sys.argv[1:]]
+assert all(held), ctypes.get_last_error()
+print("held", flush=True)
+sys.stdin.read()
+'''
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows window stations")
+def test_a_change_of_a_stations_dacl_waits_for_another_qkvms_without_holding_up_anything_else(tmp_path: Path) -> None:
+    """Where another process holds the mutex of qKVM's changes of a station's DACL (a qKVM that hangs; in session 0 one
+    of another account that took the name first), each start and end of a worker waited SHARED_WAIT (2 s) for it: on
+    the signed-in session's WinSta0 too, where nothing is changed; with this process's lock held meanwhile, so every
+    other start waited behind it; and an end with the worker's own lock held. Now a DACL that needs no entry is judged
+    before the mutex is waited for, and that wait holds neither lock."""
+    from qkvm import _video_windows as windows
+
+    api = _windows_api()
+    user = _user_sid(api)
+    # (One as WinSta0 is, which lets every AppContainer in; one as a service's station is, which lets none in.)
+    admitting = api.user.CreateDesktopW("qkvm-test-" + os.urandom(8).hex(), None, None, 0, 0x000F01FF, ctypes.byref(_only_for(api, user, "(A;;0x20020;;;AC)")))
+    closed = api.user.CreateDesktopW("qkvm-test-" + os.urandom(8).hex(), None, None, 0, 0x000F01FF, ctypes.byref(_only_for(api, user)))
+    assert admitting and closed
+
+    def present(window_object: Any) -> set[str]:
+        acl, _ = windows._dacl(window_object)
+        buffer = ctypes.create_string_buffer(acl, len(acl))  # (held while the SIDs in it are read)
+        return {windows.sid_text(entry) for *_, entry in windows._entries(buffer, int.from_bytes(acl[4:6], "little"))}
+
+    worker = ctypes.c_void_p()
+    windows.checked(windows.string_to_sid("S-1-15-2-" + "-".join(str(int.from_bytes(os.urandom(4), "little")) for _ in range(7)), ctypes.byref(worker)))
+    script = tmp_path / "holder.py"
+    script.write_text(HOLDER, encoding="utf-8")
+    holder = subprocess.Popen([sys.executable, str(script), *("Local\\qkvm-dacl-" + _name(api, d) for d in (admitting, closed))],
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    try:
+        assert holder.stdout is not None and holder.stdout.readline().strip() == b"held"
+        began = time.monotonic()
+        assert windows.grant_station(admitting, worker) is False  # (lets every AppContainer in: nothing to change)
+        assert time.monotonic() - began < 1.0, "the mutex was waited for where nothing was to be changed"
+        # A change that waits for the mutex holds no lock of this process meanwhile...
+        granting = threading.Thread(target=windows.grant_station, args=(closed, worker))
+        granting.start()
+        time.sleep(0.3)
+        assert windows._station_lock.acquire(timeout=0.5), "this process's lock was held while the mutex was waited for"
+        windows._station_lock.release()
+        granting.join()
+        # ...and a worker's end, taking its entry out, not the worker's own lock.
+        ended: Any = windows.AppProcess.__new__(windows.AppProcess)
+        ended._state_lock = threading.RLock()
+        ended._handle = ended._job = ended._profile = ended._pair = ended._desktop = None
+        ended._station, ended._sid, ended.returncode = closed, worker, 0
+        ending = threading.Thread(target=ended.wait)
+        ending.start()
+        time.sleep(0.3)
+        assert ended._state_lock.acquire(timeout=0.5), "the worker's lock was held while its entry was taken out"
+        ended._state_lock.release()
+        ending.join()
+        assert windows.sid_text(worker) not in present(closed) and windows.sid_text(worker) not in present(admitting)
+    finally:
+        holder.communicate(b"", timeout=10)
+        api.kernel.LocalFree(worker)
+        api.user.CloseDesktop(admitting)
+        api.user.CloseDesktop(closed)
+
+
 def test_qkvm_starts_no_process_that_takes_every_inheritable_handle() -> None:
     """On Windows, CPython's subprocess gives a child the handles it lists (PROC_THREAD_ATTRIBUTE_HANDLE_LIST) or none at
     all, unless it is told close_fds=False; os.system, os.spawn*, os.exec* and os.startfile give the new process every
@@ -1099,3 +1778,132 @@ def test_qkvm_starts_no_process_that_takes_every_inheritable_handle() -> None:
             ):
                 found.append(f"{path.name}:{node.lineno}: CreateProcess")
     assert not found, found
+
+
+# --- video runtimes left in the temporary folder (Builder D's soak of 0.4.0, its finding 3) ---------------------------
+#
+# A wall that Windows ended as it restarted left its video runtime (some 90 MB) in the temporary folder, and the next start
+# made another. The qKVM that made a runtime now holds a file in it open while it runs; the first worker of a run removes
+# the runtimes of earlier runs nobody holds, and nothing else.
+
+
+def runtime(folder: Path, name: str, held_mark: bool = True) -> Path:
+    """A runtime as a run of qKVM leaves one: some files and a folder, and the file that marks it held (`held_mark`)."""
+    root = folder / name
+    (root / "DLLs").mkdir(parents=True)
+    (root / "python.exe").write_bytes(b"MZ")
+    (root / "DLLs" / "_ctypes.pyd").write_bytes(b"MZ")
+    if held_mark:
+        (root / video.RUNTIME_HELD).write_bytes(b"")
+    return root
+
+
+@contextlib.contextmanager
+def held_by_another_process(mark: Path) -> Iterator[None]:
+    """Another qKVM that runs and holds its runtime: a process with that file open, until the end of this."""
+    holder = subprocess.Popen(
+        [sys.executable, "-I", "-c", "import sys; f = open(sys.argv[1], 'ab'); print('holding', flush=True); sys.stdin.read()", str(mark)],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, close_fds=True,
+    )  # fmt: skip
+    try:
+        assert holder.stdout is not None and holder.stdout.readline().strip() == b"holding"
+        yield
+    finally:
+        assert holder.stdin is not None
+        holder.stdin.close()
+        holder.wait(timeout=30)
+
+
+def test_runtimes_of_earlier_runs_that_nobody_holds_are_removed_and_nothing_else(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    ended = runtime(tmp_path, "qkvm-video-runtime-ended1")  # (its run ended: nobody holds its file)
+    second_wall = runtime(tmp_path, "qkvm-video-runtime-second")  # (a second wall that runs)
+    mine = runtime(tmp_path, "qkvm-video-runtime-mine", held_mark=False)  # (this run's own)
+    unmarked = runtime(tmp_path, "qkvm-video-runtime-older", held_mark=False)  # (made before the mark, or being made now)
+    other = runtime(tmp_path, "something-else")  # (not of qKVM's naming)
+    lone_file = tmp_path / "qkvm-video-runtime-a-file"
+    lone_file.write_bytes(b"not a runtime")
+    elsewhere = runtime(tmp_path / "outside", "qkvm-video-runtime-pointed-at")
+    linked = tmp_path / "qkvm-video-runtime-junction"
+    if sys.platform == "win32":
+        import _winapi
+
+        _winapi.CreateJunction(str(elsewhere), str(linked))  # type: ignore[attr-defined,unused-ignore]
+    else:
+        linked.symlink_to(elsewhere, target_is_directory=True)
+    video._hold_runtime(mine)
+    kept = [second_wall, mine, unmarked, other, lone_file, linked, elsewhere]
+    try:
+        with held_by_another_process(second_wall / video.RUNTIME_HELD):
+            removed = video.sweep_runtimes(tmp_path)
+            if sys.platform != "win32":
+                # (No runtime is made but on Windows, and nothing of the kind is removed elsewhere, whatever its name.)
+                assert removed == [] and ended.exists() and all(path.exists() for path in kept)
+                return
+            assert removed == [ended] and not ended.exists(), removed
+            assert all(path.exists() for path in kept), [path for path in kept if not path.exists()]
+            # The computer has started since the one without a mark was made: nobody runs who could hold it.
+            monkeypatch.setattr(video, "_booted_at", lambda: time.time() + 2 * video.RUNTIME_BEFORE_BOOT)
+            removed = video.sweep_runtimes(tmp_path)
+            assert removed == [unmarked] and not unmarked.exists(), removed
+            kept.remove(unmarked)
+            assert all(path.exists() for path in kept), [path for path in kept if not path.exists()]
+            assert (elsewhere / video.RUNTIME_HELD).exists() and (elsewhere / "python.exe").exists()  # (nothing through the junction)
+    finally:
+        video._let_go_of_runtime(mine)
+
+
+def test_the_first_video_worker_of_a_run_removes_the_runtimes_that_earlier_runs_left(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    left = runtime(tmp_path, "qkvm-video-runtime-left1")  # (by a wall that Windows ended as it restarted)
+    left_by_0_3 = runtime(tmp_path, "qkvm-video-runtime-left2", held_mark=False)  # (by an older qKVM, made before the restart)
+    monkeypatch.setattr(video, "_runtimes_folder", lambda: tmp_path)
+    monkeypatch.setattr(video, "_booted_at", lambda: time.time() + 2 * video.RUNTIME_BEFORE_BOOT)
+    monkeypatch.setattr(video, "_swept", False)
+    worker = video.Worker()  # (as a run's first worker starts)
+    try:
+        if sys.platform != "win32":
+            time.sleep(0.5)
+            assert left.exists() and left_by_0_3.exists()  # (none is made but on Windows: nothing is removed elsewhere)
+            return
+        until = time.monotonic() + 30
+        while left.exists() or left_by_0_3.exists():
+            assert time.monotonic() < until, "the runtimes earlier runs left are still there"
+            time.sleep(0.05)
+        second = video.Worker()  # (and once a run: the next worker looks through the folder no more)
+        second.close()
+        assert video._swept
+    finally:
+        worker.close()
+
+
+def test_a_runtime_with_anything_open_in_it_is_left_whole_and_one_left_in_part_is_said(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+    # (The review of the hold round, L1.) An unmarked runtime of a wall that runs (a 0.3.x wall on the same account, or one
+    # whose held file could not be made), whose making a clock set forward since put before the start, was emptied but for
+    # the files open in it, and that wall's next worker could not start. A runtime is renamed before it is removed, which
+    # Windows refuses while anything in it is open, and is removed only once that went through.
+    import logging
+    import shutil
+
+    in_use = runtime(tmp_path, "qkvm-video-runtime-olderwall", held_mark=False)
+    (in_use / "worker.py").write_text("pass\n")
+    left_running = runtime(tmp_path, "qkvm-video-runtime-workerleft")  # (its run ended, and a worker of it still runs)
+    monkeypatch.setattr(video, "_booted_at", lambda: time.time() + 2 * video.RUNTIME_BEFORE_BOOT)
+    before = {root: sorted(path.relative_to(root) for path in root.rglob("*")) for root in (in_use, left_running)}
+    with held_by_another_process(in_use / "python.exe"), held_by_another_process(left_running / "python.exe"):
+        removed = video.sweep_runtimes(tmp_path)
+        assert removed == [], removed
+        after = {root: sorted(path.relative_to(root) for path in root.rglob("*")) for root in before}
+        assert after == before, after  # (whole, its held file too)
+    if sys.platform != "win32":
+        return  # (nothing of the kind is removed elsewhere)
+    assert sorted(video.sweep_runtimes(tmp_path)) == sorted([in_use, left_running])  # (once nothing in them is open)
+    # One whose removal stopped halfway (here: nothing of it removed) is said in the log, and removed by the next sweep.
+    halfway = runtime(tmp_path, "qkvm-video-runtime-halfway")
+    real = shutil.rmtree
+    monkeypatch.setattr(shutil, "rmtree", lambda path, ignore_errors=False: None)
+    with caplog.at_level(logging.WARNING, logger="qkvm"):
+        assert video.sweep_runtimes(tmp_path) == []
+    assert "removed only in part" in caplog.text, caplog.text
+    going = tmp_path / ("qkvm-video-runtime-halfway" + video.RUNTIME_REMOVING)
+    assert going.exists() and not halfway.exists()
+    monkeypatch.setattr(shutil, "rmtree", real)
+    assert video.sweep_runtimes(tmp_path) == [going] and not going.exists()

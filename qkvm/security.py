@@ -264,6 +264,12 @@ class Session:
     since: float = 0.0
     taken_up: bool = False  # it was made by an earlier run of this program, and read back from what that one wrote down
     vouched: float = 0.0  # (signed in by the proxy) when the proxy last named this account on a request, on the clock that only goes forward
+    # The longest it lasts from when it was made, however much it is used; 0: as long as any (REMEMBER_TTL). A sign-in by an
+    # identity provider lasts a working day (oidc.SIGNED_IN_FOR): the role it was given is read from the groups at sign-in.
+    lasts: float = 0.0
+    # (Signed in by an identity provider) a mark of the provider's settings that decided its role (oidc.granted_by): changed
+    # since, the sign-in is over.
+    granted: str = ""
 
     def age(self) -> float:
         return self.aged + time.monotonic() - self.since
@@ -296,7 +302,7 @@ class Sessions:
         self._behind = False  # the last write failed: what is held here is handed over again at the next occasion
         self._tried = 0.0  # ...and this is when that was
         self._stale: str | None = None  # why what is on disk may still name a browser that has signed out; None: it does not
-        self._waiting: queue.Queue[str] = queue.Queue()
+        self._waiting: queue.Queue[str | None] = queue.Queue()  # (None: the writer ends there, see close)
         self._writer: threading.Thread | None = None
         self._starting = threading.Lock()
 
@@ -360,16 +366,36 @@ class Sessions:
         if kept == self._asked and not (self._behind and time.monotonic() - self._tried > TRY_AGAIN):
             return
         self._asked = kept
-        self._waiting.put(json.dumps(kept))
-        if self._writer is None:
-            with self._starting:
-                if self._writer is None:
-                    self._writer = threading.Thread(target=self._write_on, name="kept-sign-ins", daemon=True)
-                    self._writer.start()
+        with self._starting:  # (with the writer's end, see close: nothing is left behind a writer that has ended)
+            self._waiting.put(json.dumps(kept))
+            if self._writer is None:
+                self._writer = threading.Thread(target=self._write_on, name="kept-sign-ins", daemon=True)
+                self._writer.start()
+
+    def close(self, within: float = 10.0) -> str | None:
+        """`flush`, and then the writer's thread ends (waited for within what is left of `within`); what is handed over after
+        this starts one again, as the first was. For a wall that ends: one ended in a test went on waiting for something to
+        write that never came, a thread for every wall (see store.AuditLog.close)."""
+        began = time.monotonic()
+        why = self.flush(within)
+        with self._starting:
+            writer = self._writer
+            if writer is None:
+                return why
+            self._waiting.put(None)  # (after what was handed over before it)
+        writer.join(max(0.0, within - (time.monotonic() - began)))
+        return why
 
     def _write_on(self) -> None:
         while True:
             text = self._waiting.get()
+            if text is None:
+                with self._starting:
+                    self._waiting.task_done()
+                    if self._waiting.empty():
+                        self._writer = None
+                        return
+                continue  # (handed over after the close and before its end was come to: written by this one, in its turn)
             try:
                 self._write(text)
             finally:
@@ -518,7 +544,7 @@ class Sessions:
         self.prune()
         return len(self._sessions)
 
-    def create(self, ip: str, remember: bool, user: str = "", sso: bool = False, mark: str = "") -> str:
+    def create(self, ip: str, remember: bool, user: str = "", sso: bool = False, mark: str = "", lasts: float = 0.0, granted: str = "") -> str:
         token = secrets.token_urlsafe(32)
         now = time.monotonic()
         if user and sum(1 for session in self._sessions.values() if session.user == user) >= MOST_OF_ONE:
@@ -527,7 +553,7 @@ class Sessions:
             own = sorted((s.created, place, k) for place, (k, s) in enumerate(self._sessions.items()) if s.user == user)
             for _, _, key in own[: len(own) - MOST_OF_ONE + 1]:
                 del self._sessions[key]
-        self._sessions[self._key(token)] = Session(time.time(), now, REMEMBER_TTL if remember else IDLE_TTL, ip, user, sso, mark, 0.0, now, vouched=now)
+        self._sessions[self._key(token)] = Session(time.time(), now, REMEMBER_TTL if remember else IDLE_TTL, ip, user, sso, mark, 0.0, now, vouched=now, lasts=lasts, granted=granted)
         self._keep()
         return token
 
@@ -560,7 +586,7 @@ class Sessions:
         took up as new what was a month old. (So a clock that jumps a month ahead ends those, and they sign
         in again; a sign-in made in this run is not touched by it.)
         """
-        return session.age() > REMEMBER_TTL or (session.taken_up and time.time() - session.created > REMEMBER_TTL)
+        return session.age() > (session.lasts or REMEMBER_TTL) or (session.taken_up and time.time() - session.created > REMEMBER_TTL)
 
     def drop(self, token: str | None) -> None:
         if token:

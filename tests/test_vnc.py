@@ -17,6 +17,7 @@ from qkvm.discover import Target
 from qkvm.kvm import DeviceSpec, KvmError
 from qkvm.store import Store
 from qkvm.vncdevice import VncDevice, vnc_url
+from tests.test_discover import searched
 from tests.fake_vnc import FakeVnc, VncState
 from tests.test_wall import snap, wait_until, wall
 
@@ -76,6 +77,23 @@ def test_a_vnc_server_is_added_by_its_address_and_shows_its_screen(tmp_path: Pat
         assert [d["kind"] for d in listed] == ["vnc"]
         assert vnc.state.shared == [1]  # the connection that checked it is the wall's: made once, and nobody at the server was thrown out
     assert vnc.state.password_tries == 1
+
+
+@pytest.mark.parametrize("encoding", ["tight", "tight-jpeg"])
+def test_a_screen_whose_picture_cannot_be_made_on_this_computer_says_why(tmp_path: Path, encoding: str) -> None:
+    # Where no video worker could start (qKVM run as a Windows service, before 0.4.0), the tile said "The screen changed
+    # while its picture was being made" for good; and where the server sends JPEGs, which a worker decodes, that the
+    # server "sent what qKVM does not take", and it was left alone for minutes. It says why now, as the worker said it.
+    from tests.test_video_isolation import NO_VIDEO, video_that_cannot_start, what_the_tile_says
+
+    server = FakeVnc(VncState(width=160, height=100, encoding=encoding)).start()
+    try:
+        with video_that_cannot_start(tmp_path / "video"), wall(tmp_path / "wall") as client:
+            reply = client.post("/api/v1/devices", json={"url": server.url, "password": "secret"})
+            assert reply.status_code == 201, reply.text
+            assert what_the_tile_says(client, reply.json()["device"]["id"]) == NO_VIDEO
+    finally:
+        server.stop()
 
 
 def test_the_kind_can_be_chosen_instead_of_written_into_the_address(tmp_path: Path, vnc: FakeVnc) -> None:
@@ -198,7 +216,7 @@ def test_keys_text_and_ctrl_alt_del_reach_the_server_and_nothing_else_is_offered
 def test_the_network_search_finds_a_vnc_server_without_sending_it_anything(tmp_path: Path, vnc: FakeVnc, monkeypatch: pytest.MonkeyPatch) -> None:
     nowhere = "http://127.0.0.1:9"
     monkeypatch.setattr(discover, "VNC_PORTS", (vnc.port,))
-    monkeypatch.setattr(discover, "targets", lambda: ([Target("127.0.0.1", nowhere, nowhere, "box")], ["test network"]))
+    monkeypatch.setattr(discover, "targets", searched([Target("127.0.0.1", nowhere, nowhere, "box")], ["test network"]))
     with wall(tmp_path) as admin:
         result = admin.post("/api/v1/discover").json()
         assert result["found"] == [
@@ -608,3 +626,202 @@ def test_export_and_import_carry_a_vnc_server(tmp_path: Path, vnc: FakeVnc) -> N
         listed = other.get("/api/v1/wall").json()["devices"]
         assert [(d["name"], d["kind"], d["url"]) for d in listed] == [("Box", "vnc", vnc.url)]
         picture(other, listed[0]["id"])  # with its password
+
+
+def test_the_video_worker_of_a_vnc_server_nobody_looks_at_is_let_rest_and_the_next_look_starts_one(monkeypatch: pytest.MonkeyPatch) -> None:
+    # (The soak farm: a video worker of some 35 MB was held for every VNC server anybody had ever looked at, for as long as
+    # its connection, which is kept open while the server is on the wall.) Nobody looks for WORKER_REST (a minute and a
+    # half; here half a second), and the wall's housekeeping lets the worker rest; the connection stays, and the next
+    # picture starts a worker again.
+    from qkvm import video
+
+    monkeypatch.setattr(vncdevice, "WORKER_REST", 0.5)
+    monkeypatch.setattr(vncdevice, "KEEPALIVE_IDLE", 0.2)  # (the last pictures are let go of first, as after half a minute)
+    servers = [FakeVnc(VncState(width=160, height=100)).start() for _ in range(3)]
+
+    async def pictured(device: VncDevice) -> bytes:
+        until = time.monotonic() + 60  # (room only: a busy computer starts a worker in seconds)
+        while True:
+            try:
+                return (await device.snapshot(640)).data
+            except KvmError:
+                assert time.monotonic() < until, "no picture"
+                await asyncio.sleep(0.05)
+
+    def running(workers: list[Any]) -> int:
+        """How many of these are among the video workers that run now."""
+        return sum(1 for worker in list(video._workers) if worker._process is not None and any(worker is mine for mine in workers))
+
+    async def run() -> None:
+        devices = [VncDevice(DeviceSpec(f"v{n}", f"vnc {n}", server.url, "", "secret", kind="vnc")) for n, server in enumerate(servers)]
+        try:
+            for device in devices:
+                assert (await pictured(device))[:3] == b"\xff\xd8\xff"
+            sessions = [device._session for device in devices]
+            workers = [session.video_encoder._worker for session in sessions if session is not None]
+            assert len(workers) == 3 and running(workers) == 3
+            await asyncio.sleep(0.6)  # (nobody looks)
+            for device in devices:
+                device.tidy()  # (the wall's housekeeping, every half minute)
+            until = time.monotonic() + 15
+            while running(workers):
+                assert time.monotonic() < until, f"{running(workers)} of the 3 video workers still run"
+                await asyncio.sleep(0.05)
+            assert [device._session for device in devices] == sessions and not any(s is None or s.done.is_set() for s in sessions)
+            assert (await pictured(devices[0]))[:3] == b"\xff\xd8\xff"  # (a new look: a worker of its own again)
+            session = devices[0]._session
+            assert session is not None and session.video_encoder.running and session.video_encoder._worker not in workers
+            assert running([s.video_encoder._worker for s in sessions if s is not None]) == 1
+        finally:
+            for device in devices:
+                await device.close()
+
+    try:
+        asyncio.run(run())
+    finally:
+        for server in servers:
+            server.stop()
+
+
+def test_the_worker_a_vnc_servers_tight_jpegs_are_decoded_in_is_let_rest_once_nobody_looks(monkeypatch: pytest.MonkeyPatch) -> None:
+    # (As its encoder worker, above.) A server that sends its screen as Tight JPEGs has them decoded in a video worker of
+    # its connection's own, kept for as long as the connection: nothing is drawn while nobody looks, and the wall's
+    # housekeeping lets it rest; the next look draws again, in a new one.
+    monkeypatch.setattr(vncdevice, "WORKER_REST", 0.5)
+    monkeypatch.setattr(vncdevice, "KEEPALIVE_IDLE", 0.2)
+    # (A still screen answers no request for what changed: the pacer waits for one up to HEARTBEAT, a minute, before its
+    # next turn, which is where it stops drawing or starts again. Here a second: the review of the hold round, M2, saw the
+    # test wait out that minute on win-3, and fail once.)
+    monkeypatch.setattr(vncdevice, "HEARTBEAT", 1.0)
+    server = FakeVnc(VncState(width=160, height=100, encoding="tight-jpeg")).start()
+
+    async def looked_at(device: VncDevice) -> None:
+        until = time.monotonic() + 60  # (room only: a busy computer starts a worker in seconds)
+        while True:
+            try:
+                await device.snapshot(640)
+                return
+            except KvmError:
+                assert time.monotonic() < until, "no picture"
+                await asyncio.sleep(0.05)
+
+    async def run() -> None:
+        device = VncDevice(DeviceSpec("v", "vnc", server.url, "", "secret", kind="vnc"))
+        try:
+            await looked_at(device)
+            session = device._session
+            assert session is not None and session.client is not None
+            client = session.client
+            decoder = client._video_decoder
+            worker = decoder._worker
+            assert worker is not None and decoder.running, "its JPEGs were not decoded in a worker"
+            until = time.monotonic() + vncdevice.HEARTBEAT + 20  # (room only)
+            while client.drawing:  # (nobody looks: the pacer stops drawing at its next turn)
+                assert time.monotonic() < until, "it still draws"
+                await asyncio.sleep(0.05)
+            await asyncio.sleep(0.6)
+            device.tidy()  # (the wall's housekeeping, every half minute)
+            until = time.monotonic() + 15
+            while worker._process is not None or decoder.running:
+                assert time.monotonic() < until, "the worker its JPEGs were decoded in still runs"
+                await asyncio.sleep(0.05)
+            assert device._session is session and session.client is client and not session.done.is_set()
+            until = time.monotonic() + vncdevice.HEARTBEAT + 30  # (room only: a worker started on a busy computer)
+            while not decoder.running:  # (looked at again: what comes is drawn, in a new worker)
+                assert time.monotonic() < until, "no JPEG was decoded again"
+                await looked_at(device)
+                await asyncio.sleep(0.1)
+            assert decoder._worker is not worker and not session.done.is_set()
+        finally:
+            await device.close()
+
+    try:
+        asyncio.run(run())
+    finally:
+        server.stop()
+
+
+def test_a_vnc_servers_video_worker_in_use_is_not_let_rest(monkeypatch: pytest.MonkeyPatch, vnc: FakeVnc) -> None:
+    # (While somebody looks, the tile's pictures keep the worker: nothing is let rest.)
+    monkeypatch.setattr(vncdevice, "WORKER_REST", 0.5)
+
+    async def run() -> None:
+        device = VncDevice(DeviceSpec("v", "vnc", vnc.url, "", "secret", kind="vnc"))
+        try:
+            until = time.monotonic() + 60
+            while True:
+                try:
+                    await device.snapshot(640)
+                    break
+                except KvmError:
+                    assert time.monotonic() < until, "no picture"
+                    await asyncio.sleep(0.05)
+            session = device._session
+            assert session is not None
+            worker = session.video_encoder._worker
+            for _ in range(10):
+                await device.snapshot(640)  # (looked at, a tenth of a second apart)
+                device.tidy()
+                await asyncio.sleep(0.1)
+            assert session.video_encoder._worker is worker and session.video_encoder.running
+        finally:
+            await device.close()
+
+    asyncio.run(run())
+
+
+def test_vnc_servers_video_workers_are_started_a_few_at_a_time_in_threads_of_their_own(monkeypatch: pytest.MonkeyPatch) -> None:
+    # (The review of the hold round, L4.) A wall of many VNC tiles looked at again after their workers rested started a
+    # worker in each of the event loop's threads at once, and everything else the program hands to a thread waited behind
+    # them. Each is started in one of the threads that start workers, STARTS_AT_ONCE of them at the most.
+    import threading
+
+    from qkvm import video
+
+    monkeypatch.setattr(video, "STARTS_AT_ONCE", 2)
+    monkeypatch.setattr(video, "_starts", None)  # (made anew, with two threads)
+    starting: list[str] = []
+    at_once = [0, 0]  # now, the most
+    lock = threading.Lock()
+    real = video.Worker.__init__
+
+    def counted(self: Any, *args: Any, **kwargs: Any) -> None:
+        with lock:
+            starting.append(threading.current_thread().name)
+            at_once[0] += 1
+            at_once[1] = max(at_once)
+        try:
+            time.sleep(0.2)  # (a start takes its moment: long enough for them to meet)
+            real(self, *args, **kwargs)
+        finally:
+            with lock:
+                at_once[0] -= 1
+
+    monkeypatch.setattr(video.Worker, "__init__", counted)
+    servers = [FakeVnc(VncState(width=160, height=100)).start() for _ in range(6)]
+
+    async def pictured(device: VncDevice) -> None:
+        until = time.monotonic() + 120  # (room only)
+        while True:
+            try:
+                await device.snapshot(640)
+                return
+            except KvmError:
+                assert time.monotonic() < until, "no picture"
+                await asyncio.sleep(0.05)
+
+    async def run() -> None:
+        devices = [VncDevice(DeviceSpec(f"v{n}", f"vnc {n}", server.url, "", "secret", kind="vnc")) for n, server in enumerate(servers)]
+        try:
+            await asyncio.gather(*(pictured(device) for device in devices))
+        finally:
+            for device in devices:
+                await device.close()
+
+    try:
+        asyncio.run(run())
+    finally:
+        for server in servers:
+            server.stop()
+    assert len(starting) == 6 and all(name.startswith("qkvm-video-start") for name in starting), starting
+    assert at_once[1] <= 2, at_once

@@ -178,7 +178,7 @@ def test_a_look_that_gets_no_answer_after_an_unmount_keeps_the_box_and_asks_agai
                 return
             route.continue_()
 
-        page.route(re.compile(r".*/api/v1/devices/[^/]+/media$"), once_no_answer)
+        page.route(re.compile(r".*/api/v1/devices/[^/]+/media(\?.*)?$"), once_no_answer)  # (the list names its machine since 0.4.0: ?target=)
         box.get_by_role("button", name="Unmount", exact=True).click()
         top(page).get_by_role("button", name="Unmount", exact=True).click()
         expect(said).to_have_text("Unmount debian-13.iso: done. Device did not respond in time. Asked again in a moment.", timeout=30_000)

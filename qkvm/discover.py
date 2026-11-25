@@ -1,6 +1,6 @@
 """Find KVMs on the networks this computer is on, for the Add KVM dialog.
 
-Only the computer's own private networks and its Tailscale peers are looked at, never an
+Only the computer's own private network and the machines of its tailnet are looked at (tailnet.py), never an
 address range somebody typed in: this must not turn into a tool for scanning other people.
 """
 
@@ -8,24 +8,25 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
-import json
-import subprocess
+import logging
 from dataclasses import dataclass
 from typing import Any
 
 import httpx
 
-from . import amt
-from .kvm import MAX_PROBE, KvmError, bounded, certificate_mark, fetch_certificate, listens, other_way, plain, read_json
-from .netbind import NO_WINDOW, lan_ip, tailscale_command
+from . import amt, tailnet
+from .kvm import MAX_PROBE, KvmError, bounded, certificate_mark, fetch_certificate, listens, other_way, read_json
+from .netbind import lan_ip
 from .rfb import greeting
 from .vncdevice import vnc_url
+
+log = logging.getLogger("qkvm")
 
 AT_ONCE = 64  # addresses asked at the same time
 ANSWER_WITHIN = 4.0  # seconds an address has to answer in full; a search must not hang on one that dawdles
 AMT_PORTS = amt.PORTS  # where a PC with Intel AMT would answer on an address: (scheme, port), the preferred way first
 VNC_PORTS = (5900, 5901)  # where a VNC server listens as a rule: the first display, and the second
-TAILNET = ipaddress.ip_network("100.64.0.0/10")  # Tailscale addresses: only peers are asked, not the whole range
+TAILNET = tailnet.SHARED  # Tailscale addresses: only peers are asked, not the whole range
 
 
 @dataclass(frozen=True)
@@ -52,60 +53,50 @@ def _own_addresses() -> list[ipaddress.IPv4Address]:
     return [address] if usable else []
 
 
-def _tailscale_peers() -> list[tuple[str, str]]:
-    """(address, machine name) of the other machines on this computer's tailnet that are online."""
-    command = tailscale_command()
-    if command is None:
-        return []
-    try:
-        # Read as what it is written in (UTF-8), whatever this system reads a program's text as. Read as
-        # Windows does by default, one name in the tailnet that its code page has no letter for (a machine's,
-        # or a person's: an accent is enough) left nothing read at all, and the search was an error.
-        out = subprocess.run(
-            [command, "status", "--json"], capture_output=True, encoding="utf-8", errors="replace", timeout=5, check=True, creationflags=NO_WINDOW
-        )
-        peers = json.loads(out.stdout).get("Peer") or {}
-    except (OSError, subprocess.SubprocessError, ValueError, TypeError, AttributeError, RecursionError):
-        return []
-    hosts = []
-    for peer in peers.values() if isinstance(peers, dict) else []:
-        listed = peer.get("TailscaleIPs") if isinstance(peer, dict) else None
-        addresses = [said for said in listed if _an_address(said)] if isinstance(listed, list) else []
-        if addresses and peer.get("Online"):
-            # (Its name is what that machine calls itself: somebody else's text, like a device's.)
-            hosts.append((addresses[0], plain(peer.get("HostName"), 60) or ""))
-    return hosts[:256]
+@dataclass
+class Wanted:
+    """Every address worth asking, the names of the networks they come from, and why a tailnet that is there was not
+    asked (`notes`: a sentence each, for the admin who searched)."""
+
+    targets: list[Target]
+    networks: list[str]
+    notes: list[str]
 
 
-def _an_address(said: Any) -> bool:
-    """Whether this is an address of a tailnet, written as one: what is asked is asked there and nowhere else.
-
-    (Not this computer itself, not a cloud's own address for its machines, not somewhere on the internet:
-    whatever stands in that list, only an address Tailscale gives out is one of its machines.)
-    """
-    try:
-        return isinstance(said, str) and str(ipaddress.IPv4Address(said)) == said and ipaddress.IPv4Address(said) in TAILNET
-    except ValueError:
-        return False
-
-
-def targets() -> tuple[list[Target], list[str]]:
-    """Every address worth asking, and the names of the networks they come from."""
+async def targets(netbird: tailnet.NetbirdApi | None = None) -> Wanted:
+    """Every address worth asking: this computer's own network, and the machines of its tailnet. `netbird`: NetBird's
+    management API, where an admin set it up (asked where its client is not on this computer)."""
     hosts: list[str] = []
     names: dict[str, str] = {}
     networks: list[str] = []
-    for address in _own_addresses():
+    notes: list[str] = []
+    for address in await asyncio.to_thread(_own_addresses):
         if address in TAILNET:
             continue
         network = ipaddress.ip_network(f"{address}/24", strict=False)  # at most 254 addresses
         networks.append(str(network))
         hosts += [str(host) for host in network.hosts() if host != address]
-    peers = _tailscale_peers()
-    if peers:
-        networks.append("Tailscale")
-        names = dict(peers)
-        hosts += [peer for peer in names if peer not in hosts]
-    return [Target(host, f"https://{host}", f"http://{host}", names.get(host, "")) for host in hosts], networks
+    # Both tailnets at once: each is given its few seconds, and one that is not there costs nothing.
+    asked = await asyncio.gather(tailnet.tailscale_peers(), tailnet.netbird_peers(netbird), return_exceptions=True)
+    for called, peers in zip(("Tailscale", "NetBird"), asked, strict=True):
+        if isinstance(peers, tailnet.Unasked):
+            notes.append(str(peers))
+            continue
+        if not isinstance(peers, (list, Exception)):
+            raise peers  # (the search being stopped: not an error of the search)
+        if isinstance(peers, Exception):
+            # An error of the program's own is no reason for the search not to be made: said by its kind (its words may hold
+            # what a tailnet sent), with the whole of it in the log.
+            log.error("%s could not be asked for the machines of its tailnet", called, exc_info=peers)
+            notes.append(f"{called} could not be asked: {_own_error(peers)}")
+            continue
+        if peers:
+            networks.append(called)
+        for peer, name in peers:
+            if peer not in hosts:
+                hosts.append(peer)
+                names[peer] = name
+    return Wanted([Target(host, f"https://{host}", f"http://{host}", names.get(host, "")) for host in hosts], networks, notes)
 
 
 async def _what_is(client: httpx.AsyncClient, target: Target) -> dict[str, Any] | None:
@@ -191,19 +182,33 @@ async def _what_is(client: httpx.AsyncClient, target: Target) -> dict[str, Any] 
     return first or second or third or fourth or fifth
 
 
-async def scan() -> dict[str, Any]:
-    """Look for KVMs. Takes a few seconds per network."""
-    wanted, networks = await asyncio.to_thread(targets)
+async def scan(netbird: tailnet.NetbirdApi | None = None) -> dict[str, Any]:
+    """Look for KVMs. Takes a few seconds per network. `netbird` as for targets."""
+    wanted = await targets(netbird)
     gate = asyncio.Semaphore(AT_ONCE)
     # Nothing secret is sent and the answer only says "there is a KVM here", so certificates are not checked.
     async with httpx.AsyncClient(verify=False, timeout=httpx.Timeout(2.0, connect=0.7), follow_redirects=False, trust_env=False) as client:
 
-        async def ask(target: Target) -> dict[str, Any] | None:
+        async def ask(target: Target) -> dict[str, Any] | Exception | None:
             async with gate:
-                return await _what_is(client, target)
+                try:
+                    return await _what_is(client, target)
+                except Exception as ex:  # (one address is no reason for the rest not to be asked: see below)
+                    return ex
 
-        answers = await asyncio.gather(*(ask(target) for target in wanted))
-    return {"found": once([answer for answer in answers if answer]), "scanned": len(wanted), "networks": networks}
+        answers = await asyncio.gather(*(ask(target) for target in wanted.targets))
+    failed = [answer for answer in answers if isinstance(answer, Exception)]
+    if failed:
+        # Said once for the search, not once for each of 254 addresses: the first in the log, how many in the search's notes.
+        log.error("%d of the %d addresses of a search could not be asked whether they are a KVM", len(failed), len(answers), exc_info=failed[0])
+        wanted.notes.append(f"{len(failed)} address{'' if len(failed) == 1 else 'es'} could not be asked: {_own_error(failed[0])}")
+    found = [answer for answer in answers if isinstance(answer, dict)]
+    return {"found": once(found), "scanned": len(wanted.targets), "networks": wanted.networks, "notes": wanted.notes}
+
+
+def _own_error(ex: Exception) -> str:
+    """An error of the program's own, as a search says it: by its kind alone, and where the rest of it is."""
+    return f"an error of qKVM's own ({type(ex).__name__}); qkvm.log has it"
 
 
 def once(found: list[dict[str, Any]]) -> list[dict[str, Any]]:

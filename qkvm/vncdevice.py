@@ -49,6 +49,7 @@ from .kvm import (
     Sent,
     Snapshot,
     fetch_certificate,
+    no_video,
     pinned_context,
     plain,
     share_window,
@@ -60,7 +61,7 @@ from .kvm import (
 from .redfish import QUANTIZER
 from .redfish import screen_jpeg as rgb_jpeg  # a screen of three bytes a pixel as a JPEG, as the server's console is made into one
 from .store import device_url
-from .video import VideoSession
+from .video import WORKER_REST, VideoSession, VideoUnavailable, in_a_thread
 
 log = logging.getLogger("qkvm")
 
@@ -300,6 +301,14 @@ class VncDevice(Device):
         session = self._session
         if session is not None and time.monotonic() - self._wanted_at > KEEPALIVE_IDLE:
             session.encoded.clear()  # nobody is watching: the last pictures need not be kept
+        if session is not None and not self._making and time.monotonic() - max(self._wanted_at, self._made_at) > WORKER_REST:
+            # Nor the video worker its pictures are made in (some 35 MB): the connection may be kept open for as long as the
+            # server is on the wall, and its worker was kept with it, one for every server anyone had looked at (the soak
+            # farm). The next picture starts another. And the one its Tight JPEGs are decoded in, nothing being drawn now (the
+            # next JPEG drawn starts another).
+            session.video_encoder.rest_soon()
+            if session.client is not None and not self._is_live():
+                session.client.rest_decoder()
 
     # --- the seam for a live line ------------------------------------------------------------------------
 
@@ -525,7 +534,9 @@ class VncDevice(Device):
             asked, made_of = time.monotonic(), client.frames
             target = None if size == FULL else TIERS[size][0]
             try:
-                data = await asyncio.to_thread(rgb_jpeg, shown_width, shown_height, shown, target, QUANTIZER[size], session.video_encoder)
+                data = await in_a_thread(session.video_encoder, rgb_jpeg, shown_width, shown_height, shown, target, QUANTIZER[size], session.video_encoder)
+            except VideoUnavailable as unable:  # no video worker can start on this computer: said as that, and why
+                raise no_video(unable) from None
             except Exception:  # whatever the library says of a screen caught in the middle of a change of size
                 raise KvmError("no_stream", "The screen changed while its picture was being made", 503) from None
             snap = Snapshot(data, "image/jpeg", True, asked)
@@ -821,6 +832,11 @@ class VncDevice(Device):
                 self._settled()
         except KvmError as ex:
             error = ex  # (noted where it was raised)
+        except VideoUnavailable as unable:
+            # A JPEG the server sent could not be decoded, for no video worker can start on this computer: no fault of the
+            # server's. Said as that, and why; and not connected to again for a while, as nothing it sends can be shown.
+            # (A start that only took too long: "not yet", and the next look connects again.)
+            error = self._left_alone(no_video(unable)) if unable.lasting else no_video(unable)
         except asyncio.CancelledError:
             raise
         except Exception as ex:

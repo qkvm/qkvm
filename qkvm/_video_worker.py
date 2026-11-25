@@ -3,10 +3,11 @@
 Started by video.py in a fresh isolated interpreter, with a minimal environment and
 three pipe/null handles. No input is consumed until the kernel sandbox is active.
 The wire format is fixed integers and bounded bytes, never Python serialization.
+A worker that cannot start says why in one bounded line of ASCII (STARTING), before
+it has read anything, and ends.
 """
 from __future__ import annotations
 
-import ctypes
 import os
 import platform
 import struct
@@ -22,6 +23,14 @@ MAX_PIXELS = 16_000_000
 MAX_BYTES = 3 * MAX_PIXELS
 MAX_COMPRESSED = 16 * 1024 * 1024
 JPEG, H264, ENCODE_RGB, ENCODE_FRAME = 1, 2, 3, 4
+STARTING, MAX_REASON = 254, 512  # in place of the handshake: why the worker could not start, at most MAX_REASON bytes
+
+
+def could_not(stage: str, error: BaseException) -> bytes:
+    """What stopped the worker's start, for the wall to say: the stage, the kind of error and its words, in one line of
+    ASCII. An OSError is said without the file names it carries (the runtime's path holds the account's profile)."""
+    words = error.strerror if isinstance(error, OSError) and error.strerror else str(error)
+    return " ".join(f"could not {stage}: {type(error).__name__}: {words}".split()).encode("ascii", "replace")[:MAX_REASON]
 
 
 def dimensions(width: int, height: int) -> None:
@@ -31,6 +40,7 @@ def dimensions(width: int, height: int) -> None:
 
 def linux_lockdown() -> None:
     """Allow only in-memory computation and existing pipe IO, with no escape hatch."""
+    import ctypes
     import importlib
 
     resource = importlib.import_module("resource")
@@ -84,6 +94,7 @@ def windows_lockdown() -> None:
     """Verify the launcher supplied a capability-free AppContainer token."""
     if sys.platform != "win32":
         raise RuntimeError("AppContainer verification is Windows-only")
+    import ctypes
     from ctypes import wintypes as wt
     # This entry point is imported for Linux checks too; WinDLL exists only on Windows.
     windows_ctypes: Any = ctypes
@@ -183,25 +194,33 @@ def reply(op: int, width: int = 0, height: int = 0, ident: int = 0, data: bytes 
 
 
 def main() -> None:
-    # -I -S ignores environment, user site and .pth startup code. The parent supplies
-    # only the trusted installed PyAV location, never a device URL or credentials.
-    sys.path.insert(0, sys.argv[1])
-    import av
+    stage = "load its libraries"
+    try:
+        # -I -S ignores environment, user site and .pth startup code. The parent supplies
+        # only the trusted installed PyAV location, never a device URL or credentials.
+        sys.path.insert(0, sys.argv[1])
+        import av
 
-    av.logging.set_level(av.logging.PANIC)
-    # Exercise trusted synthetic input before lockdown, resolving lazy codec imports.
-    seed = rgb_frame(av, bytes(16 * 16 * 3), 16, 16)
-    decode_jpeg(av, jpeg(av, seed, 8, 2), 8, 8)
-    decoder = av.CodecContext.create("h264", "r")
-    decoder.thread_count = 1
-    decoder.options = {"max_pixels": str(MAX_PIXELS)}
-    decoder.open()
-    if sys.platform == "linux":
-        linux_lockdown()
-    elif sys.platform == "win32":
-        windows_lockdown()
-    else:
-        raise RuntimeError("verified video isolation is unavailable on this platform")
+        av.logging.set_level(av.logging.PANIC)
+        # Exercise trusted synthetic input before lockdown, resolving lazy codec imports.
+        stage = "test its codecs"
+        seed = rgb_frame(av, bytes(16 * 16 * 3), 16, 16)
+        decode_jpeg(av, jpeg(av, seed, 8, 2), 8, 8)
+        decoder = av.CodecContext.create("h264", "r")
+        decoder.thread_count = 1
+        decoder.options = {"max_pixels": str(MAX_PIXELS)}
+        decoder.open()
+        stage = "verify its isolation"
+        if sys.platform == "linux":
+            linux_lockdown()
+        elif sys.platform == "win32":
+            windows_lockdown()
+        else:
+            raise RuntimeError("verified video isolation is unavailable on this platform")
+    except Exception as error:
+        # Nothing has been read yet, from a device or from the wall: what is said is of the worker's own start alone.
+        reply(STARTING, data=could_not(stage, error))
+        return
     reply(0, ident=1)  # no device-controlled bytes have been read before this point
     frames: OrderedDict[int, Any] = OrderedDict()
     sequence = 0

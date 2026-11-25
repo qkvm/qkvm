@@ -31,6 +31,12 @@ def test_the_activity_log_is_sent_on_as_it_is_written(tmp_path: Path) -> None:
     try:
         # (Started locked: as it comes, "carries on by itself from the next start on" is an entry of its own, a moment after the first.)
         with wall(tmp_path / "udp", locked_start=True, audit_syslog=f"127.0.0.1:{collector.getsockname()[1]}") as admin:
+            # (0.4.0: first the log's seals as the wall begins to serve, its genesis and its start, each with its place in the
+            # chain: the heads a collector keeps of the log, by which a log written anew shows. See test_activity_chain_written.)
+            for why in ("genesis", "start"):
+                sealed = collector.recvfrom(65535)[0].decode("utf-8")
+                seal = json.loads(sealed[sealed.index(" - {") + 3 :])
+                assert " qkvm - log_sealed - {" in sealed and seal["why"] == why and set(seal["chain"]) == {"n", "prev", "mac"}
             first = collector.recvfrom(65535)[0].decode("utf-8")
             # RFC 5424: <facility "log audit", severity notice>, version 1, when, this host, the program, -, what, -, the entry.
             head, _, entry = first.partition(" - {")
@@ -52,7 +58,7 @@ def test_over_tcp_and_with_a_collector_that_is_not_there(tmp_path: Path) -> None
         connection, _ = listener.accept()
         with connection:
             connection.settimeout(10)
-            while not b"".join(received).count(b"\n"):
+            while b" qkvm - setup - {" not in b"".join(received):  # (after the log's seals of the start: its genesis, its start)
                 received.append(connection.recv(65535))
 
     reader = threading.Thread(target=collect, daemon=True)
@@ -60,7 +66,9 @@ def test_over_tcp_and_with_a_collector_that_is_not_there(tmp_path: Path) -> None
     try:
         with wall(tmp_path / "tcp", locked_start=True, audit_syslog=f"tcp://127.0.0.1:{listener.getsockname()[1]}"):
             reader.join(timeout=10)
-            assert b"".join(received).startswith(b"<109>1 ") and b" qkvm - setup - {" in b"".join(received)
+            messages = b"".join(received).split(b"\n")
+            assert all(message.startswith(b"<109>1 ") for message in messages if message)
+            assert [b" qkvm - log_sealed - {" in message for message in messages[:2]] == [True, True] and b" qkvm - setup - {" in messages[2]
     finally:
         listener.close()
 

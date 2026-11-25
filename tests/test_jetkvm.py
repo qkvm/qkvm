@@ -9,6 +9,8 @@ import pytest
 
 from qkvm import discover, jetkvm, kvm, server, update, vault
 from qkvm.kvm import DeviceSpec, KvmError
+from tests.test_discover import searched
+from tests import local_socket
 from tests.fake_jetkvm import FakeJetKvm, JetState
 from tests.test_wall import add, closed_port, snap, wait_until, wall
 
@@ -74,6 +76,15 @@ def test_jetkvm_is_recognised_and_shows_its_screen(tmp_path: Path, jet: FakeJetK
         # Different live frames have different compressibility; check actual resizing.
         assert small_size[0] < full_size[0] and small_size[1] < full_size[1]
     assert jet.state.logins == 1 and jet.state.sessions == 1  # one login, one connection, however many requests
+
+
+def test_a_jetkvm_whose_video_cannot_start_on_this_computer_says_why(tmp_path: Path, jet: FakeJetKvm) -> None:
+    # Where no video worker could start (qKVM run as a Windows service, before 0.4.0), the tile said "Secure video
+    # processing is unavailable" under "connecting", for good. It says why now, as the worker said it.
+    from tests.test_video_isolation import NO_VIDEO, video_that_cannot_start, what_the_tile_says
+
+    with video_that_cannot_start(tmp_path / "video"), wall(tmp_path / "wall") as client:
+        assert what_the_tile_says(client, add(client, jet.url)) == NO_VIDEO
 
 
 def test_an_address_typed_without_http_still_finds_a_jetkvm(tmp_path: Path, jet: FakeJetKvm) -> None:
@@ -220,7 +231,7 @@ def test_an_address_typed_with_https_is_never_answered_the_plain_way(tmp_path: P
 
 def test_a_search_finds_a_jetkvm_at_its_https_address_where_it_has_one(tmp_path: Path, both_ways: tuple[FakeJetKvm, FakeJetKvm], monkeypatch: pytest.MonkeyPatch) -> None:
     plain, secure = both_ways
-    monkeypatch.setattr(discover, "targets", lambda: ([discover.Target("127.0.0.1", "http://127.0.0.1:9", plain.url)], ["test network"]))
+    monkeypatch.setattr(discover, "targets", searched([discover.Target("127.0.0.1", "http://127.0.0.1:9", plain.url)], ["test network"]))
     with wall(tmp_path) as client:
         found = client.post("/api/v1/discover").json()["found"]
         assert [(entry["kind"], entry["url"]) for entry in found] == [("jetkvm", secure.url)]
@@ -352,9 +363,14 @@ def test_the_certificate_remembered_for_a_jetkvm_is_not_let_go_of_by_itself(tmp_
         device = add(client, plain.url, password="")
         mark = saved(client, device)["fingerprint"]
         secure.stop()
-        wait_until(lambda: client.get("/api/v1/status").json()[device]["state"] == "error", "it was never said that only plain HTTP answers", timeout=20)
+        # Its port held for the impostor below from the moment it is quiet: bound, nothing listens, and a connection is refused
+        # as at a port nobody has. Let go of for the twenty seconds the wall may take to see it quiet, the port was handed
+        # to a stand-in of another test file on a computer running fourteen at once, and the impostor could not have it
+        # (the Linux runner, 2026-11-17: "OSError: [Errno 98] Address already in use"). The system hands no bound port out.
+        held = local_socket(secure.port)
         try:
-            impostor = FakeJetKvm(JetState(password=""), port=secure.port, tls_dir=tmp_path / "another").start()
+            wait_until(lambda: client.get("/api/v1/status").json()[device]["state"] == "error", "it was never said that only plain HTTP answers", timeout=20)
+            impostor = FakeJetKvm(JetState(password=""), sock=held, tls_dir=tmp_path / "another").start()
             deadline = time.monotonic() + 4
             while time.monotonic() < deadline:
                 client.get("/api/v1/status")
@@ -365,6 +381,8 @@ def test_the_certificate_remembered_for_a_jetkvm_is_not_let_go_of_by_itself(tmp_
         finally:
             if impostor is not None:
                 impostor.stop()
+            else:
+                held.close()
 
 
 def test_an_edit_of_a_plain_jetkvm_sends_its_saved_password_over_https_where_that_is_offered_by_now(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -553,7 +571,7 @@ def test_a_jetkvm_is_found_when_looking_for_kvms(tmp_path: Path, jet: FakeJetKvm
     from qkvm import discover
 
     wanted = [discover.Target("127.0.0.1", "http://127.0.0.1:9", jet.url)]
-    monkeypatch.setattr(discover, "targets", lambda: (wanted, ["test network"]))
+    monkeypatch.setattr(discover, "targets", searched(wanted, ["test network"]))
     with wall(tmp_path) as client:
         found = client.post("/api/v1/discover").json()["found"]
     assert found == [{"address": "127.0.0.1", "kind": "jetkvm", "url": jet.url, "name": "", "also": [], "known": False, "known_as": None, "known_id": None, "moved_from": None}]

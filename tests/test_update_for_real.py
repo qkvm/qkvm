@@ -28,7 +28,7 @@ import pytest
 import qkvm
 from qkvm._version import __version__
 from tests.fake_github import FakeGitHub, a_key, with_key
-from tests.test_wall import CSRF, closed_port
+from tests.test_wall import closed_port, CSRF, port_to_listen_on
 
 PROGRAM = Path(qkvm.__file__).resolve().parent
 PASSWORD = "a wall only for this test 7"
@@ -69,7 +69,7 @@ class Running:
     """An installed copy of the program, its data folder, and the process that runs it."""
 
     def __init__(self, folder: Path, github: FakeGitHub) -> None:
-        self.folder, self.data, self.port = folder, folder / "data", closed_port()
+        self.folder, self.data, self.port = folder, folder / "data", port_to_listen_on()
         shutil.copytree(PROGRAM, folder / "installed" / "qkvm", ignore=shutil.ignore_patterns("__pycache__"))
         built = folder / "installed" / "qkvm" / "update.py"
         built.write_bytes(with_key(built.read_bytes(), TRUSTED))

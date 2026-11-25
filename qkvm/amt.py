@@ -90,6 +90,22 @@ STILL_EVERY = STANDARD_HOLD
 # above, and the default), "health" (no KVM session at all: Intel's border never comes up on the PC's monitor), "live" (a
 # session held while its tile is shown as well, at the wall's pace: the border stays). Health only says this wherever a
 # session would be opened for it: its stills, its live view, keys and text.
+# What the tile says where a session would need the consent code (client control mode always; admin control mode where
+# user consent is on): the engine shows it on the PC's own screen, and qKVM opens no session, as it has no way to type it.
+# Said with what to do: set the PC up in admin control mode with consent off, or use a tool that asks for the code while
+# somebody at the PC reads it out. And where the engine has no KVM at all (vPro Essentials): no remote screen, and no
+# black tile for it.
+CODE_NOW = "to see it now, use a tool that asks for the code while somebody at the PC reads it out. Power and status work as they are."
+CONSENT_CLIENT = (
+    "Client control mode: Intel AMT shows a six-digit code on the PC's own screen for every remote screen session, which qKVM "
+    "cannot type, so it opens none. To see its screen here, set the PC up again in admin control mode with user consent off "
+    f"(in its MEBx, or with Intel's or MeshCentral's tools); {CODE_NOW}"
+)
+CONSENT_ON = (
+    "User consent is on: Intel AMT shows a six-digit code on the PC's own screen for every remote screen session, which qKVM "
+    f"cannot type, so it opens none. To see its screen here, set User Consent to None in the PC's MEBx; {CODE_NOW}"
+)
+NO_KVM = "No remote screen on this PC: its Intel AMT has no KVM (vPro Essentials). Power and status work as they are."
 HEALTH_ONLY = "This PC is set to health only: qKVM opens no KVM session to it. An admin or an operator can change its view under Actions."
 # What a session to the screen brings to the tile's `can`.
 SESSION_CAN = ("screen", "keys", "text", "live", "control")
@@ -103,6 +119,24 @@ RETRY_LOOK = 4.0
 # where it can be seen whether it was carried out (on, off), it is looked for, this long and this often.
 CONFIRM_WITHIN = 25.0
 CONFIRM_EVERY = 2.0
+# A shutdown (12) asks the operating system, which takes its time: on five real engines (2026-11-17) the engine took it at
+# once and Windows was off about 80 s later, and meanwhile the engine said nothing of it and offered no power cut (a hard
+# off was refused "from the state it is in"). The tile says "Shutting down" from the moment the engine takes one of the
+# wall's until the PC is seen off; where it is not off SHUTDOWN_LATE after, it says so as well (Windows may be installing
+# updates, or the operating system did not take it: Intel's management service is needed there), and Hold power is the
+# way then. Said until SHUTDOWN_SAID after the press at the most: somebody at the PC may have cancelled it.
+SHUTDOWN_LATE = 180.0
+SHUTDOWN_SAID = 900.0
+SHUTTING_DOWN = "Shutting down"
+UNDER_WAY, LATE = "under_way", "late"  # (how a shutdown of the wall's stands: see AmtDevice._shutting_down)
+SHUTDOWN_LATE_WORDS = (
+    f"It was asked to shut down more than {round(SHUTDOWN_LATE / 60)} minutes ago and is still on: Windows may be installing updates, or the "
+    "operating system did not take the request (Intel's management service is needed there). Hold power cuts the power."
+)
+SHUTDOWN_UNDER_WAY = (
+    "a shutdown is under way, and the engine offers no power cut until it is done (a real one did not while Windows shut "
+    "down). If the PC is still on in a few minutes, press Hold power again."
+)
 # A real engine neither offered nor carried out these while a KVM session, or a serial console, was open (it answered 2):
 # the power cut off and the power cycled. With the wall's own session closed for them, it listed them again about a second later.
 OFFER_WAIT = 5.0
@@ -114,6 +148,105 @@ STARTING = 90.0
 # Times a command, or a read it is decided by, asks which PC answers before it goes (see AmtDevice._request and
 # _bound_read): once where the nonce changed since the last question, once more after a no, once for a nonce that ran out.
 MOST_ASKED = 3
+# Intel AMT refuses sign-ins from one address for a while after failed ones, on both of its ports, whatever the password
+# then: five real engines (2026-11-17) answered every try of one wall with a plain 401 while a wall at another
+# address was let in with the same password, and only a quarter of an hour without a try from that address lifted it; the
+# wall's tries meanwhile (its rungs after a rejected password, a minute, then five) kept it refusing. How long an engine
+# holds it by itself, and after how many failures it begins, is not in what was read here. So: a plain no to a password
+# that engine took before is answered once more with the fresh challenge (one engine answered a right password so, once,
+# while another client was using it: see AmtDevice._login); refused again, it is said as the engine refusing this wall for
+# a while, not as a wrong password, and nothing is sent for REFUSING_WAIT, the quiet seen to lift it and a minute more.
+# Only a refusal after that wait is a verdict on the password (as is a refusal of one the engine never took): the engine
+# was left quiet past its own refusal, so its no is to the password, and that waits as every device's rejected password
+# does (kvm.LOGIN_BACKOFFS: a minute, five, a quarter of an hour, then hourly). The two are kept apart in kvm.REJECTED: a
+# verdict is one more no in a row (`said_no`), the engine refusing is a wait it asks for and no verdict (`later`).
+REFUSING_WAIT = 16 * 60.0
+# A refusal after that wait is tried once more, LAST_TRY later, before it is a verdict: a real engine left quiet for
+# REFUSING_WAIT refused the next sign-in still, and let the wall in 75 s later, by when the wall had said "Login rejected"
+# and alerted (the soak of 0.4.0, 2026-11-17). Refused then too, the password is taken for wrong.
+LAST_TRY = 90.0
+MOST_SIGN_INS = 2048  # passwords remembered as taken (see `_SIGN_INS`); the oldest go first
+TAKEN = 0.0
+# By what was offered where (kvm.Rejected.what: a digest, never the password): TAKEN where the engine took it and has not
+# refused it since; else the moment until which a refusal of it is still the engine refusing this wall (REFUSING_WAIT from
+# its last refusal). Kept beside the connections, as the noes are, for as long as the program runs: a connection made anew
+# (an edit, the saved passwords opened again) knows it too.
+_SIGN_INS: dict[str, float] = {}
+_LAST_TRIED: set[str] = set()  # of _SIGN_INS: refused once after REFUSING_WAIT, its next refusal (LAST_TRY later) the verdict
+
+
+def refusing_words(last: bool = False) -> str:
+    """What a tile says while its engine refuses this wall (`last`: refused once more after the wait, tried a last time)."""
+    if last:
+        return (
+            f"Its management engine still refused sign-ins from qKVM after {max(1, round(REFUSING_WAIT / 60))} minutes of quiet, with "
+            f"the password it took before: qKVM tries once more in {max(1, round(LAST_TRY / 60))} minutes, and takes the password for "
+            "wrong if it is refused then. If the password was changed on the PC, edit the tile and type it."
+        )
+    minutes = max(1, round(REFUSING_WAIT / 60))
+    return (
+        "Its management engine refuses sign-ins from qKVM for now, with the password it took before. Intel AMT does so for "
+        "a while after failed sign-ins from one address (another tool's on this computer count too), and every try meanwhile "
+        f"keeps it refusing: qKVM tries again in {minutes} minutes. If the password was changed on the PC, edit the tile and type it."
+    )
+
+
+class Refusing(KvmError):
+    """The engine refuses sign-ins from this wall for a while, with a password it took before (see REFUSING_WAIT; `last`: the
+    try after LAST_TRY is the last before a verdict)."""
+
+    def __init__(self, last: bool = False) -> None:
+        super().__init__("no_sign_in", refusing_words(last), 503)
+
+
+def refusal(offered: str) -> Refusing:
+    """The engine refusing this wall, as said of this password now."""
+    return Refusing(last=offered in _LAST_TRIED)
+
+
+def _taken(offered: str) -> None:
+    """The engine took the password offered: a refusal of it from now on is first taken for the engine refusing this wall."""
+    _SIGN_INS.pop(offered, None)  # (the newest last)
+    _SIGN_INS[offered] = TAKEN
+    _LAST_TRIED.discard(offered)
+    while len(_SIGN_INS) > MOST_SIGN_INS:
+        _LAST_TRIED.discard(oldest := next(iter(_SIGN_INS)))
+        del _SIGN_INS[oldest]
+
+
+def taken_before(offered: str) -> bool:
+    """Whether the engine took this password and has not refused it since."""
+    return _SIGN_INS.get(offered) == TAKEN
+
+
+def refusing(offered: str) -> bool:
+    """Whether a refusal of this password is said as the engine refusing this wall (until it is refused after the wait)."""
+    return _SIGN_INS.get(offered, TAKEN) != TAKEN
+
+
+def _refused(offered: str) -> bool:
+    """The engine said no to the password, after every try it gets: True where that is said as the engine refusing this
+    wall for a while (no verdict on the password: taken before and not refused since, or refused and tried again before
+    the wait was over, by a person who typed it, say: each try keeps the engine refusing; not offered again for
+    REFUSING_WAIT; or refused the first time after that wait, which is tried once more LAST_TRY later), False where it is
+    a verdict (one more no in a row, waited out as every device's: kvm.LOGIN_BACKOFFS). Both are kept in kvm.REJECTED,
+    beside the connections."""
+    now = time.monotonic()
+    until = _SIGN_INS.get(offered)
+    if until is not None and (until == TAKEN or now < until):
+        _SIGN_INS[offered] = now + REFUSING_WAIT
+        _LAST_TRIED.discard(offered)
+        REJECTED.later(offered, REFUSING_WAIT)
+        return True
+    if until is not None and offered not in _LAST_TRIED:
+        _SIGN_INS[offered] = now + LAST_TRY  # (a refusal of it before then is the engine refusing still: the wait anew)
+        _LAST_TRIED.add(offered)
+        REJECTED.later(offered, LAST_TRY)
+        return True
+    _SIGN_INS.pop(offered, None)
+    _LAST_TRIED.discard(offered)
+    REJECTED.said_no(offered)
+    return False
 TIMEOUT = "PT30S"  # how long the engine may take over a question, as the question says it
 # What a tile says, and a power button or its screen is answered with, where the engine at its address is not that of the
 # PC it was added for (see AmtDevice._same_machine).
@@ -309,6 +442,20 @@ KVM_GO = bytes((0x40, 0, 0, 0, 0, 0, 0, 0))  # "the KVM may begin", said once th
 QUERY, DIGEST = 0, 4  # kinds of sign-in message: "which do you take", and Digest with qop and a cnonce
 ACCEPTED, ASKING = 0, 1  # what the engine says to one: yes; or "not so" (with the challenge to answer, or a no)
 IN_USE = 2  # what a real engine answered the start of a KVM session with while another viewer had one open
+# The engine gives its KVM to one viewer at a time. Five real engines (2026-11-17) did not answer IN_USE to a second: they
+# reset the connection once its start was read (the other wall's tile said "the connection to the server ended
+# (ConnectionResetError)", this one's waited for a picture). Such a reset, before anything of the password went out, is said
+# as another viewer having it where the engine says a KVM session is open (CIM_KVMRedirectionSAP.EnabledState 2; 6 is
+# enabled and idle) and the wall has none. The port is then asked again no sooner than BAD_HOLD, doubling to IN_USE_MOST:
+# each try is a connection, a TLS handshake and a start on the small computer that is serving the other viewer's screen.
+# A look that finds the engine's KVM idle again lets the next try go BAD_HOLD after the refusal (not before: an engine
+# that said idle and reset again is not asked at every look).
+KVM_SESSION_OPEN, KVM_IDLE = 2, 6
+IN_USE_MOST = 60.0
+IN_USE_WORDS = (
+    "In use by another viewer: Intel AMT gives its KVM to one viewer at a time, and another has it open (another qKVM, or "
+    "Intel's or MeshCentral's tools). qKVM asks again now and then, not so often as to disturb that viewer."
+)
 REDIRECTION_STEP = 8.0  # seconds each answer of the handshake has to come in
 REDIRECTION_WITHIN = 30.0  # ...and the whole handshake (the sign-in's answer included, which an engine may hold back)
 MOST_SIGN_IN_DATA = 1024  # bytes an answer to a sign-in message may carry: three short texts at the most
@@ -443,6 +590,10 @@ class OtherEngine(rfb.RfbError):
     password went to it."""
 
 
+class InUse(rfb.RfbError):
+    """The engine answered the start of a session that another viewer has one (IN_USE): nothing of the password went out."""
+
+
 async def redirect(
     stream: rfb.Stream,
     username: str,
@@ -495,7 +646,7 @@ async def signed_in(
     if head[0] != STARTED:
         raise rfb.RfbError(rfb.PROTOCOL, "what answers on the redirection port is not Intel AMT's redirection service")
     if head[1] == IN_USE:
-        raise rfb.RfbError(rfb.REFUSED, f"another viewer has {words[0]}: the engine gives one session at a time")
+        raise InUse(rfb.REFUSED, f"another viewer has {words[0]}: the engine gives one session at a time")
     if head[1] != 0:
         raise rfb.RfbError(rfb.REFUSED, f"the engine does not start {words[1]} (it answers {head[1]})")
     rest = await stream.read(9, within)
@@ -927,12 +1078,18 @@ class AmtScreen(VncDevice):
     STILL_WAIT = REDIRECTION_WITHIN + CONNECT_WAIT + 3.0
     STILL_RETRY = BAD_HOLD  # seconds before a still that came to nothing is tried again, doubling up to STILL_EVERY
 
-    def __init__(self, spec: DeviceSpec, checked: Callable[[], Awaitable[Answered]] | None = None) -> None:
+    def __init__(
+        self, spec: DeviceSpec, checked: Callable[[], Awaitable[Answered]] | None = None, session_open: Callable[[], Awaitable[bool | None]] | None = None
+    ) -> None:
         """`checked`: asked before each session is opened whether the engine at the address is that of the tile's PC (the
         tile's AmtDevice._before_a_session): KvmError where it is not, or could not be told; else where that engine answered
-        from and the realm it signs in in (see Answered), which the session goes to and compares."""
+        from and the realm it signs in in (see Answered), which the session goes to and compares. `session_open`: whether
+        the engine says its KVM has a session open (the tile's AmtDevice._kvm_session_open; see IN_USE_WORDS)."""
         super().__init__(spec, None)  # (the certificate is the engine's, remembered by the tile on its first look)
         self._checked = checked
+        self._session_open = session_open
+        self._in_use = False  # another viewer has the engine's KVM, as the last session found (until one is let in)
+        self._in_use_at = float("-inf")  # ...when that was found
         self._live_at = float("-inf")
         # The engine's SessionTimeout (minutes), as the tile's last look found it. A real engine ended a session at
         # that time to the second although it was asked for a picture every second: such an end is no failure.
@@ -990,9 +1147,12 @@ class AmtScreen(VncDevice):
         last), at a looking pace and not a viewer's. Only shown on the wall otherwise: a still every STILL_EVERY, each a
         short session; the cached one between them, with its age."""
         if held or self._is_live():
-            self._looking()
             try:
-                snap = await self._picture(width, fresh)
+                # (Through VncDevice.snapshot: the session is held while the picture is made, and LET_GO_AFTER from when it is
+                # handed over. Asked for here without it, a tile set to live KVM had its session let go of under a picture
+                # that took longer than that, as the first of a session does on a busy computer, and the next look opened
+                # another.)
+                snap = await super().snapshot(width, fresh)
             except KvmError as ex:
                 if ex.code == "no_stream" and self._live_last is not None and time.monotonic() - self._ran_out_at < BRIDGE:
                     return self._live_last
@@ -1018,6 +1178,8 @@ class AmtScreen(VncDevice):
             self._tried_still_at = now  # (`_refresh_still` stays until a still is stored: a power change's still that fails is tried again)
             self._taking = asyncio.create_task(self._one_still(width))
         if self._still is None:
+            if self._in_use and self._refusal is not None:
+                raise self._refusal.with_traceback(None)  # (said as that, not as a picture to wait for: see IN_USE_WORDS)
             raise KvmError("no_stream", f"Waiting for {self.THING}", 503)
         return replace(self._still, still=True)
 
@@ -1139,16 +1301,20 @@ class AmtScreen(VncDevice):
         except OSError as ex:
             raise self._failed(self._connect_error(ex, self.spec.tls)) from None
         offered = REJECTED.what("login", self.spec)
+        password_out = False
 
         def sending() -> None:
             # Asked again the moment before the answer goes out: the handshake takes seconds, and a no heard on the
             # WS-Management port meanwhile (or a sign-in of its under way) stands for this password here too.
+            nonlocal password_out
             self._not_yet(offered, NO_SAID)
             session.mark = REJECTED.sent(offered)
+            password_out = True
 
         def taken() -> None:
             # The password was taken: that is the sign-in, whatever the handshake or RFB says after it.
             REJECTED.accepted(offered)
+            _taken(offered)
             session.mark = None
 
         try:
@@ -1162,15 +1328,63 @@ class AmtScreen(VncDevice):
         except OtherEngine:
             await stream.close()
             raise self._left_alone(KvmError("another_machine", OTHER_ENGINE), most=BAD_HOLD) from None
+        except InUse:
+            await stream.close()
+            raise self._in_use_now() from None
+        except rfb.RfbError as ex:
+            await stream.close()
+            if ex.code == rfb.CLOSED and not password_out and self._session_open is not None and await self._session_open() is True:
+                # Reset before anything of the password went out, while the engine says a KVM session is open and none is the
+                # wall's: another viewer's (see IN_USE_WORDS).
+                raise self._in_use_now() from None
+            raise
         except BaseException:
             await stream.close()
             raise
         return stream
 
+    def _in_use_now(self) -> KvmError:
+        """Another viewer has the engine's KVM: said so, and the port left alone for a while (see IN_USE_WORDS)."""
+        self._in_use, self._in_use_at = True, time.monotonic()
+        return self._left_alone(KvmError("in_use", IN_USE_WORDS, 409), most=IN_USE_MOST)
+
+    @property
+    def in_use(self) -> bool:
+        """Whether another viewer is said to have the engine's KVM (until a session of the wall's is let in)."""
+        return self._in_use
+
+    def free_again(self) -> None:
+        """A look found the engine's KVM idle again: no longer said to be in another viewer's use, and the next session is
+        tried BAD_HOLD after the refusal (sooner than the doubled wait; not at once, see IN_USE_WORDS)."""
+        if not self._in_use:
+            return
+        self._in_use = False
+        self._refusal_until = min(self._refusal_until, self._in_use_at + BAD_HOLD)
+        self._still_fails = 0  # (a still is due then, not at the end of its own ladder)
+        self._keep_still_pace()
+
+    def _let_in(self) -> None:
+        super()._let_in()
+        self._in_use = False
+
     async def _redirection_tls(self) -> ssl.SSLContext:
         return await redirection_tls(self.spec)
 
+    def _not_yet(self, offered: str, said: str) -> None:
+        if REJECTED.wait_left(offered) > 0 and refusing(offered):
+            raise refusal(offered)  # (the engine refusing this wall, as its WS-Management port found: see REFUSING_WAIT)
+        super()._not_yet(offered, said)
+
     def _ended(self, session: Any, offered: str, ex: rfb.RfbError) -> KvmError:
+        if ex.code == rfb.AUTH:
+            # A no on this port, judged as one on WS-Management's (the engine's refusal of an address is the engine's,
+            # on both ports): the engine refusing this wall where it took the password before (REFUSING_WAIT), else a
+            # verdict, waited out as every device's.
+            engine_refusing = _refused(offered)
+            self._login_retry_at = time.monotonic() + REJECTED.wait_left(offered)
+            self._login_error = refusal(offered) if engine_refusing else KvmError("auth_failed", NO_SAID)
+            log.warning("%s: its redirection port %s (%s)", self.label, "refused the password it took before" if engine_refusing else "rejected the login", ex.message)
+            return self._login_error
         lasted = time.monotonic() - session.since
         if ex.code == rfb.CLOSED and session.client is not None and self.timeout_minutes and lasted >= 60 * self.timeout_minutes - TIMEOUT_SLACK:
             # The engine's own time for a session (SessionTimeout): nothing went wrong, and the next look opens another at once.
@@ -1209,9 +1423,11 @@ class AmtScreen(VncDevice):
         redirection port said no to; None where nothing stands. `starting`: the PC is starting (see STARTING)."""
         now = time.monotonic()
         if self._login_error is not None and now < self._login_retry_at:
+            if isinstance(self._login_error, Refusing):
+                return self._login_error.message
             return f"Its redirection port does not take the saved password: {self._login_error.message}"
-        if self._refusal is not None and now < self._refusal_until:
-            return self._refusal.message
+        if self._refusal is not None and (now < self._refusal_until or self._in_use):
+            return self._refusal.message  # (another viewer's KVM: said until a session is let in, or a look finds it idle)
         # Its redirection port alone failing while the engine answers on its own: said where it is no moment of its (another
         # certificate there; or no answer, time after time), until it is time to ask again. Unsaid, the tile went on
         # promising a screen that never came.
@@ -1273,7 +1489,7 @@ class AmtDevice(Device):
 
     def __init__(self, spec: DeviceSpec, on_pin: Any = None) -> None:
         super().__init__(spec, on_pin)
-        self._screen = AmtScreen(spec, self._before_a_session)
+        self._screen = AmtScreen(spec, self._before_a_session, self._kvm_session_open)
         # Where the engine at the address is not that of the PC this tile was added for: what is said, until a look finds
         # the right one there again (see `_same_machine`). Nothing is sent to the PC meanwhile.
         self._other: KvmError | None = None
@@ -1319,6 +1535,7 @@ class AmtDevice(Device):
         self._hiccup = False
         self._power_on: bool | None = None  # what the last look found: on, off, or between the two
         self._starting_at = float("-inf")  # when the PC was last seen to start (switched on, reset, cycled: see STARTING)
+        self._shutdown_at: float | None = None  # when the engine took a shutdown of the wall's that is not seen done (SHUTDOWN_LATE)
         # What the last good look found of its screen before the tile's view is applied (see `_viewed`): whether a session
         # could be had, why not where not, and whether it can start into its BIOS setup.
         self._could_screen = False
@@ -1372,11 +1589,19 @@ class AmtDevice(Device):
             self._realm_seen = challenge.realm
         return challenge
 
-    async def _login(self) -> str:
+    def _not_yet(self, offered: str, said: str) -> None:
+        if REJECTED.wait_left(offered) > 0 and refusing(offered):
+            raise refusal(offered)  # (the engine refusing this wall: said as that, also by a connection made anew)
+        super()._not_yet(offered, said)
+
+    async def _login(self, after_a_no: bool = False) -> str:
         """Have the password taken once: the first request that carries it is the sign-in.
 
         What comes back is the realm it was taken for. Every request after it carries the password again (that
-        is what Digest is), and a no to any of them is a no to the password, paced as every driver paces one.
+        is what Digest is), and a no to any of them is a no to the password, paced as every driver paces one;
+        where the engine took that password before, a plain no is answered once more with the fresh challenge, and a
+        second is said as the engine refusing this wall for a while (see REFUSING_WAIT). `after_a_no`: this sign-in
+        is that once more, after a request signed with the password was refused (see `_request`).
         """
         async with self._login_lock:
             if self._token:
@@ -1412,7 +1637,7 @@ class AmtDevice(Device):
                     # password is not sent anywhere on the strength of it.
                     raise KvmError("bad_response", f"The machine does not ask for a Digest sign-in as Intel AMT does (HTTP {asked.status_code})")
             before = REJECTED.sent(offered)
-            answered_stale = False
+            answered_stale, retried = False, after_a_no
             while True:
                 challenge = self._challenge
                 assert challenge is not None
@@ -1451,12 +1676,24 @@ class AmtDevice(Device):
                     # met in _request, which keeps the new nonce and signs in again with it, at no cost.)
                     answered_stale = True
                     continue
-                self._login_error = KvmError("auth_failed", NO_SAID)
-                self._login_retry_at = time.monotonic() + REJECTED.said_no(offered)
-                log.warning("%s: login rejected", self.label)
+                if not retried and taken_before(offered):
+                    # A plain no to a password this engine took before. A real one answered so, once, while another client
+                    # used it, and took the same password again later: the fresh challenge is answered once more before
+                    # anything is made of it (once: a password that is wrong now costs one more try, never more).
+                    retried = True
+                    continue
+                engine_refusing = _refused(offered)
+                self._login_retry_at = time.monotonic() + REJECTED.wait_left(offered)
+                if engine_refusing:
+                    self._login_error = refusal(offered)
+                    log.warning("%s: its engine refused the sign-in with the password it took before: left alone for %d s", self.label, round(REJECTED.wait_left(offered)))
+                else:
+                    self._login_error = KvmError("auth_failed", NO_SAID)
+                    log.warning("%s: login rejected", self.label)
                 raise self._login_error
             self._login_error = None
             REJECTED.accepted(offered)
+            _taken(offered)
             self._token = challenge.realm
             return self._token
 
@@ -1479,7 +1716,7 @@ class AmtDevice(Device):
         retried = relogged = answered_stale = sent = False
         asked = 0
         while True:
-            await self._login()
+            await self._login(after_a_no=relogged)  # (after a no: that sign-in is the one more try, see `_login`)
             challenge, client = self._challenge, await self._http()
             if challenge is None:
                 raise RETIRED.with_traceback(None)  # (let in by one connection, asked over another: the tile asks again)
@@ -1740,6 +1977,19 @@ class AmtDevice(Device):
             await self._same_machine(urgent=False, vital=False)
             return Answered(self._checked_from, self._checked_realm or self._token)
 
+    async def _kvm_session_open(self) -> bool | None:
+        """Whether the engine says its KVM has a session open (CIM_KVMRedirectionSAP.EnabledState 2: True), is idle (6:
+        False), or neither, or could not be asked (None). Asked where a session of the wall's was reset before its sign-in,
+        and at each look while another viewer is said to have it (see IN_USE_WORDS): one small question, not to the port
+        that serves that viewer's screen."""
+        try:
+            async with self._quiet:
+                sap = await self._get(KVM_SAP, urgent=False, vital=False)
+        except KvmError:
+            return None
+        state = int_of(sap, "EnabledState", 0, 65535)
+        return True if state == KVM_SESSION_OPEN else False if state == KVM_IDLE else None
+
     async def _judge(self, seen: str | None, strict: bool) -> None:
         """Whether the engine that answers is that of the PC this tile was added for, by the number it gives for itself
         (`seen`, as own_number makes it; None: none said). Nothing where it is; KvmError "another_machine" where it is not.
@@ -1829,7 +2079,7 @@ class AmtDevice(Device):
         """
         state, consent, control = kvm.get("kvm"), kvm.get("consent"), kvm.get("control")
         if state == "absent":
-            return "This PC has no KVM: it is vPro Essentials, which has none."
+            return NO_KVM
         if state == "mebx":
             return "Its KVM is switched off in the PC's MEBx, which only somebody at the PC can change (Ctrl+P as it starts)."
         if state == "disabled" or (state == "enabled" and kvm.get("listener") is False):
@@ -1837,11 +2087,11 @@ class AmtDevice(Device):
         if state is None:
             return "Whether its KVM can be used is not known."
         if control == "client":
-            return "Needs the code shown on the PC for every session: in client control mode Intel AMT always asks for it, and a wall cannot type it. A PC set up in admin control mode, with user consent off, shows its screen here."
+            return CONSENT_CLIENT
         if consent is not False:
             if consent is None:
                 return "Whether a session needs the code shown on the PC is not known, so none is opened."
-            return "Needs the code shown on the PC for every session, which a wall cannot type. Switch user consent off in the PC's MEBx to see its screen here."
+            return CONSENT_ON
         return None
 
     def _screen_now(self) -> str | None:
@@ -2012,12 +2262,26 @@ class AmtDevice(Device):
         """Note what a look at the PC's power found: on, off, or between the two (restarting, being cycled), which is not
         "off" to the wall (a PC that is off is there, and dark, as a server that is off is)."""
         on = True if power in RUNNING else False if power in NOT_RUNNING else None
+        if on is False:
+            self._shutdown_at = None  # (seen off: a shutdown under way is done)
         if on and self._power_on is False:
             self._starting_at = time.monotonic()  # (switched on at the PC, or by another: seen off, and now on)
         if on is not None and self._power_on is not None and on != self._power_on:
             self._screen.want_still()  # a power change: a still at the next look, to catch the PC starting or going dark
         self._power_on = on
         return on
+
+    def _shutting_down(self) -> str | None:
+        """Whether a shutdown the engine took from this wall is under way: "under_way", "late" (not off SHUTDOWN_LATE after
+        it), or None (none, seen off, another power command since, or SHUTDOWN_SAID ago)."""
+        at = self._shutdown_at
+        if at is None:
+            return None
+        since = time.monotonic() - at
+        if since >= SHUTDOWN_SAID:
+            self._shutdown_at = None
+            return None
+        return LATE if since >= SHUTDOWN_LATE else UNDER_WAY
 
     def _stale(self) -> bool:
         return self._status is None or time.monotonic() - self._status_at > (RETRY_LOOK if self._hiccup else LOOK_EVERY)
@@ -2054,6 +2318,8 @@ class AmtDevice(Device):
             about = await self._read_about()
             await self._judge(about["ident"], strict=False)  # (read anew every ABOUT_TTL, and at once after a challenge in another realm)
             kvm = await self._read_kvm()
+            if self._screen.in_use and await self._kvm_session_open() is False:
+                self._screen.free_again()  # (another viewer's session is over, as the engine says: see IN_USE_WORDS)
             if self._other is not None:
                 # (Found meanwhile, by a button or the screen: what this look read may be the other PC's, and is forgotten.)
                 raise self._another(self._other.message)
@@ -2090,6 +2356,7 @@ class AmtDevice(Device):
             no_screen = refused
         has_screen = on is not False and no_screen is None
         size = self._screen.size()
+        shutting = self._shutting_down() if on is not False else None
         found = {
             "state": "no_signal" if on is False else "online",
             "error": None,
@@ -2110,7 +2377,8 @@ class AmtDevice(Device):
             "ports": None,
             "console": False,
             "server": {
-                "power": POWER_WORDS.get(power, f"Unknown ({power})"),
+                # (A shutdown of the wall's under way, which the engine says nothing of: see SHUTDOWN_LATE.)
+                "power": SHUTTING_DOWN if shutting else POWER_WORDS.get(power, f"Unknown ({power})"),
                 "health": None,
                 "processor": about["processor"],
                 "processors": about["processors"],
@@ -2134,6 +2402,7 @@ class AmtDevice(Device):
                     "bios": about["bios"],
                     "plain": plain_http,
                     "view": self.spec.amt_view,  # the tile's view (store.DeviceRecord.amt_view), applied below
+                    "shutdown": SHUTDOWN_LATE_WORDS if shutting == LATE else None,  # a shutdown of the wall's not done in time
                 },
             },
         }
@@ -2345,6 +2614,11 @@ class AmtDevice(Device):
         what was wanted). (None, wanted) where the engine offers none of it while a KVM session is open: see `act`."""
         power, offered = await self._power_before(checked=True)
         running = power in RUNNING
+        shutting = self._shutting_down()  # (None where the PC was seen off just now: `_power_before` looked)
+        if action in ("power_off", "atx_power") and shutting == UNDER_WAY:
+            # Asked to shut down a moment ago, and the operating system is at it (the engine may say the PC is on meanwhile, or
+            # in a state of its own). Not asked again until it is late: then it may not have been taken, and is sent again.
+            raise AlreadySo("already shutting down")
         if action in ("power_on", "power_off", "atx_power") and power not in RUNNING and power not in NOT_RUNNING:
             # Neither running nor off (resetting, shutting down, a power cycle under way, or a state that says nothing): what
             # these go by is not there to go by. Taken for "off", Power off said "already off" and Power on sent "on" into it.
@@ -2365,6 +2639,10 @@ class AmtDevice(Device):
             "atx_reset": [RESET, CYCLE],
         }[action]
         state = next((one for one in wanted if not offered or one in offered), None)
+        if state is None and action == "atx_power_long" and shutting is not None:
+            # A real engine offered no power cut while the operating system shut down, and said it was not one it could make
+            # "from the state it is in". Said as what it is; where the engine offers the cut then, it is sent (above).
+            raise KvmError("action_failed", f"Nothing was sent: {SHUTDOWN_UNDER_WAY}")
         if state is None and running and any(one in KVM_BARS for one in wanted):
             return None, wanted  # (a KVM session stands in the way: see `act`)
         if state is None:
@@ -2375,6 +2653,8 @@ class AmtDevice(Device):
 
     async def _after_the_command(self, state: int) -> None:
         """The power command was taken: the tile looks again, and switching on or cutting the power is waited for until seen."""
+        # A shutdown is said from now until the PC is seen off (SHUTDOWN_LATE); any other command goes before one under way.
+        self._shutdown_at = time.monotonic() if state == OFF_GRACEFUL else None
         if state in (ON, RESET, CYCLE):
             self._starting_at = time.monotonic()
             self._screen.want_still()  # a start or restart: a fresh still, to catch the boot, even where on/off did not change
@@ -2451,6 +2731,8 @@ class AmtDevice(Device):
             if state is not None:
                 return state
             if time.monotonic() >= deadline:
+                if OFF in wanted and self._shutting_down() is not None:
+                    raise KvmError("action_failed", f"Nothing was sent: {SHUTDOWN_UNDER_WAY}")
                 what = POWER_WORDS[wanted[0]].lower()
                 raise KvmError("action_failed", f"This machine does not offer {what} ({wanted[0]}) just now. Intel AMT offers neither a power cut nor a power cycle while somebody has its KVM or its serial console open (Intel's own tools, say).")
             await asyncio.sleep(OFFER_EVERY)

@@ -24,7 +24,7 @@ from typing import Any
 
 import pytest
 
-from qkvm import rfb
+from qkvm import rfb, video
 from qkvm.rfb import Client, RfbError
 from tests import fake_vnc
 from tests.fake_vnc import PixelFormat, rectangle_header, update_message
@@ -356,11 +356,32 @@ def test_one_long_step_of_a_costly_server_does_not_hold_up_every_other_server(mo
     small = fake_vnc.TightStreams()
     cheap_picture = fake_vnc.known_picture(64, 64, 5)
     cheap = Client(Scripted(screen(64, 64) + b"".join(update_message([rectangle_header((0, 0, 64, 64), rfb.TIGHT) + small.basic(cheap_picture, 0, None)]) for _ in range(20))), None)
+    # The costly server's own video worker, started before it is served, for as long as that takes; and then the costly
+    # server drawing at its pace (two pictures) before the cheap one is served. (Started at its first picture, a busy
+    # computer's worker took seconds, the costly server drew nothing all the while, and the cheap one was served before it
+    # had drawn a thing; one start of 15 s ran past the worker's own time and ended the costly server's connection: the
+    # Windows test VM running 16 test files at a time, where a large picture then took 0.7 to 3 s to decode, and once more
+    # than the 5 s a worker is given for one, which ended the connection too. The deadline is room here, as what it bounds
+    # is not what this is about: a picture that takes seconds is its server's alone, see the test named above.)
+    monkeypatch.setattr(video, "WORK_WITHIN", 30.0)
+    tiny = fake_vnc.jpeg_of(bytes(3 * 16 * 16), 16, 16, 8)
+    until = time.monotonic() + 300  # (room only)
+    while True:
+        try:
+            rfb.decode_jpeg(tiny, 16, 16, costly._video_decoder)
+            break
+        except (video.VideoError, RfbError):  # (a start past its own time; the session's pause before the next)
+            assert time.monotonic() < until, "no video worker could be started for the costly server"
+            time.sleep(0.2)
 
     async def go() -> float:
         for client in (costly, cheap):
             await client.handshake()
         busy = asyncio.create_task(costly.serve())
+        until = time.monotonic() + 60  # (room only)
+        while costly.frames < 2:
+            assert not busy.done() and time.monotonic() < until, f"the costly server drew {costly.frames} pictures"
+            await asyncio.sleep(0.05)
         await asyncio.sleep(1.5)  # (its burst used up: from here on it draws a large JPEG now and then, at its share)
         began = time.monotonic()
         try:

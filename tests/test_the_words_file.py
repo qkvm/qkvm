@@ -102,11 +102,14 @@ def test_every_state_and_code_of_the_program_is_in_the_file() -> None:
     assert 409 in WORDS["refusals"]["same_device"]  # (the one refusal written out by hand, with more in it than a code)
     for code in re.findall(r'ExchangeError\(\s*"([a-z_]+)"', PROGRAM["exchange.py"]):
         assert 422 in WORDS["refusals"].get(code, []), code  # (a file that does not pass is answered 422)
+    for code in re.findall(r'BackupError\(\s*"([a-z_]+)"', PROGRAM["backup.py"]):
+        assert WORDS["refusals"].get(code), code  # (a backup that cannot be read, or a run that cannot be made: said by its code)
     # And nothing in the file that the program never says.
     said = set()
     for text in PROGRAM.values():
         said |= set(re.findall(r'KvmError\(\s*"([a-z_]+)"', text)) | set(re.findall(r'fail\(\s*\d{3},\s*"([a-z_]+)"', text))
         said |= set(re.findall(r'"code": "([a-z_]+)"', text)) | set(re.findall(r'ExchangeError\(\s*"([a-z_]+)"', text))
+        said |= set(re.findall(r'BackupError\(\s*"([a-z_]+)"', text))
     said.add("console_time_up")  # made from a word (redfish.py: the controller ended the console session, its time being up)
     assert codes - said == set(), codes - said
 

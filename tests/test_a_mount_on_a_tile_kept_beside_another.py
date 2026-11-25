@@ -1,4 +1,4 @@
-"""A mount on a tile kept beside another at its address ("Keep both"), as the outside review's fifth round (Codex, R5-M1)
+"""A mount on a tile kept beside another at its address ("Keep both"), as the outside review's fifth round (R5-M1)
 found it: the tile's own label (`own:<id>`, qKVM's, which no controller said) counted as something known of its
 controller, and a mount known by nothing else learned another controller's numbers, by a look or by an edit, and its
 old address still read the image. The label is compared, and is no evidence of the controller.

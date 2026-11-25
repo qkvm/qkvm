@@ -10,9 +10,10 @@ from typing import Any
 
 import pytest
 
-from qkvm import alerts, kvm, update, vault
+from qkvm import alerts, destinations, egress, kvm, update, vault
 from qkvm.alerts import Alert, Watcher
-from tests.fake_kvm import FakeKvm
+from tests.stand_ins import stand_in
+from tests.fake_kvm import FakeKvm, FakeState
 from tests.test_users import OTHER, account, visitor
 from tests.test_wall import add, snap, wait_until, wall
 from tests.settings_file import settings_text
@@ -50,7 +51,8 @@ class Inbox:
                 pass
 
         self._server = HTTPServer(("127.0.0.1", 0), Handler)
-        self.url = f"http://127.0.0.1:{self._server.server_address[1]}/hook"
+        # By a name of its own: the wall's rules send nothing to loopback, and the tests' stand-ins are reached by name.
+        self.url = f"http://{stand_in(self._server.server_address[1])}/hook"
         threading.Thread(target=self._server.serve_forever, daemon=True).start()
 
     def titles(self) -> list[str]:
@@ -66,6 +68,14 @@ def inbox() -> Iterator[Inbox]:
     box = Inbox()
     yield box
     box.close()
+
+
+def request_for(url: str, form: str, alert: Alert) -> destinations.Post:
+    """What an address of 0.3.2, with its format, is sent for `alert`: as the first destination it is carried over to."""
+    kind = "webhook" if form in ("auto", "json") else form
+    [sent] = destinations.outgoing(kind, {"format": form} if kind == "webhook" else {}, {"url": url}, [alert], link="", minimal=False)
+    assert isinstance(sent, destinations.Post)
+    return sent
 
 
 def baseline() -> None:
@@ -89,6 +99,67 @@ def test_a_change_counts_once_it_has_settled() -> None:
     assert watcher.observe("a", "offline") is None and watcher.observe("a", "offline") is None
 
 
+def a_large_wall(path: Path, machines: int) -> Watcher:
+    """A watcher of `machines` machines, each offline, and of what every one of the destinations knows of each, written down."""
+    watcher = Watcher(path)
+    ids = [f"{number:08x}" for number in range(machines)]
+    for _ in range(alerts.SETTLE):
+        for machine in ids:
+            watcher.observe(machine, "offline")
+    for number in range(alerts.MOST_DESTINATIONS):
+        watcher.heard[f"d{number:07x}"] = dict.fromkeys(ids, "offline")
+    text = watcher.to_write()
+    assert text is not None
+    watcher.write(text)
+    return watcher
+
+
+def test_the_book_a_large_wall_writes_is_read_back_whole(tmp_path: Path) -> None:
+    # (The outside review of 0.4.0, bugs round 2, M7.) The book of what each machine was last seen as, and what each
+    # destination knows of it, was written whole and read back up to a megabyte: a wall of 1100 machines and fifty
+    # destinations (within what is taken up of it: alerts.MOST_WATCHED, MOST_DESTINATIONS) wrote more, and started with
+    # nothing known, so that a receiver told a machine was offline was never told it was back. What the writer may write
+    # is what the reader reads: MOST_BOOK, made of those limits.
+    path = tmp_path / "watcher.json"
+    written = a_large_wall(path, 1100)
+    assert path.stat().st_size > 1_000_000
+    again = Watcher(path)
+    assert again.state("00000000") == "offline" and again.heard == written.heard and len(again.heard) == alerts.MOST_DESTINATIONS
+    # The longest book those limits make fits: every id at its longest, every state at its longest.
+    longest = "x" * alerts.MOST_ID
+    book = {"stable": {f"{longest[:-8]}{n:08x}": "no_signal" for n in range(alerts.MOST_WATCHED)}}
+    book["held"] = dict(book["stable"])
+    one = json.dumps({"heard": {f"{longest[:-8]}{n:08x}": book["stable"] for n in range(alerts.MOST_DESTINATIONS)}, **book}, sort_keys=True)
+    assert len(one) <= alerts.MOST_BOOK
+
+
+def test_a_book_too_large_to_be_read_back_is_not_written_and_one_that_does_not_read_is_said(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # (M7.) One the reader would not take is never written over the one before, which still reads; and one that cannot be
+    # read (damaged, or larger than is read) is said in the log, not taken silently for nothing known.
+    path = tmp_path / "watcher.json"
+    a_large_wall(path, 10)
+    before = path.read_bytes()
+    monkeypatch.setattr(alerts, "MOST_BOOK", len(before) + 100)
+    with caplog.at_level("WARNING", logger="qkvm"):
+        grown = a_large_wall(path, 20)
+    assert path.read_bytes() == before and Watcher(path).state("00000009") == "offline" and Watcher(path).state("00000013") is None
+    assert any("larger than qKVM reads back" in record.getMessage() for record in caplog.records), caplog.text
+    assert grown.to_write() is None  # (the same, not tried again at every look: after a while, or a change)
+    caplog.clear()
+    path.write_bytes(before[: len(before) // 2])  # (cut short: a disk that failed under it)
+    with caplog.at_level("WARNING", logger="qkvm"):
+        assert Watcher(path).state("00000000") is None
+    assert any("could not be read back" in record.getMessage() for record in caplog.records), caplog.text
+    caplog.clear()
+    monkeypatch.setattr(alerts, "MOST_BOOK", len(before) - 1)
+    path.write_bytes(before)
+    with caplog.at_level("WARNING", logger="qkvm"):
+        assert Watcher(path).state("00000000") is None
+    assert any("larger than qKVM reads back" in record.getMessage() for record in caplog.records), caplog.text
+
+
 def test_each_service_is_spoken_to_in_its_own_way() -> None:
     alert = alerts.describe("Büro PC", "10.0.0.5", "online", "offline")
     assert (alert.kind, alert.title) == ("offline", "Büro PC is offline")
@@ -96,21 +167,21 @@ def test_each_service_is_spoken_to_in_its_own_way() -> None:
     assert alerts.describe("x", "", "offline", "online").kind == "recovered"
     assert alerts.describe("x", "", "online", "auth").kind == "problem"
 
-    assert alerts.request_for("https://discord.com/api/webhooks/1/abc", "auto", alert)["json"]["content"].startswith("**Büro PC")
-    assert "text" in alerts.request_for("https://hooks.slack.com/services/T/B/x", "auto", alert)["json"]
-    ntfy = alerts.request_for("https://ntfy.sh/my-topic", "auto", alert)
-    assert ntfy["headers"] == {"Title": "Bro PC is offline", "Tags": "warning", "Priority": "high"}
-    assert ntfy["content"] == "The KVM stopped answering.".encode()
-    generic = alerts.request_for("https://example.org/hook", "auto", alert)["json"]
+    assert json.loads(request_for("https://discord.com/api/webhooks/1/abc", "auto", alert).body)["content"].startswith("**Büro PC")
+    assert "text" in json.loads(request_for("https://hooks.slack.com/services/T/B/x", "auto", alert).body)
+    ntfy = request_for("https://ntfy.sh/my-topic", "auto", alert)
+    assert ntfy.headers == {"Title": "Bro PC is offline", "Tags": "warning", "Priority": "high"}
+    assert ntfy.body == "The KVM stopped answering.".encode()
+    generic = json.loads(request_for("https://example.org/hook", "auto", alert).body)
     assert (generic["event"], generic["device"], generic["state"], generic["previous"]) == ("offline", "Büro PC", "offline", "online")
-    assert "json" in alerts.request_for("https://ntfy.sh/topic", "json", alert)  # the admin's choice wins over the guess
+    assert "app" in json.loads(request_for("https://ntfy.sh/topic", "json", alert).body)  # the admin's choice wins over the guess
     with pytest.raises(ValueError):
-        alerts.check_url("ftp://example.org/x")
+        egress.check_url("ftp://example.org/x")
     with pytest.raises(ValueError):
-        alerts.check_url("not an address")
+        egress.check_url("not an address")
     for odd in ("https://example.org/a" + chr(9) + "b", "https://example.org/a b", "https://exa" + chr(0) + "mple.org/x"):
         with pytest.raises(ValueError):  # the sender would choke on these later, with nobody watching
-            alerts.check_url(odd)
+            egress.check_url(odd)
 
 
 def test_alerts_are_posted_when_a_kvm_changes(tmp_path: Path, inbox: Inbox) -> None:
@@ -144,6 +215,52 @@ def test_alerts_are_posted_when_a_kvm_changes(tmp_path: Path, inbox: Inbox) -> N
             ]  # fmt: skip
     finally:
         fake.stop()
+
+
+def test_a_stock_pikvm_whose_streamer_stops_while_nobody_watches_keeps_what_it_last_said_of_the_signal(tmp_path: Path, inbox: Inbox) -> None:
+    # (The fake farm of 2026-11-22, finding 1.) Stock kvmd runs its streamer only while somebody watches, and says nothing of the
+    # signal while it is stopped (null). A machine without a signal was taken for one with a picture each time nobody watched:
+    # "has no video signal" and "has a picture again" in pairs, each time somebody looked. What it said last stands until it says
+    # otherwise: one alert for the signal lost, none for its streamer stopping or starting. A machine with a picture stays online.
+    dark, lit = FakeKvm(FakeState(stock=True)).start(), FakeKvm(FakeState(stock=True)).start()
+    fakes = (dark, lit)
+
+    def watched(on: bool) -> None:
+        for fake in fakes:
+            fake.state.streamer_until = time.monotonic() + 3600 if on else 0.0
+
+    def looked(times: int) -> None:
+        asked = [list(fake.state.asked).count("GET /api/streamer") for fake in fakes]
+        wait_until(lambda: all(list(fake.state.asked).count("GET /api/streamer") >= was + times for fake, was in zip(fakes, asked, strict=True)), "no looks")
+
+    try:
+        watched(True)
+        with wall(tmp_path) as admin:
+            device, shown = add(admin, dark.url, name="Dark"), add(admin, lit.url, name="Lit")
+            assert admin.put("/api/v1/alerts", json={"enabled": True, "webhook": inbox.url}).status_code == 200
+
+            def states() -> tuple[str, str]:
+                now = admin.get("/api/v1/status").json()
+                return now[device]["state"], now[shown]["state"]
+
+            wait_until(lambda: states() == ("online", "online"), "they never answered a look")
+            baseline()
+            dark.state.signal = False
+            wait_until(lambda: inbox.titles() == ["Dark has no video signal"], f"no alert for the lost signal: {inbox.titles()}")
+            for _ in range(3):  # (nobody watches, and somebody looks again: three times)
+                watched(False)
+                looked(4)
+                assert states() == ("no_signal", "online")
+                baseline()
+                watched(True)
+                looked(4)
+                assert states() == ("no_signal", "online")
+            baseline()
+            assert inbox.titles() == ["Dark has no video signal"]
+            assert admin.get("/api/v1/status").json()[device]["video"]["signal"] is False  # (said again while it is watched)
+    finally:
+        for fake in fakes:
+            fake.stop()
 
 
 def test_only_the_wanted_kinds_and_only_admins(tmp_path: Path, inbox: Inbox) -> None:
@@ -211,12 +328,12 @@ def test_alert_objects_are_plain_data() -> None:
 def test_an_alert_says_where_to_look_in_each_services_own_way() -> None:
     alert = alerts.describe("Build server", "10.0.0.5", "online", "offline")
     alert.link = "https://wall.example:8787/#tile=ab12cd34"
-    assert alerts.request_for("https://example.org/hook", "auto", alert)["json"]["link"] == alert.link
-    assert alerts.request_for("https://ntfy.sh/topic", "auto", alert)["headers"]["Click"] == alert.link  # a tap on the notification opens it
-    assert alerts.request_for("https://hooks.slack.com/services/T/B/x", "auto", alert)["json"]["text"].endswith(alert.link)
-    assert alerts.request_for("https://discord.com/api/webhooks/1/abc", "auto", alert)["json"]["content"].endswith(alert.link)
+    assert json.loads(request_for("https://example.org/hook", "auto", alert).body)["link"] == alert.link
+    assert request_for("https://ntfy.sh/topic", "auto", alert).headers["Click"] == alert.link  # a tap on the notification opens it
+    assert json.loads(request_for("https://hooks.slack.com/services/T/B/x", "auto", alert).body)["text"].endswith(alert.link)
+    assert json.loads(request_for("https://discord.com/api/webhooks/1/abc", "auto", alert).body)["content"].endswith(alert.link)
     plain = alerts.describe("Build server", "10.0.0.5", "online", "offline")
-    assert alerts.request_for("https://example.org/hook", "auto", plain)["json"]["link"] is None  # none was given: none is made up
+    assert json.loads(request_for("https://example.org/hook", "auto", plain).body)["link"] is None  # none was given: none is made up
 
 
 def test_a_muted_kvm_and_a_pause_keep_quiet_and_what_is_still_wrong_is_told_afterwards(tmp_path: Path, inbox: Inbox) -> None:

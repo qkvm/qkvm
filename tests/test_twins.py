@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -12,6 +13,7 @@ from qkvm.core import identity
 from qkvm.discover import Target, once
 from qkvm.redfish import own_number
 from qkvm.store import DeviceRecord
+from tests.test_discover import searched
 from tests.fake_kvm import FakeKvm, FakeState, make_device_certificate
 from tests.fake_redfish import BmcState, FakeBmc
 from tests.test_users import account, browser
@@ -162,6 +164,20 @@ def test_a_server_is_known_by_its_own_number(tmp_path: Path) -> None:
             server.stop()
 
 
+def search(client: Any, *addresses: str) -> list[dict[str, Any]]:
+    """What a search finds, searched again (four times at most) until every one of these addresses answered in it.
+
+    On a machine as busy as GitHub's under the whole suite, a stand-in's TLS handshake can take longer than the 0.7
+    seconds a search waits to connect, and an address there is missed. Searched again, never told what to find: a
+    search that lists a KVM twice, or under the wrong address, still lists every address and is looked at as it is.
+    """
+    for _ in range(4):
+        found: list[dict[str, Any]] = client.post("/api/v1/discover").json()["found"]
+        if {entry["address"] for entry in found} | {also["address"] for entry in found for also in entry["also"]} >= set(addresses):
+            break
+    return found
+
+
 def test_a_search_lists_a_kvm_once_under_its_nearer_address(tmp_path: Path, comet: FakeKvm, monkeypatch: pytest.MonkeyPatch) -> None:
     other = FakeKvm(FakeState(), tls_dir=tmp_path / "another-certificate").start()
     wanted = [
@@ -169,10 +185,10 @@ def test_a_search_lists_a_kvm_once_under_its_nearer_address(tmp_path: Path, come
         Target("127.0.0.2", other.url, NOWHERE),
         Target("localhost", by_name(comet), NOWHERE, "rack-kvm"),  # the first one again, over the VPN, where it has a name
     ]
-    monkeypatch.setattr(discover, "targets", lambda: (wanted, ["test network", "Tailscale"]))
+    monkeypatch.setattr(discover, "targets", searched(wanted, ["test network", "Tailscale"]))
     try:
         with wall(tmp_path / "data") as client:
-            found = client.post("/api/v1/discover").json()["found"]
+            found = search(client, "127.0.0.1", "127.0.0.2", "localhost")
             assert found == [
                 {
                     "address": "127.0.0.1", "kind": "kvmd", "url": comet.url, "name": "rack-kvm", "known": False, "known_as": None,
@@ -184,11 +200,11 @@ def test_a_search_lists_a_kvm_once_under_its_nearer_address(tmp_path: Path, come
             assert comet.state.logins == other.state.logins == 0  # looking is not logging in
             # On the wall under the address it has on the VPN: it is not offered again under the one on the network.
             add(client, by_name(comet), name="Rack KVM")
-            found = client.post("/api/v1/discover").json()["found"]
+            found = search(client, "127.0.0.1", "127.0.0.2")
             assert [(entry["address"], entry["known"], entry["known_as"]) for entry in found] == [("127.0.0.1", True, "Rack KVM"), ("127.0.0.2", False, None)]
             # Nor when only its other address is found this time.
-            monkeypatch.setattr(discover, "targets", lambda: (wanted[:1], ["test network"]))
-            assert [(entry["known"], entry["known_as"]) for entry in client.post("/api/v1/discover").json()["found"]] == [(True, "Rack KVM")]
+            monkeypatch.setattr(discover, "targets", searched(wanted[:1], ["test network"]))
+            assert [(entry["known"], entry["known_as"]) for entry in search(client, "127.0.0.1")] == [(True, "Rack KVM")]
     finally:
         other.stop()
 
@@ -206,7 +222,7 @@ def test_a_kvm_that_answers_somewhere_else_now_is_offered_there(tmp_path: Path, 
             device = add(client, before.url, name="Rack KVM")
 
             def search(at: FakeKvm) -> list[tuple[object, ...]]:
-                monkeypatch.setattr(discover, "targets", lambda: ([Target("127.0.0.1", at.url, NOWHERE)], ["test network"]))
+                monkeypatch.setattr(discover, "targets", searched([Target("127.0.0.1", at.url, NOWHERE)], ["test network"]))
                 found = client.post("/api/v1/discover").json()["found"]
                 return [(e["known"], e["known_as"], e["known_id"], e["moved_from"]) for e in found]
 

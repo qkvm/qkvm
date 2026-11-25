@@ -20,6 +20,7 @@ import pytest
 
 from qkvm import discover, kvm, live, update, vault
 from qkvm.discover import Target
+from tests.test_discover import searched
 from tests.fake_kvm import FakeKvm, FakeState
 from tests.test_live import Wall, a_jpeg
 from tests.test_wall import add, snap, wait_until, wall
@@ -253,7 +254,7 @@ def test_a_stock_pikvm_that_rejects_the_password_says_so(tmp_path: Path, stock: 
 
 def test_a_stock_pikvm_is_found_by_the_search_and_is_no_server_for_its_redfish_root(tmp_path: Path, stock: FakeKvm, monkeypatch: pytest.MonkeyPatch) -> None:
     # Stock kvmd answers a Redfish service root to anybody, at /redfish/v1 (and sends /redfish/v1/ there). It is a KVM.
-    monkeypatch.setattr(discover, "targets", lambda: ([Target("127.0.0.1", stock.url, "http://127.0.0.1:9", "pikvm")], ["test network"]))
+    monkeypatch.setattr(discover, "targets", searched([Target("127.0.0.1", stock.url, "http://127.0.0.1:9", "pikvm")], ["test network"]))
     with wall(tmp_path) as admin:
         found = admin.post("/api/v1/discover").json()["found"]
         assert [(each["kind"], each["url"]) for each in found] == [("kvmd", stock.url)]

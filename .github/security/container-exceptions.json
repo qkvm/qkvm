@@ -2,7 +2,7 @@
   "schema": 1,
   "os": {
     "family": "debian",
-    "version": "13.7"
+    "version": "13.8"
   },
   "exceptions": [
     {
@@ -15,9 +15,9 @@
       "packages": {
         "libsqlite3-0": "3.46.1-7+deb13u2"
       },
-      "reviewed": "2026-11-16",
-      "expires": "2026-12-17",
-      "reason": "A heap overflow in SQLite's FTS5 full-text search (fts5MergeRowidLists, detail=none prefix doclists). Its trigger needs a detail=none FTS5 table filled with negative rowids and a prefix MATCH query on it. qKVM makes and queries no FTS5 or other virtual table (its databases, audit.sqlite and history.sqlite, are plain tables written and read with bound parameters), so the trigger is not reachable from it. Debian has no fixed package for trixie, bookworm or unstable on the review date. Accepted for the 0.2.1 image by the owner on 2026-11-02; a published fix or a changed version or severity fails the gate. Renewed for the 0.3.2 image on 2026-11-16 under the owner's standing rule for findings Debian marks no-dsa (minor): Debian's tracker still lists trixie's 3.46.1-7+deb13u2 as vulnerable, no-dsa (Minor issue), fixed only in forky and sid.",
+      "reviewed": "2026-11-23",
+      "expires": "2026-12-24",
+      "reason": "A heap overflow in SQLite's FTS5 full-text search (fts5MergeRowidLists, detail=none prefix doclists). Its trigger needs a detail=none FTS5 table filled with negative rowids and a prefix MATCH query on it. qKVM makes and queries no FTS5 or other virtual table (its databases, audit.sqlite and history.sqlite, are plain tables written and read with bound parameters), so the trigger is not reachable from it. Debian has no fixed package for trixie, bookworm or unstable on the review date. Accepted for the 0.2.1 image by the owner on 2026-11-02; a published fix or a changed version or severity fails the gate. Renewed for the 0.3.2 image on 2026-11-16 under the owner's standing rule for findings Debian marks no-dsa (minor): Debian's tracker still lists trixie's 3.46.1-7+deb13u2 as vulnerable, no-dsa (Minor issue), fixed only in forky and sid. Renewed for the 0.4.0 image on 2026-11-23, now on Debian 13.8 with the same package version, under the same rule: Debian's tracker still lists trixie's 3.46.1-7+deb13u2 as vulnerable, no-dsa (Minor issue), fixed only in forky and sid.",
       "references": [
         "https://security-tracker.debian.org/tracker/CVE-2026-119373",
         "https://sqlite.org/src/info/a7f8c92f62",
@@ -34,9 +34,9 @@
       "packages": {
         "libsqlite3-0": "3.46.1-7+deb13u2"
       },
-      "reviewed": "2026-11-16",
-      "expires": "2026-12-17",
-      "reason": "A heap overflow in SQLite's FTS5 secure delete (fts5DoSecureDelete), reached by deleting from an FTS5 table whose index was crafted, with secure-delete on. qKVM makes and queries no FTS5 or other virtual table (its databases, audit.sqlite and history.sqlite, are plain tables written and read with bound parameters), so it is not reachable from it. Debian has a fixed package in unstable alone on the review date, and marks it a minor issue for trixie. Accepted for the 0.3.0 image by the owner on 2026-11-06; a published fix or a changed version or severity fails the gate. Renewed for the 0.3.2 image on 2026-11-16 under the owner's standing rule for findings Debian marks no-dsa (minor): Debian's tracker still lists trixie's 3.46.1-7+deb13u2 as vulnerable, no-dsa (Minor issue), fixed only in forky and sid.",
+      "reviewed": "2026-11-23",
+      "expires": "2026-12-24",
+      "reason": "A heap overflow in SQLite's FTS5 secure delete (fts5DoSecureDelete), reached by deleting from an FTS5 table whose index was crafted, with secure-delete on. qKVM makes and queries no FTS5 or other virtual table (its databases, audit.sqlite and history.sqlite, are plain tables written and read with bound parameters), so it is not reachable from it. Debian has a fixed package in unstable alone on the review date, and marks it a minor issue for trixie. Accepted for the 0.3.0 image by the owner on 2026-11-06; a published fix or a changed version or severity fails the gate. Renewed for the 0.3.2 image on 2026-11-16 under the owner's standing rule for findings Debian marks no-dsa (minor): Debian's tracker still lists trixie's 3.46.1-7+deb13u2 as vulnerable, no-dsa (Minor issue), fixed only in forky and sid. Renewed for the 0.4.0 image on 2026-11-23, now on Debian 13.8 with the same package version, under the same rule: Debian's tracker still lists trixie's 3.46.1-7+deb13u2 as vulnerable, no-dsa (Minor issue), fixed only in forky and sid.",
       "references": [
         "https://security-tracker.debian.org/tracker/CVE-2026-119374",
         "https://nvd.nist.gov/vuln/detail/CVE-2026-119374"
@@ -52,12 +52,54 @@
       "packages": {
         "libsqlite3-0": "3.46.1-7+deb13u2"
       },
-      "reviewed": "2026-11-16",
-      "expires": "2026-12-17",
-      "reason": "A heap overflow in SQLite's session extension (sqlite3changeset_apply with a crafted changeset that names a table twice with more columns). CPython's sqlite3 module offers no changesets, and qKVM applies none, so it is not reachable from it. Debian has a fixed package in unstable alone on the review date, and marks it a minor issue for trixie. Accepted for the 0.3.0 image by the owner on 2026-11-06; a published fix or a changed version or severity fails the gate. Renewed for the 0.3.2 image on 2026-11-16 under the owner's standing rule for findings Debian marks no-dsa (minor): Debian's tracker still lists trixie's 3.46.1-7+deb13u2 as vulnerable, no-dsa (Minor issue), fixed only in forky and sid.",
+      "reviewed": "2026-11-23",
+      "expires": "2026-12-24",
+      "reason": "A heap overflow in SQLite's session extension (sqlite3changeset_apply with a crafted changeset that names a table twice with more columns). CPython's sqlite3 module offers no changesets, and qKVM applies none, so it is not reachable from it. Debian has a fixed package in unstable alone on the review date, and marks it a minor issue for trixie. Accepted for the 0.3.0 image by the owner on 2026-11-06; a published fix or a changed version or severity fails the gate. Renewed for the 0.3.2 image on 2026-11-16 under the owner's standing rule for findings Debian marks no-dsa (minor): Debian's tracker still lists trixie's 3.46.1-7+deb13u2 as vulnerable, no-dsa (Minor issue), fixed only in forky and sid. Renewed for the 0.4.0 image on 2026-11-23, now on Debian 13.8 with the same package version, under the same rule: Debian's tracker still lists trixie's 3.46.1-7+deb13u2 as vulnerable, no-dsa (Minor issue), fixed only in forky and sid.",
       "references": [
         "https://security-tracker.debian.org/tracker/CVE-2026-119379",
         "https://nvd.nist.gov/vuln/detail/CVE-2026-119379"
+      ]
+    },
+    {
+      "id": "CVE-2026-124709",
+      "severity": "HIGH",
+      "architectures": [
+        "amd64",
+        "arm64"
+      ],
+      "packages": {
+        "libssl3t64": "3.5.9-1~deb13u1",
+        "openssl": "3.5.9-1~deb13u1",
+        "openssl-provider-legacy": "3.5.9-1~deb13u1"
+      },
+      "reviewed": "2026-11-23",
+      "expires": "2026-12-24",
+      "reason": "Memory kept without bound by an OpenSSL QUIC server for streams it rejected that the peer reset first (a slow denial of service, no memory corruption or disclosure; OpenSSL rates it Low, the HIGH is another vendor's). Only a QUIC server built on OpenSSL reaches it. qKVM runs none: its web server is HTTP over TLS on TCP through CPython's ssl module, which has no QUIC, and no library in the image speaks QUIC. Debian has no fixed package for trixie, forky or sid on the review date (bookworm is not affected). Accepted for the 0.4.0 image by the owner on 2026-11-23; a published fix or a changed version or severity fails the gate.",
+      "references": [
+        "https://security-tracker.debian.org/tracker/CVE-2026-124709",
+        "https://openssl-library.org/news/secadv/20261117.txt",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-124709"
+      ]
+    },
+    {
+      "id": "CVE-2026-107494",
+      "severity": "HIGH",
+      "architectures": [
+        "amd64",
+        "arm64"
+      ],
+      "packages": {
+        "libssl3t64": "3.5.9-1~deb13u1",
+        "openssl": "3.5.9-1~deb13u1",
+        "openssl-provider-legacy": "3.5.9-1~deb13u1"
+      },
+      "reviewed": "2026-11-24",
+      "expires": "2026-12-25",
+      "reason": "Frames queued without bound by an OpenSSL QUIC endpoint for a peer that keeps resending NEW_CONNECTION_ID frames (a denial of service by memory, no memory corruption or disclosure; the earlier fix of CVE-2026-84784 was incomplete). OpenSSL rates it Low; the HIGH is CISA's CVSS score. Only a QUIC connection made with OpenSSL, as client or server, reaches it. qKVM makes none: its web server is HTTP over TLS on TCP through CPython's ssl module, which has no QUIC, and no library in the image speaks QUIC. Debian has no fixed package for trixie, forky or sid on the review date (OpenSSL fixed it in 3.5.10). Accepted for the 0.4.0 image by the owner on 2026-11-24; a published fix or a changed version or severity fails the gate.",
+      "references": [
+        "https://security-tracker.debian.org/tracker/CVE-2026-107494",
+        "https://www.cve.org/CVERecord?id=CVE-2026-107494",
+        "https://github.com/openssl/openssl/pull/33544"
       ]
     }
   ]

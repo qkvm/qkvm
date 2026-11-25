@@ -25,6 +25,23 @@ def test_the_openbmc_run_in_qemu_is_said_to_have_passed_on_github() -> None:
     assert "passed on GitHub" in row
 
 
+def where_the_program_says_readme(app: Path) -> dict[str, str]:
+    """Every line of the program (its Python, and what its pages are made of) that says README: place -> the line."""
+    said = {}
+    for path in sorted(path for path in (app / "qkvm").rglob("*") if path.suffix in (".py", ".js", ".html", ".css", ".json")):
+        for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            if "README" in line:
+                said[f"{path.relative_to(app).as_posix()}:{number}"] = line.strip()
+    return said
+
+
+def test_the_program_sends_nobody_to_the_readme_for_what_is_in_the_guide() -> None:
+    # Since 2026-11-16 the README is the landing page and the manual is GUIDE.md: the page said 'see "Publishing releases" in
+    # the README', where there is no such thing now, and so did two answers of the wall and the program's own notes.
+    assert where_the_program_says_readme(APP) == {}
+    assert "### Publishing releases" in README  # (what the page names, where it says it is)
+
+
 def told(beginning: str) -> str:
     """The README's bulleted paragraph that begins so, its lines joined."""
     lines = README.splitlines()

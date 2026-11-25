@@ -13,6 +13,7 @@ The stand-in for the command is this Python itself, run in a folder that holds a
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 from collections.abc import Callable
@@ -21,7 +22,7 @@ from typing import Any
 
 import pytest
 
-from qkvm import discover, netbind, update, vault
+from qkvm import discover, netbind, tailnet, update, vault
 from tests.test_wall import wall
 
 WRITES = "import sys\nsys.stdout.buffer.write(open(sys.argv[0] + '.out', 'rb').read())\n"
@@ -39,7 +40,8 @@ def prints(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Callable[[str, by
     work = tmp_path / "in place of tailscale"
     work.mkdir()
     monkeypatch.chdir(work)
-    monkeypatch.setattr(discover, "tailscale_command", lambda: sys.executable)
+    monkeypatch.setattr(tailnet, "tailscale_command", lambda: sys.executable)
+    monkeypatch.setattr(tailnet, "netbird_command", lambda: None)
     monkeypatch.setattr(netbind, "tailscale_command", lambda: sys.executable)
 
     def said(asked: str, answer: bytes) -> None:
@@ -70,19 +72,19 @@ NOT_READ = chr(0xFFFD)  # what stands where a byte could not be read as text
 )
 def test_a_machine_is_called_what_it_is_called(prints: Callable[[str, bytes], None], name: str) -> None:
     prints("status", as_the_command_writes({"Peer": {"k1": peer(name), "k2": peer("other", "100.64.0.2")}}))
-    assert discover._tailscale_peers() == [("100.64.0.1", name), ("100.64.0.2", "other")]
+    assert asyncio.run(tailnet.tailscale_peers()) == [("100.64.0.1", name), ("100.64.0.2", "other")]
 
 
 def test_a_person_of_the_tailnet_with_a_name_in_another_alphabet(prints: Callable[[str, bytes], None]) -> None:
     said = {"Peer": {"k1": peer("nas")}, "User": {"1": {"DisplayName": f"{LI} {A_WITH_ACCENT}", "LoginName": "li@example.invalid"}}}
     prints("status", as_the_command_writes(said))
-    assert discover._tailscale_peers() == [("100.64.0.1", "nas")]
+    assert asyncio.run(tailnet.tailscale_peers()) == [("100.64.0.1", "nas")]
 
 
 @pytest.mark.parametrize("printed", [b"\xff\xfe\x00\x81\x9d", b'{"Peer": {"k1": {"HostName": "a\x81\x9db", "TailscaleIPs": ["100.64.0.1"], "Online": true}}}', b"", b"null", b"7"], ids=["no text at all", "a name that is no text", "nothing", "null", "a number"])
 def test_bytes_that_are_not_what_it_writes(prints: Callable[[str, bytes], None], printed: bytes) -> None:
     prints("status", printed)
-    found = discover._tailscale_peers()
+    found = asyncio.run(tailnet.tailscale_peers())
     assert found in ([], [("100.64.0.1", f"a{NOT_READ}{NOT_READ}b")])  # nobody, or the machine with what could not be read marked as that
 
 
@@ -108,8 +110,8 @@ def test_only_an_address_of_a_tailnet_is_a_machine_of_it(prints: Callable[[str, 
     # over HTTP. This computer itself, the address a cloud keeps for its machines' own secrets, a router,
     # somewhere on the internet: none of them is what Tailscale gives a machine.
     prints("status", as_the_command_writes({"Peer": {"k1": peer("x", address)}}))
-    assert discover._tailscale_peers() == ([(address, "x")] if asked else [])
-    assert discover._an_address(address) is asked
+    assert asyncio.run(tailnet.tailscale_peers()) == ([(address, "x")] if asked else [])
+    assert tailnet.in_shared_space(address) is asked
 
 
 @pytest.mark.parametrize("printed", [b"100.64.0.9\n", b"100.64.0.9\r\nfd7a:115c:a1e0::9\r\n"], ids=["one line", "as Windows ends a line"])

@@ -1157,6 +1157,50 @@ def test_the_wall_proper_is_started_from_this_copy_of_the_program(tmp_path: Path
     assert env["PYTHONPATH"].split(os.pathsep) == [str(Path(starter.__file__).resolve().parent.parent), "somewhere-of-the-owners"]
 
 
+def glibc() -> bool:
+    asked = getattr(os, "confstr", None)
+    return sys.platform.startswith("linux") and asked is not None and (asked("CS_GNU_LIBC_VERSION") or "").startswith("glibc")
+
+
+def test_on_glibc_the_wall_keeps_two_arenas_and_gives_memory_back_sooner_unless_told_otherwise(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # The soaks' main process grew 1 to 3 MB an hour on glibc Linux while Python's own memory stayed level: memory freed and
+    # kept in malloc's arenas, which one malloc_trim(0) gave back (488 to 321 MB). The wall's process is started with two
+    # arenas and a fixed, lower trim threshold (the owner's choice; the threshold by a soak's evidence); whoever runs the wall
+    # and set either already keeps their own. Nothing of it where the C library is another (Windows, macOS, musl).
+    launches: list[dict[str, str]] = []
+
+    def launch(command: list[str], env: dict[str, str], **options: Any) -> FakeChild:
+        launches.append(env)
+        return FakeChild(0)
+
+    monkeypatch.setattr(starter.subprocess, "Popen", launch)
+    for name in ("MALLOC_ARENA_MAX", "MALLOC_TRIM_THRESHOLD_"):
+        monkeypatch.delenv(name, raising=False)
+    assert starter.supervise(["--data-dir", str(tmp_path)]) == 0
+    given = {name: launches[-1].get(name) for name in ("MALLOC_ARENA_MAX", "MALLOC_TRIM_THRESHOLD_")}
+    if glibc():
+        assert given["MALLOC_ARENA_MAX"] == "2" and given["MALLOC_TRIM_THRESHOLD_"] == str(starter.TRIM_THRESHOLD), given
+        assert 64 * 1024 <= starter.TRIM_THRESHOLD <= 4 * 1024 * 1024  # (lower than glibc's own, which grows to 32 MB)
+    else:
+        assert given == {"MALLOC_ARENA_MAX": None, "MALLOC_TRIM_THRESHOLD_": None}, given
+    assert "MALLOC_ARENA_MAX" not in os.environ  # (the wall's own environment: the starter's is as it was)
+    # An operator's own value wins, each by itself.
+    monkeypatch.setenv("MALLOC_ARENA_MAX", "4")
+    assert starter.supervise(["--data-dir", str(tmp_path)]) == 0
+    given = {name: launches[-1].get(name) for name in ("MALLOC_ARENA_MAX", "MALLOC_TRIM_THRESHOLD_")}
+    assert given == ({"MALLOC_ARENA_MAX": "4", "MALLOC_TRIM_THRESHOLD_": str(starter.TRIM_THRESHOLD)} if glibc() else {"MALLOC_ARENA_MAX": "4", "MALLOC_TRIM_THRESHOLD_": None}), given
+    monkeypatch.setenv("MALLOC_TRIM_THRESHOLD_", "1")
+    assert starter.supervise(["--data-dir", str(tmp_path)]) == 0
+    assert (launches[-1]["MALLOC_ARENA_MAX"], launches[-1]["MALLOC_TRIM_THRESHOLD_"]) == ("4", "1")
+    # A Linux without glibc (musl, as on Alpine): nothing of glibc's set.
+    if sys.platform.startswith("linux"):
+        monkeypatch.delenv("MALLOC_ARENA_MAX")
+        monkeypatch.delenv("MALLOC_TRIM_THRESHOLD_")
+        monkeypatch.setattr(starter.os, "confstr", lambda name: None, raising=False)
+        assert starter.supervise(["--data-dir", str(tmp_path)]) == 0
+        assert "MALLOC_ARENA_MAX" not in launches[-1] and "MALLOC_TRIM_THRESHOLD_" not in launches[-1]
+
+
 def test_a_release_that_no_copy_would_install_is_not_made(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     # What the release workflow runs with the signing key. A missing key used to skip the signing, and the
     # release went out all the same: of a version with a key built in, that is a release nobody can install.
@@ -1277,6 +1321,120 @@ def test_marking_an_update_as_one_that_ran_does_not_put_back_what_was_installed_
     monkeypatch.undo()
     starter.proven(tmp_path, "9.9.3")
     assert json.loads((tmp_path / "updates" / "current.json").read_text(encoding="utf-8"))["proven"] is True
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="only Windows refuses to replace a file that another handle has open")
+def test_a_note_another_handle_reads_at_that_moment_is_marked_once_it_is_let_go(tmp_path: Path) -> None:
+    # The program reads updates/current.json now and then; on Windows a file open in another handle cannot be replaced, and
+    # the one try the starter made failed without a word: the update that had started and stayed up was on trial again at
+    # the next start. It is tried again for a short while.
+    an_update_that_leaves_a_mark(tmp_path)
+    note = tmp_path / "updates" / "current.json"
+    reader = open(note, "rb")  # (what the program's own read of the note holds while it reads)
+    let_go = threading.Timer(0.5, reader.close)
+    let_go.start()
+    try:
+        starter.proven(tmp_path, "9.9.9")
+    finally:
+        let_go.cancel()
+        reader.close()
+    assert json.loads(note.read_text(encoding="utf-8"))["proven"] is True
+    assert not (tmp_path / "qkvm.log").exists()  # (nothing to say: it was written)
+    # Held for longer than the starter tries, it stays on trial, and the log says so; the starter goes on all the same.
+    note.write_text(json.dumps({"version": "9.9.9", "previous": None}), encoding="utf-8")
+    with open(note, "rb"):
+        began = time.monotonic()
+        starter.proven(tmp_path, "9.9.9")
+        took = time.monotonic() - began
+    assert json.loads(note.read_text(encoding="utf-8")).get("proven") is not True
+    said = (tmp_path / "qkvm.log").read_text(encoding="utf-8")
+    assert "WARNING" in said and "9.9.9" in said and "could not be written down" in said and "on trial" in said, said
+    assert 1 < took < 30
+
+
+def test_marking_an_update_tries_again_while_the_note_cannot_be_replaced(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    # (What Windows does while another handle has the note open, wherever the tests run: the replace refused for a moment.)
+    an_update_that_leaves_a_mark(tmp_path)
+    note = tmp_path / "updates" / "current.json"
+    replace = os.replace
+    refusals = [2]
+
+    def held(source: Any, target: Any) -> None:
+        if Path(target) == note and refusals[0] > 0:
+            refusals[0] -= 1
+            raise PermissionError(13, "Access is denied", str(target))
+        replace(source, target)
+
+    monkeypatch.setattr(starter.os, "replace", held)
+    starter.proven(tmp_path, "9.9.9")
+    assert refusals == [0] and json.loads(note.read_text(encoding="utf-8"))["proven"] is True
+    assert not (tmp_path / "qkvm.log").exists() and capsys.readouterr().err == ""
+    # Refused for longer than it tries: left on trial, said where it was started from and in the log, and nothing raised.
+    note.write_text(json.dumps({"version": "9.9.9", "previous": None}), encoding="utf-8")
+    refusals[0] = 1000
+    starter.proven(tmp_path, "9.9.9")
+    assert json.loads(note.read_text(encoding="utf-8")).get("proven") is not True
+    said = (tmp_path / "qkvm.log").read_text(encoding="utf-8")
+    assert "could not be written down" in said and "on trial" in said and "could not be written down" in capsys.readouterr().err, said
+    assert 1000 - refusals[0] > 2  # (tried more than once)
+    # Going back, written the same way, is tried again alike.
+    note.write_text(json.dumps({"version": "9.9.9", "previous": "9.9.8", "previous_proven": True}), encoding="utf-8")
+    refusals[0] = 2
+    assert starter.roll_back(tmp_path)
+    assert json.loads(note.read_text(encoding="utf-8")) == {"version": "9.9.8", "previous": None, "proven": True}
+
+
+def refused_once_while(note: Path, monkeypatch: pytest.MonkeyPatch, meanwhile: dict[str, Any]) -> None:
+    """The starter's first replace of `note` refused (as Windows refuses it while another handle reads the note: the
+    program's install, or `qkvm --roll-back`, which read it right before they write it), and `meanwhile` written there by
+    that other program before the starter tries again."""
+    replace = os.replace
+    refused = [1]
+
+    def held(source: Any, target: Any) -> None:
+        if Path(target) == note and Path(source).name.endswith(".new") and refused[0]:
+            refused[0] -= 1
+            other = note.with_name("by-the-other")
+            other.write_text(json.dumps(meanwhile), encoding="utf-8")
+            replace(other, note)
+            raise PermissionError(13, "Access is denied", str(target))
+        replace(source, target)
+
+    monkeypatch.setattr(starter.os, "replace", held)
+
+
+@pytest.mark.parametrize("meanwhile", ["a newer one installed", "a roll back typed"])
+def test_a_note_written_while_the_starter_waited_to_try_again_is_never_put_back(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, meanwhile: str) -> None:
+    # (The review of this round, M1.) The rule of test_marking_an_update_as_one_that_ran_does_not_put_back_what_was_installed_
+    # meanwhile, under the retry: the starter looked once, then tried again for seconds, and its next try put the version it
+    # had read back over what the program wrote meanwhile, marked proven: a version just installed dropped, or a roll back
+    # typed by a person undone while it said "Back on the previous version.". Before each later try it looks again.
+    an_update_that_leaves_a_mark(tmp_path, "9.9.2")
+    note = tmp_path / "updates" / "current.json"
+    if meanwhile == "a newer one installed":
+        other: dict[str, Any] = {"version": "9.9.3", "previous": "9.9.2", "previous_proven": False}
+    else:
+        note.write_text(json.dumps({"version": "9.9.2", "previous": "9.9.1", "previous_proven": True}), encoding="utf-8")
+        other = {"version": "9.9.1", "previous": None, "proven": True}  # (what roll_back writes)
+    refused_once_while(note, monkeypatch, other)
+    starter.proven(tmp_path, "9.9.2")
+    assert json.loads(note.read_text(encoding="utf-8")) == other
+    assert not note.with_name("current.json.new").exists()
+
+
+def test_a_roll_back_whose_note_changed_while_it_waited_says_so_and_writes_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    # The other way round: `qkvm --roll-back` refused once, and the starter marking the update proven meanwhile. Going back is
+    # not written over it; the person is told it was not done, and to type it again.
+    an_update_that_leaves_a_mark(tmp_path, "9.9.2")
+    note = tmp_path / "updates" / "current.json"
+    note.write_text(json.dumps({"version": "9.9.2", "previous": "9.9.1", "previous_proven": True}), encoding="utf-8")
+    marked = {"version": "9.9.2", "previous": "9.9.1", "previous_proven": True, "proven": True}
+    refused_once_while(note, monkeypatch, marked)
+    monkeypatch.setattr(sys, "argv", ["qkvm", "--data-dir", str(tmp_path), "--roll-back"])
+    assert starter.main() == 1
+    said = capsys.readouterr()
+    assert "Back on the previous version" not in said.out and "changed" in said.err and "again" in said.err, said
+    assert json.loads(note.read_text(encoding="utf-8")) == marked
 
 
 @pytest.mark.skipif(os.name != "posix", reason="who may write a file is kept another way on Windows, and not looked at there")

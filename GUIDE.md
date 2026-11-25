@@ -7,7 +7,7 @@ One page shows a live picture and the status of every KVM, and lets you act on o
 or on many at once, or take one machine's keyboard and mouse in the browser. Servers with a
 management controller of their own (a BMC) go on the same wall, with their power state and
 health, and their screen where the controller's console can be read; and so do business PCs
-with Intel AMT (experimental), any machine with a VNC server, and virtual machines on Proxmox
+with Intel AMT, any machine with a VNC server, and virtual machines on Proxmox
 VE. Nothing goes through anyone's cloud: qKVM talks to each device directly, over your LAN or
 Tailscale.
 
@@ -72,6 +72,9 @@ secret volumes (links) and Docker swarm secrets (owned by root) are refused as t
 `QKVM_UNLOCK_FILE` controls the inner automatic
 unlocking policy and is a different key. See [Security](SECURITY.md) for migration, backup
 and locked-start behavior.
+
+To run it in a container beside Tailscale's or NetBird's, with the tailnet's machines found and a certificate browsers
+trust for its tailnet name, see [Over Tailscale or NetBird](#over-tailscale-or-netbird).
 
 For a reverse proxy that terminates HTTPS, publish the backend only on loopback
 (`-p 127.0.0.1:8787:8787`) or an isolated private container network. Only then omit
@@ -138,7 +141,8 @@ The first visit walks you through four steps:
   address is refused and is not sent the password. A device that shows no certificate (a
   JetKVM on plain HTTP) cannot be known again that way, so there the password is typed. In a
   container the search sees the container's network, not yours, unless it is started with
-  `--network host` (Linux), and no Tailscale peers (the image has no `tailscale` command):
+  `--network host` (Linux); its Tailscale or NetBird peers it finds where it runs beside their
+  container as [Over Tailscale or NetBird](#over-tailscale-or-netbird) shows, and otherwise you
   type the addresses there.
 - **A KVM that answers on HTTPS only.** A Comet or a PiKVM whose plain address sends everybody on to
   HTTPS at the same host (its web server answers `http://` with a redirect) is said so when it
@@ -161,7 +165,14 @@ The first visit walks you through four steps:
 - **Multi-port KVMs** (GL.iNet Comet X, four computers on one KVM) get one tile with numbered
   port buttons. The lit one is the computer on screen; click another to switch. Such a KVM
   captures one computer at a time, so there is one live picture per KVM, not one per port.
-  Switching takes the KVM a few seconds and also changes a monitor plugged into it.
+  Switching takes the KVM a few seconds and also changes a monitor plugged into it. Keys and
+  text from *Actions* go to the computer lit when the menu showed it, and its questions name
+  that port: right before they go, qKVM asks the KVM which computer is on screen, and where it
+  is another by then (switched at the KVM's own buttons, or from another browser), or the KVM
+  does not say, nothing is sent and it says so. While qKVM cannot tell which port is lit (the
+  port buttons are gone from the tile: its switch did not answer), no keys or text are offered
+  for it. Power is the KVM's own: its board presses whatever it is wired to, whichever
+  computer is on screen.
 - **Actions** (the lightning button on a tile):
   - *Keyboard*: Wake screen, Ctrl+Alt+Del, Lock screen, Task Manager, Show desktop, Enter,
     Esc, Close window; *Send keys...* for any other combination; *Type text...* to type a command.
@@ -176,8 +187,16 @@ The first visit walks you through four steps:
     it on one that is on) is done when the board shows the change, which takes it some seconds;
     where the change does not come within twenty, the answer says so ("pressed, but the computer
     is still off"; or that the board has said nothing since), and nothing offers to press again. A short press on a running computer asks its system to shut down, which takes the time
-    it takes: the tile shows when it is off, as it does after a reset that the power stays on
-    through. The tile says *Power on* or *Power off* by the board; with no picture and the board
+    it takes: the tile shows when it is off. A reset leaves the power on, and on some machines the
+    video signal too (a Comet's computer kept its signal up through its restart and its firmware's
+    screens), so it is judged by the picture: done once the screen is seen to change from what it
+    was just before the press (its signal goes or comes, its size changes, or a tenth of the
+    picture or more changes, which a moving pointer or a clock does not). Where it is not seen
+    within twenty seconds, the answer says the button was pressed and the restart not seen ("its
+    screen was not seen to change"; or that it stayed dark), never that it was not carried out:
+    look at the machine before pressing again. Where the screen cannot be read just before the
+    press (a stock PiKVM nobody is watching, whose video is stopped), the reset is done when the
+    button is let go, as before. The tile says *Power on* or *Power off* by the board; with no picture and the board
     saying off, that the computer is off or asleep (a computer asleep may put its power light
     out, and the board then says off: a real one did). Where the board says off beside a picture,
     it says *Power unknown*, and why (its footer's tooltip, and the enlarged view's *Details*):
@@ -283,6 +302,32 @@ is OpenBMC's is sent a US keyboard's keys, Shift with them where needed. A JetKV
 layout its computer uses, and text is typed in that one: see [JetKVM](#jetkvm).) The keys of the
 live view are places on the keyboard, whatever the layout.
 
+### Open in
+
+A machine that is also reached by a remote desktop tool can carry a link to it, so that the
+team opens it there from the wall. An admin sets them with *Open in...* in the tile's menu (the
+lightning button); operators and admins see them in that menu, viewers do not:
+
+- **MeshCentral**: the address of the machine's page on your MeshCentral, as its browser shows
+  it (`https://` only). It opens in a new tab, where MeshCentral asks for its own sign-in.
+- **RustDesk**: the machine's RustDesk ID, as the RustDesk app shows it. The link opens the
+  RustDesk app on your computer at that ID (`rustdesk://connection/new/<ID>`), where it asks
+  for the machine's password.
+- **Remote Desktop**: the machine's host name or address (an IPv6 address without a zone, the
+  `%` and the name of an interface after it, which names an interface of the computer that reads it), with a port where it is not 3389. The
+  menu gives a small `.rdp` file to open with Windows' Remote Desktop (or another client that
+  reads one), holding that host and nothing else: the client asks for the account and password.
+
+They are plain links. No password, key or login token is kept for them or put in them (a
+MeshCentral address with a user name, a password or a `login=` token in it is refused), and the
+wall fetches nothing from them, nor checks that anything answers there. Each is checked as it
+is typed (one line, its own characters, a length) and again wherever it is read, so a hand
+edit of the settings or a file to import cannot put anything else into a link or a line into
+an `.rdp` file. As a tile's console link, a MeshCentral link is not offered on a page looked at
+under the same host name, where a browser would hand that page the sign-in to qKVM. They go
+into an export with the machine and come back with an import. A change is in the activity log
+(`open_in_changed`).
+
 ## Live view and control
 
 Beside the tiles, which ask for a picture about once a second, qKVM offers one machine live:
@@ -295,6 +340,11 @@ WebSocket at the same address, which carries no cookie, and shows the pass in it
 `GET /api/v1/wall` says `"live": 2` of a qKVM that has this; a program that speaks another form
 of it asks for none. A line whose first message is not a pass this qKVM gave for that machine
 is closed with a word (`no_pass`), and so is one whose pass was used before or has run out.
+A line, and a pass, are for the machine the tile is at when they are made: an edit of the
+tile ends the line (`gone`), and a pass given before it opens none. Since 0.4.0 the pass can
+be asked for with the machine's `target` (`POST .../live?target=...`), as the view that opens
+the line shows it, and is refused (409 `machine_changed`) where the tile is at another machine
+by then; the page asks so, and shows the wall anew.
 
 **In the page.** Enlarging a tile opens the machine's line, where it has one: the stills give
 way once the first live picture is drawn, and come back when the line ends. **Control** (or
@@ -407,7 +457,9 @@ loop cannot push out of the log what was done before (see [Activity log](#activi
 is set on the KVM (its own settings): to a place (absolute, stock kvmd's default) or by steps
 (relative), and drops a move of the other kind; a real Comet set to relative never moved its
 pointer to a place the page sent. The line says which (`pointer` in its `state` message), and
-the page follows it: where the mouse moves by steps only, the bar says so and a click on the
+the page follows it: where the mouse moves by steps only, the bar says so, and that the mouse
+can be set to absolute on the KVM's own page (a Comet on GL.iNet's newer firmware was found set
+to relative, and moved its pointer only by steps), and a click on the
 picture hands the pointer to the machine (the browser's pointer lock; Esc gives it back), as
 the KVM's own page does it, and that click is no click on the machine; where it takes places
 only, *Relative mouse* is not offered. A JetKVM, a PC with Intel AMT, a virtual machine, a VNC
@@ -502,7 +554,8 @@ the image's SHA-256 where qKVM carried it there. The tile says what is in the dr
   cannot have a drive and a keyboard on one USB port: that is the owner's to switch, at the KVM),
   nor uses GL.iNet's File Sharing or its partition routes, some of which change things on a
   plain GET. While File Sharing is on, or the drive is offline or busy, nothing is changed, and
-  the box says why.
+  the box says why. A drive that is offline is not ready: a Comet on GL.iNet's newer firmware
+  said so while the machine behind it was starting, so try again once it has started.
 - **Delete images after use.** They stay on the KVM's own storage, readable to anyone with its
   own password (kvmd can hand one back), and an unattended-install file in one holds passwords.
 - **A JetKVM** is asked over the connection the wall holds to it, which is only ever to the JetKVM
@@ -649,11 +702,132 @@ QR code to scan (and the same key as text); a code works once.
   If it was the only admin's phone, run `qkvm --disable-2fa NAME` on the computer qKVM runs
   on.
 
-### Signing in through your identity provider
+### Sign in with an identity provider
 
-Where people already sign in in one place (Authelia, authentik, Keycloak with oauth2-proxy,
-a company's own gateway), qKVM can take that place's word for who somebody is. It is the
-reverse proxy in front of qKVM that signs people in, and tells qKVM in a header:
+A team that signs in to everything in one place (Microsoft Entra ID, Google Workspace,
+Authentik, Keycloak, anything that speaks OpenID Connect) signs in to the wall there too, and
+the provider's groups say who may do what. It is part of qKVM like everything else, free.
+
+*Settings > Accounts > Identity provider > Set up*:
+
+- **Redirect URI**, shown in the box: this wall's address as you are looking at it, followed by
+  `/api/v1/oidc/callback`. Enter it at the provider. Open the settings at the address your
+  team uses (`https://kvm.example.org`): sign-ins begin and end there, and the button tells
+  whoever presses it at another address where to go.
+- **Issuer**: the provider's address, exactly as it says it of itself. qKVM reads
+  `<issuer>/.well-known/openid-configuration` and the provider's keys when you save, and says
+  so where the provider cannot be asked, or calls itself otherwise (a slash at the end counts).
+- **Client ID** and **client secret**: what the provider gave qKVM as an application. The secret
+  is stored encrypted with the saved passwords and never shown again. It goes to that issuer and
+  that client ID and to no other: change either, and it is asked for again.
+- **Scopes**: `openid profile email`, and what else the provider needs to send the groups.
+- **Groups claim**: where the provider puts a person's groups, `groups` as it comes (`roles` for
+  Entra's app roles; a path such as `realm_access.roles` works too). Empty: none is read.
+- **Groups and the role each gives**, written exactly as the provider sends them (a group whose
+  name differs in case is another group). Somebody in several gets the highest of them.
+- **Who else may sign in**: nobody but those in a group above, as it comes; or anybody else the
+  provider signs in, as a viewer, an operator or an admin. That is anybody who can have an
+  account there: with a provider that lets people sign up, set the email domain too (the box
+  says so). From Google, which signs in any Google account there is, it is refused without one.
+  It is for those in none of the groups above: somebody in one of them gets the role of their
+  groups, whether it is lower than this one or higher.
+- **Email domain**: only people whose address at that domain the provider says is verified
+  (`email_verified`), for Google, which sends no groups. Where a provider says the domain of
+  the account itself (`hd`, Google's word for a Workspace account), that has to be it too; from
+  Google it has to be said.
+- **May be a private address**: the provider is on your own network. As for alerts (see
+  [What leaves the wall, and what never does](#what-leaves-the-wall-and-what-never-does)), this
+  computer, its own addresses and link-local addresses never are, and no proxy is used.
+
+The provider is spoken to over HTTPS only. Its certificate is checked against the list the HTTP
+library ships with, or the one `SSL_CERT_FILE` names (for a company's own authority).
+
+How it goes:
+
+- The sign-in page shows *Sign in with* and the name you gave, above the password. The wall's own
+  passwords keep working beside it: they are the way in when the provider is down. qKVM keeps
+  one such admin: the last admin who signs in here cannot be removed, demoted or suspended,
+  not even by an admin of the provider's.
+- The first sign-in makes the account, named after the person's verified email (or their user
+  name, or name), and known by the provider's own number for them (`sub`) with the issuer. A name
+  that is taken is never taken over: an account `olga@example.org` of the wall's own stays
+  hers, and the provider's Olga becomes `olga@example.org-1a2b3c`.
+- The role is read from the groups at every sign-in, and the activity log says when it
+  changed. **A sign-in by the provider lasts 8 hours at the most**, however much it is used (or
+  12 hours without use, or until qKVM restarts); then the button signs in again, without a
+  question where the person's own sign-in at the provider still holds, and with the role their
+  groups give them then. So somebody taken out of a group at the provider loses that role within
+  8 hours; *Sign them out*, under *Identity provider*, ends at once every sign-in the provider
+  made but that of the admin who presses it, live views included. Suspending the account here keeps that person out, whatever the
+  provider says.
+- A change here of anything that decides who gets what (the groups and their roles, who else may
+  sign in, the email domain, the groups claim, the scopes, the client ID, the issuer, switching
+  it off) signs out everybody the provider signed in, at once, live views included: they sign
+  in again with the role the new settings give them. (Not the name on the button.)
+- Such an account never has a password here, and the recovery key does not give it one. Its role
+  is its groups'; which machines it may see is set here (*Edit*), and stays set.
+- The provider does its own second step: qKVM's (*Two-factor sign-in*) is not asked of it.
+- A sign-in by the provider does not outlast a restart: the button signs in again.
+- Started with `--locked-start`, the client secret is locked with the saved passwords: after a
+  restart the button works once somebody has signed in with a password.
+- In an export the settings go with the part *Identity provider*, the client secret only in an
+  encrypted file, and not the redirect URI, which is the address of the wall the file came from.
+  Taken in, they come in switched off: an admin switches them on in the box, where the provider
+  is asked first.
+
+What is checked, for whoever reviews it: the authorization code flow with PKCE (S256) and
+nothing else; a `state` and a `nonce` of each sign-in's own, kept ten minutes and taken once,
+from the browser that began it (by a cookie of its own, `SameSite=Lax`, which a browser sends on
+the way back from another site; over HTTPS a `__Host-` cookie, which no page on a name beside the
+wall's can set); the code exchanged by the wall itself with the client secret;
+the ID token's signature against the provider's published keys, RS256 or ES256 only (never
+`none`, never HS256, never a key the token carries); a key it names and the set does not have
+refused, the set fetched again for that at most every five minutes, and kept an hour in all;
+its `iss`, `aud`, `azp`, `exp`, `iat`, `nbf` (with two minutes of leeway) and `nonce`; and
+`iss` on the way back where the provider says it sends it (RFC 9207). Every sign-in, every
+refusal with its reason, a role changed by groups and every change of the settings are in the
+activity log, never a token, a code or the secret.
+
+Entra ID, for somebody in more groups than fit in a token, sends none and says where to fetch
+them: qKVM says so in the activity log, and refuses the sign-in. Have Entra send only the groups
+given to the application, as below.
+
+**Microsoft Entra ID.** Entra admin center, *App registrations > New registration*; redirect URI
+of the platform *Web*: the one qKVM shows. *Certificates & secrets > New client secret*: its
+*Value* is the client secret. The client ID is the *Application (client) ID*, and the issuer
+`https://login.microsoftonline.com/<Directory (tenant) ID>/v2.0`. *Token configuration > Add
+groups claim*: security groups, as *Groups assigned to the application*; then under
+*Enterprise applications*, the application's *Users and groups*, assign the groups. Entra sends
+each group as its *Object ID*: map those. (Or app roles: define them under *App roles*, assign
+them, and set the groups claim to `roles`.)
+
+**Google Workspace.** Google Cloud console, *APIs & Services > Credentials > Create credentials
+> OAuth client ID*, of the type *Web application*, with the redirect URI qKVM shows under
+*Authorized redirect URIs*; on its consent screen, *Internal*. The issuer is
+`https://accounts.google.com`. Google sends no groups: leave the groups claim empty, set *Who
+else may sign in* to the role everybody gets, and the email domain to your Workspace's.
+
+**Authentik.** *Applications > Providers > Create*, an *OAuth2/OpenID Provider*: client type
+*Confidential*, the redirect URI qKVM shows (strict), and a signing key (a certificate, for
+RS256). Then an application with that provider. The issuer is on the provider's page,
+*OpenID Configuration Issuer*: `https://auth.example.org/application/o/<slug>/`, with the slash
+at its end. Its `profile` scope sends `groups`, by their names.
+
+**Keycloak.** *Clients > Create client*, OpenID Connect, *Client authentication* on, the
+*Standard flow* only, and the redirect URI qKVM shows under *Valid redirect URIs*; the secret is
+under *Credentials*. Under *Client scopes*, the client's own (dedicated) scope, *Add mapper > By
+configuration > Group Membership*: token claim name `groups`, *Full group path* off (the groups
+then read `wall-admins`, not `/wall-admins`), added to the ID token. The issuer is
+`https://keycloak.example.org/realms/<realm>`.
+
+SAML and SCIM are not offered, nor does the Desktop App sign in to a wall through its provider.
+
+### Signing in through a proxy in front of qKVM
+
+The other way, for a proxy that signs people in itself: where people already sign in in one
+place (Authelia, authentik, Keycloak with oauth2-proxy, a company's own gateway), qKVM can take
+that place's word for who somebody is. It is the reverse proxy in front of qKVM that signs
+people in, and tells qKVM in a header:
 
 ```
 qkvm --trusted-proxy 172.18.0.5 --sso-header Remote-User
@@ -710,27 +884,106 @@ server {
 
 ## Alerts
 
-*Settings > Alerts* makes qKVM watch the KVMs and tell you when one goes offline, when a
-computer loses its picture, when a login is rejected or a certificate changes, and when that
-is over. A change counts once it has lasted about half a minute.
+*Settings > Alerts* makes qKVM watch the machines and tell you when one goes offline, loses
+its picture, has its login rejected or its certificate changed, reports a critical fault (a
+server), and when that is over. A change counts once it has lasted about half a minute, so
+one hiccup stays quiet.
 
-- Alerts are posted to a webhook address: an [ntfy](https://ntfy.sh) topic, a Slack or
-  Discord incoming webhook, or anything that accepts a JSON POST. The address is stored
-  encrypted. *Send a test alert* tries it.
-- Every change is also written to the activity log, with or without an address.
+- **Where they go:** to the destinations you add (*Add destination*, at the top right), as
+  many as you like (fifty at the most), each of these kinds:
+  - **Email (SMTP):** your own mail server, or Gmail. Always encrypted: STARTTLS on port 587
+    or TLS on 465 (no other port), with the server's certificate checked; a server that does
+    not offer STARTTLS on 587 is sent nothing. For Gmail: `smtp.gmail.com`, 587, your address
+    as the user name, and an *app password* (Google Account, Security, App passwords), never
+    the password of the account. Up to ten addresses to send to. The password is kept as it
+    is typed, blanks at its ends too. One of fewer than four characters (those blanks not
+    counted) is refused, typed or saved: what the server says back is shown with the password
+    taken out, and one that short could not be told apart from the server's own words.
+  - **Email (Resend):** mail through Resend, by its API key; the sender is of a domain you
+    verified there.
+  - **Slack:** an incoming webhook, or a service that takes Slack's messages.
+  - **Microsoft Teams:** a Workflows webhook (in Teams, *Workflows*, "Post to a channel when
+    a webhook request is received"), sent an Adaptive Card with a button to the wall. The
+    Office 365 connectors (addresses on `outlook.office.com` and `webhook.office.com`) were
+    retired by Microsoft, take nothing any more, and are refused with a sentence saying so.
+  - **Telegram:** a bot (from BotFather) and the chat it writes to: its number (`-100...` for
+    a group or a channel) or a channel's `@name`.
+  - **Discord:** a webhook (Server Settings, Integrations, Webhooks). It may mention nobody.
+  - **PagerDuty:** an integration of the Events API v2, by its routing key, in the US or the
+    EU region. A problem opens an incident and "back to normal" resolves it: one incident per
+    machine and kind of trouble (down, login, a problem, the screen), so a machine that goes
+    offline and then answers without a picture stays one incident.
+  - **ntfy:** a topic on ntfy.sh or on a server of your own, with an access token where it
+    asks for one. A tap on the notification opens the wall at the tile.
+  - **Webhook (JSON):** anything that takes a JSON POST, signed (below).
+- Every address, key, token and password of a destination is stored encrypted with the
+  saved passwords, and never shown again: the list shows where it goes by its host only. A
+  password, token or key goes only where it was saved for: where a destination is to be
+  reached elsewhere (another host or port in its address, another mail server or port,
+  PagerDuty's other region), it is typed again, and the box asks for it.
+- **Edited to send elsewhere, a destination starts with nothing known:** another address (a
+  webhook's, a chat's or ntfy's, its path and topic included), another Telegram chat, another
+  PagerDuty routing key or region, other recipients of a mail, or another mail server. What
+  the receiver before was told is not carried over: the new one is told no "back to normal",
+  no reminder and no "Backups are made again" of a trouble it never heard, and what waited for
+  the destination is dropped (its log says "Not sent"). A trouble still open at the receiver
+  before (a PagerDuty incident, a message in a channel) is closed there by hand, and a machine
+  already in trouble is told to the new receiver at its next trouble. Its name, the events it is
+  told, the machines it hears of, its quiet hours, its login, token or signing secret keep what it knows.
+- **Each destination is told what it asked for.** *Tell it* ticks the events; *From* sets
+  how serious one has to be (below); *KVMs* is all machines (new ones too), or chosen
+  machines and groups, as an account is limited to some (a group's machines whichever are in
+  it on the day). The kinds under *Tell me when* are the wall's: what is not ticked there is
+  told to no destination and no browser.
+- **Send test** on each tries it at once and says what its service answered, in its own
+  words: a mail server's `535 5.7.8 Username and Password not accepted`, Slack's
+  `invalid_token`, Telegram's `chat not found`, with every secret of the destination taken
+  out. A machine's secret (a token, a key, a signing secret, and of an address its path, its
+  query, and the name and password in it), whatever its letters, goes whole and in part.
+  Whole in any case and spelling: its other signs changed or left out, and read through JSON's
+  escapes, an address's percent escapes and HTML's character references (`&amp;`, `&#38;`); a
+  percent escape is read as one byte, so a letter of two bytes written that way (`%C3%A4`) is
+  not read as that letter. In part wherever six of its signs stand together as the text has
+  them (not read through escapes), in any case, also within a word of the service's (an ntfy
+  topic `office-alerts` takes `alerts` with it). What stands between an address's slashes in
+  small letters alone is taken for a word of the address, such as `services` or `manual`,
+  which qKVM cannot tell from the service's own words: it goes only where it stands as a word
+  of its own, and so does a topic or an id written that way. A mail login's password is a
+  person's: it goes whole only, in any case and spelling as above, composed or not, with the
+  blanks at its ends or without them, and only where it stands whole, so that the server's own
+  words stay. One of fewer than six letters and digits goes so only where it has two runs of
+  them or more (`x9!Q#z`) and the text shows them in as many; with one run (`Mail!`), only as
+  it is spelt, in any case. Its host is shown as it
+  is (the list shows it too): a receiver that carries its token in its host name has it shown
+  there. **Log** shows the last fifty deliveries since qKVM started: when, what, and how each
+  went, after how many attempts.
+- Every change is also written to the activity log, with or without a destination.
 - **An alert says where to look.** *Link in alerts* is the address of the wall as you reach
-  it; an alert then carries a link that opens the wall at the tile it is about (in ntfy, a
-  tap on the notification does). Leave it empty for alerts without one.
+  it; an alert then carries a link that opens the wall at the tile it is about. Leave it
+  empty for alerts without one.
 - **One machine can be left out:** *Settings > KVMs > Edit > Send alerts about this one*. For
   a test bench that is switched on and off all day, or a machine that sleeps.
 - **A machine's screen can be watched** (below): *Settings > KVMs > Edit*, *No signal for* and
   *Screen unchanged for*, in minutes.
 - **On a phone:** *Settings > Alerts > This browser* has them told to the browser it is pressed
   in, by Web Push ([below](#on-a-phone)): for any account, of the machines it may see.
-- **Pause for maintenance:** *Pause alerts*, for an hour or for four, sends nothing while machines
-  are worked on, restarts included. When the pause is over, what is not as it was before it is
-  told then, so nothing that went wrong meanwhile stays unseen; what went wrong and was put
-  right within the pause is not mentioned. The changes are in the activity log all the same.
+- **Pause for maintenance:** *Pause alerts*, for an hour or for four, sends nothing new while
+  machines are worked on, restarts included; the daily seal of the activity log is no alert of
+  a machine and goes within a pause too ([Activity log](#activity-log)). When the pause is
+  over, what is not as it was before it is told then, so nothing that went wrong meanwhile
+  stays unseen; what went wrong and was put right within the pause is not mentioned. The
+  changes are in the activity log all the same. An alert already on its way when the pause
+  begins is sent as it would have been ([How they are delivered](#how-they-are-delivered)).
+- **Quiet hours** of a destination recur, every day or on the days ticked, by this wall's
+  clock (a container's is often UTC: set `TZ`). A window past midnight belongs to the day it
+  starts on. Nothing new is sent there meanwhile; when they end, what is not as it was when
+  they began is told, as after a pause, and as a pause they stop nothing that was already on its
+  way. (A restart within them forgets what they held. A screen watch that goes off within them
+  is not told there, nor then its end; one told there before them that is over within them is
+  told over when they end, and after a pause, where the screen is still back then.)
+- **Reminders** (off by default): every 30 minutes up to once a day, a destination is told
+  again of a machine that is still offline, without a picture or with a problem ("Still: ...",
+  and for how long). Not while alerts are paused, nor within its quiet hours.
 - While alerts are on, qKVM keeps watching after everyone has signed out, and after a restart
   (see below). What each machine was last seen as is written down, so a machine that does not
   come back when qKVM does (after a power cut, most of all) is told about: two minutes after
@@ -739,28 +992,184 @@ is over. A change counts once it has lasted about half a minute.
 - A JetKVM that is not on screen is only checked for answering, because looking at its
   picture would take its one viewer slot.
 - For a [server](#servers), "lost its picture" means it was switched off, and a critical
-  fault reported by its controller counts as a problem. So it does for a KVM whose power board
+  fault reported by its controller is told as one. So it does for a KVM whose power board
   says the computer is off: the alert says it is off or asleep (its power light is out, which
   rules out a cable that came loose). Without a board, or with one that says the computer is on
   (its screen asleep), it says the picture is gone.
 - **After a restart qKVM goes on alerting by itself**, as it goes on watching. Not where it
-  is started with `--locked-start`: the address alerts go to is itself saved encrypted, and
-  so are the devices' passwords, and until somebody signs in qKVM can then neither look at a
-  device nor tell anybody. `GET /healthz` says `"locked": true` for as long as that lasts
-  (both under [Keeping it running](#keeping-it-running)).
+  is started with `--locked-start`: the destinations are saved encrypted, and so are the
+  devices' passwords, and until somebody signs in qKVM can then neither look at a device nor
+  tell anybody. `GET /healthz` says `"locked": true` for as long as that lasts (both under
+  [Keeping it running](#keeping-it-running)).
+
+### How serious each event is
+
+| Event | Severity |
+|---|---|
+| Offline (the KVM or the server's controller stopped answering) | critical |
+| Server critical fault (its controller says so) | critical |
+| Certificate changed | error |
+| Login rejected | error |
+| Other problem (what the tile shows as a problem) | error |
+| Backup failed (a backup of the wall was not made: see [Backups](#backups)) | error |
+| Picture lost (no video signal; a server switched off) | warning |
+| Screen unchanged (a watch, below) | warning |
+| Back to normal | info |
+
+*From* "Critical only" tells offline and faults; "Errors and worse" adds the certificate, the
+login, other problems and a backup not made; "Warnings and worse" adds the picture and the screen. "Back to
+normal" is told exactly where the trouble it ends was told (whatever came between), so an
+incident opened is closed; it is written down, so after a restart too. PagerDuty
+is sent the severity as it is; ntfy is sent high priority for trouble, default for what is
+over. A machine told as offline that answers again without a picture is not told "picture
+lost" where it was told as offline (it had none to lose); a destination that was not told it
+was offline (it does not hear offline) is told the picture is lost. Its "back to normal" comes
+with the picture.
+
+### How they are delivered
+
+- Each destination is sent to by itself, in the order things happened: one that is slow or
+  away holds up neither the watching nor another destination.
+- **Many changes at once are one message.** A switch that dies takes its machines with it in
+  the same look: an email, a chat or ntfy is sent one message listing them (thirty by name,
+  then a count). So such a destination waits one look (about fifteen seconds) before the first
+  message of a run, for the machines a look behind the others, and is left alone for one look
+  more after a message of several. Between two messages to one destination there is a second at the least
+  (Discord two, Telegram three), within what each service allows. The JSON webhook and
+  PagerDuty are sent each change by itself: a program, or an incident per machine.
+- **Tried again** after 5, 30 and 120 seconds where the service was busy (429, and then after
+  its own `Retry-After`, ten minutes at the most), broken (5xx) or did not answer in time;
+  never where it said no (any other 4xx: a wrong token is not sent again and again). A mail
+  server's yes to the end of the message is the delivery: the line lost after it is no
+  failure, and the mail is not sent again. One that takes the mail for some of its addresses
+  and refuses the others is not tried again either (the others have it): the delivery log
+  says it was not delivered, and which addresses were refused, in the server's words, and
+  the destination counts as failing (below). A hundred alerts wait for one destination at the
+  most; the oldest give way. A machine's
+  trouble that was not delivered counts as told there all the same, so that its end goes there
+  too: one given up on after all its tries, one refused at its one try, one that gave way when
+  a hundred waited (no try at all), and one whose destination could not be sent to (the saved
+  passwords locked, its settings that do not open).
+- **Switched off, what waits is dropped.** Before each try, and once more right before it goes
+  (after its turn and its name's lookup), what waits for a destination is held to its switches:
+  the destination on, and alerts on (the daily seal of the activity log: the destination on),
+  and neither switched off at any moment since it was handed over, even where it is on again
+  by its next try; once a message of it went, the rest of it goes (PagerDuty is sent a change
+  between two kinds of trouble as two events). Switched off, it is dropped: not sent, then or later. Its line in
+  the delivery log says "Not sent" and why (`withheld`), and the destination is not counted as
+  failing. A machine's trouble dropped so, a screen watch's too, is as if it never went there:
+  that destination is not reminded of it, nor told that the machine is back to normal (an end
+  or a reminder of it that waits behind it is dropped too), and the machine's next trouble is
+  told there as any other. So it stays over a restart, but for the end of a screen watch that
+  went off before it ([Watching a screen](#watching-a-screen)). That backups are made again is
+  the one thing owed after it: where a failure was told, until it is delivered there (over a
+  restart too), and told once alerts are on again; a destination switched off is owed nothing.
+- **A pause or quiet hours stop new alerts only.** They are judged when an alert is routed. An
+  alert already handed to a destination when they begin (waiting to be tried again, or being
+  gathered with others for one message) is delivered as it would have been, or given up on as
+  any other. Its tries stay bounded: four at the most, after 5, 30 and 120 seconds, each given
+  fifteen seconds where the service does not answer (each of PagerDuty's two events of one
+  change as much), so the last ends some three and a half minutes after its own first began
+  (some four and a half for PagerDuty's two); a wait is longer only where the service itself
+  asked to be left alone, ten minutes at the most each time. Alerts that wait for one
+  destination go in turn (the JSON webhook and PagerDuty are sent one alert at a time), so
+  while its service is away each one's first try comes after the tries of those before it.
+  What changes while they are on is held and told when they end, as above. A test (*Test*)
+  goes whatever the switches say.
+- **Across a restart** (a known limit): an alert still waiting to be tried again when qKVM
+  stops is not sent after it starts, though the wall counts it as told there, so a machine still
+  down then is not told again. The one exception is that backups are made again, which stays
+  owed until it is delivered.
+- **A destination that fails** is written to the activity log when it begins to fail, with
+  its service's words, and once more when it is delivered to again: not a line for every
+  alert. The list shows its last error until then.
+
+### What leaves the wall, and what never does
+
+- An alert carries the machine's name, what happened and when, the machine's address (as
+  the tile shows it), the text the tile shows for a problem, and the link. **Never** a
+  password, a token, a picture, or anything of the wall but the link you gave. *Minimal
+  content* on a destination leaves out the address and the text: the machine's name, what
+  happened and the link.
+- The words are fixed, with fixed places for the name, the event and the link: there are no
+  templates, and nothing a name or a device sends can run. A machine named `<!channel>` does
+  not call a Slack channel together, Discord is told to mention nobody, and a name with a line
+  break in it cannot add a header to a mail.
+- **Where qKVM may send.** Before every send the name is looked up, and every address it
+  leads to is checked; the connection then goes to the address that was checked, with the
+  name where the service looks for it (and its certificate checked for that name). No
+  redirect is followed, no proxy is used, and no more of an answer is read than says how it
+  went. Never sent to, whatever is ticked: the wall itself (the port qKVM listens on, at any
+  of its addresses and on this computer's loopback), link-local addresses (169.254.0.0/16,
+  where clouds keep their metadata service, and fe80::/10), the metadata services that sit in
+  private ranges (`fd00:ec2::254`, `100.100.100.200`), the unspecified address, multicast and
+  ranges kept for other uses; nor any of those written inside an IPv6 address (IPv4-mapped,
+  NAT64, 6to4); nor an IPv6 address that names an interface of this computer (a zone, `%1` or
+  `%25eth0` after it), which is refused where it is typed as well. The computer's own
+  addresses are judged as `127.0.0.1` is, whatever the wall listens on: on Linux each interface's (its first IPv4 address, and every IPv6 one), on
+  Windows every address the computer's name leads to, and everywhere the addresses of its
+  routes out. Not known as its own: a second IPv4 address on a Linux interface, the interfaces
+  of a Mac beyond those, and the host's addresses seen from a container. This computer
+  (`127.0.0.1`, `localhost`, `::1`) and your own network's addresses (10.x, 172.16 to 31.x,
+  192.168.x, fc00::/7, and 100.64.0.0/10, where Tailscale's are) only where the destination's
+  *May be a private address* is ticked, which is off for a new one. The same holds for a mail
+  server. So a self-hosted ntfy on the network, over a tailnet, or on the same computer as
+  qKVM (at another port than qKVM's) needs that tick.
+- A webhook's JSON, as 0.3.2 sent it, with three fields more:
+  `{"app": "QKVM", "event": "offline", "device": "Build server", "address": "192.168.1.20",
+  "state": "offline", "previous": "online", "title": "...", "message": "...", "link": "...",
+  "time": "2026-11-16T09:00:00Z", "id": "msg_...", "what": "offline", "severity": "critical"}`.
+  `event` is `offline`, `no_signal`, `problem`, `unchanged`, `recovered` or `test`; `what`
+  is the event as above (`offline`, `no_signal`, `unchanged`, `auth`, `certificate`, `fault`,
+  `problem`, `recovered`, `test`).
+- **The signature** (Standard Webhooks): each request has `webhook-id`, `webhook-timestamp`
+  (Unix seconds) and `webhook-signature`: `v1,` and the base64 of HMAC-SHA256, keyed with the
+  secret after `whsec_` (base64), over `webhook-id.webhook-timestamp.body`. The secret is
+  shown once, when the webhook is added; *Make a new one*, under *Signing secret* in its
+  *Edit* box, makes another, and the old one stops working. The libraries of standardwebhooks.com check it; a receiver should also
+  refuse a timestamp more than five minutes off. *Send without a signature* is for a
+  receiver that cannot check one.
+
+### From 0.3.2
+
+A wall of 0.3.2 had one address. It is its first destination after the update, of the kind
+its *Service* said ("Work it out from the address" still does), with *May be a private
+address* ticked, since every address could be one then: an address on `127.0.0.1` or
+`localhost` (a relay or an ntfy on the same computer) keeps working. Two things are new for
+it: link-local addresses and the wall itself (qKVM's own port) are refused, and a JSON webhook
+carried over is sent unsigned until *Make a new one* in its *Edit* box makes it a secret.
+
+**Alerts go through no proxy any more.** 0.3.2 posted them through the proxy the environment
+named (`HTTPS_PROXY`, `HTTP_PROXY`); 0.4.0 connects to the address it has checked, directly, so
+that a proxy cannot be made to carry an alert somewhere the rules above refuse. A wall that
+reaches the internet only through a proxy stops alerting after the update (the activity log
+and the list say why). Behind such a proxy, let the firewall pass the wall's connections to
+the services it alerts (HTTPS on 443 to their hosts, the mail server on 587 or 465), or send
+the alerts to a service on your own network (an ntfy or a mail relay of your own, with *May be
+a private address* ticked), which passes them on.
+
+Until the first destination is changed in 0.4.0, its address is also kept where 0.3.2 reads it:
+a wall that goes back to 0.3.2 (an update that did not start, `qkvm --roll-back`) finds it there
+and goes on alerting. `GET` and `PUT
+/api/v1/alerts` and `POST /api/v1/alerts/test` keep their fields and their meaning: they
+speak of the first destination (`webhook`, `format`, `forget_webhook`, `has_webhook`,
+`last_sent`, `last_error`; `private` is new). The rest is under
+`/api/v1/alerts/destinations` (see [The API](#the-api)).
 
 ### Watching a screen
 
 A machine whose tile shows a screen has two watches on its *Edit*, each in minutes (empty is
 off, a day the most). Each is told through the alerts, with the picture that set it off kept
-on the wall, and again when it is over ("back to normal").
+on the wall, and again when it is over ("back to normal"), where it was told.
 
 - **No signal for N minutes:** the KVM's own signal flag has said "no signal" for that long,
   as the alert round sees it (every fifteen seconds, settled over two looks). The computer
   sends no picture: it is off, asleep, its screen switched off, or its cable out. A machine
   with this watch has no "no video signal" alert at the half minute; it is told after its
-  minutes, and "a picture again" only where that was told. A KVM that stops answering ends
-  the run; what was told stands until a picture comes.
+  minutes, and "a picture again" only where that was told (and not dropped by a switch: see
+  [How they are delivered](#how-they-are-delivered)). Where that was told is kept in memory:
+  after a restart, the end of a watch that went off before it is told wherever "back to normal"
+  is heard. A KVM that stops answering ends the run; what was told stands until a picture comes.
 - **Screen unchanged for N minutes:** every picture the wall had of the machine in that time
   looked the same. These are the pictures the wall gets anyway, while the tile is on a screen
   somewhere (a wall screen, a browser): no session is opened for it and nothing is asked of
@@ -787,9 +1196,11 @@ on the wall, and again when it is over ("back to normal").
   machine's history; for a program, `GET /api/v1/devices/{id}/alert-picture/{stamp}` in
   [The API](#the-api)). It is never sent with an alert.
 - As every alert: nothing goes off while alerts are paused (what is so when the pause ends is
-  told then), nor for a machine whose alerts are off. A watch is told whatever kinds are
+  told then; one already on its way when it begins is sent), nor for a machine whose alerts are
+  off. A watch is told whatever kinds are
   ticked in *Settings > Alerts*, since it was asked for on the machine itself; its "back to
-  normal" only where *It is over* is ticked. A webhook's JSON has `event`
+  normal" only where *It is over* is ticked; and each destination as it asked (*Screen
+  unchanged*, *Picture lost*, *Back to normal*). A webhook's JSON has `event`
   `unchanged` for a screen that looked the same, `no_signal` for no signal and `recovered`
   for either being over. Which watches stand is written down (`screens.json`), so that the
   "back to normal" comes after a restart too. The minutes go into an export with the machine.
@@ -808,7 +1219,7 @@ for this one once that account or an admin has removed it (an admin may take it 
   The certificate qKVM makes itself, which a browser warns about, does not do. On an iPhone or
   iPad (iOS 16.4 or later) the wall has to be added to the Home Screen (*Share*, *Add to Home
   Screen*), opened from there, and turned on there. And alerts on (*Watch the KVMs and send
-  alerts*): the browsers are told what the webhook is, with or without a webhook.
+  alerts*): the browsers are told what the destinations are, with or without a destination.
 - **Through whom.** A browser is reached through its maker's push service: Apple's for Safari,
   Google's for Chrome and most browsers on Android, Mozilla's for Firefox, Microsoft's for
   Edge. The wall posts each alert there, and the service carries it to the phone without being
@@ -819,11 +1230,18 @@ for this one once that account or an admin has removed it (an admin may take it 
   which names nothing of it: never its address.
 - **What an alert carries:** the machine's name and what happened, as the webhook says it, and
   which tile it is about. Never a password, a token, a machine's address or a picture.
-- **When.** As every alert: not while they are paused, not for a machine whose alerts are off,
-  of the kinds ticked. A suspended account's browsers are told nothing; an account that is
-  removed takes its browsers with it. A phone that is off gets, when it is on again, what came
-  within a day.
-- **Sending** holds up neither the watching, nor the webhook, nor another browser: each
+- **When.** As every alert: not for a machine whose alerts are off, of the kinds ticked; a pause
+  stops new ones, and what is not as it was when it ends is told then. What waits for a browser
+  (its push service away) is held to the switch before each try and right before it goes:
+  alerts switched off, now or at any moment since it was put in, it is dropped; one already on
+  its way when a pause begins is sent. A
+  suspended account's browsers are told nothing; an account that is removed takes its browsers
+  with it. A phone that is off gets, when it is on again, what came within a day.
+- **A known limit:** the wall keeps no record of what each browser was told, as it does for a
+  destination. Where alerts were switched off while a machine's trouble waited for a browser,
+  so that the trouble was dropped, that browser may be told later that the machine is back to
+  normal, without the trouble before it.
+- **Sending** holds up neither the watching, nor a destination, nor another browser: each
   browser's alerts go in the order they happened, eight sends at a time from the whole wall,
   each given 15 seconds, tried again after 5, 30 and 120 seconds where its push service was
   away, and 20 waiting for one browser at the most (the oldest give way). A browser its push
@@ -890,7 +1308,8 @@ when it reads one.
 **Not in any such file:** accounts, tokens and display links, two-factor keys and the
 recovery key. Each is locked to the key of the qKVM it was made on, and could be carried
 over only by carrying that key. Nor the [history](#history) of what the wall saw: that is what
-happened here, not a setting, and an import leaves the one that is here as it is. To keep a whole qKVM, accounts and all, keep a copy of its
+happened here, not a setting, and an import leaves the one that is here as it is. To keep a whole qKVM, accounts and all, use
+[Backups](#backups), or keep a copy of its
 data folder with qKVM stopped, plus a separately protected backup of its server storage key.
 Keep a record that pairs those backups; an account password or recovery code cannot replace
 that key. See [How it is protected](#how-it-is-protected).
@@ -900,6 +1319,216 @@ An export is written to the activity log, with who made it and whether it was en
 address, as one that is typed in is.
 A token cannot ask for one, and neither can an account that only your identity provider
 signs in: it has no password here to be asked for. Export as an admin that has one.
+
+## Backups
+
+*Settings > Backups* has the wall write an encrypted backup of itself to a folder every day:
+everything it takes to bring the wall back on another computer, in one file that opens with
+the backup key's recovery kit and with nothing else. An admin's to set up, as every setting is.
+
+### What is in a backup
+
+- The settings as the wall keeps them: the KVMs, servers, PCs and virtual machines with their
+  passwords and remembered certificates; the saved actions; the accounts with their roles,
+  the machines they may see, what their passwords open and their two-factor keys; the
+  tokens and display links; the recovery key's record; the alert settings and destinations
+  with their secrets; the identity provider as it is set up; the wall's own settings.
+- The wall's data key, which every saved password in those settings is sealed with: the
+  accounts' passwords open it, so a wall restored with another would lose them.
+- The activity log, every file of it, with its key and the place its chain had come to. A
+  backup begins with a seal of the log (why "backup"), and the restored log checks as the
+  wall's did.
+- The history, where *With the history* is ticked. It can be large, and a wall comes back
+  without it.
+
+Not in it: the backup key itself, this one or any other (a restored wall has none until its
+admin makes one); the server storage key (a restore makes one of the new folder's own); the key
+that opens the saved passwords at a start (`unlock.key`: the restored wall makes and fits its own
+at the first sign-in); who is signed in; the wall's own HTTPS certificate (made anew, and
+browsers ask once more); the program's log; the pictures kept for screen alerts.
+
+A backup is not an export. An export ([Export and import](#export-and-import)) is a file for a
+person to take devices and settings to another wall, sealed with a passphrase they choose,
+read entry by entry on the way in, and never holding accounts. A backup is the wall itself,
+made by the clock, and restored only into an empty data folder, as it was.
+
+### Setting it up
+
+1. **Make the key.** *Make the backup key* asks for your password, then shows the key's
+   recovery kit, once (see below). Print it, or save it as a file, and keep it apart from
+   the wall.
+2. **Name the folder:** a whole path on the computer qKVM runs on (`/srv/qkvm-backups`,
+   `D:\qkvm-backups`). It may be a mounted share or a folder another tool copies elsewhere;
+   not the data folder, which it would go with. A folder that is not there is made, its owner's
+   alone, but only inside a folder that is there: a share that is not mounted leaves its mount
+   point empty, and backups made below it would be on the computer's own disk. FTP, Dropbox,
+   Drive and S3 are not built in.
+3. **Choose** the hour (3 at night by the wall's clock, unless you choose another), how many
+   to keep (7), and whether the history goes in. Switch them on and save.
+
+The first backup is made the next time the hour comes; *Back up now* makes one at once. One
+missed while qKVM was not running is made soon after it starts. On the night the clock is set
+back, the hour shown twice runs at its first; on the night it is set on, an hour it skips runs
+at the first minute after it. Times saved while the computer's clock was a day or more ahead
+(set right since) would have held the next backup back until they came round: they are set to
+now at the clock's next look, and the activity log says so. While backups are on, qKVM
+keeps the saved passwords open after the last sign-out, as it does while alerts are on: a
+backup at night seals with the backup key, which the vault keeps. Started with
+`--locked-start`, nothing is made until somebody signs in, and every run says why it made none.
+
+Each backup is one file, `qkvm-backup-<key id>-<date>-<time>.qkvmbackup` (the key it opens with,
+by the id its kit names, and the time in UTC), the wall's account's alone. It is written under
+a name of its own and takes that name only once it is whole, on the disk, and has been read
+back with the key. Only then do the oldest of this key's backups beyond those to keep go: those
+older than the new one, never the new one, and never one whose name is later than it (made
+while the clock was ahead). A run cut off leaves no backup behind, and the next run takes away
+what it left (a `.partial` file of this key's). Backups of another key are never touched: another
+wall's in the same folder, or this wall's from before its key was made new. Settings says how
+many there are; delete them yourself when they are no longer wanted. Nothing else in the
+folder is touched either. *Verify the latest* reads this key's newest backup whole with the
+key, restores nothing, and says what it holds: machines, accounts, saved secrets and whether
+each opens, the activity log, the history. After the folder is changed, the latest is the new
+folder's, and there is none until a backup is made there; the last run says where the backup
+it made is.
+
+**A folder that never answers** (a share whose server is gone, mounted so that it waits for
+it for good) holds a run without end. After an hour the run is said to have failed, and alerted,
+once, also where qKVM opened its listeners anew meanwhile (a changed address, HTTPS switched on);
+its thread, which nothing can stop, goes on waiting for that folder. Settings says what waits
+and since when, and once a day at the hour an alert says so again. No other backup is begun into
+that folder meanwhile, by any name for it that this computer gives it: a junction or a link to it,
+a short name, another spelling, and on Windows a mapped drive and the share's `\\server\share` name.
+On a share whose server gives no file numbers, no backup is begun into any folder of its volume:
+every share that reports the same volume number is held, of any server and by any name. Where
+that number is 0 (some servers say 0 for every share of theirs) the share is told apart by its
+root as well (on Windows its `\\server\share`, also behind a mapped drive; on Linux the source of
+its mount, as `//server/share` or `server:/export`), so a share of another server is another;
+where the root cannot be had, every share numbered 0 is held. Such a share numbered 0 and reached
+by another name of its server (its address, say) is not known as the same. On Linux a second
+mount of the same share usually has a device number of its own, and is not known as the same
+folder either (a bind mount of it is). A backup begun beside the one that waits, in a folder not
+known as the same, still leaves that one's file in the making alone: each run's is its own. Move
+the backups to another folder and they are made there. A
+restart of qKVM frees what waits; a run that ends by itself once its folder answers is said in
+the activity log, and its backup is kept.
+
+**A run that fails** is a line in the activity log, the last run in Settings says why, and
+every alert destination that asks for *Backup failed* (severity error, ticked for a new
+destination) is told; none while alerts are off. A run that fails within a pause, or within a
+destination's quiet hours, is held as a machine's change is: told when they end where backups
+still fail, and not at all where a backup was made meanwhile (a restart within them forgets
+it; the next run that fails is told). The next backup that is made is told as back to normal
+where the failure was told (when a pause or quiet hours end, where it is made within them), a
+restart of qKVM between (who was told is kept with the settings). Every run, made or
+not, is in the activity log with the folder it was made for, and so
+are a key made, the settings changed and each Verify. A run that ends after its folder or
+the key was changed (it was under way then) is said there as that folder's, and leaves the
+last run, the latest backup and the next run in Settings as they were, and alerts nobody:
+they are of the backups as they are set up now.
+
+### The recovery kit
+
+The backup key is 32 random bytes of the wall's own, apart from every other key it has. The
+wall keeps it sealed in its vault, so that a backup at night needs nobody, and shows it once,
+when it is made, as its recovery kit: the key in fourteen groups of four letters and digits,
+what it opens, and how to restore. No page, answer, log or export ever holds it again. The kit
+is all it takes to restore a backup on a new computer, and it opens every backup made with
+that key: whoever has a backup and its kit has every device password in it. A backup also
+carries the key the wall seals its own secrets with (accounts' passwords and second steps work
+only with it), so a backup and its kit together open the wall's settings file too: the kit is
+as strong as the wall's own key, and is kept as carefully. Keep it as a password is kept,
+printed and put away or in a password manager, and not on the computer qKVM runs on or in the
+folder of the backups.
+
+*Make a new key* (it asks for your password) shows a new kit, once. Backups made from then on
+open with the new kit, and those made before with the kit before: keep that one for as long as
+you keep them. A backup being made at that moment takes its key with the settings it holds,
+at one moment: what it holds of the wall from after the new key opens with the new kit only.
+No backup holds a backup key, its own or another, so a kit opens the backups made with it and
+nothing in them leads to a later key. The backups made before are no longer pruned (they are
+another key's now): delete them yourself when they are no longer wanted. A new key changes
+nothing in an older backup. Where an older kit may have been seen, delete the backups made
+with it, and change the passwords of the devices.
+
+A kit that is lost cannot be shown again: make a new key, and the backups made from then on
+open with the new kit. The backups made before it open with nothing.
+
+### Restoring
+
+On the new computer, with qKVM installed and not running:
+
+1. Copy the backup file there, and save the kit as a text file (or have the key at hand to
+   type).
+2. Run, with a data folder that is new or empty:
+
+   ```
+   python -m qkvm --restore qkvm-backup-43d96c035ccc455a-20261117-030000.qkvmbackup --backup-key kit.txt --data-dir /var/lib/qkvm
+   ```
+
+   Without `--backup-key` it asks for the key, where it runs in a terminal. The key itself is
+   never given on the command line, where other users of the computer could see it.
+3. It refuses a data folder with anything in it, a backup made with another key (it names the
+   key the backup needs), one made by a later version of qKVM, and one in which anything was
+   changed, cut off or added: it reads the whole file and takes back whatever it wrote before
+   it found that. Then the wall is in the folder, its settings sealed with a server storage
+   key of the new folder's own (beside it as `<data folder>.keys/vault.key`, or where
+   `--vault-key-file` says: keep a separate private backup of it, as
+   [How it is protected](#how-it-is-protected) says). A restore that fails leaves the storage
+   key where it is, whoever made it (another restore may have been given that file meanwhile),
+   and the next restore into the folder uses it; a key is written whole before it is put in its
+   place, so a restore stopped as it makes one leaves none or a whole one. On Linux and macOS the
+   key's folder must be on a volume that takes hard links and keeps the key private to the
+   server's account (not FAT or exFAT): elsewhere no key is made and the restore is refused, and
+   `--vault-key-file` chooses another place; an empty `.qkvm-key.lock` stays there beside a key
+   once one was made. On every system no key may be named so, nor `.qkvm-key-` and 16 hex digits
+   and `.part`, the file a key is written into first. On Windows a `.qkvm-key.lock` carried there
+   from Linux or macOS, or left by a power cut, keeps a first key from being made: remove it by
+   hand while no qKVM is making a key there. A line in the activity
+   log says it was restored, from which file, and the log is checked as `python -m qkvm.checklog --data-dir`
+   checks it. While it runs, the folder is held for it (`qkvm.restoring` in it): a second
+   restore into the same folder is refused until it ends, and takes nothing away. A restore
+   that was stopped before it finished (the computer went down, it was killed) leaves that
+   file, with what it had written: run the same command again, and it takes away what the
+   stopped one wrote, and nothing else, and begins again. It writes the settings (`qkvm.json`)
+   last, after its line in the activity log: a folder with them in it is a wall, which the same
+   command refuses, and its line is there. Until then qKVM does not start on the folder: it says
+   to run the same command again. Beside anything else in the folder it is refused as ever, and the
+   folder is left as it is.
+4. Start qKVM with that data folder and sign in as before. Until somebody signs in, the
+   restored wall watches nothing and sends no alert (the key that opened its saved passwords
+   at a start was the old computer's); from the first sign-in on, it carries on by itself as
+   before, or as `--unlock-file` or `--locked-start` say.
+5. Make a new backup key in *Settings > Backups* (the restored wall has none, since a backup
+   holds no backup key) and keep its kit, then switch backups on again once this is the only
+   wall writing to their folder. A restore leaves them off, so that two walls never both
+   write, and prune, one folder. The kit you used opens only the backups made with it.
+
+Everything else comes back as it was: every account with its role, its machines, its password
+and its second step; the identity provider as it was set up, switched on or not; the tokens,
+the destinations, the recovery key. A restore makes nothing more than it was.
+
+### What a backup does not protect against
+
+- **A lost kit.** Nobody can open the backups made with it, qKVM included.
+- **Somebody with a backup and its kit.** They have every device password in it, and every
+  account as it was.
+- **One disk for both.** A folder on the disk the wall is on goes with it: keep the backups on
+  another disk, a share, or a folder copied elsewhere.
+- **What happened since.** A backup a day can be up to a day old.
+- **Others who may change the folder.** They can neither read a backup nor change one
+  unnoticed, but they can delete them. Keep the folder writable by qKVM's account alone (on a
+  share, by the share's own rights).
+- **What the machines hold.** The settings of the KVMs and controllers themselves, their
+  firmware and the computers behind them are not in a backup.
+
+### How a backup is sealed
+
+Each file has a key of its own, derived from the backup key and random bytes in its head
+(HKDF-SHA256); its content is compressed and sealed with AES-256-GCM in pieces of a mebibyte,
+each bound to the head and to its place, so that a file cut short, added to or changed anywhere
+is refused as a whole. The head says in clear that it is a backup of qKVM's, which version of
+the format and of the program made it, when, and which key opens it, by a mark of the key that
+gives nothing of it away; nothing of the wall can be read off a backup but its size.
 
 ## Scripts and wall screens
 
@@ -943,14 +1572,50 @@ the role operator may also act (`GET /api/v1/actions`, `POST /api/v1/devices/{id
 ## The API
 
 Everything the page does, it does through this interface, and so can any other program:
-a script, a monitoring system, a program of its own that shows a wall. The paths are under
-`/api/v1/`, and the `v1` is the version of the interface. **Within `v1`, requests and fields
-are added and none is taken away or given another meaning**; a change that would break a
-program written against it gets a path of its own (`/api/v2/`) beside this one. `GET
-/healthz` says which versions a qKVM speaks (`"api"`). What this chapter lists is promised
-that way; the other requests under `/api/v1/` are the page's own and change with it (they
-are named at the end). A client takes what it knows from an answer and leaves the rest: a
-field or a word it has not met is one that was added since.
+a script, a monitoring system, a program of its own that shows a wall (the Desktop App is
+one). The paths are under `/api/v1/`, and the `v1` is the version of the interface. This
+chapter is what a wall promises such a program. A wall and the programs that talk to it are
+upgraded at different times, so the promise is kept from one version of qKVM to the next;
+[Clients and versions](#clients-and-versions) says how a program keeps its side.
+
+### The promise
+
+- **What is promised** is what this chapter lists: the requests in the table below, who may
+  ask each, what it takes, what it answers and with what kind of value in each field, and the
+  codes it refuses with; the records a machine, how a machine is and an account are described
+  as; the errors. The other requests under `/api/v1/` are the page's own and change with it
+  (they are named at the end): a program written against them is written against one version
+  of qKVM.
+- **Within `v1`, requests, fields, states, codes and words are added; none is taken away or
+  given another meaning.** A request keeps its method, its path and the role it takes; a
+  field keeps its name and its kind (a text stays a text, and one that may be null is said to
+  be so where it is described). A change that would break a program written against `v1`
+  gets a path of its own (`/api/v2/`) beside this one.
+- **A program leaves out what it does not know.** A field, a state, a code or a word of `can`
+  it has not met is one that was added since: an answer with more in it than the program
+  expected is not wrong. A request is sent with the fields its row names and no others.
+- **What a wall offers is said, not guessed.** `GET /healthz` says the version of qKVM
+  (`version`) and the versions of this interface it speaks (`api`); the list below says since
+  which version each request, and each field added later, is promised; each machine's `can`
+  says what it can be asked, and the wall's `live` the form of the live line.
+- **The list.** `qkvm/api_v1.json`, in the source and in every installed copy, says all of
+  this for a program: each promised request with who may ask it, what it takes, the kind of
+  each field of what it answers, the codes it refuses with and since which version it is so;
+  the records; the codes every request may answer with, and since which version those added
+  later are promised (`codes_since`); and the page's own requests by name.
+  qKVM's own tests fail when a request is added, taken away or changed without the list and
+  this chapter changing with it.
+- **Every answer under `/api/`** carries `Cache-Control: no-store`. Every answer is JSON
+  (`application/json`) but a picture and an export's file, and every refusal is
+  `{"code": "...", "message": "..."}` (below), with more beside them only where its row says
+  so (`by`, `unknown`, `mounted`).
+- **If a `/api/v2/` ever comes**, it comes beside `/api/v1/`, which is served on as it is: for
+  at least twelve months after the first release that has `v2`, and through at least two
+  minor releases after it, whichever is longer. From that release on, every `v1` answer carries
+  `Deprecation` and `Sunset` headers, and the day `v1` ends is said here and in that release's
+  changelog. `v1` goes only in a minor release, never in a fix release.
+- **A wall can be held to all of this** by a program, reading only:
+  [Checking a wall](#checking-a-wall).
 
 ### Who may
 
@@ -983,14 +1648,15 @@ with the statuses it comes with; the ones the requests below answer:
 | 400, 408 | `disconnected` (the body was not sent in full), `timeout` (it took too long to arrive) | the request |
 | 401 | `unauthorized` (sign in first; in the middle of things: the session ended, sign in again and do not loop), `bad_password`, `bad_code`, `code_required`, `bad_key`, `bad_recovery` | the session |
 | 403 | `forbidden` (the header), `not_allowed` (the role, or a token), `totp_required` (set the second step up first), `suspended`, `stopped` (whoever asked lost the right while it was under way) | |
-| 404 | `not_found` (also: a machine this account was not given), `no_picture`, `no_console`, `no_live` (no live picture of this machine), `no_virtual_media` (no `media` in its `can`) | |
-| 409 | `busy` (something else is being done to that machine), `changed`, `moved` (a change of a machine's virtual media picked from a list of another machine: its tile was edited to another address, or another machine, since), `duplicate` (an image of that name is there already), `no_text`, `in_use`, `console_held`, `enabled`, `not_enabled`, `not_started`, `not_initialized`, `no_second_step`, `no_password` (the account has no password here: it is signed in by the identity proxy), `same_host` (a device's page on a host name qKVM is looked at under), `unknown_kind` (a tile of a kind of machine this version does not know, kept from a later version: nothing is sent to it; it can be removed) | the state of things |
+| 404 | `not_found` (also: a machine this account was not given; an address nothing is served at), `no_picture`, `no_console`, `no_live` (no live picture of this machine), `no_virtual_media` (no `media` in its `can`) | |
+| 405 | `method_not_allowed`: the address is served, by another method, which `Allow` names. Only an admin meets it, and an address nothing is served at: to anybody else either is 403 `not_allowed` | the request |
+| 409 | `busy` (something else is being done to that machine), `changed`, `moved` (a change of a machine's virtual media picked from a list of another machine: its tile was edited to another address, or another machine, since), `machine_changed` (an action or a live picture asked for the machine a tile was at when it was looked at, its `target`, and an edit has put another machine under the tile since: nothing was sent; since 0.4.0), `input_changed` (keys or text asked for the computer on one input of a KVM with several, its `input`, and the KVM, asked right before they were to go, showed another on screen or did not say which: nothing was sent; since 0.4.0), `duplicate` (an image of that name is there already), `no_text`, `in_use`, `console_held`, `enabled`, `not_enabled`, `not_started`, `not_initialized`, `no_second_step`, `no_password` (the account has no password here: it is signed in by the identity proxy), `same_host` (a device's page on a host name qKVM is looked at under), `unknown_kind` (a tile of a kind of machine this version does not know, kept from a later version: nothing is sent to it; it can be removed) | the state of things |
 | 411, 413 | `length_required` (a body sent without its length), `too_large` (a body over 64 KiB, a file over what a file may be, an image over 16 GB) | the request |
 | 422 | `invalid`, `name_required`; for a file: `not_a_file`, `damaged`, `newer`, `passphrase_needed`, `wrong_passphrase`, `too_large` | the request |
 | 429 | `rate_limited`, with `Retry-After` in seconds, which is meant; `busy` (too many passwords being checked at once: try again shortly) | |
 | 500, 501 | `internal` (the details are in the wall's log); `missing_driver` (a JetKVM, where the Python that runs qKVM lacks the aiortc package qKVM is installed with) | the wall's |
 | 502 | the device's: `unreachable`, `dropped`, `auth_failed`, `no_password`, `not_set_up`, `cert_mismatch`, `cert_invalid`, `plain_only`, `https_only` (a KVM whose plain address sends everybody on to HTTPS at the same host, which is said and not followed; 422 from an add or an edit), `another_machine` (another machine answers at the address than the one the tile was added for, a PC with Intel AMT by its PlatformGUID, a JetKVM by its own number (which it says once signed in), a server by its UUID and its controller's, or has its guest's number on its Proxmox, by the guest's SMBIOS UUID: nothing was sent; 422 from an edit), `bad_response`, `action_failed`, `console_time_up` | the device |
-| 503 | `no_stream` (not yet: ask again), `no_sign_in` (the device answers, and does not sign qKVM in), `locked` (qKVM cannot open the saved passwords just now), `busy` (no memory to check a password with) | |
+| 503 | `no_stream` (not yet: ask again), `no_sign_in` (the device answers, and does not sign qKVM in), `locked` (qKVM cannot open the saved passwords just now), `busy` (no memory to check a password with), `no_video` (no picture can be made on the computer qKVM runs on: no video worker can start there, and the message says why; the same for every machine whose picture qKVM makes itself, and `GET /healthz` says `"video": "unavailable"` meanwhile. A worker that only takes long to start is `no_stream` until three in a row do) | |
 | 504 | `timeout`: no answer from the device | |
 | 507 | `not_saved`: the change could not be written down (a full disk), and was taken back | the wall's disk |
 | 507 | `no_space`: an image larger than the space free on the device's own storage | the device's |
@@ -998,11 +1664,12 @@ with the statuses it comes with; the ones the requests below answer:
 After an action, `unreachable` and `no_stream` mean that nothing was sent; `timeout` and `dropped` mean
 that the request went out and its answer did not come, or came broken: **it may have been done**, so do
 not offer a blind retry of a power button for either. Every request may answer, beside what its row
-names: `unauthorized`, `not_allowed`, `forbidden` and `totp_required` (who may); `invalid`, `too_large`
-and `length_required` (the request); `rate_limited` and `busy` (429, 503) wherever a password is checked;
+names: `unauthorized`, `not_allowed`, `forbidden` and `totp_required` (who may); `invalid`, `too_large`,
+`length_required`, `disconnected` and `timeout` (400, 408: the body did not arrive in full, or in time)
+(the request); `internal` (the wall's); `rate_limited` and `busy` (429, 503) wherever a password is checked;
 `no_password` (409) wherever one's own password is asked for of an account that has none here; `not_saved`
 wherever something is written down; `locked`; and the device's own wherever a device is asked, `in_use`
-(409) and `missing_driver` (501) among them.
+(409), `missing_driver` (501) and `no_video` (503) among them.
 
 ### The requests
 
@@ -1010,7 +1677,7 @@ wherever something is written down; `locked`; and the device's own wherever a de
 
 | Request | Who | Body | Answers |
 |---|---|---|---|
-| `GET /healthz` | nobody | | `status` ("ok"), `version`, `api` (the versions spoken: `["v1"]`), `page` (a mark of the page's own files, of no use to another program), `locked` (true: restarted with `--locked-start` and nobody has signed in since, so it reaches no device). Never refuses |
+| `GET /healthz` | nobody | | `status` ("ok"), `version`, `api` (the versions spoken: `["v1"]`), `page` (a mark of the page's own files, of no use to another program), `locked` (true: restarted with `--locked-start` and nobody has signed in since, so it reaches no device); from 0.4.0, `video` ("unavailable", there only then: no picture can be made on this computer, as `no_video` says on the tiles, with why). Never refuses |
 | `GET /api/v1/session` | nobody | | `initialized` (false: nobody has set this wall up, which is done on its page), `authenticated`, `user` (the account, below, or null), `ask_name` (true: more than one account, and signing in needs the name), `recovery` (a recovery key exists), `recovery_created` (to an admin: when, in seconds since 1970; otherwise null), `setup_code_required`, `min_password`, `unlocks_at_start`. Started with `--sso-header`: `sso` (`on`, `name`, `known`), and whoever the proxy signed in is signed in here by this answer, cookie included |
 | `POST /api/v1/login` | nobody | `password`*, `name` (where `ask_name`), `code` (where asked for), `remember` (30 days) | `ok`, `user`, and the cookie. 401 `bad_password`; 401 `code_required`: the password was right and the account has a second step, send the same request again with `code`; 401 `bad_code`; 403 `suspended`; 409 `not_initialized`; 409 `no_second_step` (the key of the account's second step does not open any more: `qkvm --disable-2fa` where qKVM runs); 422 `name_required`; 429 `rate_limited` |
 | `POST /api/v1/logout` | viewer, a person | `scope`: "this" (default), "others" (the account's other sessions), "all" | `ok`; the cookie is cleared, except for "others". 507 `not_saved`: signed out all the same, and a restart may undo it |
@@ -1021,19 +1688,19 @@ wherever something is written down; `locked`; and the device's own wherever a de
 | `POST /api/v1/totp/disable` | viewer, a person | `password`* | `ok`, `user`. 401 `bad_password`; 409 `changed` (as for `/password`) |
 | `POST /api/v1/recover` | nobody | `recovery_key`*, `new_password`*, `name` (where there are several accounts) | `ok`; every session of that account ends. 401 `bad_recovery`; 409 `not_initialized`; 422 `name_required`; 429 `rate_limited` |
 | `POST /api/v1/display` | nobody | `key`* | `ok`, `user` (`token` true), `expires` (when the link runs out, in seconds since 1970; null: when it is taken back), `expires_in` (how many seconds that is from now, by the wall's clock: a screen counts those, whatever its own clock says; null as for `expires`), and the cookie. 401 `bad_key`: the link was taken back or has run out |
-| `GET /api/v1/about` | viewer | | `version`, `licence`; to an admin also what it runs on |
+| `GET /api/v1/about` | viewer | | `version`, `licence`; to an admin also what it runs on: `python` (its version), `system`, `libraries` (each `name`, `version`, `licence`) |
 | `GET /api/v1/wall` | viewer | | `interval` (seconds between two pictures of a tile, as set for this wall), `live` (the form of the live line this qKVM speaks, as a number: 2; a program that speaks another form asks for no live picture, see [Live view and control](#live-view-and-control)), `devices` (the machines this account may see, each as below). Never waits for a device |
 | `GET /api/v1/status` | viewer | | by device `id`, how each is (below), from what is known: it waits for no device, except up to a second and a half for one's very first look |
 | `GET /api/v1/devices/{id}/history?what=summary&since=&until=&limit=&every=` | viewer | | what the wall saw of the machine, kept beside the settings (the chapter [History](#history)). `what`: "summary" (default), "states", "samples" or "events"; `since` and `until` in seconds since 1970 (left out: the last week, for samples the last day); `limit` 1 to 5000 (1000 left out); `every` 0 to 86400: samples averaged over spans of that many seconds. A summary: `since`, `until`, `first_seen`, `last_seen` (seconds since 1970, or null), `state` and `power` ("on", "off", or null) as last seen, `watched`, `online`, `answering` (seconds of the window), `share`, `answering_share` (online, and answering, over watched; null where nothing was seen), `changes`, `events` (how many in the window), `sensors` (the names of its readings of the last day). The rest: `since`, `until`, `rows` (oldest first; a state `t`, `state`, `code`; an event `t`, `kind` ("pressed": a power button pressed from the wall, "power": a change of power state seen), `what`, `ok` (null: nobody heard how it went), `note`; a sample `t`, `sensor`, `unit`, `value`), `more` (the page was cut: narrow the window), and for samples `every`; with `every` given, `series` in place of `rows`, one per sensor: `sensor`, `unit`, `points` of `[t, average, min, max]` (a sensor whose series does not fit whole is left out). 404 `not_found`; 503 `busy` (three reads at once are answered, from everybody together, and one at a time of each account or token, whose next waits its turn for eight seconds at the most and, after a read, as long again as that read took; `Retry-After` says when); 503 `history_unavailable` (the file is being opened or replaced, or brought up to date for longer than three seconds, or the read took too long) |
-| `GET /api/v1/devices/{id}/snapshot?w=640&age=1` | viewer | | the screen as `image/jpeg` or `image/png`, with `X-KVM-Signal` 1 or 0 (0: a placeholder, the computer shows nothing) and `Cache-Control: no-store`. A still kept between sessions (a PC with Intel AMT whose tile is only shown) carries `X-KVM-Still: 1` and `X-KVM-Age: <seconds>`, how old the still is. `w`: the width wanted, 1 to 16384 (the source's own is never exceeded); `age`: how old, in seconds, the frame may be (0 to 3600; viewers asking within that window share one frame). 404 `not_found`; 404 `no_picture` (a server whose controller gives none); 503 `no_stream` (not yet: ask again); 409 `in_use` (a JetKVM whose one viewer is somebody else); the device's |
-| `POST /api/v1/devices/{id}/live` | viewer | `{}` | `v` (the form of the live line this qKVM speaks: 2), `ticket` (a pass for one live line to this machine, good for half a minute and for one use: 16 to 200 letters, digits, `-` or `_`; it is in no log, and is not to be kept). A viewer, a wall screen and a token may ask, and may watch; taking keyboard and mouse over the line takes an operator or an admin, by cookie or by token. 404 `not_found`; 404 `no_live` (a server whose console is not read: `live` is not in its `can`); 429 `busy` (this account, token or wall screen has 32 live lines open, the passes it has not used counted with them; or the wall 256 passes out: `Retry-After`); 503 `locked` |
+| `GET /api/v1/devices/{id}/snapshot?w=640&age=1` | viewer | | the screen as `image/jpeg` or `image/png`, with `X-KVM-Signal` 1 or 0 (0: a placeholder, the computer shows nothing) and `Cache-Control: no-store`. A still kept between sessions (a PC with Intel AMT whose tile is only shown) carries `X-KVM-Still: 1` and `X-KVM-Age: <seconds>`, how old the still is. `w`: the width wanted, 1 to 16384 (the source's own is never exceeded); `age`: how old, in seconds, the frame may be (0 to 3600; viewers asking within that window share one frame); `target` (since 0.4.0: the machine's `target` as the client has the tile; left out or empty, it is not asked). 404 `not_found`; 404 `no_picture` (a server whose controller gives none); 503 `no_stream` (not yet: ask again); 409 `machine_changed` (the tile is at another machine than `target` names: nothing was asked of either, and the wall is to be fetched again); 409 `in_use` (a JetKVM whose one viewer is somebody else; a PC with Intel AMT whose KVM another viewer has, since 0.4.0); the device's |
+| `POST /api/v1/devices/{id}/live?target=...` | viewer | `{}`; `target` (since 0.4.0: the machine's `target` as the view that opens the line shows it; left out, it is not asked) | `v` (the form of the live line this qKVM speaks: 2), `ticket` (a pass for one live line to this machine, good for half a minute and for one use: 16 to 200 letters, digits, `-` or `_`; it is in no log, and is not to be kept). The pass is for the machine the tile is at as it is given: once an edit of the tile has put another connection in its place (another address, another machine, or only another name), it opens no line, which is told `bye` `gone`, as a line open by then is. A viewer, a wall screen and a token may ask, and may watch; taking keyboard and mouse over the line takes an operator or an admin, by cookie or by token. 404 `not_found`; 404 `no_live` (a server whose console is not read: `live` is not in its `can`); 409 `machine_changed` (the tile is at another machine than `target` names: no pass is given); 429 `busy` (this account, token or wall screen has 32 live lines open, the passes it has not used counted with them; or the wall 256 passes out: `Retry-After`); 503 `locked` |
 | a WebSocket at `/api/v1/devices/{id}/live` (`GET`, upgraded) | by the pass | the first message, text: `{"t": "hello", "v": 2, "ticket": "...", "video": ["h264", "jpeg"], "max_w": 1920, "max_fps": 30}` | the live line: the machine's picture down, keyboard and mouse up, with the messages [Live view and control](#live-view-and-control) lists. It carries no cookie, and is asked for from the address the pass was given to. A line whose first message is not a pass this qKVM gave for this machine is told `{"t": "bye", "code": "no_pass", "message": ...}` and closed; one from a page of another host, or for a host this wall does not answer to, is refused 403 before anything is read |
 | `GET /api/v1/actions` | operator | | `actions`: each `id`, `name`, `kind` ("keys" or "text"), `keys`, `enter`, `danger`, `changed` (how often it was edited). Never the text a saved action types |
-| `GET /api/v1/devices/{id}/wol` | operator | | `targets`: each `mac`, `name` (what the device calls it, which a KVM fills with the address where it has no name; empty where it has nothing). A machine without `wol` in `can` answers an empty list. 404 `not_found`; the device's |
-| `POST /api/v1/devices/{id}/actions` | operator | `action`*, and what that one needs (the table below); `batch` (any id of letters, digits and "-", up to forty: ties several requests together as one act in the activity log) | `ok`, `note` (null; or "already on", "already off" for a server that was so; or "pressed, but the computer is still off", "held, but the computer is still on", "pressed; its board has not said since", "pressed; not seen: its connection ended" (the tile was edited or removed, or the wall locked itself; and "held; ..." of the same) for a KVM's power button whose change its board did not show: it was pressed). 404 `not_found` (also: the saved action is gone); 409 `busy` (with `by`, the name of whoever has the machine's keyboard and mouse over a live line, where that is why: an account's, or a token's with "(token)"; to an admin in person the message adds that they can take them over in the live view: an action never takes over by itself); 409 `conflict` (it waited for the last holder of the keyboard to be let go of, and meanwhile the tile was changed or taken off the wall: nothing was sent); 409 `changed` (the saved action was edited since it was listed); 409 `no_text`; 403 `not_allowed` (a token and a saved text); 403 `stopped`; 422 `invalid` (also: an action this machine cannot do); 502 `action_failed` (the device refused); 504 `timeout` and 502 `dropped` (it may have been done); the device's. Every action is written to the activity log with the account |
-| `PUT /api/v1/devices/{id}/view` | operator, a person | `view`*: "health", "stills" or "live" | which of its three views a PC with Intel AMT is in (see [Intel AMT](#intel-amt)): `ok`, `amt_view` (as it is now). In effect at once; each change is written to the activity log (`amt_view_changed`, with `view` and `was`), and one that changes nothing is not. 403 `not_allowed` (a token: it changes no setting of a tile); 404 `not_found`; 422 `invalid` (no PC with Intel AMT); 507 `not_saved` |
-| `POST /api/v1/devices/{id}/console` | operator, a person | `{}` | `url`: a way into a server's own console, signed in, good for one use, for the browser of whoever asked; it is in no log, and is not to be kept. 403 `not_allowed` (a token); 404 `not_found`; 404 `no_console` (no such way in from this device); 409 `same_host` (the browser reaches the device by a host name qKVM is looked at under, the one this request came by or one in `allowed_hosts`: it would hand the device its sign-in to qKVM, and nothing is asked of the device); the device's |
-| `GET /api/v1/devices/{id}/media` | admin, a person | | what can be mounted on the machine, asked of it now: `images` (each `id`, the only thing a mount names, `name`, `where` (for a virtual machine on Proxmox, the storage; null on a KVM's own and a server's), `size` in bytes or null, `partial` (an upload of it was cut off: only to delete; a JetKVM's keeps its name with `.incomplete`), `sha256` (where qKVM carried it there and it is still that image, else null)), `unseen` (a sentence for each place whose images could not be listed, in the device's words: a storage the token may not read), `left_out` (how many entries were no image qKVM passes on to the device), `notes` (sentences of what stands against a change now: a KVM's File Sharing on, its drive offline or busy), `space` (a KVM's own storage: `free` and `size` in bytes; null elsewhere), `mounted` (what is in its drive now, as the status's `media` below, or null), `uploading` (an upload to it under way, as `GET .../media/upload` says it, or null), `listed` (the machine this list was made of: a mark of the address it is spoken to at and of what it is known by there, which a change sends back) and `offers`, by what the last look at the machine found: `drives` (what an image goes in as: "cd", read-only; "flash", a kvmd KVM's USB flash drive; "disk", a JetKVM's, read-only), `writable` (of `drives`: those an image may be mounted writable in, where that is chosen), `boot` (how it can be told to start from it: "once", "until_unmounted"; none on a KVM), `restart` (it can be restarted from here: a KVM with a power board too), `upload` (images are carried through qKVM to it), `delete` (images can be deleted from it), `drops_input` (a mount or an unmount drops its keyboard and mouse for a moment), `where` ("proxmox": the images are on the storages of its node; "device": on the KVM's own storage; "qkvm": a server's, in the folder qKVM serves them from); and for a server `served_from` (the wall's address as its controller reaches it, or null where there is none). 403 `not_allowed` (a token); 404 `not_found`; 404 `no_virtual_media`; 502 `another_machine`; the device's |
+| `GET /api/v1/devices/{id}/wol?target=...` | operator | `target` (since 0.4.0, in the address: the machine's `target` as the menu that lists was opened for it; left out or empty, it is not asked) | `targets`: each `mac`, `name` (what the device calls it, which a KVM fills with the address where it has no name; empty where it has nothing). A machine without `wol` in `can` answers an empty list. 404 `not_found`; 409 `machine_changed` (the tile is at another machine than `target` names: nothing was asked of it); the device's |
+| `POST /api/v1/devices/{id}/actions` | operator | `action`*, and what that one needs (the table below); `batch` (any id of letters, digits and "-", up to forty: ties several requests together as one act in the activity log); `target` (since 0.4.0: the machine's `target` as the person saw it when they were asked, which [Doing something](#doing-something) says more of; left out, it is not asked); `input` (since 0.4.0: on a KVM with several inputs, the status's `ports.active` as the person saw it, for keys, text, `ctrl_alt_del` and a saved action; left out, it is not asked); `one_input` (since 0.4.0: `true` instead of `input`, for the same actions, where the status said neither `several_inputs` nor `ports`; left out, it is not asked) | `ok`, `note` (null; or "already on", "already off" for a server that was so; or "pressed, but the computer is still off", "held, but the computer is still on", "pressed; its board has not said since", "pressed; not seen: its connection ended" (the tile was edited or removed, or the wall locked itself; and "held; ..." of the same) for a KVM's power button whose change its board did not show: it was pressed). 404 `not_found` (also: the saved action is gone); 409 `busy` (with `by`, the name of whoever has the machine's keyboard and mouse over a live line, where that is why: an account's, or a token's with "(token)"; to an admin in person the message adds that they can take them over in the live view: an action never takes over by itself); 409 `conflict` (it waited for the last holder of the keyboard to be let go of, and meanwhile the tile was changed or taken off the wall: nothing was sent); 409 `changed` (the saved action was edited since it was listed); 409 `machine_changed` (the tile is at another machine than `target` names: nothing was sent); 409 `input_changed` (keys or text, and the KVM, asked right before they were to go, shows another input than `input` on screen, or does not say which; or a machine that has no inputs to choose from; or, with `one_input`, a KVM qKVM knows has several inputs, or may have several where its inputs are not known at the moment (the status's `several_inputs` without `ports`), or whose switch, asked right before they were to go, answers anything but kvmd's own word that it has none within two seconds of a connection; with `input` too, where its switch says it is not in step; or where they could not leave within half a second of that answer: nothing was sent); 409 `no_text`; 403 `not_allowed` (a token and a saved text); 403 `stopped`; 422 `invalid` (also: an action this machine cannot do; `input` and `one_input` both); 502 `action_failed` (the device refused); 504 `timeout` and 502 `dropped` (it may have been done); the device's. Every action is written to the activity log with the account; keys and text with the input they named (`input`, counted from 1 there) or `one_input` (since 0.4.0), and one refused for its input before anything went, as the KVM's own refusal is (`action_failed`, in its words). Never the text that was typed |
+| `PUT /api/v1/devices/{id}/view` | operator, a person | `view`*: "health", "stills" or "live"; `target` (since 0.4.0: the PC's `target` as the person saw it, as for an action; left out, it is not asked) | which of its three views a PC with Intel AMT is in (see [Intel AMT](#intel-amt)): `ok`, `amt_view` (as it is now). In effect at once; each change is written to the activity log (`amt_view_changed`, with `view` and `was`), and one that changes nothing is not. 403 `not_allowed` (a token: it changes no setting of a tile); 404 `not_found`; 409 `machine_changed` (the tile is at another machine than `target` names, a PC or not: nothing was changed); 422 `invalid` (no PC with Intel AMT, where `target` names the machine it is at or none); 507 `not_saved` |
+| `POST /api/v1/devices/{id}/console?target=...` | operator, a person | `{}` | `url`: a way into a server's own console, signed in, good for one use, for the browser of whoever asked; it is in no log, and is not to be kept. `target` (since 0.4.0, in the address: the machine's `target` as the person saw it, as for an action; left out, it is not asked). 403 `not_allowed` (a token); 404 `not_found`; 404 `no_console` (no such way in from this device); 409 `machine_changed` (the tile is at another machine than `target` names: nothing was asked of it); 409 `same_host` (the browser reaches the device by a host name qKVM is looked at under, the one this request came by or one in `allowed_hosts`: it would hand the device its sign-in to qKVM, and nothing is asked of the device); the device's |
+| `GET /api/v1/devices/{id}/media?target=...` | admin, a person | `target` (since 0.4.0, in the address: the machine's `target` as the box that lists was opened for it; left out or empty, it is not asked) | what can be mounted on the machine, asked of it now: `images` (each `id`, the only thing a mount names, `name`, `where` (for a virtual machine on Proxmox, the storage; null on a KVM's own and a server's), `size` in bytes or null, `partial` (an upload of it was cut off: only to delete; a JetKVM's keeps its name with `.incomplete`), `sha256` (where qKVM carried it there and it is still that image, else null)), `unseen` (a sentence for each place whose images could not be listed, in the device's words: a storage the token may not read), `left_out` (how many entries were no image qKVM passes on to the device), `notes` (sentences of what stands against a change now: a KVM's File Sharing on, its drive offline or busy), `space` (a KVM's own storage: `free` and `size` in bytes; null elsewhere), `mounted` (what is in its drive now, as the status's `media` below, or null), `uploading` (an upload to it under way, as `GET .../media/upload` says it, or null), `listed` (the machine this list was made of: a mark of the address it is spoken to at and of what it is known by there, which a change sends back) and `offers`, by what the last look at the machine found: `drives` (what an image goes in as: "cd", read-only; "flash", a kvmd KVM's USB flash drive; "disk", a JetKVM's, read-only), `writable` (of `drives`: those an image may be mounted writable in, where that is chosen), `boot` (how it can be told to start from it: "once", "until_unmounted"; none on a KVM), `restart` (it can be restarted from here: a KVM with a power board too), `upload` (images are carried through qKVM to it), `delete` (images can be deleted from it), `drops_input` (a mount or an unmount drops its keyboard and mouse for a moment), `where` ("proxmox": the images are on the storages of its node; "device": on the KVM's own storage; "qkvm": a server's, in the folder qKVM serves them from); and for a server `served_from` (the wall's address as its controller reaches it, or null where there is none). 403 `not_allowed` (a token); 404 `not_found`; 404 `no_virtual_media`; 409 `machine_changed` (the tile is at another machine than `target` names: nothing was asked of it, and its list, whose `listed` a change would carry, is not handed out); 502 `another_machine`; the device's |
 | `POST /api/v1/devices/{id}/media` | admin, a person | `image`* (an `id` as listed), `machine`* (the machine's name, as the confirmation named it), `listed` (`listed` of the `GET .../media` the image was picked from: the change is refused where the tile's machine is no longer that one, its tile edited to another address or another machine meanwhile; left out, as by a client before 0.3.2, it is not asked), `drive` (of the offer's `drives`; "cd", the default), `writable` (true: the machine may change what is on it; only for a drive of the offer's `writable`; false, the default), `boot` ("none", the default: its boot order is left as it is; "once": it is restarted now to start from the image, and its boot order is as before for every start after; "until_unmounted": it starts from the image from its next start until it is unmounted), `restart` (true: restart it now, with "until_unmounted"; "once" always restarts; on a machine that cannot be told to start from it, a KVM, with `boot` "none": its reset button, its power button where it is off, for its boot menu to find the drive). A restart of a virtual machine stops it at once and starts it again | the image is put in its drive, read-only: `ok`, `note` (null, or a sentence: a CD-ROM drive added where there was none, which a running guest has from its next start; how it starts), `mounted`. 409 `moved` (the tile's machine is not the one `listed` names any more: nothing was done, and nothing was asked of either machine); 409 `changed` (the machine is called otherwise now, the image is no longer listed, or its settings were changed on the device meanwhile: nothing was done); 409 `busy` (as for an action; with a restart also while somebody has its keyboard and mouse over a live line, with `by`); 409 `changed` also where another image is in a KVM's drive (unmount it first), or the image is not there whole; 409 `busy` where another image is in a server's drive; 409 `action_failed` (no CD-ROM drive and no place for one, a boot order the wall does not read; a KVM's File Sharing on, its drive offline; a KVM that did not mount it as asked, which has it taken out again; no address servers reach the wall at, a server's controller that takes HTTPS alone while the wall is reached over plain HTTP, another tool's boot override); 502 `action_failed` (a server's controller did not mount it: in its words); 422 `invalid` (a drive it has not got, writable where that is not offered, a way of starting it cannot do, a restart with `boot` "none" where it can be told to start from it, a restart where it has no power board); 504 `timeout` and 502 `dropped` (it may have been done); 502 `another_machine`; the device's. A refusal after the image was put in says so: `"mounted": true`. Every mount, and every start or restart from it, is in the activity log with the account, the machine, the image, the drive, and its SHA-256 where qKVM carried it there |
 | `POST /api/v1/devices/{id}/media/unmount` | admin, a person | `image`* (`image` of `mounted`, as the confirmation named it), `machine`*, `listed` (as for a mount) | the drive is emptied, and the boot order put back where it was set to start from the image from here: `ok`, `note` ("nothing was mounted"; or what is left of the boot order), `mounted` (null). 409 `moved` (as for a mount); 409 `changed` (another image is in the drive now, or the machine is called otherwise: nothing was taken out); 409 `busy`; 502 `another_machine`; the device's. In the activity log as a mount is |
 | `POST /api/v1/devices/{id}/media/upload?name=...&machine=...&listed=...` | admin, a person | the image itself as the body, its length said (`Content-Length`, 16 GB at the most); `name`* (what it is called on the device), `machine`* (as the confirmation named it), `listed` (as for a mount) | the image carried into the device's own storage (an offer with `upload`), streamed as it comes and hashed on its way, kept nowhere on the wall: `ok`, `image` (as `GET .../media` lists it: `id`, `name`, `where`, `size`, `partial`, `sha256`), `sha256`. 409 `moved` (as for a mount, before a byte is read); 409 `changed` (the machine is called otherwise); 409 `duplicate` (an image of that name is there); 409 `busy` (another upload to it under way, its drive busy); 411 `length_required`; 413 `too_large` (over 16 GB, refused before a byte is read); 422 `invalid` (a name of characters qKVM does not hand on, an empty body, a machine without uploads); 507 `no_space`; 400 `disconnected` (cut off, gone quiet for a minute) and 403 `stopped` (the account may no longer); the device's. What a refused or cut-off upload wrote is removed from the device, where it allows that; the answer says where it could not be. In the activity log with the account, the machine, the image, its size and its SHA-256 (one that failed: how much of it came) |
@@ -1044,11 +1711,15 @@ wherever something is written down; `locked`; and the device's own wherever a de
 | `GET /api/v1/tokens` | admin | | `tokens`: each `id`, `name`, `kind` ("api" or "display"), `role`, `devices` (ids, or null for all), `groups`, `created`, `expires` (null: never), `used` (null: not yet). Never the token itself |
 | `POST /api/v1/tokens` | admin | `name`*, `kind` ("api" default, "display"), `role` ("viewer" default, "operator"; never admin), `devices`, `groups`, `days` (1 to 3650; left out: until taken back) | 201 `token` (shown this once), `record` (as listed). 507 `not_saved` |
 | `DELETE /api/v1/tokens/{id}` | admin | | `ok`; a screen showing with it goes dark. 404 `not_found` |
-| `POST /api/v1/export` | admin, a person | `password`* (the account's own, again), `parts`* (of "devices", "actions", "alerts", "wall"), `passphrase` (10 characters or more: an encrypted file with the passwords in it; empty: a plain file without them) | the file as `application/json` with a `Content-Disposition` name (`qkvm-<date>.qkvm` or `.json`), and the header `X-QKVM-Not-Opened`: how many saved passwords or texts are not in it because they do not open any more. 401 `bad_password`; 422 `invalid`, `too_large` (more in the wall than a file holds); 503 `locked` |
-| `POST /api/v1/import/read` | admin, a person | `file`* (its text), `passphrase` (of an encrypted one) | what the file holds, changing nothing: `encrypted`, `secrets` (a plain file with passwords in it), `made` (seconds since 1970, 0 where it does not say), `program` (the version that wrote it), `devices` (null where the file has no such part; else each `name`, `host`, `kind`, `group`, `password` (whether one is in the file), `tls`, `open_url`, `new` (this wall would take it), `same_as` (the name of the tile here that is the same device, or empty)), `actions` (null, or each `name`, `kind`, `keys`, `text` (of the new ones; what a button will type is read before it is taken), `enter`, `danger`, `new`), `alerts` (null, or `enabled`, `address` (the file names one), `host` (of that address), `format`, `kinds`), `wall` (null, or `interval`, `update_check`), `left_out` (a sentence for each entry that did not pass). 422 `not_a_file`, `damaged`, `newer`, `passphrase_needed`, `wrong_passphrase`, `too_large` |
-| `POST /api/v1/import` | admin, a person | `file`*, `passphrase`, `take` (which parts, of the four; left out: the file is read and nothing is taken) | what was taken: `devices`, `actions` (how many were added), `alerts`, `wall` (whether they were replaced), `left_out`. 422 `not_a_file`, `damaged`, `newer`, `passphrase_needed`, `wrong_passphrase`, `too_large`; 503 `locked`; 507 `not_saved` |
+| `POST /api/v1/export` | admin, a person | `password`* (the account's own, again), `parts`* (of "devices", "actions", "alerts", "wall", and since 0.4.0 "signin": signing in through an identity provider, its client secret only in an encrypted file), `passphrase` (10 characters or more: an encrypted file with the passwords in it; empty: a plain file without them) | the file as `application/json` with a `Content-Disposition` name (`qkvm-<date>.qkvm` or `.json`), and the header `X-QKVM-Not-Opened`: how many saved passwords or texts are not in it because they do not open any more. 401 `bad_password`; 422 `invalid`, `too_large` (more in the wall than a file holds); 503 `locked` |
+| `POST /api/v1/import/read` | admin, a person | `file`* (its text), `passphrase` (of an encrypted one) | what the file holds, changing nothing: `encrypted`, `secrets` (a plain file with passwords in it), `made` (seconds since 1970, 0 where it does not say), `program` (the version that wrote it), `devices` (null where the file has no such part; else each `name`, `host`, `kind`, `group`, `password` (whether one is in the file), `tls`, `open_url`, `new` (this wall would take it), `same_as` (the name of the tile here that is the same device, or empty)), `actions` (null, or each `name`, `kind`, `keys`, `text` (of the new ones; what a button will type is read before it is taken), `enter`, `danger`, `new`), `alerts` (null, or `enabled`, `address` (the file names one), `host` (of that address), `format`, `kinds`, `destinations` (each `kind`, `name`, `host`, `private`; the first is the one `address`, `host` and `format` speak of)), `wall` (null, or `interval`, `update_check`), `signin` (since 0.4.0, there where the file has it: `enabled`, `name`, `issuer`, `client_id`, `password` (whether the client secret is in the file), `roles` (each `group` and the `role` it gives), `anyone`, `domain`, `private`), `left_out` (a sentence for each entry that did not pass). 422 `not_a_file`, `damaged`, `newer`, `passphrase_needed`, `wrong_passphrase`, `too_large` |
+| `POST /api/v1/import` | admin, a person | `file`*, `passphrase`, `take` (which parts, of the five; left out: the file is read and nothing is taken) | what was taken: `devices`, `actions` (how many were added), `alerts`, `wall` (whether they were replaced), `signin` (since 0.4.0, there where it was taken: true; it is taken in switched off), `left_out`. 422 `not_a_file`, `damaged`, `newer`, `passphrase_needed`, `wrong_passphrase`, `too_large`; 503 `locked`; 507 `not_saved` |
 | `GET /api/v1/audit?device=&limit=` | admin | | what the activity log says of one machine (the chapter [Activity log](#activity-log)): `device`* (its `id`; entries written before 0.2.0 named it only, and are found by the name it has now), `limit` (1 to 500, 100 left out; a number beyond either end is taken as that end). `entries` (newest first, at most `limit` of them), `more` (there are older ones than the last), `missing` (null; or `count`, `since` and `why`: entries the wall could not write, and so the log is not whole). Each entry: `time` (seconds since 1970), `event` (a word for what happened: `device_added`, `action`, `action_failed`, `alert`, `live_opened` and the rest; one not met is one added since), `user` (who did it: an account's name, or a token's followed by " (token)"; left out where the wall did it by itself, as an alert), `device` and `device_id` (the machine by its name at the time, and by its id: since 0.2.0); where its event has them, `action` (the action's name, as `POST .../actions` takes it), `error` and `note` (sentences: why it failed, and what else is to be known), `state` and `was` (an alert: the state the machine went into and the one it came from); and an alert of a [watched screen](#watching-a-screen) `watch` (`no_signal` or `unchanged`), `minutes`, `back` (true: it is over) and, where its picture was kept, `picture` (the stamp to ask for it by, below: digits) and `picture_at` (when the wall had that picture, in seconds since 1970). Whatever else an entry holds is as its event writes it. 503 `activity_unavailable` (the log could not be read in time: ask again in a moment); 503 `busy` (read in turns, as the history is: `Retry-After` says when). Without `device` (the whole log), with the log's other parameters, and its download, it is the page's own |
 | `GET /api/v1/devices/{id}/alert-picture/{stamp}` | admin | | the picture a screen alert of the machine kept, by the `picture` of the alert's entry (above): `image/jpeg` or `image/png`, with `Cache-Control: no-store`. Only the last alert's picture of each machine is kept, for 30 days, and it goes when the machine leaves the wall. 404 `not_found`; 404 `no_picture` (no longer kept, or never of this machine) |
+| `GET /api/v1/alerts` | admin | | how the wall tells of trouble (the chapter [Alerts](#alerts)): `enabled`, `has_webhook` (an address to send to is saved; it is never shown), `format` ("auto", "json", "ntfy", "slack", "discord"), `offline`, `no_signal`, `problem`, `recovered` (which changes are told), `link` (the wall's own address, for an alert to point at; empty: none), `paused_until` (seconds since 1970 while alerts are paused; else null), `last_sent` (when an alert last went out, or null), `last_error` (why the last one did not, a sentence, or null) |
+| `PUT /api/v1/alerts` | admin | `enabled`*, `webhook` (the address; left out or empty: the saved one is kept), `forget_webhook` (true: the saved one goes), `format`, `offline`, `no_signal`, `problem`, `recovered` (each true where left out), `link` (left out: as it is; empty: none), `private` (since 0.4.0: whether the address may be a private one; left out or null: as it is) | as `GET /api/v1/alerts` answers, as saved. 422 `invalid` (an address alerts are not sent to, a link that is no address of a wall: nothing was changed); 507 `not_saved` |
+| `POST /api/v1/alerts/pause` | admin | `minutes`* (0 to 10080; 0: send again from now) | as `GET /api/v1/alerts` answers. 507 `not_saved` |
+| `POST /api/v1/alerts/test` | admin | | a test alert, sent at once and tried once, to the saved address: as `GET /api/v1/alerts` answers. 409 `no_webhook` (no address is saved); 502 `not_delivered` (the message says what the other end answered) |
 
 ### A machine, as the wall lists it
 
@@ -1064,6 +1735,8 @@ In `devices` of `GET /api/v1/wall`:
 | `same_as` | other tiles that are the same machine under another address: each `id`, `name`, `host` |
 | `can` | what this tile can be asked, as words (below) |
 | `amt_view` | a PC with Intel AMT's only: which of its three views its tile is in, `health`, `stills` or `live` (`PUT .../view` changes it) |
+| `target` | the machine the tile is at (0.4.0): 32 hexadecimal digits, a mark of the address it is spoken to at and of what it is known by there, which an action and a live picture send back. It changes where an edit puts another machine under the tile, and where what qKVM knows of the machine grows (its certificate or its number first remembered); not with a new name or group. Nothing secret is in it, and nothing can be read out of it |
+| `open_in` | to an operator and an admin, where the machine has any (0.4.0): where else it is opened, by kind, `meshcentral` (the https address of its page on a MeshCentral), `rustdesk` (its RustDesk ID), `rdp` (its Remote Desktop host, and port where it is not 3389), as [Open in](#open-in) says. Plain links: nothing secret is in them |
 | to an admin only | `url`, `custom_open_url`, `username`, `tls` (`pinned`, `system`, `insecure`), `fingerprint`, `has_password`, `alerts`, `fingerbot_strength` (how hard a Fingerbot paired with the KVM presses: `firm` or `light`), `no_signal_minutes` and `unchanged_minutes` (its screen watched: [Watching a screen](#watching-a-screen); 0 is off). The password is never sent to anybody |
 
 **`can`** says what this machine can be asked: from its driver, and from what the wall last
@@ -1106,6 +1779,7 @@ guessed at.
 | Field | Is |
 |---|---|
 | `can` | as above, as of this look |
+| `target` | since 0.4.0: the machine this status was found at, as the tile's `target` in the wall says it. Where it is not the `target` of the tile as a client has it, the tile was pointed at another machine since the client fetched the wall: that status is not of the machine it shows, and the wall is fetched again |
 | `state` | `online`, `no_signal` (there, and its computer shows nothing; a server: switched off), `offline`, `auth` (it refuses the saved password), `error` (its certificate changed, it does not sign qKVM in, a server reports a critical fault, and the like: `error.code` says which), `busy` (a JetKVM whose one viewer is somebody else), `connecting` (nothing known yet) |
 | `error` | null, or `code` and `message` (the message fit to show) |
 | `last_seen_ago` | seconds since the device last answered; null: never |
@@ -1116,10 +1790,11 @@ guessed at.
 | `health` | `temp` (the KVM's own, or a server's hottest processor, in degrees Celsius), `cpu`, `mem` (percent) |
 | `about` | `model`, `version`, as the device says them |
 | `ports` | null, or `active` (counted from 0) and `list` (each `name`, `signal`) for a KVM with several inputs |
+| `several_inputs` | since 0.4.0, a KVM's: true where it has shown several inputs at the machine its tile is at, kept with the tile across restarts, locks and a certificate trusted anew, also while `ports` is null; let go of once its switch has said at every look for ten minutes that there is none, or when the tile is removed or pointed elsewhere (for an hour after that its switch is asked at every look); true also where qKVM cannot tell yet, until the KVM's switch answers (left out otherwise). Keys and text for it name their input ([Doing something](#doing-something)) |
 | `kind` | said by a JetKVM's and a server's status; a KVM's says neither this nor `picture` (the wall says both for every tile) |
 | `picture` | said by a server's status: false |
 
-Before the first look at a device there is only `can`, `state` (`connecting`), `error` and
+Before the first look at a device there is only `can`, `target`, `state` (`connecting`), `error` and
 `last_seen_ago`; while it cannot be reached, those with `error` filled in, and `kind` (and a server's
 `picture`) where the status says them at all. A server adds
 `screen` (a picture of its screen can be asked for), `console` (a signed-in way into its
@@ -1136,15 +1811,19 @@ A business PC with Intel AMT (`kind` `amt`) is said as a server is, with no temp
 or light (empty, or null), `screen` true where its screen can be had through its KVM (and
 `screen`, `keys`, `text`, `live` and `control` in its `can`), else false with `no_screen` saying
 why, and one more record in `server`, `amt`: `power` (the engine's own number for the power
-state, of which `server`'s `power` is the word), `control` (how the engine was set up: "none",
+state, of which `server`'s `power` is the word, but for *Shutting down*, which `server`'s `power`
+says from the moment the engine takes a shutdown of the wall's until the PC is seen off, while
+the engine itself says nothing of it), `control` (how the engine was set up: "none",
 "client", "admin", or null where it did not say), `kvm` ("enabled", "disabled", "mebx" where it
 was switched off in the PC's MEBx, "absent" on vPro Essentials, which has none, or null),
 `consent` (true where a KVM session needs the code the PC shows on its own screen, false, or
 null), `listener` (true where the engine's redirection listener is on, which its KVM is reached
 through; false, or null), `session_timeout` (the minutes after which the engine ends a KVM
 session, 0 for never, or null), `make`, `model`, `serial` and `bios` as the engine says them,
-`plain` (true where the wall reaches the engine over plain HTTP), and `view` (its tile's view, as
-`amt_view` above: in `health`, `screen` is false and `no_screen` says so, whatever the KVM is like).
+`plain` (true where the wall reaches the engine over plain HTTP), `view` (its tile's view, as
+`amt_view` above: in `health`, `screen` is false and `no_screen` says so, whatever the KVM is like),
+and `shutdown` (since 0.4.0: what may be the matter where a shutdown of the wall's has not come
+about three minutes after the engine took it; else null).
 
 A virtual machine on Proxmox VE (`kind` `proxmox`) is said as a server is: `state` `online` while it
 runs and `no_signal` while it is stopped, `atx.power` the same, no temperatures, fans or light,
@@ -1192,7 +1871,7 @@ selection, not from a view.
 | `text` | type text | `"text": "...", "enter": true` (up to 2000 characters, US keyboard layout; on a JetKVM, the layout it says its computer uses, and 422 `invalid` before anything is typed for a character that layout cannot type) | `text` |
 | `custom` | a saved action | `"custom_id": "..."`, and `"custom_changed"`: the action's `changed` as it was listed, refused with 409 `changed` if it was edited since, or edited or removed while it waited for what the last holder of the keyboard had down to be let go of (saved text is typed by people only: a token that types it could read it back off the screen) | `keys` or `text` |
 | `atx_power`, `atx_power_long` | press the power button, hold it; answered once the button is let go, and where it must switch the computer on (or off) once that is seen; the KVM's refusal (a 4xx) is 502 `action_failed`, anything else that is not its yes 504 `timeout` or 502 `dropped` (it may have pressed), after which a press of the board's (or a Fingerbot's) is 409 `busy` for eight seconds and the button's hold | | `power` |
-| `atx_reset` | press reset; an answer that is neither yes nor no as for the power button | | `reset` |
+| `atx_reset` | press reset; an answer that is neither yes nor no as for the power button; on a KVM with the kvmd interface answered once its screen is seen to change, and where it is not within twenty seconds, done with a `"note"` that says it was pressed and the restart not seen (see *Power* under [Using it](#using-it)) | | `reset` |
 | `fingerbot_power`, `fingerbot_power_long` | a Fingerbot presses the power button for half a second, or holds it for eight, as hard as the machine's `fingerbot_strength` says; answered once the KVM has said the Fingerbot took the press and the press's own time is over (some three and eleven seconds); the KVM's refusal ("Failed to click") is 502 `action_failed`, anything else that is not its yes 504 `timeout` or 502 `dropped` (it may have pressed), after which a press is 409 `busy` for as long as that one can last; 422 `invalid` where the KVM said no Fingerbot is paired | | `fingerbot` |
 | `power_on`, `power_off` | a server: switch on, or ask it to shut down; one that is so already is left alone and answers `"note": "already on"` or `"already off"` | | `power_state` |
 | `bios_setup` | start into the BIOS setup once, then switch on (if off) or restart (if on); 422 `invalid` with a `"batch"` (one machine at a time); 409 `action_failed` where another boot override, or a boot option that destroys data, is already set | `"watching": true` (as for any action: see below) | `bios_setup` |
@@ -1207,6 +1886,43 @@ The page asks before power, reset, a restart, and anything marked `danger`, and 
 anything sent to several machines: a program should do no less. One thing at a time per
 machine: while an action is on its way, a second one for the same machine is refused with
 409 `busy`, whoever sends it.
+
+**The machine it was asked for** (since 0.4.0). A tile keeps its `id` when an admin points
+it at another machine, so an action sent by the id alone goes to whatever the tile is at
+when it arrives. With `"target"`, the machine's `target` as the wall listed it when the
+question was asked (taken then, for a menu's button that acts at a click when the menu was
+drawn, and kept for as long as the question and a bulk run's turn take), it goes only to
+that machine: where an edit has put another machine under the tile meanwhile, it is
+refused with 409 `machine_changed`, and nothing is sent to either. The
+page sends it with every action, and on that refusal says so, shows the wall anew and sends
+nothing again by itself: a program should ask the person again too. Where what qKVM knows
+of the machine grows meanwhile (its certificate or its number first remembered), the mark
+changes as well, and the action is refused once. Left out, as by a script or a program
+before 0.4.0, it is not asked: the action goes to the machine the tile is at.
+
+**The computer on screen** (since 0.4.0). A KVM with several inputs types keys and text on
+the computer on screen, so they go with `"input"`, the status's `ports.active` as the person
+saw it (taken with `target`), by every action that sends keys: `keys`, `text`, `ctrl_alt_del`
+and a saved action. Right before they go, after any signing in, qKVM asks the KVM itself which
+input is on screen: not what its last look found. Where the KVM shows another, or does not say
+(its switch does not answer), they are refused with 409 `input_changed`, and nothing is sent.
+So a switch at the KVM's own buttons a moment before is no longer a way for them to reach the
+other computer, and the keys must leave within half a second of its answer or they are refused
+the same way (a KVM whose connections are all busy); a switch inside that half second still is. The
+status says `several_inputs` of such a KVM, also while `ports` is null: the page sends `input`
+with every keyboard action of it, and offers no keys, text or shortcuts while it cannot name
+the input. Where the status says neither `several_inputs` nor `ports`, a keyboard action goes
+with `"one_input": true` instead: the sender took the machine for one of a single input. It is
+refused the same way, with 409 `input_changed` and nothing sent, where qKVM knows the KVM has
+several inputs, or its switch, asked right before the keys go, answers anything but kvmd's own
+word that it has none within two seconds (stock kvmd's empty switch, a GL.iNet KVM's
+`UnavailableError`, its web server's 404); a machine
+with no inputs to choose from (a JetKVM, a PC with Intel AMT, a server, Proxmox, VNC) takes it
+as so. The page sends `input` or `one_input` with every keyboard action, never neither. Power,
+reset, a Fingerbot and the rest are the KVM's own and are not bound to an input (its board
+presses whatever it is wired to): neither is asked of them. Left out, as by a script or a
+program before 0.4.0, they are not asked, and the keys go to whichever computer is on screen,
+as before.
 
 ### Manners
 
@@ -1226,18 +1942,37 @@ whose plain address sends everybody on to HTTPS at the same host is refused 422 
 `use`, that address, which the page offers and nothing takes by itself; but for an edit with
 `force` that leaves its address, kind, certificate check, user name and password as they are,
 saved as any other),
-`devices/{id}/certificate`, `devices/{id}/trust`, `devices/{id}/kvm` (switching a PC's Intel AMT
-KVM on or off on its engine, `{"on": true}`; 409 `busy` with `by` as for an action), `discover`; `proxmox` (`proxmox/guests`, `{"url",
+`devices/{id}/certificate` and `devices/{id}/trust` (since 0.4.0 with `target` as for an action, in the address and in the
+body: 409 `machine_changed`, nothing shown or pinned, where the tile is at another machine by then), `devices/{id}/kvm` (switching a PC's Intel AMT
+KVM on or off on its engine, `{"on": true}`, and since 0.4.0 `target` as for an action: 409 `machine_changed`, nothing
+changed on either engine, where the tile is at another PC by then; 409 `busy` with `by` as for an action), `devices/{id}/open-in`
+(a machine's "Open in" links, `PUT` with `meshcentral`, `rustdesk` and `rdp`, all at once: one left out or empty is
+none of that kind; 422 `invalid` for one that is no such link, saying why; and since 0.4.0 `target` as for an action: 409
+`machine_changed`, nothing saved, where the tile is at another machine by then), `discover` (with `notes`: why a
+tailnet that is there was not asked); `netbird` (NetBird's management API, `{"url", "token", "private"}`, as
+[Over Tailscale or NetBird](#over-tailscale-or-netbird) says: its token is taken and never handed back); `proxmox` (`proxmox/guests`, `{"url",
 "username", "password"}`: the virtual machines an API token may see on a Proxmox, to pick from when
 adding them, and `named`, the one an address names by its ID); `actions` (saving one);
-`users`; `security`; `recovery`; `settings` (and `settings/media`, `{"folder", "address"}`: the folder of
-images for servers and the wall's address as their controllers reach it); `alerts`; `push` (the browsers told the alerts by Web
+`users`; `security`; `recovery`; `oidc` (signing in through an identity provider, as
+[Sign in with an identity provider](#sign-in-with-an-identity-provider) says: `oidc` itself, its settings, whose client
+secret is taken and never handed back; `oidc/logout`, which signs out every browser the provider signed in; and three that
+take nobody, `oidc/offer` for the sign-in page's button, `oidc/begin` for its press, and `oidc/callback`, the way back from
+the provider); `settings` (and `settings/media`, `{"folder", "address"}`: the folder of
+images for servers and the wall's address as their controllers reach it); `backups` (their settings; `backups/key`,
+which takes the admin's password and answers with a new backup key's recovery kit, that once and never again;
+`backups/run`, "Back up now"; `backups/verify`, which reads the latest whole, as [Backups](#backups) says); `alerts` beyond the four requests promised
+above (`alerts/destinations`, `alerts/destinations/{id}` and under it `test`, `log` and `secret`, the places alerts go,
+as [Alerts](#alerts) says; every
+address, key, token and password of one is taken and never handed back: a destination is shown by its host); `push` (the browsers told the alerts by Web
 Push, which takes any account, for its own: `push`, `push/key`, `push/{id}`, `push/{id}/test`, as
 [On a phone](#on-a-phone) says); `audit` (the activity log beyond one machine's, which is promised
 above: `q`, `kind`, `before`, `since`, `until` and `user`, the whole log without `device`, and
 `audit/export` to download it, as the chapter [Activity log](#activity-log) says); `metrics` (the token for
-`/metrics`); `update`. A program written against them is written against this version. Their
-codes are in `words.json` all the same.
+`/metrics`); `update`. And what two promised requests take beyond their rows: `big` of a picture
+(`GET .../snapshot?big=1`: it is for the large view, and a PC with Intel AMT holds a session open
+for it), and `take` sent to `import/read`, which is checked as for an import and not heard. A
+program written against them is written against this version. Their codes are in `words.json` all
+the same.
 
 ## Clients and versions
 
@@ -1267,9 +2002,56 @@ next, and says the same things the page says.
   reads it as it starts; another program is built from it, or checked against it when it is
   built, so that no two programs call one thing by two names. A test of qKVM's own fails when
   the page or a driver uses a word the file does not have.
-- **What the page does beyond this** (setting a wall up, its settings, accounts, alerts,
-  updates) is the page's own, listed at the end of [The API](#the-api): a program leaves
-  that to the page, in a browser.
+- **What the page does beyond this** (setting a wall up, its settings, accounts, the
+  browsers told the alerts by Web Push, updates) is the page's own, listed at the end of
+  [The API](#the-api): a program leaves that to the page, in a browser.
+
+### Checking a wall
+
+`qkvm.conformance` holds a running wall to the promise of [The API](#the-api) as a program
+meets it: every promised read, what each answer holds and the kind of each value, the
+refusals and their codes, the headers. It reads only. It sends nothing but GET, and so adds,
+changes and presses nothing, and opens no live line and no console; it asks each machine it
+reads for its history and one picture, as a tile of the page does, and with an operator's
+token what its KVM can wake. One machine of each kind is read, or every one with
+`--every-machine`; `--no-pictures` asks for no picture.
+
+```
+python -P -m qkvm.conformance https://192.168.1.20:8787 --token-file token.txt --cafile cert.pem
+```
+
+- **The token** is one for a script ([Scripts and wall screens](#scripts-and-wall-screens)),
+  a viewer's or an operator's, alone on the one line of a file of its own. It is sent to that
+  wall and nowhere else, and never written out. A token for the machines it may look at is
+  enough.
+- **The wall's certificate.** One that a public authority vouches for needs nothing more.
+  The one qKVM made itself is given with `--cafile` (`tls/cert.pem` in the wall's data folder,
+  copied to where the check runs), and the wall is reached by an address the certificate is
+  for: one qKVM listens on. There is no way to check without verifying it, since the token
+  would go to whoever answers. Over plain HTTP, the check says that the token crossed the
+  network unencrypted.
+- **Behind a proxy that signs people in** (a wall started with `--sso-header`), check the
+  wall's own address: through the proxy, `GET /api/v1/session` signs in whoever the proxy
+  names.
+- **What it says:** a line for each thing it looked at, `ok`, `FAIL` (what is not as
+  promised, by the field and its kind, never its value), `note` or `skip`, and at the end how
+  many of each. It exits 0 where the wall answered everything as promised, 1 where it did not,
+  and 2 where it could not check: the wall out of reach, its certificate not trusted, the
+  token not taken, the wall locked (started with `--locked-start`, and nobody has signed in
+  since), or older than 0.2.0.
+- **Versions.** It holds the wall to the promise as the copy of qKVM it is run from has it,
+  and to no more than the wall's own version promised: a request or a field promised since a
+  later version is not asked of it (`skip`), nor a code of its words that every request or
+  device may answer with since a later one; a field, a code or a word the wall added
+  since is a `note`. `--strict` makes those failures and expects all of it whatever the wall's
+  version: for a wall of the very same version, as qKVM's own tests run it against a wall with
+  a stand-in of every kind of machine.
+- **For a program's own tests** (the Desktop App's joint test with a wall, a phone app's):
+  run the check from the version of qKVM the program was written against (`pip install
+  qkvm==0.4.0` in an environment of its own is enough; it needs no wall of its own), against a
+  wall of every version the program is to work with, set up with machines and a token for a
+  script, and stop the release on any exit code but 0. A newer wall has to pass whole; against
+  an older one, what is skipped is what the program cannot ask there.
 
 ## Metrics
 
@@ -1418,7 +2200,8 @@ Who signed in, changed what, and did what to which machine: *Settings > Activity
 - **How much is kept:** 50 MB, in ten files of 5 MB. A busy wall (64 machines with alerts
   on, three people working at them: live views, keyboards taken, actions, sign-ins, some 1,200
   entries a day) writes about 190 kB a day: 50 MB is some nine months of it. An entry is 90 to
-  180 bytes; a live view is two, keyboard and mouse taken and given back two more. At the worst,
+  180 bytes (since 0.4.0 some 136 bytes more, its place in the chain: about five months then);
+  a live view is two, keyboard and mouse taken and given back two more. At the worst,
   64 machines whose state changes at every look of the alerts (every half minute) write some
   27 MB a day, and 50 MB is two days of that. The size is `activity_mb`
   (10 to 100000; nothing, or 0, is 50), read at the start. Change it with
@@ -1501,6 +2284,121 @@ Who signed in, changed what, and did what to which machine: *Settings > Activity
   (503 `activity_unavailable`: narrow it down). A read that waited asks again whether its asker
   may still have it (signed out, removed, or no longer an admin meanwhile: refused), and so does
   a download before each page.
+- **A chain that shows an edit (since 0.4.0).** Each line the wall writes carries, at its end,
+  its place in a chain: `"chain": {"n": 1234, "prev": "...", "mac": "..."}`. `n` counts the
+  lines from the first the log ever had. `prev` is the head of the chain before the line (64
+  hex digits), and `mac` signs the head after it (32 hex digits). The head after line `n` is
+  SHA-256 over, one after the other: the text `qkvm activity log link 1` and a line feed, the
+  head before it (32 bytes), `n` as 8 bytes (the highest first), and the SHA-256 of the line's
+  canonical form. The canonical form is the line's fields but `chain`, as JSON with the names
+  in the order of their characters (code points), no blanks, each character beyond ASCII as a
+  `\u` escape (two of them beyond `\uffff`), whole numbers in decimal and others in the shortest
+  form that reads back the same (`1763300000.123456`, `0.1`, `1e-07`), `true`, `false` and
+  `null`: what Python's `json.dumps(fields, sort_keys=True, separators=(",", ":"))` writes. So
+  a line hashes the same on every system and Python, in the files and in a download. `mac` is
+  the first 16 bytes of HMAC-SHA256 over the text `qkvm activity log mac 1`, a line feed and
+  the head, with the log's key. The writer does this as it writes, in its order, one line at
+  a time; a line cut off by a power cut is no line of the chain, and the log checks to its last
+  whole line. It costs some 136 bytes a line (a typical entry of 164 bytes becomes 300, so the
+  same `activity_mb` keeps some 45% fewer lines: about five months of the busy wall above, where
+  it was nine) and some 14 microseconds of the writer's time; nobody waits for it.
+- **The key** is made at the first start of 0.4.0 and kept in the wall's settings, which are
+  sealed with the vault key outside the data folder, never in the activity log and never in
+  the clear. The settings also keep where the chain had come to: the line and head of its last
+  seal, kept at each (at the start and the stop, every hour, the daily seal). Before its first
+  line the wall holds the files to that, and what it finds wrong there it says in a seal of its
+  own (`broken`), which every check counts as a problem.
+- **What is caught**, of somebody who edits the files or a copy of them and does not hold the
+  vault key: a line changed, taken out, moved or put in among chained lines; the log written
+  anew with the chain worked out again; the chain taken away from lines (to have them taken in
+  as an earlier version's: a later start says so), from all of it (a chain is begun again only
+  where the settings know of none), or from seals; lines put in where the wall did not stop;
+  the end cut off while the wall ran (its own last head), or while it was stopped (the settings
+  say where it had come to); the oldest file taken away without its seal.
+- **What is not caught:** somebody who holds the running wall, or the data folder together with
+  the vault key (as it comes, the vault key lies in a folder beside the data folder: whoever has
+  the whole disk has both). They can write the log anew and sign it, settings and all; only heads
+  kept elsewhere show that (below). Nor, without such heads: lines written after the last seal
+  the settings kept, cut off after a crash (an hour's at the most; a wall that stops as it should
+  keeps its stop seal); settings put back from an older copy together with a log cut back to it;
+  and lines put in after a stop seal while the wall was stopped, which look as an earlier
+  version's do (`qkvm --roll-back`): they are taken in at the next start, and every check says
+  so as lines not proved, never as plainly intact. A log put back from a backup without the
+  settings, or deleted, shows as broken: each start writes a seal that says so until the chain
+  is past the line the settings keep, and every check names those seals until the log lets
+  their file go as it grows (put back the settings and the log together, from one backup, and
+  the start finds them as they were).
+  The key stays the same for the life of the wall: a wall that goes back to 0.3.2 keeps it in
+  its settings, and a password reset does not touch it. A wall whose settings are lost and
+  made anew makes a new key, and its earlier lines then check as not signed by it.
+- **Seals** are lines of the chain written by the wall itself, `log_sealed` with `why`:
+  `genesis`, the first line of the chain, which takes in the lines an earlier version wrote as
+  they are (`before`: how many, numbered from the first line of the oldest file; `files`: the
+  line and head at the end of each of their files), so that they are checked as "from before
+  the chain" and never as broken; `start` and `stop`, as the wall begins and ends to serve
+  (`key`: what the key it signs with is known by, never the key); `hourly`, every hour in which
+  something was written; `pruned`, written just before the oldest file goes: the last line it
+  holds and the head after it (`to`, `head`), or of a file from before the chain how many lines
+  it holds (`let_go`), so that what the log lets go of as it grows is not missing; `unchained`,
+  lines without the chain that a start finds right after a stop seal (an earlier version ran in
+  between, `qkvm --roll-back`), none of them a seal, taken in as they are (`count`) and said as
+  not proved; `broken`, what a start found wrong (`said`; `held`: where the settings said the
+  chain had come to), always a problem; and `daily`, for the alert destinations below. A run
+  whose stop seal is missing (a crash, a power cut, the program killed) is said by a check, and
+  is not broken.
+- **Heads kept outside the wall.** Every line goes to syslog with its chain
+  (`--audit-syslog`): what a collector keeps is the head of every line. And an alert destination
+  with *Daily seal of the activity log* ticked (not offered for PagerDuty, where every event
+  opens an incident) is sent, ten minutes after each start and then once a day (within a pause
+  too; in its quiet hours, when they end), a message that is no trouble: `qKVM activity log seal: line N head H`,
+  through the alerts' own way out, with no secret in it and nothing of what the log says. With
+  those heads kept elsewhere, even a log written anew with the key shows.
+- **Check the log** (*Settings > Activity*, beside the downloads) reads the files through on the
+  wall (some 3 s for 50 MB), with the key, and against the head the wall wrote last and the place
+  its settings keep, in whatever order the lines are. It says
+  intact, with the first and last line and the head; or broken at line N, and what: a line not
+  as the wall wrote it (its signature does not match: changed, or written by somebody without
+  the key), lines missing, a line out of its order or there twice, a line put in without the
+  chain, lines from before the chain not as they were when it began, the oldest lines gone with
+  no seal saying they were let go, a seal that does not fit, the end cut off while the wall ran
+  or while it was stopped, and what a start found wrong. Intact means the lines are as the wall
+  wrote them. It cannot show an older copy of the whole data folder put back (the settings and
+  the log together, from a backup or a copy of the disk), which checks as the wall wrote it then:
+  only heads kept outside the wall show that (below).
+  One check at a time for the whole wall; the check itself is then a line of the log
+  (`log_checked`: who checked, whether it was intact, the last line and its head). Lines not
+  proved are said wherever the check is (`unproved`: how many, in its answer and its line):
+  such a log is intact only where it is chained, never plainly.
+- **Away from the wall:** `python -m qkvm.checklog FILE`, where `FILE` is the log's own files,
+  `audit.log.9` to `audit.log`, the oldest first, or a download as JSON lines (all of it: what a
+  search leaves out shows as missing; a table, CSV, cannot be checked). It reads them and
+  nothing else. Without a key it checks how the lines hang together; with `--key-file KEY`
+  each signature too (`python -m qkvm.checklog --save-key KEY --data-dir DATA` writes the key
+  into a new private file: whoever has it can write lines that check, so keep it as the vault
+  key is kept), or with `--data-dir DATA` the key is read from the wall's settings (with
+  `--vault-key-file` where the vault key is elsewhere), and the log is held to the place the
+  settings keep for its chain as well. `--heads FILE` holds the log to heads kept outside: lines
+  as syslog keeps them, the daily seal messages, or lines `N HEX`.
+  What is given is checked as the whole log: where the settings, or a head kept outside, name a
+  line after its last, lines were cut off its end, and it is broken, in whatever order its lines
+  are. A download ends where it was made, and the wall writes on: check it with `--part`. Lines
+  known to come after it are then said, and it is intact as far as it goes and not proved
+  complete (compare with when it was downloaded). Only you say that a file is a part: the order
+  of its lines never does. A log cut short shows in a part too once the wall has written after
+  it, as the numbers it gives again do not fit the heads kept, or are missing.
+  Intact cannot show an older copy of the whole data folder put back (the settings and the log
+  together), which checks as the wall wrote it then: only heads kept outside the wall show that.
+  `--json` says it as JSON (`part`, and `later`: the last line known to come after a part).
+  Exit status 0 intact; 1 broken; 2 could not check (a file that cannot be read, a CSV, a log
+  without the chain, a key that is not the log's); 3 intact where it is chained, with lines not
+  proved (taken in after the wall stopped, as above); 4 (`--part`) intact as far as it goes, and
+  not proved complete: lines are known to come after it. Where more than one holds, the first of
+  1, 4, 3 and 0: a part known to go on that holds lines not proved is 4 (what it says, and its
+  JSON, say both).
+- **The first start of 0.4.0** takes the log in once before its first line (some 3 s for
+  50 MB; what is done meanwhile waits in memory and is written right after). A 0.3.2 wall's
+  files and index are used as they are; the downloads keep their format, with `chain` added to
+  each entry (in the table, under `more`).
 - **For a program** (an admin's session; a token is never an admin): `GET /api/v1/audit` with
   `q` (words, any of them, in any case; several `q`), `kind` (`signin`, `action`, `change`,
   `alert`), `device` (a machine's id), `user` (an account's name, or a token's as the log
@@ -1509,7 +2407,12 @@ Who signed in, changed what, and did what to which machine: *Settings > Activity
   `limit` (1 to 500, 100 left out) answers `entries` (newest first, as written), `more`, and
   `missing` (entries that could not be written, or null). `GET /api/v1/audit/export` takes the
   same but `before` and `limit`, and `format` (`csv` or `jsonl`), and answers the file with its
-  `Content-Length`, or 503 `activity_unavailable` or `busy`, 507 `not_saved`. Of these, what is
+  `Content-Length`, or 503 `activity_unavailable` or `busy`, 507 `not_saved`. `POST
+  /api/v1/audit/check` checks the chain and answers `running`, `said` and `result` (`intact`,
+  `first`, `last`, `head`, `problems` with `line`, `what` and `said`, `notes`), or 202 with how
+  far it got where it takes longer than 20 s, or 409 `no_chain` where the wall writes its log
+  without the chain (its key could not be saved at the start: the log of qKVM says why); `GET
+  /api/v1/audit/check` answers the same, of the check under way or the last one. Of these, what is
   said of one machine (`GET /api/v1/audit` with `device` and `limit`, which the Desktop App reads) is
   promised in [The API](#the-api), with the picture of a screen alert; the rest is the page's own,
   and changes with it. `qkvm status` says how large the files and the index are.
@@ -1914,11 +2817,13 @@ A few things are worth knowing:
 
 A business PC with Intel vPro Enterprise has a management engine beside its processor
 (Intel AMT) that answers while the PC is off, asleep or hung. qKVM speaks WS-Management to
-it, as Intel's own tools do, and reads its screen through the engine's own KVM. **This is
-experimental**: it was built from Intel's published class reference and MeshCommander's
+it, as Intel's own tools do, and reads its screen through the engine's own KVM. It was built
+from Intel's published class reference and MeshCommander's
 published source (read to learn the redirection handshake, not copied), tried against a
 stand-in, and tried on one real machine, a business PC with a recent Intel AMT, set up by hand
-in admin control mode without user consent (see [Limits](#limits) for what exactly). Add a PC like
+in admin control mode without user consent (see [Limits](#limits) for what exactly), and since on
+five more business PCs, two walls at once, whose lessons are below (an engine that refuses a wall
+for a while, a shutdown that takes its time, one viewer at a time on the KVM). Add a PC like
 a KVM: type its address, with the engine's user name (`admin`, as it comes) and password, and
 qKVM recognises it. *Find KVMs on my network* finds such PCs as well.
 
@@ -1955,7 +2860,14 @@ What a PC's tile gives:
   slowly while the PC starts); its power cut, the screen went dark at once and the engine said
   "off" after 12 to 15 seconds. A shutdown is done once the engine has taken it: Windows then
   says "You're about to be signed out" for a minute and shuts down, and the tile says *Off*
-  about 80 seconds after the click. A reset is done once the engine has taken it too: the PC's
+  about 80 seconds after the click; until then it says *Shutting down* (the engine itself says
+  nothing of it), and *Shut down* pressed again meanwhile says it is shutting down already. The
+  engine offers no power cut while the operating system shuts down: *Hold power button* then
+  says that a shutdown is under way and sends nothing, and sends the cut where the engine offers
+  it. Where the PC is not off three minutes after, the tile says so: Windows may be installing
+  updates, or the operating system did not take the request (it needs Intel's management
+  service), and *Hold power button* is the way then. It says *Shutting down* for a quarter of
+  an hour at the most (somebody at the PC may have cancelled it). A reset is done once the engine has taken it too: the PC's
   power does not change, so there is nothing to see it by.
 - **No power cut while a KVM session is open.** The engine neither offers cutting the power
   (nor a power cycle) while somebody has its KVM or its serial console open, nor does it when
@@ -2049,8 +2961,13 @@ about it:
   shows the cached picture and says how old it is. Only while the machine is enlarged, or its
   live view is open, does qKVM hold a session open and ask it for what changed at a viewer's
   pace. A still is also taken at once when the tile first appears and after a power change is
-  seen. While another viewer (Intel's tools, say) has the KVM, the engine refuses a session,
-  and the tile says so; qKVM asks again every fifteen seconds (asking costs the engine nothing).
+  seen. **One viewer at a time:** while another viewer (another qKVM, Intel's or MeshCentral's
+  tools) has the KVM, the engine refuses a session (newer engines reset the connection, older
+  ones say so), and the tile says *In use by another viewer*, as a JetKVM's does, until a
+  session of its own gets in. qKVM asks the port again after fifteen seconds, then thirty, then
+  once a minute: each try is a connection to the small computer that is serving the other
+  viewer's screen. Meanwhile each look asks the engine, on its other port, whether its KVM is
+  still in use, and once it says it is not, the next try goes after the first fifteen seconds.
   A still that gives up waiting for its session (a slow engine: some forty seconds) closes the
   session it began, or, where its sign-in is on its way just then, closes it the moment it is
   open: it is not left open, and held, for a picture nobody takes.
@@ -2093,6 +3010,32 @@ setup with Serial over LAN asked for, a graphical BIOS sent the codes that clear
 nothing else. So nothing in this version shows it: no PC that writes text there was at hand.
 While a serial console is open, the engine does not cut the power either.
 
+**Setting a PC up for qKVM, in short.** qKVM uses an engine that is set up; it does not set
+one up (activate, or provision, it). That is done at the PC, or with Intel's tools or
+MeshCentral's, never from the wall.
+
+1. **At the PC, in the MEBx** (Ctrl+P as it starts, or the Intel AMT page of the BIOS setup on
+   some makes): set the MEBx password (the engine's `admin` account, which qKVM signs in with),
+   switch Intel AMT on, and its network access (*Activate Network Access*), with the network
+   settings (DHCP, or a fixed address) and a host name.
+2. **For its screen on the wall:** *KVM* on (it is, as it comes), and *User Consent* set to
+   *None*. That needs admin control mode, which setting it up in the MEBx gives (as do a USB
+   setup file and remote configuration with a certificate). A PC set up from inside its
+   operating system (host-based setup, as Intel's and MeshCentral's agents do by default) is in
+   client control mode: every KVM session then shows a six-digit code on the PC's own screen,
+   which qKVM cannot type, so its tile shows power and state, says why there is no screen, and
+   what to do (set it up again in admin control mode with consent off, or use a tool that asks
+   for the code while somebody at the PC reads it out). A PC with vPro Essentials has no KVM at
+   all, and its tile says so.
+3. **TLS.** Newer engines take only TLS from the network (16993, and 16995 for the screen).
+   An engine's own certificate is remembered on first contact, as a KVM's is; one from your
+   company's authority (remote configuration gives one) is checked against the authorities this
+   computer trusts, where that authority is among them, and nothing is remembered. qKVM speaks
+   to the plain port (16992) only where nothing listens on 16993, and the tile says so.
+4. **In qKVM:** add the PC by its address with `admin` and the MEBx password. Where its KVM is
+   switched off on the engine (a PC set up by hand comes so), an admin switches it on from its
+   enlarged tile.
+
 What the owner of such a PC sets up, and what qKVM does with it:
 
 - **Intel AMT is switched on in the MEBx** (Ctrl+P at boot, or the BIOS setup): a password
@@ -2129,9 +3072,22 @@ What the owner of such a PC sets up, and what qKVM does with it:
   never travels, a hash made with a nonce from the engine does, and it is only ever sent to
   the address the password was saved for, after the engine has asked for it. Over the plain
   port a weak password can still be guessed from what travels by whoever listens on the
-  network, which is one more reason for 16993. A password the engine refuses, on either port,
-  is left alone as every device's is (see [Servers](#servers)): a minute, five, a quarter of an
-  hour, then hourly. Intel AMT locks an account after a few wrong passwords.
+  network, which is one more reason for 16993.
+- **An engine that refuses this wall for a while.** Intel AMT refuses sign-ins from one address
+  for a while after failed ones, on both ports and whatever the password, and every try
+  meanwhile keeps it refusing: on real engines only a quarter of an hour without a try from
+  that address lifted it, while a wall at another address was let in with the same password.
+  So a plain no to a password the engine took before is answered once more, with the engine's
+  fresh challenge (one engine answered a right password so while another client was using it).
+  Refused again, the tile says that the engine refuses sign-ins from qKVM for now, not that the
+  password is wrong, and qKVM sends nothing for 16 minutes (its buttons say so and send nothing
+  either). A refusal after that wait is tried once more 90 seconds later (a real engine still
+  refused after the quiet, and let qKVM in 75 seconds later), and only a refusal then is taken for
+  a wrong password (*Login rejected*). A
+  password the engine refuses then (or one it never took) is left alone as every device's is (see
+  [Servers](#servers)): a minute, five, a quarter of an hour, then hourly. One computer is one
+  address: two walls on it, or a wall and Intel's or MeshCentral's tools, with a wrong password
+  in one of them keep the engine refusing the other as well.
 - **The account decides what works.** The engine's `admin` account can do everything here. An
   account of your own needs the realms for remote control (the power buttons), the hardware
   asset information and the general settings (the name), and for the screen the redirection
@@ -2250,6 +3206,44 @@ An iDRAC's own VNC server (iDRAC Enterprise, port 5901 where it is switched on i
 VNC password set there) is a VNC server like any other: type `vncs://` where its SSL encryption is
 on. That was built from Dell's documentation and has not been tried: whether that encryption is TLS
 from the first byte, as `vncs://` speaks it, has not been seen.
+
+### No KVM in front of it? A VNC server
+
+A KVM shows a machine's screen from the moment it is switched on: its firmware setup, its boot
+menu, a system that does not start. Where none of that is needed, and the machine only has to be
+seen and used while its operating system runs (a desktop in an office, a test machine, a virtual
+machine whose hypervisor gives it no console qKVM reads), a VNC server on the machine itself is
+enough, and costs nothing. What it cannot do: it is a program of the operating system, so it is
+not there before the system has started, nor once it has hung or shut down, and it has no power
+button. A machine that has to be switched on, or seen while it starts, wants a KVM, its own
+controller or Intel AMT.
+
+Running one safely:
+
+- **On your own network only.** Have the server listen on the machine's address in the LAN, or
+  in a tailnet (Tailscale) or a VPN, and not on every address it has; and have the machine's
+  firewall let its port (5900, or 5901) in from the wall's address, or from that network, alone.
+  Never forward the port to the internet, nor open it there: VNC servers on the internet are
+  found by scanners, and their passwords tried.
+- **A password of its own.** Set a VNC password that is used for nothing else (VNC
+  authentication reads its first eight characters only: see above), and give that one to the
+  wall. A view-only password, or the server's view-only mode, takes keys and does nothing with
+  them: leave it off where the wall is to type.
+- **Encryption where the server offers it.** Plain VNC sends the pictures and the keys in the
+  clear, and its password's answer can be tried against at leisure. A server that speaks TLS
+  from the first byte is added with `vncs://`, and its certificate is remembered. Where a server
+  encrypts only in a way qKVM does not speak (VeNCrypt, or a maker's own), carry the line in a
+  tailnet or an SSH tunnel instead, with the server listening only where that ends (on the
+  machine itself, for an SSH tunnel to it).
+- **Say so to whoever sits there.** Where people work at the machine, use the server's setting
+  that shows them, or asks them, when somebody connects, where it has one and that suits the
+  place.
+- **Keep it up to date**, as any program that listens on the network.
+
+On Windows, TigerVNC, TightVNC or RealVNC run as a service; on Linux, x11vnc shows the desktop
+that is on the screen and TigerVNC's server a desktop of its own. Of these, only TigerVNC's
+server has been tried with qKVM (above). Then add it as the start of this chapter says: qKVM
+already shows VNC servers, on a tile, enlarged and live with keyboard and mouse.
 
 ## Proxmox and virtual machines
 
@@ -2443,6 +3437,301 @@ a VM's settings has the same line, and its *VNC Password* is that `passwd`.
 **XCP-ng** (and Citrix Hypervisor) is not on the wall: its consoles speak VNC's protocol behind an
 HTTP request of their own, with a session; that door is not built.
 
+## Over Tailscale or NetBird
+
+A tailnet (Tailscale's, or a NetBird network) lets the wall reach KVMs wherever they are, and lets people reach the
+wall, with no port open to the internet. qKVM talks to each device directly over it, as on a local network; nothing goes
+through anyone's cloud but the tailnet's own coordination. qKVM never logs, shows back or exports a key or a token of a
+tailnet.
+
+### Finding KVMs on a tailnet
+
+*Find KVMs on my network* asks the machines of the tailnet as well as this computer's own network:
+
+- **Tailscale:** the machines Tailscale says are online, by its command (`tailscale status --json`) where it is
+  installed, and where it is not (qKVM in a container beside Tailscale's) by Tailscale's local API, over its socket on
+  this computer (`/var/run/tailscale/tailscaled.sock`): never over a network, and only a socket that is one and is
+  root's or qKVM's own account's. On Windows the local API (a named pipe) is never asked; the command is.
+- **NetBird:** the machines its client lists (`netbird status --json`) where it is installed; where it is not (qKVM in
+  a container beside NetBird's), the connected machines its management API lists, once an admin has given that API's
+  address and a token under *Settings > Network > NetBird* (see [qKVM in Docker beside NetBird](#qkvm-in-docker-beside-netbird)).
+
+Only addresses of the shared space both give out (100.64.0.0/10) are asked, 256 machines at the most, and what is found
+is a suggestion: nothing is added to the wall but what you tick. Where a tailnet is there and could not be asked (its
+local API said no, the token was not taken), the search says why under its result, and is made without it.
+
+### Only the wall reaches the KVMs
+
+A tailnet lets every machine in it reach every other until its access rules say otherwise. Give the KVMs and the wall
+tags of their own, and let only the wall reach the KVMs:
+
+- **A GL.iNet Comet** has a Tailscale client of its own: switch it on in the Comet's own web page and sign it in with an
+  auth key tagged `tag:kvm`. Any other KVM or server's controller is reached through a machine of the tailnet that routes
+  to its network (a subnet router), or is added by its address on the network where the wall is.
+- **The wall** is tagged `tag:qkvm` (the auth key of the Compose file below, or `tailscale up --advertise-tags=tag:qkvm`).
+- **Tailscale's access rules** (the admin console, *Access controls*), in place of the default rule that lets everybody
+  reach everything:
+
+```
+{
+  "tagOwners": {
+    "tag:kvm":  ["autogroup:admin"],
+    "tag:qkvm": ["autogroup:admin"]
+  },
+  "acls": [
+    // The wall reaches the KVMs, on every port their video and control use; nobody else does.
+    {"action": "accept", "src": ["tag:qkvm"], "dst": ["tag:kvm:*"]},
+    // People reach the wall, and nothing else of it.
+    {"action": "accept", "src": ["autogroup:member"], "dst": ["tag:qkvm:8787"]}
+  ]
+}
+```
+
+- **NetBird** does the same with groups and policies in its dashboard: a group for the KVMs and one for the wall, a
+  policy from the wall's group to the KVMs' group, one from your team's group to the wall on TCP port 8787, and the
+  policy "Default" (everybody to everybody) taken away.
+
+On the wall's side, `--allow-from` answers only the addresses it names (and this computer) and turns everybody else away
+before there is a sign-in page to guess at: `--allow-from 100.64.0.0/10` for the tailnet only (see
+[How it is protected](#how-it-is-protected)). On a plain install, `--bind tailscale` listens on the tailnet's address
+and on this computer, and nowhere else.
+
+### Names on the tailnet
+
+Tailscale's MagicDNS names every machine: the wall is `qkvm` to the tailnet, or in full `qkvm.<your tailnet>.ts.net`.
+qKVM answers every name under ts.net as its own without more settings (a name of a public domain has to be in
+`allowed_hosts`). A KVM can be added by its MagicDNS name where this computer resolves those names (a plain install
+with MagicDNS on); in a container, add it by its tailnet address (100.x.y.z). Either way its certificate is remembered
+the first time, as for any KVM.
+
+### A certificate browsers trust: `--tls-tailscale`
+
+Started with `--tls-tailscale`, qKVM serves HTTPS, and to whoever opens it at its tailnet name
+(`https://qkvm.<your tailnet>.ts.net:8787/`) it shows Tailscale's certificate for that name, which browsers trust: no
+warning to click through. Every other name and address is shown the wall's own certificate (or `--tls-cert`'s), as
+before.
+
+- Switch on *HTTPS Certificates* in Tailscale's admin console (*DNS*). The machine's name and the tailnet's are then
+  written into the public logs of certificates (Certificate Transparency), as Tailscale says as you switch it on.
+- qKVM asks Tailscale on this computer for the name and the certificate (its command, or its local API in a container),
+  checks that it is one key and its certificate, for that name, in its time, keeps a copy in the data folder
+  (`tls/tailscale.pem`, its own account's alone) and serves it. It asks again every six hours (Tailscale renews it some
+  thirty days before it ends), every hour in its last two weeks, and soon after a failure; a new one is served from the
+  next connection on, without a restart.
+- The start says which it serves (`https://qkvm.<your tailnet>.ts.net:8787/ with Tailscale's certificate for that name,
+  until ...`, or why there is none yet, and that the wall's own is served meanwhile), and so does *Settings > Network*.
+- Where qKVM does not run as root, Tailscale on Linux hands the certificate only to an account named in tailscaled's
+  environment: `TS_PERMIT_CERT_UID=qkvm` (the account's name or number; for a service, `sudo systemctl edit tailscaled`
+  and `Environment=TS_PERMIT_CERT_UID=qkvm` under `[Service]`). The Compose file below sets it for the image's account,
+  10001. On Windows and macOS the account signed in to Tailscale may ask.
+
+**Never Funnel.** Tailscale's Funnel puts a service of a machine on the internet, for anybody, under the same name and
+certificate. The wall holds the passwords of KVMs and can press the power buttons of servers: it is for your tailnet,
+not the internet. qKVM never switches Funnel on, nor anything else of Tailscale's; do not put it behind Funnel yourself.
+
+### qKVM in Docker beside Tailscale
+
+[`docker-compose.tailscale.yml`](https://github.com/qkvm/qkvm/blob/main/docker-compose.tailscale.yml) runs Tailscale's
+container and qKVM's in its network, with the socket of Tailscale's local API mounted into qKVM's read-only:
+
+1. Make an auth key in Tailscale's admin console (*Settings > Keys*), tagged `tag:qkvm`.
+2. Put it in a file called `.env` beside the Compose file: `TS_AUTHKEY=tskey-auth-...`. It is needed for the first start
+   only; take it out afterwards (the machine's identity is kept in the volume `tailscale-state`).
+3. `docker compose -f docker-compose.tailscale.yml up -d`, and open `https://qkvm.<your tailnet>.ts.net:8787/` with the
+   setup code from `docker compose -f docker-compose.tailscale.yml logs qkvm`.
+
+```yaml
+# qKVM beside Tailscale, in containers:   docker compose -f docker-compose.tailscale.yml up -d
+#
+# Tailscale's own container joins your tailnet as the machine "qkvm", and qKVM's container shares its network: the wall
+# is reached at https://qkvm.<your tailnet>.ts.net:8787/ with Tailscale's certificate for that name (--tls-tailscale,
+# once HTTPS certificates are on in the tailnet), reaches the KVMs over the tailnet, and "Find KVMs" lists the tailnet's
+# machines, read from Tailscale's local API over its socket, which is mounted into qKVM's container read-only.
+# Nothing is published on this machine's own network: only the tailnet reaches the wall. Never use Funnel for it.
+#
+# The auth key: make one in Tailscale's admin console (Settings > Keys), tagged (tag:qkvm, see the guide's chapter
+# "Over Tailscale or NetBird" for the access rules), and put it in a file called .env beside this one:
+#     TS_AUTHKEY=tskey-auth-...
+# It is not written in here, and is needed for the first start only: the machine's identity is kept in the volume
+# tailscale-state, and the key can be taken out of .env then. Without one, `docker compose logs tailscale` shows an
+# address to sign the machine in at instead.
+#
+# First run: choose a password at the address above, with the setup code from `docker compose -f
+# docker-compose.tailscale.yml logs qkvm`.
+services:
+  tailscale:
+    # Tailscale v1.104.7, pinned by the digest of its image for every platform (the guide says how to move it on).
+    image: tailscale/tailscale:v1.104.7@sha256:72c1e19e0aedca96b8533bbb0b4368564410ff20b17e53b804eb6c1f04a31be4
+    container_name: qkvm-tailscale
+    hostname: qkvm
+    restart: unless-stopped
+    environment:
+      TS_AUTHKEY: ${TS_AUTHKEY:-}
+      TS_HOSTNAME: qkvm
+      TS_STATE_DIR: /var/lib/tailscale
+      # Where qKVM looks for Tailscale's local API (the place tailscaled keeps it on Linux).
+      TS_SOCKET: /var/run/tailscale/tailscaled.sock
+      # The tailnet as a network of this container's own (not a proxy): qKVM reaches the KVMs through it.
+      TS_USERSPACE: "false"
+      # qKVM runs as uid 10001: it may ask for this machine's certificate, and for nothing else that changes anything.
+      TS_PERMIT_CERT_UID: "10001"
+    volumes:
+      - tailscale-state:/var/lib/tailscale
+      - tailscale-socket:/var/run/tailscale
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    # To reach the wall from this machine's own network as well (it is the tailnet only without this):
+    # ports:
+    #   - "8787:8787"
+
+  qkvm:
+    image: qkvm/qkvm
+    container_name: qkvm
+    restart: unless-stopped
+    network_mode: service:tailscale
+    depends_on:
+      - tailscale
+    volumes:
+      - qkvm-data:/data
+      - qkvm-keys:/keys
+      - tailscale-socket:/var/run/tailscale:ro
+    command: ["--https", "--setup-code", "--tls-tailscale"]
+    #
+    # /keys holds the independent server storage key. Back up this volume separately
+    # from /data. Losing it prevents recovery; account recovery codes cannot replace it.
+    # Run with as little as it needs.
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
+
+volumes:
+  qkvm-data:
+  qkvm-keys:
+  tailscale-state:
+  tailscale-socket:
+```
+
+### qKVM in Docker beside NetBird
+
+[`docker-compose.netbird.yml`](https://github.com/qkvm/qkvm/blob/main/docker-compose.netbird.yml) runs NetBird's
+container and qKVM's in its network. NetBird's own client speaks to its container only, so qKVM asks NetBird's
+management API for the network's machines instead:
+
+1. Make a setup key in NetBird's dashboard (*Setup Keys*) and put it in a file called `.env` beside the Compose file:
+   `NB_SETUP_KEY=...`, and `NB_MANAGEMENT_URL=...` where you run NetBird's management yourself.
+2. `docker compose -f docker-compose.netbird.yml up -d`, and open the wall at its NetBird address with the setup code
+   from `docker compose -f docker-compose.netbird.yml logs qkvm`.
+3. In NetBird's dashboard (*Team > Service Users*), make a service user that may see the peers, and a token for it. In
+   qKVM, *Settings > Network > NetBird > Set up*: the management API's address (`https://api.netbird.io` for NetBird's
+   own) and the token. qKVM asks the API once before it saves them, and says how many connected machines it lists.
+
+The token is kept encrypted in qKVM's vault and never shown again; it is sent to the address it was entered for and to
+no other (another address asks for it again), over HTTPS only, by the same outbound rules as alerts (a management API
+on your own network takes its switch *May be a private address*). It is in no export, and resetting the accounts
+(`--reset-password`) forgets it. The activity log says when the settings changed (`netbird_changed`), never the token.
+
+```yaml
+# qKVM beside NetBird, in containers:   docker compose -f docker-compose.netbird.yml up -d
+#
+# NetBird's own container joins your NetBird network as the machine "qkvm", and qKVM's container shares its network:
+# the wall is reached at its NetBird address (https://<its 100.x address>:8787/), and reaches the KVMs over NetBird.
+# Nothing is published on this machine's own network: only the NetBird network reaches the wall.
+#
+# The setup key: make one in NetBird's dashboard (Setup Keys), and put it in a file called .env beside this one:
+#     NB_SETUP_KEY=...
+# Where you run NetBird's management yourself, its address as well:
+#     NB_MANAGEMENT_URL=https://netbird.example.org
+# Neither is written in here. The key is needed for the first start only: the machine's identity is kept in the
+# volumes netbird-config and netbird-state, and the key can be taken out of .env then.
+#
+# "Find KVMs" lists the NetBird network's machines once qKVM is given NetBird's management API and a token of a service
+# user, under Settings > Network: the token is kept encrypted in qKVM's vault and never shown again (see the guide's
+# chapter "Over Tailscale or NetBird").
+#
+# First run: choose a password at the address above, with the setup code from `docker compose -f
+# docker-compose.netbird.yml logs qkvm`.
+services:
+  netbird:
+    # NetBird 0.83.1, pinned by the digest of its image for every platform (the guide says how to move it on).
+    image: netbirdio/netbird:0.83.1@sha256:3c9d68ae8b730aaed841ff5374e3efad8be550099871a52b1a653d30e5f4faf2
+    container_name: qkvm-netbird
+    hostname: qkvm
+    restart: unless-stopped
+    environment:
+      NB_SETUP_KEY: ${NB_SETUP_KEY:-}
+      NB_MANAGEMENT_URL: ${NB_MANAGEMENT_URL:-https://api.netbird.io}
+    volumes:
+      - netbird-config:/etc/netbird
+      - netbird-state:/var/lib/netbird
+    cap_add:
+      - NET_ADMIN
+      - SYS_ADMIN
+      - SYS_RESOURCE
+    # To reach the wall from this machine's own network as well (it is the NetBird network only without this):
+    # ports:
+    #   - "8787:8787"
+
+  qkvm:
+    image: qkvm/qkvm
+    container_name: qkvm
+    restart: unless-stopped
+    network_mode: service:netbird
+    depends_on:
+      - netbird
+    volumes:
+      - qkvm-data:/data
+      - qkvm-keys:/keys
+    command: ["--https", "--setup-code"]
+    #
+    # /keys holds the independent server storage key. Back up this volume separately
+    # from /data. Losing it prevents recovery; account recovery codes cannot replace it.
+    # Run with as little as it needs.
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
+
+volumes:
+  qkvm-data:
+  qkvm-keys:
+  netbird-config:
+  netbird-state:
+```
+
+**The images beside qKVM's are pinned.** Tailscale's and NetBird's containers hold this machine's identity in the tailnet
+and hand qKVM the key of its certificate, so each file names the image it was written with by its digest (the version is
+its tag, and the comment above it), never by whatever `stable` or `latest` points to the day it is pulled. To move one
+on, look up the digest of the newer version, for every platform at once, and put the version and the digest in its place:
+
+```
+docker buildx imagetools inspect tailscale/tailscale:<version>    # its first "Digest:" line
+docker buildx imagetools inspect netbirdio/netbird:<version>
+```
+
+then `docker compose -f <the file> up -d`. Release notes are on Tailscale's and NetBird's own pages. qKVM's own image is
+taken as `docker-compose.yml` takes it, and updated with `docker compose -f <the file> pull qkvm` as described in
+[Run it](#run-it).
+
 ## How it is protected
 
 - **No account's password is stored.** Each account's password derives (scrypt) a key that
@@ -2468,6 +3757,9 @@ HTTP request of their own, with a session; that door is not built.
     and the recovery key, so the first account can be created again. The saved KVM passwords
     were encrypted for those accounts, so they are erased and must be entered again; the
     list of KVMs and the other settings stay.
+- **Signing in through an identity provider** holds its ID token to every rule of OpenID
+  Connect before anybody is let in on it, and keeps one admin who signs in here: see
+  [Sign in with an identity provider](#sign-in-with-an-identity-provider).
 - **Sign-in** uses an HttpOnly, SameSite=Strict session cookie. Repeated wrong passwords lock
   the address they come from out for 30 seconds, doubling up to 15 minutes. Signing in to one
   account does not forgive guesses made at another, and the addresses of one IPv6 network
@@ -2531,7 +3823,8 @@ HTTP request of their own, with a session; that door is not built.
   through an edit of the rest of the tile, until it is written again.
 - **HTTPS** for qKVM itself is one checkbox (a certificate is made on this computer; its
   fingerprint is shown so you can check the browser's warning). Turn it on whenever qKVM
-  listens on the local network. Tailscale already encrypts its traffic.
+  listens on the local network. Tailscale already encrypts its traffic, and `--tls-tailscale` gives the wall a
+  certificate browsers trust for its tailnet name (see [Over Tailscale or NetBird](#over-tailscale-or-netbird)).
 - Every change must come from qKVM's own page (cross-site requests are refused), the page
   runs under a strict Content-Security-Policy, and requests for unknown host names are rejected.
 - **Nobody holds a connection for nothing.** One that has not sent a whole request within 20
@@ -2605,7 +3898,12 @@ HTTP request of their own, with a session; that door is not built.
   now: it was started with `--locked-start` and nobody has signed in since, or it has not
   been signed in to once since it was set up or its key was changed. It is running, and
   until somebody signs in it cannot reach a single device, so nothing is watched and no
-  alert is sent. Have whatever monitors qKVM tell you about it.
+  alert is sent. Have whatever monitors qKVM tell you about it. `"video": "unavailable"`, there
+  only then, means that no picture can be made on this computer: the last video worker that was
+  to start could not, and none has since (one that only took longer than 15 seconds to start, as a
+  computer under load can, counts only when three do so in a row). The tiles whose pictures qKVM makes itself (JetKVMs,
+  servers, PCs with Intel AMT, VNC servers, Proxmox guests) say why (`no_video`), and so does
+  `qkvm.log`, once.
 - **Carrying on after a restart:** qKVM opens the saved device passwords itself at start, and
   goes on watching, alerting and answering a collector without anybody signing in. A browser
   that signed in with *Keep this browser signed in for 30 days* stays signed in across the
@@ -2624,7 +3922,9 @@ HTTP request of their own, with a session; that door is not built.
     storage key to load settings; a user's password alone cannot open a copied data folder.
 
   Switching this runtime policy does not revoke old backups or rotate device credentials.
-- **Backup and restore:** back up the data directory and the server storage key **separately**.
+- **Backup and restore:** *Settings > Backups* makes an encrypted backup of the whole wall every day, which
+  restores with its recovery kit alone: see [Backups](#backups). To copy the folder by hand instead,
+  back up the data directory and the server storage key **separately**.
   Stop the server for a consistent backup including history and audit databases, or use a
   filesystem/database backup mechanism that preserves their transactional state. Restore the
   data and matching key privately, select the key with `--vault-key-file`, and run
@@ -2636,6 +3936,11 @@ HTTP request of their own, with a session; that door is not built.
   an hour with a picture a second each: about 40 % of one processor core and 130 MB of memory,
   steady. Each tile that is being looked at costs the KVM one picture a second and qKVM
   little; a JetKVM costs more (see [JetKVM](#jetkvm)). Nothing is known yet about hundreds.
+- **Memory on Linux:** with glibc, every wall of 0.4.0 keeps malloc to two arenas and a trim threshold
+  of 131072 bytes (as `MALLOC_ARENA_MAX=2` and `MALLOC_TRIM_THRESHOLD_=131072` say), however it came to
+  0.4.0: pip, the service, the image, or an update from inside the app. Memory it frees piles up more
+  slowly over the days. Set either yourself (the unit's `Environment=`, `docker run -e`, or
+  `GLIBC_TUNABLES`) and qKVM keeps yours.
 - **Settings file:** every change is written atomically, and a second copy of what was just
   saved is kept as `qkvm.bak` next to it. If `qkvm.json` is ever unreadable or gone (storage damage
   or a start that was cut off), qKVM starts from that copy, sets a damaged file aside
@@ -2702,16 +4007,22 @@ HTTP request of their own, with a session; that door is not built.
   then add `LoadCredential=qkvm-unlock:/etc/qkvm/unlock.key` under `[Service]`, and
   ` --unlock-file %d/qkvm-unlock` to the end of the `ExecStart` line. Sign in once, and from
   the next restart on it is this key that opens the saved passwords.
-- **Start it with Windows:** one way is a task that runs at log-on:
+- **Start it with Windows:** one way is a task that runs at log-on, made in PowerShell:
 
   ```
   schtasks /Create /TN "qKVM" /SC ONLOGON /RL LIMITED /TR "pythonw -P -m qkvm"
+  Set-ScheduledTask -TaskName qKVM -Settings (New-ScheduledTaskSettingsSet -ExecutionTimeLimit 0 -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries)
   ```
+
+  The second line keeps Windows from stopping it: a task made with `schtasks` alone is ended
+  after three days, and on a laptop as soon as it runs on its battery.
 
   qKVM comes up watching; a browser shows screens once someone has signed in there. Started this way there is
   no terminal: what it would say there is in `qkvm.log` in the data folder (the setup code
   too, where it was started with `--setup-code`), and it is stopped with `qkvm stop` from
-  any terminal.
+  any terminal. Started as a Windows service, by a task that runs whether anybody is signed in
+  or not, or over SSH, qKVM shows pictures as well since 0.4.0; before, it could make none there
+  (each video worker is given a desktop of its own now: see [SECURITY.md](SECURITY.md#native-video-isolation)).
 
 ## Updates
 
@@ -2761,6 +4072,40 @@ for your password again.
   can be downloaded again, no settings (without it qKVM starts the version pip installed).
 - **A container is updated by replacing its image**, not from inside: the app tells you when
   there is a new one.
+- **Each release lists what it brings in** (0.4.0 on), in `qkvm-<version>-sbom.cdx.json` beside
+  its other files on GitHub: an SBOM in CycloneDX 1.5 of every library that installing the
+  version brings in, for each Python and system it is built for (the libraries its signed list
+  names), with each one's version, licence where its metadata says it, a package URL
+  (`pkg:pypi/...`) and the SHA-256 of its wheels. `SHA256SUMS` lists it, and `SHA256SUMS.sig`
+  signs that list. To check a copy you downloaded, put `SHA256SUMS` and `SHA256SUMS.sig` beside
+  it and run, where qKVM is installed,
+  `python -m qkvm.release verify --signed SHA256SUMS qkvm-<version>-sbom.cdx.json`: it checks the
+  signature with the publisher's key built into qKVM, and the file's checksum. (The container
+  image carries an SBOM of its own; see [Security](SECURITY.md#checking-what-you-install).)
+
+### Which versions get fixes
+
+- **Before 1.0, only the newest release gets fixes**, security fixes too: they come as the next
+  release (0.4.1, 0.4.2, or 0.5.0), and nothing is carried back to an older line, so that the
+  program can move fast. An older release gets none: update (it is made to be easy, below).
+- **Long-term support starts with 1.0**: from then on some minor versions are kept with
+  security fixes for a stated time while newer ones come out, as large projects keep their
+  long-term-support releases. Which ones, and for how long, is said here when 1.0 comes.
+- **A security fix is announced** by a GitHub security advisory on
+  [qkvm/qkvm](https://github.com/qkvm/qkvm/security/advisories) (with a CVE where one is
+  given), a *Security* part in its version's chapter of CHANGELOG.md, and the release itself,
+  which every wall that checks for updates shows with its **Update** button. Watch the
+  repository's releases or advisories on GitHub to hear of them without a wall.
+- **An update works from every release of the minor version before it** and of its own: in
+  place, with pip or by a new image (to 0.4.x: from 0.3.0 on). From an older release, go to the
+  newest release of each minor version between first (from 0.2.2: to 0.3.2, then on). What
+  those releases saved (settings, the vault, exports) is carried over by the program itself,
+  and a test opens a data folder made by the newest release of the minor version before.
+- **Going back to the release an update came from** (by itself, where the new version does not
+  start, or with `qkvm --roll-back`) finds what that release saved. What only the newer version
+  has (a second alert destination, say) it does not see.
+
+There is no promise of a response time; see [Security](SECURITY.md) for how to report a problem.
 
 ### From 0.1.x to 0.2.0, and back
 
@@ -2927,7 +4272,12 @@ app says there is nothing newer.
    `qkvm-<version>-libraries.json`. The package job and the image are installed from that lock, and
    the suite runs against it on Linux x86-64 and ARM64 and on Windows, with Python 3.11 to 3.14,
    before anything is signed; every library it names is audited.
-   Then it signs `SHA256SUMS` (of the wheel, the source archive, the lock and `qkvm-<version>-image.json`,
+   The same job makes the release's SBOM, `qkvm-<version>-sbom.cdx.json` (CycloneDX 1.5;
+   `.github/security/make-sbom.py`, Python's own library alone): it installs each target's lock and
+   the wheel as pip installs them there, from the wheels it downloaded (nothing is fetched, nothing
+   of a wheel runs), and reads the metadata of what is installed; what each target holds must be
+   what the lock names, library for library.
+   Then it signs `SHA256SUMS` (of the wheel, the source archive, the lock, the SBOM and `qkvm-<version>-image.json`,
    the record of what each architecture's scan saw) with openssl in a job that does only that,
    checks the signature with the cryptography library (what every installed copy checks with)
    in a job with no secret, and only then makes a **draft** release of the tag
@@ -3022,6 +4372,7 @@ qkvm                             # run it here, in this window, until it is stop
 qkvm status                      # is a copy running with this data folder, since when, where does it listen, and how large are the history and the activity log
 qkvm stop                        # end the copy that runs, from any window
 qkvm restart                     # have it started again, where it runs
+qkvm --restore FILE --backup-key KIT --data-dir NEW   # a wall back from its backup, into an empty folder (see Backups)
 ```
 
 `status`, `stop` and `restart` are about the copy that already runs, whatever it was started
@@ -3081,6 +4432,7 @@ qkvm --port 9000
 qkvm --setup-code                # first-run setup from another machine asks for a code printed here
 qkvm --https                         # HTTPS from the first request, with a certificate made here
 qkvm --tls-cert qkvm.pem --tls-key qkvm.key   # ...or with a certificate of your own
+qkvm --tls-tailscale                 # ...and Tailscale's own for this computer's name.ts.net (see Over Tailscale or NetBird)
 qkvm --allow-from 192.168.1.0/24    # answer these addresses only (and this computer)
 qkvm --trusted-proxy 172.18.0.0/16   # a reverse proxy in front of qKVM (see How it is protected)
 qkvm --unlock-file /etc/qkvm/unlock.key   # keep the key that carries it on after a restart here, not in the data folder
@@ -3132,7 +4484,7 @@ or from published source, and tried on a stand-in laid out like it.
 | XCP-ng, Citrix Hypervisor, VMware ESXi, Hyper-V | Not supported |
 | Servers through Redfish, the standard itself | DMTF's own example (DSP2043 `public-rackmount1`, in Redfish-Mockup-Server 1.3.0), and sushy-tools 2.2.0, whose stand-in server really goes on and off a few seconds after it is told: on, shut down, power cut and reset, each seen to happen |
 | Servers through Redfish, other controllers (Supermicro, Lenovo XCC and the rest) | Expected to work where they follow the standard; not tried, and no emulator or capture of theirs is published |
-| Business PCs with Intel AMT (vPro Enterprise) | Experimental. One real machine (a recent Intel AMT, admin control mode, no consent): its state, power state, what it is and how it was set up; its KVM switched on and off from the wall; its screen on the tile, enlarged and live, and the still every five minutes of a tile only shown; keys, typed text and the pointer, and nothing held after keyboard and mouse were given back with a key down; every power button. Against a stand-in only: client control mode and consent, the plain port, the network search: see below |
+| Business PCs with Intel AMT (vPro Enterprise) | Tried on real machines (a recent Intel AMT, admin control mode, no consent): its state, power state, what it is and how it was set up; its KVM switched on and off from the wall; its screen on the tile, enlarged and live, and the still every five minutes of a tile only shown; keys, typed text and the pointer, and nothing held after keyboard and mouse were given back with a key down; every power button. Against a stand-in only: client control mode and consent, the plain port, the network search: see below |
 | VNC servers (QEMU and libvirt guests, TigerVNC, TightVNC, RealVNC, x11vnc, a controller's own VNC server) | Built from RFC 6143 and tried against a stand-in; the reader against TigerVNC's `Xvnc` and QEMU's own server by the test written for GitHub, passed on Linux and on GitHub; a libvirt guest's console as a tile (above). TightVNC, RealVNC, x11vnc and a controller's own VNC server not tried |
 | Sipeed NanoKVM, IPMI without Redfish | Not supported |
 
@@ -3558,6 +4910,13 @@ python tools/under_load.py --late 10:0 --repeat 20 -- tests/test_jetkvm.py      
 
 Such a test waits for what it means instead of a moment of the clock; where the time is a limit of
 the program's, it stays, and the test measures it with the program's own clock.
+
+An update is tried on a data folder the released version before it made: `tests/fixtures/data-0.3.2.tar`,
+made by 0.3.2 as published, run as a person runs it, with accounts, devices, alerts, history and
+an export (`tools/make_0_3_2_data.py` says how; every name and secret in it is made up for it).
+`tests/test_a_data_folder_of_0_3_2.py` opens it with the version of today; with
+`QKVM_RELEASED_0_3_2` naming the released 0.3.2's source, it also starts that 0.3.2 again on the
+folder afterwards, as a person who goes back would.
 
 ## About
 

@@ -22,7 +22,7 @@ from qkvm.security import client_allowed, client_ip, is_local, is_secure, proxy_
 from qkvm.store import AuditLog, Store, StoreError
 from tests.test_unlock import fits
 from tests.test_users import OTHER, account, visitor
-from tests.test_wall import PASSWORD, closed_port, wait_until, wall
+from tests.test_wall import PASSWORD, port_to_listen_on, wait_until, wall
 from tests.settings_file import settings_text, write_settings_text
 
 
@@ -228,7 +228,7 @@ def test_https_that_could_not_be_switched_on_does_not_keep_the_next_start_from_s
         shown = admin.get("/api/v1/settings").json()
     saved = json.loads(settings_text(data / "qkvm.json", encoding="utf-8"))["server"]["https"]
     monkeypatch.setattr(uvicorn.Server, "run", lambda self, sockets=None: None)  # (if it gets as far as serving, it has started)
-    core = Core(data, bind_override=["local"], port_override=closed_port())
+    core = Core(data, bind_override=["local"], port_override=port_to_listen_on())
     core.unlock_at_start()
     capsys.readouterr()
     status = cli.serve(core)
@@ -252,7 +252,7 @@ def test_a_certificate_that_cannot_be_made_for_another_reason_than_the_disk(tmp_
     saved = json.loads(settings_text(data / "qkvm.json", encoding="utf-8"))["server"]["https"]
     print(f"\n[https] on a computer called 'büro-pc': {answer.status_code} {answer.json()}; saved https={saved}")
     monkeypatch.setattr(uvicorn.Server, "run", lambda self, sockets=None: None)
-    core = Core(data, bind_override=["local"], port_override=closed_port())
+    core = Core(data, bind_override=["local"], port_override=port_to_listen_on())
     core.unlock_at_start()
     try:
         status: Any = cli.serve(core)

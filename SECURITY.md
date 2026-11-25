@@ -318,14 +318,32 @@ Nothing else: no telemetry, no licence check, nothing that reports use.
   container image is built from it too.
 - The container image carries a record of what it was built from (provenance) and of what is
   in it (SBOM); `docker buildx imagetools inspect qkvm/qkvm` lists both.
+- **Each release lists what installing it brings in** (0.4.0 on): `qkvm-<version>-sbom.cdx.json`,
+  an SBOM in CycloneDX 1.5 of every library its lock names, for each Python and system, with its
+  version, licence (where its metadata says it), package URL and the SHA-256 of its wheels, read
+  by the release workflow from the metadata of what pip installs from that lock. `SHA256SUMS`
+  lists it and its signature covers it, as the packages: with qKVM installed,
+  `python -m qkvm.release verify --signed SHA256SUMS qkvm-<version>-sbom.cdx.json` (with
+  `SHA256SUMS.sig` beside `SHA256SUMS`) checks both.
 - Each version on PyPI from 0.1.0 on is uploaded by the release workflow of the public
   repository (PyPI's "trusted publishing"), and PyPI shows that with its files. (0.0.1, which
   only held the name, was uploaded by hand.)
 
 ## Supported versions
 
-The newest release is the one that gets fixes. There is no promise of a response time; a
-report is answered as soon as it has been read and understood.
+- Before 1.0, only the newest release gets fixes, security fixes too: they come as the next
+  release, and nothing is carried back to an older line. An older release gets none: update.
+- Long-term support starts with 1.0: which minor versions are kept with security fixes, and
+  for how long, is said when 1.0 comes.
+- A security fix is announced by a GitHub security advisory on this repository (with a CVE
+  where one is given), a *Security* part in its version's chapter of CHANGELOG.md, and the
+  release itself, which every wall that checks for updates shows with its *Update* button.
+- An update works from every release of the minor version before it and of its own (in place,
+  with pip or by a new image); from an older release, go through the newest release of each
+  minor version between. The guide (GUIDE.md) says more under *Which versions get fixes*.
+
+There is no promise of a response time; a report is answered as soon as it has been read and
+understood.
 
 ## Live access revocation
 
@@ -355,6 +373,14 @@ falls back to native decoding in the credential-holding application. The screen 
 compares in a worker of its own, as the rest; it shrinks the decoded pixels itself, in
 Python, and a picture that cannot be decoded is not compared.
 
+A worker that cannot start (its libraries do not load, its self-test or the check of
+its isolation fails) says why in place of its handshake, before it has read anything:
+the stage, the kind of error and its words, without the file names an operating-system
+error carries, in at most 512 bytes. The application reads that only in place of the
+handshake, refuses anything longer unread, and keeps printable ASCII of it, on one line.
+It is shown on the tiles that need a worker, to those signed in, and written to the log
+once; `GET /healthz`, which answers anybody, says only `"video": "unavailable"`.
+
 On Linux x86-64 and ARM64, the worker loads trusted runtime code before applying a
 seccomp syscall allowlist. It then cannot open files, create sockets, processes or
 threads, inspect other processes or change its sandbox. It retains only the three
@@ -368,7 +394,9 @@ of committed memory, restricts UI access, and holds all the worker's threads to
 two of the processors qKVM itself runs on (one where it runs on fewer than four),
 spread apart; the worker cannot widen them. Each new worker is placed on the pair
 with the fewest live workers, and gives it back when it ends, so a pair that falls
-empty is reused before any pair is shared. Windows cannot forbid a worker more
+empty is reused before any pair is shared. That holds among one qKVM's workers: several
+qKVMs on one computer know nothing of each other's, and each begins at a pair drawn at
+random when it starts, so their first workers share a pair only by chance. Windows cannot forbid a worker more
 threads as the Linux filter does: the processors bound the CPU they get, and the
 memory limit bounds their number (each costs the worker about 35 KiB of it). The
 worker's own work is one thread. A CPU rate cap is not used for this: Windows gives
@@ -405,7 +433,9 @@ not ended: that worker's job ends its process as qKVM exits, but its AppContaine
 profile (an entry named qkvm.video.<id> among the account's AppContainer mappings
 and a folder of that name under Packages) stays, and so may the runtime bundle in
 the temporary folder if a worker still held its files. They hold no qKVM data and
-are never reused, each worker having a profile of its own. qKVM does not sweep such
+are never reused, each worker having a profile of its own. A later run removes such
+a bundle once nothing in it is open (a running qKVM keeps a file in its own bundle
+open, so another wall's bundle is left alone). qKVM does not sweep such
 profiles when it starts: another qKVM on the same computer may own them.
 
 Only the explicit input, output and null-error handles are inherited: they are
@@ -416,6 +446,41 @@ capabilities before reading video. It may access its own empty profile and syste
 resources permitted to AppContainers; it is not a no-filesystem sandbox. Windows
 installations need permission to create an AppContainer profile and a writable
 temporary directory for the public runtime bundle.
+
+Each worker is started on a desktop of its own, which qKVM makes for it on qKVM's
+own window station and closes when it ends. The desktop's DACL lets in SYSTEM,
+qKVM's account and, of all AppContainers, that worker's identity alone, with the two
+rights its user32 library needs to load (DESKTOP_READOBJECTS, DESKTOP_WRITEOBJECTS);
+no other process is on it. In a signed-in session that desktop is not a boundary: a
+worker taken over can still open the session's own desktop (Default), which Windows
+lets every AppContainer use, move a thread of its own to it (SetThreadDesktop, which
+the job's desktop restriction does not cover, unlike CreateDesktop and SwitchDesktop)
+and read the user's screen there; it sees no window of another process's (the job's
+handle restriction holds). That was so before 0.4.0 as well, the worker then on that
+desktop from the start. On a service's or an SSH session's station there is no desktop
+an AppContainer may use but the worker's own. Until 0.4.0 a worker was started on the desktop qKVM was
+started from: the user's own in a signed-in session, and, where qKVM runs as a
+service or over SSH, one that no AppContainer may use, so that there no worker could
+load the libraries it needs and no picture was made. Windows lets every AppContainer
+onto the window station of a signed-in session (WinSta0) and onto no other. Where
+qKVM's station does not let them in (a service's, an SSH session's), the worker's
+identity is given one entry of its own in that station's DACL, with READ_CONTROL and
+WINSTA_ACCESSGLOBALATOMS (the job's UI restrictions give the worker an atom table of
+its own all the same), at the end, after any entry that denies; it is taken out again
+when the worker ends, and nothing else in the DACL is changed. A worker left running
+when qKVM stops (above) leaves its entry until the station ends with its logon
+session; so does every running worker of a qKVM that ends without its own shutdown
+(ended from outside, by TerminateProcess or the task manager, or by a crash): on a
+LocalSystem service's station, until the computer
+restarts. Each entry names an identity no other process has, and grants nothing to
+anybody else. About 1,300 of them fill the DACL (64 KiB), and then no worker can start
+there ("no room") until the computer restarts. Windows writes a DACL only
+whole, so every qKVM of one account in one session (several services of one account, a
+test runner's processes) changes a station's DACL under one mutex, which only that
+account and SYSTEM may use; one it cannot have, or that another holds for two seconds,
+leaves the change to qKVM's own lock. Another program changing the same station's DACL
+at the same moment could still lose its change or qKVM's. The DACL
+of a signed-in session's station, which lets every AppContainer in, is not changed.
 
 Other operating systems and Linux architectures currently fail closed for these
 native-video paths. Connections that require a worker cannot start; this includes

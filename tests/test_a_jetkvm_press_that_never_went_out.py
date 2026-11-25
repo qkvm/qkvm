@@ -10,13 +10,14 @@ may have been done.
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from qkvm import jetkvm, kvm, update, vault
+from qkvm import jetkvm, kvm, update, vault, video
 from qkvm.kvm import DeviceSpec, KvmError
 from tests.fake_jetkvm import FakeJetKvm, JetState
 from tests.test_wall import add, wall
@@ -52,6 +53,47 @@ def test_a_press_on_a_jetkvm_whose_video_connection_never_comes_about_is_not_don
         said = asyncio.run(run())
         assert said.code == "action_failed" and said.status == 502, (said.code, said.status, said.message)
         assert said.message.startswith("Nothing was typed" if action == "text" else "It was not done"), said.message
+        assert state.actions == [] and state.typed == []
+    finally:
+        jet.stop()
+
+
+@pytest.mark.parametrize("slow", ["still starting", "past its own time"])
+@pytest.mark.parametrize("action", ["atx_power", "text"])
+def test_a_press_while_the_connections_video_worker_is_slow_to_start_is_not_done(monkeypatch: pytest.MonkeyPatch, action: str, slow: str) -> None:
+    # (0.4.0, the Windows test VM, where a worker took longer to start than the second this file gives a connection.) The
+    # connection starts its video worker before anything is asked of the JetKVM. A press asked while it was still starting, or
+    # one whose start ran past its own time, was refused in the words of the video ("Video is slow to start on this
+    # computer", no_stream): the press answers for itself, and nothing of it was sent.
+    monkeypatch.setattr(jetkvm, "CONNECT_TIMEOUT", 0.5)
+    state = JetState(extension="atx-power")
+    jet = FakeJetKvm(state).start()
+    released = threading.Event()
+
+    class SlowToStart(video.Worker):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            if slow == "past its own time":
+                raise video.VideoUnavailable("the video worker did not answer within 15 seconds", lasting=False)
+            released.wait(30)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(video, "Worker", SlowToStart)
+
+    async def run() -> KvmError:
+        device = jetkvm.JetKvmDevice(DeviceSpec("j9", "jet", jet.url, "", "secret", kind="jetkvm"))
+        try:
+            with pytest.raises(KvmError) as refused:
+                await device.act(action, text="ok")
+            return refused.value
+        finally:
+            released.set()
+            await device.close()
+
+    try:
+        said = asyncio.run(run())
+        assert said.code == "action_failed" and said.status == 502, (said.code, said.status, said.message)
+        assert said.message.startswith("Nothing was typed" if action == "text" else "It was not done"), said.message
+        assert "video" not in said.message.lower(), said.message
         assert state.actions == [] and state.typed == []
     finally:
         jet.stop()

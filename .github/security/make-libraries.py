@@ -15,6 +15,10 @@ What is written: `qkvm-X-libraries.json`, read back with the program's own reade
 written; `requirements/<target>.txt`, the lock of each target as pip takes it (`--require-hashes --no-deps`), for the
 jobs that install what walls will run and for the image; and `LIBRARIES.sums`, the SHA-256 of each of those files.
 
+With `--environments DIR`, each target's lock and the built wheel are then installed into DIR/<target> as pip installs
+them there (`--target`, the target's platforms, Python and implementation), from the wheels downloaded above, each held
+to its hash again: nothing is fetched and nothing of a wheel runs. make-sbom.py reads the release's SBOM from them.
+
 Python's own library, packaging and pip only. Nothing of a wheel is run here.
 """
 
@@ -194,12 +198,31 @@ def requirements(read: _libraries.Lock, target: str) -> str:
     )
 
 
+def installed(target: str, wheel: Path, work: Path, locked: Path, into: Path) -> None:
+    """The target's lock (`locked`, as pip takes it) and the built wheel, installed into `into` as pip installs them there
+    (`--target`: the target's platforms, Python and implementation), in one go, from the wheels in `work` that were
+    downloaded and held to PyPI's hashes before: nothing is fetched, every wheel is held to its hash again, and nothing
+    of a wheel runs (no build, and no file compiled). What make-sbom.py reads a release's SBOM from."""
+    python, system = target.split("-", 1)
+    asked = work / f"environment-{target}.txt"
+    digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
+    asked.write_text(locked.read_text(encoding="utf-8") + f"qkvm @ {wheel.resolve().as_uri()} --hash=sha256:{digest}\n", encoding="utf-8", newline="\n")
+    command = [
+        sys.executable, "-m", "pip", "install", "--no-cache-dir", "--quiet", "--disable-pip-version-check", "--no-compile",
+        "--target", str(into), "--no-index", "--find-links", str(work), "--require-hashes", "--no-deps", "--only-binary", ":all:",
+        "--implementation", "cp", "--python-version", f"3.{python[3:]}", "--abi", python,
+        *(option for platform in PLATFORMS[system] for option in ("--platform", platform)), "-r", str(asked),
+    ]  # fmt: skip
+    subprocess.run(command, check=True)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--version", required=True)
     parser.add_argument("--wheel", type=Path, required=True)
     parser.add_argument("--work", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--environments", type=Path, help="also install each target's lock and the wheel into a folder of its own here (for make-sbom.py)")
     options = parser.parse_args(argv)
     options.work.mkdir(parents=True, exist_ok=False)
     chosen = {target: resolved(options.wheel, target, options.work) for target in _libraries.TARGETS}
@@ -229,6 +252,11 @@ def main(argv: list[str] | None = None) -> int:
     sums = "".join(f"{hashlib.sha256((options.out / file).read_bytes()).hexdigest()}  {file}\n" for file in written)
     (options.out / "LIBRARIES.sums").write_text(sums, encoding="ascii", newline="\n")
     print(f"{name}: {sum(len(libraries) for libraries in read.targets.values())} libraries in {len(read.targets)} targets, {len(made)} bytes")
+    if options.environments is not None:
+        options.environments.mkdir(parents=True, exist_ok=False)
+        for target in _libraries.TARGETS:
+            installed(target, options.wheel, options.work, options.out / "requirements" / f"{target}.txt", options.environments / target)
+        print(f"{len(_libraries.TARGETS)} environments installed in {options.environments}")
     return 0
 
 

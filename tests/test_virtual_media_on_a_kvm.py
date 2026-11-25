@@ -47,6 +47,8 @@ def forgotten(monkeypatch: pytest.MonkeyPatch) -> None:
     MEDIA_NOTES.hashes.clear()
     monkeypatch.setattr(kvm, "STATUS_TTL", 0)
     monkeypatch.setattr(kvm, "MSD_EVERY", 0)  # (a look asks its drive every time: the line's event is asked about on its own)
+    # A picture asked for is waited for as in the other tests (at the usual 1.5 s a loaded runner says "slow to answer").
+    monkeypatch.setattr(kvm, "PICTURE_PATIENCE", 10)
 
 
 def images(sizes: dict[str, int]) -> dict[str, dict[str, Any]]:
@@ -230,6 +232,10 @@ def test_what_stands_against_a_change_is_said_and_nothing_is_sent(tmp_path: Path
         comet.state.msd_busy, comet.state.msd_online = False, False
         reply = mount(admin, device)
         assert (reply.status_code, reply.json()["code"]) == (409, "action_failed") and "offline" in reply.json()["message"]
+        # What that means, and what to do (a real Comet on GL.iNet's newer firmware said it while the machine behind it was
+        # starting, 2026-11-16: an upload was refused with only "offline"). The media box says it too.
+        assert "drive is not ready" in reply.json()["message"] and "try again once the machine has started" in reply.json()["message"]
+        assert admin.get(media(device)).json()["notes"] == [reply.json()["message"]]
         comet.state.msd_online = True
         if not comet.state.stock:
             comet.state.msd_sharing = True  # (GL.iNet's File Sharing: the whole storage open to the machine, read-write)
@@ -487,7 +493,7 @@ def test_a_kvm_that_says_no_number_for_a_size_gets_an_answer_and_an_activity_ent
 
 
 def test_an_upload_cut_off_by_its_tile_moved_to_another_kvm_takes_nothing_off_that_one(tmp_path: Path) -> None:
-    # (The outside review of 0.3.0, Codex's M3: the tile was moved to another KVM while its upload ran; the cut-off
+    # (The outside review of 0.3.0, M3: the tile was moved to another KVM while its upload ran; the cut-off
     # upload's leftovers were "taken off" by the client that took the tile's place, on the other KVM: a partial image of
     # the same name there, which was none of this upload's, was deleted.)
     original = FakeKvm(FakeState(msd=True, msd_write_pause=0.05, msd_keeps_incomplete=True)).start()
@@ -686,3 +692,34 @@ def test_names_left_out_of_a_kvms_listing_are_counted_and_never_handed_back(tmp_
             assert fake.state.msd_drive["image"] == "folder/inside.iso"
     finally:
         fake.stop()
+
+
+def test_a_list_of_images_asked_for_the_machine_seen_is_not_the_list_of_the_one_put_in_its_place(tmp_path: Path) -> None:
+    # (The second fresh review of the HA round, HIGH.) GET .../media went by the tile's id alone, and its `listed` binds a change to
+    # whatever answered it: a Media box made for one machine that listed again after an edit got the other machine's images and
+    # mark, and its next mount went there. Asked with the `target` the box was opened for, it is refused (409 `machine_changed`).
+    first = FakeKvm(FakeState(msd=True, msd_images=images({DEBIAN: 700_000_000}))).start()
+    second = FakeKvm(FakeState(msd=True, msd_images=images({DEBIAN: 700_000_000, "only-there.iso": 700_000_000}))).start()
+    try:
+        with wall(tmp_path) as admin:
+            device = add(admin, first.url, name="rack 1")
+            seen = next(d for d in admin.get("/api/v1/wall").json()["devices"] if d["id"] == device)["target"]
+
+            def listed_ids(**params: str) -> list[str]:
+                admin.get("/api/v1/status")
+                reply = admin.get(media(device), params=params)
+                return [image["id"] for image in reply.json().get("images", [])] if reply.status_code == 200 else []
+
+            wait_until(lambda: DEBIAN in listed_ids(target=seen), "the first KVM's images were never listed for it")
+            edited = admin.put(f"/api/v1/devices/{device}", json={"name": "rack 1", "url": second.url, "username": "admin", "password": "secret"})
+            assert edited.status_code == 200 and edited.json()["device"]["target"] != seen, edited.text
+            now = edited.json()["device"]["target"]
+            wait_until(lambda: "only-there.iso" in listed_ids(target=now), "the second KVM's images were never listed for it")
+            asked = admin.get(media(device), params={"target": seen})
+            said = asked.json()
+            assert (asked.status_code, said.get("code")) == (409, "machine_changed"), (asked.status_code, [image["id"] for image in said.get("images", [])])
+            assert "Nothing was sent" in said["message"]
+            assert "only-there.iso" in listed_ids()  # (none named, as by a client before 0.4.0: as before)
+    finally:
+        first.stop()
+        second.stop()

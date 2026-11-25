@@ -280,9 +280,9 @@ def test_the_activity_log_keeps_what_it_is_given_and_makes_nobody_wait(tmp_path:
     slow = AuditLog(tmp_path / "slow.log")
     append = slow._append
 
-    def slowly(line: str) -> None:
+    def slowly(line: str, sealing: object = None) -> list[str]:  # (0.4.0: a seal asked for is handed on with its line)
         time.sleep(0.4)
-        append(line)
+        return append(line, sealing)  # type: ignore[arg-type]
 
     slow._append = slowly  # type: ignore[method-assign]
     began = time.monotonic()

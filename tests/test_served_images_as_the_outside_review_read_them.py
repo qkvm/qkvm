@@ -1,5 +1,5 @@
 """A server's image as qKVM serves it to the server's controller (served.py, the route `/media/<token>/<name>`), as the
-outside review of 0.3.0 read it (Codex's, from its probes):
+outside review of 0.3.0 read it (from its probes):
 
 M1: reads that come together are counted together. The slot was counted only after the file was open (and never for a
 HEAD): 32 reads at once were all taken, where eight are the most (MOST_AT_ONCE).

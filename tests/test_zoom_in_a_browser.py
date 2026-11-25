@@ -41,9 +41,19 @@ def live_drawn(page: Page) -> None:
 
 
 def sized(page: Page, scale: float) -> dict[str, float]:
-    """Once the canvas has the size of the picture at this scale (0: fitted into the view): where it lies, and how large it is."""
+    """Once the canvas has the size of the picture at this scale (0: fitted into the view), and the view has taken it in:
+    where it lies, and how large it is.
+
+    (The app says whether the picture is dragged, and brings back what was in the middle, in a ResizeObserver's turn once
+    the canvas has its new size. On a loaded runner that turn came after the size was read here: the scroll position read
+    was the one before, 0 where the app then put 179. So this waits for the mark of that turn as well.)"""
     if scale:
-        page.wait_for_function(f"() => document.querySelector('#focus-canvas').width === {round(WIDTH * scale)} && document.querySelector('#focus-canvas').height === {round(HEIGHT * scale)}")
+        page.wait_for_function(f"""() => {{
+          const canvas = document.querySelector('#focus-canvas'), scroller = document.querySelector('#focus-scroll');
+          if (canvas.width !== {round(WIDTH * scale)} || canvas.height !== {round(HEIGHT * scale)}) return false;
+          const larger = scroller.scrollWidth > scroller.clientWidth + 1 || scroller.scrollHeight > scroller.clientHeight + 1;
+          return document.querySelector('#focus-screen').classList.contains('pannable') === larger;
+        }}""")
     found: dict[str, float] = page.evaluate("""() => {
       const canvas = document.querySelector('#focus-canvas'), scroller = document.querySelector('#focus-scroll');
       const at = canvas.getBoundingClientRect(), view = scroller.getBoundingClientRect();

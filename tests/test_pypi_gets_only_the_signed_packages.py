@@ -165,7 +165,7 @@ def test_pypi_gets_nothing_before_every_file_is_held_to_the_signed_list() -> Non
     every = jobs(RELEASE)
     first = "\n".join(steps(every["published"]))
     assert re.search(r'/usr/bin/python3 -m qkvm\.release verify --all --signed "\$RUNNER_TEMP/published/SHA256SUMS" "\$\{files\[@\]\}"', first)
-    assert 'test "$listed" = "qkvm-${TAG#v}-image.json qkvm-${TAG#v}-libraries.json qkvm-${TAG#v}-py3-none-any.whl qkvm-${TAG#v}.tar.gz "' in first, "every package listed goes"
+    assert 'test "$listed" = "qkvm-${TAG#v}-image.json qkvm-${TAG#v}-libraries.json qkvm-${TAG#v}-py3-none-any.whl qkvm-${TAG#v}-sbom.cdx.json qkvm-${TAG#v}.tar.gz "' in first, "every package listed goes"
     assert "published" in waits_for(every, "pypi")
     pypi = every["pypi"]
     order = steps(pypi)

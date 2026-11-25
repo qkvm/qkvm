@@ -290,7 +290,7 @@ def test_a_wheel_larger_than_the_lock_says_is_cut_off(github: FakeGitHub, tmp_pa
 
 
 def test_a_lock_the_checksums_name_is_not_done_without_where_the_release_leaves_it_out(github: FakeGitHub, tmp_path: Path) -> None:
-    # (The outside review of 0.3.0, Codex's M4: whether a release has a list of libraries was read from its own list of
+    # (The outside review of 0.3.0, M4: whether a release has a list of libraries was read from its own list of
     # assets, which is not signed. One with the list left out of it, its signed checksums naming it all the same, was
     # taken without it: on whatever libraries the computer has, the tested ones not brought.)
     release_with(github, kit.pure("2.0"), requires=(f"{kit.PURE}>=2",))

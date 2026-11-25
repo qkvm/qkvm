@@ -15,6 +15,7 @@ import os
 import ssl
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -51,6 +52,7 @@ class Service:
     hanging: set[str] = field(default_factory=set)  # paths answered nothing at all
     headers: dict[str, str] = field(default_factory=dict)
     body: bytes = b""
+    echo: Callable[[Received], bytes] | None = None  # the body made of what arrived (a service that says back what it got)
 
 
 def b64(data: bytes) -> str:
@@ -77,8 +79,9 @@ class FakePush:
         class Handler(BaseHTTPRequestHandler):
             def do_POST(self) -> None:
                 body = self.rfile.read(int(self.headers.get("content-length", "0")))
+                received = Received(self.path, dict(self.headers), body, named.get(id(self.connection)))
                 with fake._lock:
-                    fake.received.append(Received(self.path, dict(self.headers), body, named.get(id(self.connection))))
+                    fake.received.append(received)
                     service = fake.service
                     status = service.then.pop(0) if service.then else service.status
                 if self.path in service.hanging:
@@ -89,9 +92,10 @@ class FakePush:
                 self.send_response(status)
                 for name, value in service.headers.items():
                     self.send_header(name, value)
-                self.send_header("Content-Length", str(len(service.body)))
+                answer = service.echo(received) if service.echo is not None else service.body
+                self.send_header("Content-Length", str(len(answer)))
                 self.end_headers()
-                self.wfile.write(service.body)
+                self.wfile.write(answer)
 
             def log_message(self, *args: Any) -> None:
                 pass

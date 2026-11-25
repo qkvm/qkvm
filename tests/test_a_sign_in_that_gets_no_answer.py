@@ -342,6 +342,7 @@ class Odd:
     """What a stand-in does differently in a test here."""
 
     sign_in_says: int | None = None  # a JetKVM: what its sign-in answers, whatever the password
+    sign_in_number = 0  # ...that sign-in alone (1: the first it is sent; 0: every one)
     web_no: Any = None  # a controller: how its web page says no to a wrong password (a status, or several taken in turn)
     web_silent_from = 0  # a controller: from this sign-in on (0: never), its web page takes longer to answer than is waited for
     web_takes = 0.0  # ...this long
@@ -366,7 +367,7 @@ def odd(monkeypatch: pytest.MonkeyPatch) -> Odd:
             answer = await call_next(request)
             if request.method == "POST" and request.url.path == "/auth/login-local" and how.sign_in_takes:
                 await asyncio.sleep(how.sign_in_takes)
-            if request.method == "POST" and request.url.path == "/auth/login-local" and how.sign_in_says is not None:
+            if request.method == "POST" and request.url.path == "/auth/login-local" and how.sign_in_says is not None and how.sign_in_number in (0, state.logins):
                 return JSONResponse({"error": "busy with itself"}, status_code=how.sign_in_says)
             return answer
 
@@ -401,9 +402,17 @@ def odd(monkeypatch: pytest.MonkeyPatch) -> Odd:
     return how
 
 
-def test_a_jetkvm_over_https_that_answers_one_sign_in_oddly_is_not_said_to_answer_over_plain_http_only(tmp_path: Path, odd: Odd, scaled: None, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_a_jetkvm_over_https_that_answers_one_sign_in_oddly_is_not_said_to_answer_over_plain_http_only(
+    tmp_path: Path, odd: Odd, scaled: None, monkeypatch: pytest.MonkeyPatch, a_video_worker_first: None
+) -> None:
     for name in ("WAY_PATIENCE", "WAY_WHEN_DOWN", "RETRY_PAUSE"):
         monkeypatch.setattr(jetkvm, name, getattr(jetkvm, name) / SCALE)
+    # The second sign-in, and only that one, is answered oddly: by the stand-in, as it comes. (Set by this test once its look
+    # had seen the first, it came too late wherever a look took longer than the second sign-in did: each connection starts a
+    # video worker of its own before it signs in, seconds on a busy computer, and the second sign-in had its plain no. The
+    # tile is looked at until the sign-in after the odd one is answered, and two seconds more: not for two and a half
+    # seconds fixed beforehand, in which the Windows test VM running 16 test files at a time made one look of ten.)
+    odd.sign_in_says, odd.sign_in_number = 500, 2
     state = JetState()
     plain, secure = FakeJetKvm(state).start(), FakeJetKvm(state, tls_dir=tmp_path / "jet").start()
     other_ways(monkeypatch, {plain.url: secure.url})
@@ -415,14 +424,18 @@ def test_a_jetkvm_over_https_that_answers_one_sign_in_oddly_is_not_said_to_answe
             device = added.json()["device"]["id"]
             line: list[tuple[int, str, str]] = []
             began = time.monotonic()
-            while time.monotonic() - began < 2.5:
+            after = None  # (when the sign-in after the odd one was answered)
+            while time.monotonic() - began < 2.5 or after is None or time.monotonic() - after < 2.0:
                 status = admin.get("/api/v1/status").json()[device]
                 said = (status["state"], ((status.get("error") or {}).get("message") or "")[:120])
                 if not line or line[-1][1:] != said:
                     line.append((round((time.monotonic() - began) * SCALE), *said))
-                odd.sign_in_says = 500 if state.logins == 1 else None  # the second sign-in, and only that one
+                if after is None and state.logins >= 3:
+                    after = time.monotonic()
+                if after is None and time.monotonic() - began > 60:  # (room only)
+                    break
                 time.sleep(0.02)
-            assert state.logins >= 2, line
+            assert state.logins >= 3, line
             assert not [entry for entry in line if "plain HTTP" in entry[2]], line
             assert line[-1][1] == "auth" and set(state.passwords_over) == {"https"}, line
     finally:

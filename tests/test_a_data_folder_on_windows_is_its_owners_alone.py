@@ -33,7 +33,7 @@ import qkvm
 from qkvm import __main__ as starter
 from qkvm.cli import main as run_cli
 from tests.test_update import an_update_that_leaves_a_mark, typed
-from tests.test_wall import closed_port
+from tests.test_wall import port_to_listen_on
 
 pytestmark = pytest.mark.skipif(os.name != "nt", reason="who may write a folder is kept in its ACL on Windows")
 
@@ -82,7 +82,7 @@ def test_a_data_folder_made_where_everybody_may_write_is_its_owners_alone(tmp_pa
 def started_once(data: Path, tmp_path: Path) -> str:
     """A real start of the wall on `data` (it serves), stopped again once it answers. What it said at start."""
     environment = {**os.environ, "PYTHONPATH": str(APP), "QKVM_CHILD": "1", "PYTHONDONTWRITEBYTECODE": "1"}  # (the program itself, no starter)
-    port = closed_port()
+    port = port_to_listen_on()
     said = tmp_path / f"started-{port}.txt"
     with said.open("w", encoding="utf-8") as out:
         wall = subprocess.Popen(
@@ -191,7 +191,7 @@ def test_the_storage_keys_folder_found_open_is_said_and_left_as_it_is_found(tmp_
     # A real start makes no key in it (the round 4 review, L5: as on Linux, create_key refuses such a folder): it ends, said,
     # and the folder is left as it was found. (It started, and made the key there, before.)
     environment = {**os.environ, "PYTHONPATH": str(APP), "QKVM_CHILD": "1", "PYTHONDONTWRITEBYTECODE": "1"}
-    done = subprocess.run([sys.executable, "-P", "-m", "qkvm", "--data-dir", str(data), "--port", str(closed_port()), "--bind", "local"], env=environment, cwd=tmp_path, capture_output=True, text=True, timeout=120)
+    done = subprocess.run([sys.executable, "-P", "-m", "qkvm", "--data-dir", str(data), "--port", str(port_to_listen_on()), "--bind", "local"], env=environment, cwd=tmp_path, capture_output=True, text=True, timeout=120)
     said = done.stdout + done.stderr
     assert done.returncode == 2 and "the vault key directory must belong to the server and not be writable by others" in said, said
     assert entries(keys, tmp_path) == before and not (keys / "vault.key").exists()
@@ -598,7 +598,7 @@ def test_a_start_that_finds_another_copy_running_changes_nothing(tmp_path: Path)
     try:
         environment = {**os.environ, "PYTHONPATH": str(APP), "QKVM_CHILD": "1", "PYTHONDONTWRITEBYTECODE": "1"}
         done = subprocess.run(
-            [sys.executable, "-P", "-m", "qkvm", "--data-dir", str(data), "--port", str(closed_port()), "--bind", "local"],
+            [sys.executable, "-P", "-m", "qkvm", "--data-dir", str(data), "--port", str(port_to_listen_on()), "--bind", "local"],
             env=environment, cwd=tmp_path, capture_output=True, text=True, timeout=120,
         )  # fmt: skip
     finally:

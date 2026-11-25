@@ -1,4 +1,4 @@
-"""What a server's controller says of its virtual media, as the outside review's fourth round (Codex, R4-M3 and LOWs)
+"""What a server's controller says of its virtual media, as the outside review's fourth round (R4-M3 and LOWs)
 read it: a board that named another description of its InsertMedia at every read grew a cache of the strings it named;
 links it names stay on it; its remote media's status is read as a string; and a mount whose settings changed while it
 was under way was sent with an HTTPS address and no password.

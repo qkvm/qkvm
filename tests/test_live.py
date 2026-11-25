@@ -1161,6 +1161,25 @@ def test_a_jetkvm_live(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, hidrpc: 
         jet.stop()
 
 
+def test_a_servers_live_screen_that_no_video_worker_can_make_says_why(tmp_path: Path) -> None:
+    # Where no video worker can start, a server's tile says why (no_video); its live view said nothing, its pictures let go
+    # of quietly as screens caught in a change of size, for good. Its line is told what the tile is, until a picture comes.
+    from tests.test_video_isolation import NO_VIDEO, video_that_cannot_start
+
+    bmc = FakeBmc(BmcState(own_console=True, screen=[console_screen(640, 480, seed=5)])).start()
+    try:
+        with video_that_cannot_start(tmp_path / "video"), Wall(tmp_path) as wall:
+            admin = wall.browser()
+            line = wall.line(admin, wall.add(admin, bmc.url, kind="redfish"), max_fps=5)
+            give_up = time.monotonic() + 30
+            said = line.word("state", timeout=30)
+            while not said.get("error"):
+                said = line.word("state", timeout=max(0.1, give_up - time.monotonic()))
+            assert said == {"t": "state", "state": "error", "error": {"code": "no_video", "message": NO_VIDEO["message"]}}
+    finally:
+        bmc.stop()
+
+
 def test_a_servers_screen_live_with_its_keys_and_the_pointer(tmp_path: Path) -> None:
     # A server whose controller is AMI's takes keyboard and mouse over the same console the screen comes on, like a KVM.
     bmc = FakeBmc(BmcState(own_console=True, screen=[console_screen(640, 480, seed=5)])).start()

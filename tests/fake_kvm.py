@@ -81,6 +81,10 @@ class FakeState:
     computer_follows: bool = False
     shuts_down_after: float | None = 0.0
     atx_lag: float = 0.0
+    # Set: a reset of the computer while it is on shows this picture from `restart_after` seconds after the button is let go
+    # (its firmware's screen), its signal staying up, as a real one's HDMI did through its restart (2026-11-16).
+    restarts_to: bytes = b""
+    restart_after: float = 0.0
     word_was: bool = True  # (what the word says until `word_until`)
     word_until: float = 0.0
     held_over: int = 0  # presses that came while the board held another
@@ -161,7 +165,12 @@ class FakeState:
     # A multi-port KVM (Comet X): one colour per input, None for an input with nothing plugged in.
     ports: list[tuple[int, int, int] | None] = field(default_factory=list)
     active_port: int = 0
+    switch_synced: bool = True  # what its switch says of itself in `summary.synced` (False: its state is not in step with the switch)
     switch_fails: int = 0  # so many of the next answers of its switch are a 502, its web server's while kvmd restarts behind it
+    # Set: what its switch answers instead of its own state, one of SWITCH_REPLIES (kvmd's own word that it has none, or what
+    # comes instead of kvmd's word: a page of something in front of it, kvmd's word of another trouble), or "cut" (an answer
+    # that breaks off on its way).
+    switch_reply: str = ""
     keyboard_online: bool = True  # what it says of the keyboard it is to the computer (a cable that is out: False)
     # Whether its mouse is absolute (stock kvmd's default) or relative (a real Comet was set to "usb_rel": `mouse.absolute`
     # false in its /api/hid). kvmd drops a move of the other kind: counted in `pointer_dropped` (every event is in `hid`
@@ -249,6 +258,69 @@ GLINET_ONLY = (
 REDFISH_ROOT = {
     "@odata.id": "/redfish/v1", "@odata.type": "#ServiceRoot.v1_6_0.ServiceRoot", "Id": "RootService", "Name": "Root Service",
     "RedfishVersion": "1.6.0", "Managers": {"@odata.id": "/redfish/v1/Managers"}, "Systems": {"@odata.id": "/redfish/v1/Systems"},
+}  # fmt: skip
+def _switch_state(units: int, active: int, synced: bool, ports: int = 0) -> bytes:
+    """kvmd's state of its switch (kvmd/apps/kvmd/switch/state.py), as JSON: so many units found, ports listed, the one on screen."""
+    listed = [{"unit": 0, "channel": ch, "name": "", "id": f"1.{ch + 1}", "video": {"dummy": False}} for ch in range(ports)]
+    return json.dumps({"ok": True, "result": {
+        "model": {"firmware": {"version": 9}, "units": [{"firmware": {"version": 7}}] * units, "ports": listed},
+        "summary": {"active_port": active, "active_id": f"1.{active + 1}" if active >= 0 else "", "synced": synced},
+        "video": {"links": [True] * ports}, "usb": {"links": [True] * ports}, "beacons": {"uplinks": [], "downlinks": [], "ports": []},
+    }}).encode()  # fmt: skip
+
+
+def _stock_switch(*left_out: str, **summary: Any) -> bytes:
+    """Stock kvmd's state of a switch with no units (kvmd 4.226, switch/state.py), as JSON: what it answers without a switch,
+    while its switch starts and after one is unplugged (which keeps the input it had on screen: `summary` says so). `left_out`:
+    the parts a kvmd may not give, as "model.units" or "video"."""
+    state: dict[str, Any] = {
+        "model": {"firmware": {"version": 9}, "units": [], "ports": [], "limits": {"atx": {"click_delays": {}}}},
+        "summary": {"active_port": -1, "active_id": "", "synced": True, **summary},
+        "video": {"links": []}, "usb": {"links": []}, "beacons": {"uplinks": [], "downlinks": [], "ports": []},
+        "edids": {}, "colors": {}, "atx": {"busy": False},
+    }
+    for part in left_out:
+        *above, last = part.split(".")
+        place = state
+        for step in above:
+            place = place[step]
+        del place[last]
+    return json.dumps({"ok": True, "result": state}).encode()
+
+
+_NGINX = "<html>\r\n<head><title>{0}</title></head>\r\n<body>\r\n<center><h1>{0}</h1></center>\r\n<hr><center>nginx</center>\r\n</body>\r\n</html>\r\n"
+# What a switch answers with FakeState.switch_reply: status, media type, body.
+SWITCH_REPLIES: dict[str, tuple[int, str, bytes]] = {
+    # kvmd's own word that it has no switch: a GLKVM of one input (its error object), kvmd from before switches (a route its
+    # web server has not got, in that server's words), stock kvmd (an empty one: no ports, none on screen).
+    "unavailable": (503, "application/json", b'{"ok": false, "result": {"error": "UnavailableError", "error_msg": "Service Unavailable"}}'),
+    "no_route": (404, "text/plain; charset=utf-8", b"404: Not Found"),
+    "empty": (200, "application/json", json.dumps({"ok": True, "result": {
+        "model": {"firmware": {"version": 9}, "units": [], "ports": []}, "summary": {"active_port": -1, "active_id": "", "synced": True},
+        "video": {"links": []}, "usb": {"links": []}, "beacons": {"uplinks": [], "downlinks": [], "ports": []},
+    }}).encode()),
+    # Not kvmd's word: its web server's while kvmd restarts behind it, a bare error of the moment, a proxy's page, a sign-in
+    # page of something in between, and kvmd's own word of another trouble than a switch it has not got.
+    "bad_gateway": (502, "text/html", _NGINX.format("502 Bad Gateway").encode()),
+    "server_error": (500, "text/plain", b"Internal Server Error"),
+    "proxy_not_found": (404, "text/html", _NGINX.format("404 Not Found").encode()),
+    "portal": (200, "text/html", b"<html><body>Sign in to the network</body></html>"),
+    "kvmd_error": (500, "application/json", b'{"ok": false, "result": {"error": "SwitchError", "error_msg": "The switch does not answer"}}'),
+    # ...and at a 200: kvmd's error object; kvmd's state of a switch that is there (a unit found, input 2 on screen) whose ports
+    # are not listed yet, in step and not; its empty one said not in step; a switch that lists one port.
+    "error_at_200": (200, "application/json", b'{"ok": false, "result": {"error": "SwitchError", "error_msg": "The switch does not answer"}}'),
+    "unit_found": (200, "application/json", _switch_state(units=1, active=1, synced=True)),
+    "unit_found_not_in_step": (200, "application/json", _switch_state(units=1, active=1, synced=False)),
+    "empty_not_in_step": (200, "application/json", _switch_state(units=0, active=-1, synced=False)),
+    "one_port": (200, "application/json", _switch_state(units=1, active=0, synced=True, ports=1)),
+    # Stock kvmd's word of no switch in its other shapes: a switch unplugged (no units, no ports, the input it had on screen
+    # kept), and its empty state without the units, the video links or `synced`.
+    "unplugged": (200, "application/json", _stock_switch(active_port=0, active_id="1")),
+    "empty_without_units": (200, "application/json", _stock_switch("model.units")),
+    "empty_without_links": (200, "application/json", _stock_switch("video")),
+    "empty_without_synced": (200, "application/json", _stock_switch("summary.synced")),
+    # A model that says neither its units nor its ports, with input 2 named on screen: no kvmd's (kvmd 4.226 gives both).
+    "bare_model": (200, "application/json", b'{"ok": true, "result": {"model": {}, "summary": {"active_port": 1}}}'),
 }  # fmt: skip
 
 
@@ -472,6 +544,9 @@ def make_fake_kvm(state: FakeState) -> FastAPI:
         elif button == "power" and was_on and state.shuts_down_after is not None:
             await pause(state.shuts_down_after)
             power_to(False)
+        elif button == "reset" and was_on and state.restarts_to:
+            await pause(state.restart_after)
+            state.picture = state.restarts_to
 
     def board(overlapping: bool) -> dict[str, Any]:
         """The board's state as it says it, at /api/atx and on the line for events alike; "no board, off" where it is answering somebody else."""
@@ -613,6 +688,28 @@ def make_fake_kvm(state: FakeState) -> FastAPI:
         if state.switch_fails > 0:
             state.switch_fails -= 1
             return PlainTextResponse("502 Bad Gateway", status_code=502)
+        if state.switch_reply == "cut":
+
+            async def cut() -> AsyncIterator[bytes]:
+                yield b'{"ok": true, "result": {"model": {"ports": ['
+                raise ConnectionAbortedError("the stand-in's switch breaks its answer off")
+
+            # (Said to be longer than it is: the connection ends short of it, as an answer that broke off.)
+            return StreamingResponse(cut(), media_type="application/json", headers={"Content-Length": "4096"})
+        if state.switch_reply == "trickle":
+            whole = SWITCH_REPLIES["empty"][2]
+
+            async def trickle() -> AsyncIterator[bytes]:
+                step = max(1, len(whole) // 7)
+                for at in range(0, len(whole), step):
+                    yield whole[at : at + step]
+                    await pause(1.2, lambda: state.switch_reply == "trickle")  # (each piece within a read's wait of two seconds)
+
+            # (Its empty state, as seven pieces 1.2 s apart: about eight seconds for the whole.)
+            return StreamingResponse(trickle(), media_type="application/json", headers={"Content-Length": str(len(whole))})
+        if state.switch_reply:
+            status, kind, body = SWITCH_REPLIES[state.switch_reply]
+            return Response(body, status_code=status, media_type=kind)
         if not state.ports and state.stock:
             # Stock kvmd answers for a switch it has not got: with one of no ports, none of them on screen.
             return ok({
@@ -628,7 +725,7 @@ def make_fake_kvm(state: FakeState) -> FastAPI:
         ]
         return ok({
             "model": {"firmware": {"version": 1}, "units": [], "ports": ports},
-            "summary": {"active_port": state.active_port, "active_id": f"1.{state.active_port + 1}", "synced": True},
+            "summary": {"active_port": state.active_port, "active_id": f"1.{state.active_port + 1}", "synced": state.switch_synced},
             "video": {"links": [colour is not None for colour in state.ports]},
             "usb_otg": {"links": [colour is not None for colour in state.ports]},
         })

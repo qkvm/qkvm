@@ -1283,6 +1283,34 @@ def test_a_line_the_program_ends_while_a_key_is_down_leaves_nothing_down_and_the
         comet.stop()
 
 
+def test_a_view_of_a_tile_whose_machine_an_admin_replaced_opens_no_line_to_the_new_one_until_it_is_looked_at_again(tmp_path: Path, browser: Browser) -> None:  # noqa: F811
+    # (The outside review of 0.4.0, H3.) The page looked at the wall; an admin elsewhere then pointed the tile at another KVM.
+    # Enlarged from the page as it was, the tile asks for its line with the machine it showed, is refused, says so, and the wall
+    # is fetched anew; "Open again" opens the line to the machine the tile is at now.
+    first = FakeKvm(FakeState(picture=jpeg_picture(320, 240, (40, 40, 160)), picture_type="image/jpeg", width=320, height=240)).start()
+    second = FakeKvm(FakeState(picture=jpeg_picture(320, 240, (160, 40, 40)), picture_type="image/jpeg", width=320, height=240)).start()
+    try:
+        with the_program(tmp_path, first) as live, looking(browser, live) as page:
+            sign_in(page, live)
+            expect(tile(page, "Machine 1")).to_have_attribute("data-state", "online")
+            with httpx.Client(base_url=live.url, headers=CSRF, timeout=30) as admin:
+                assert admin.post("/api/v1/login", json={"password": PASSWORD}).status_code == 200
+                edit = {"url": second.url, "name": "Machine 1", "username": "admin", "password": DEVICE_PASSWORD}
+                assert admin.put(f"/api/v1/devices/{live.device}", json=edit).status_code == 200  # type: ignore[attr-defined]
+            with page.expect_response(lambda reply: reply.url.endswith("/api/v1/wall")):  # (fetched anew after the refusal)
+                enlarged(page, "Machine 1")
+                expect(page.locator("#focus-live")).to_have_attribute("title", re.compile("is not the machine you saw any more"))
+            expect(page.locator("#focus-again")).to_be_visible()
+            page.keyboard.press("c")  # (nothing to take: no line was opened)
+            page.wait_for_timeout(300)
+            assert second.state.hid == [] and first.state.hid == []
+            page.locator("#focus-again").click()
+            expect(page.locator("#focus-live")).to_contain_text("Live · JPEG")
+    finally:
+        first.stop()
+        second.stop()
+
+
 def test_an_admin_takes_over_where_somebody_else_holds_the_keyboard_and_the_holders_page_says_who(tmp_path: Path, browser: Browser) -> None:  # noqa: F811
     # An operator holds the machine's keyboard, with Ctrl down. An admin sees who, takes over after a question that names
     # her, and types; her page says that the admin took over, offers her no take-over of her own, and sends nothing more.
@@ -1434,3 +1462,187 @@ def test_a_take_over_slower_than_five_seconds_is_waited_for_and_leaves_the_admin
                 expect(mine.locator("#focus-control")).to_have_text("Control")
     finally:
         comet.stop()
+
+
+def pressed_in_the_view(page: Page, button: str) -> None:
+    """A button of the large view's row of keys, with keyboard and mouse taken first (from More where the row is full)."""
+    control = page.locator("#focus-control")
+    expect(control).to_be_visible()
+    if control.get_attribute("aria-pressed") != "true":
+        control.click()
+    expect(control).to_have_attribute("aria-pressed", "true")
+    if not page.locator(button).is_visible():
+        page.locator("#focus-keys-more summary").click()
+    page.locator(button).click()
+
+
+def test_keys_that_waited_for_control_to_be_let_go_are_looked_at_again_before_they_go(tmp_path: Path, browser: Browser) -> None:  # noqa: F811
+    # (The outside review 6.2 narrow look at the third re-check's fixes, HIGH 5.) Text typed from the large view waits up to three
+    # seconds after its question for keyboard and mouse to be let go. Its selection was looked at before the question only: word
+    # that the KVM has several inputs, come meanwhile, did not stop it, and it went naming none. It is looked at again then.
+    from tests.test_in_a_browser import a_wall
+
+    desk = FakeKvm(FakeState()).start()
+    try:
+        with a_wall(tmp_path, ("Desk", desk)) as (live, _), looking(browser, live) as page:
+            sign_in(page, live)
+            expect(tile(page, "Desk")).to_have_attribute("data-state", "online")
+            enlarged(page, "Desk")
+            pressed_in_the_view(page, "#focus-type")
+            top(page).locator("textarea").fill("whoami")
+            top(page).get_by_role("button", name="Continue").click()
+            expect(top(page).locator("p").first).to_have_text("Type this on Desk?")
+            page.route("**/api/v1/status", lambda route: route.fulfill(json={}))  # (no other word of it from here: only the one below)
+            # As keyboard and mouse are let go, word comes that the KVM has several inputs (its switch answered at last).
+            page.evaluate("""() => {
+              const real = giveBack;
+              window.giveBack = () => {
+                real();
+                const shown = tiles.get(focus.id);
+                applyStatuses({ [focus.id]: { ...shown.status, several_inputs: true } }, askedOf());
+              };
+            }""")
+            top(page).locator(".actions button").last.click()
+            told(page, "Desk: qKVM could not tell which computer it shows")
+            page.wait_for_timeout(400)
+            assert desk.state.actions == [] and kvm_keys(desk) == [], (desk.state.actions, kvm_keys(desk))
+    finally:
+        desk.stop()
+
+
+SHORTCUT_ASKED = {"#focus-cad": "Ctrl+Alt+Del on {}?", "#focus-alt-f4": "Alt+F4 on {}? It closes the window that is in front there."}
+SHORTCUT_SENT = {"#focus-cad": "shortcut ControlLeft,AltLeft,Delete", "#focus-alt-f4": "shortcut AltLeft,F4"}
+
+
+@pytest.mark.parametrize("shortcut", [*SHORTCUT_ASKED])
+def test_the_large_views_ctrl_alt_del_and_alt_f4_go_as_actions_to_a_kvm_of_one_input_too(tmp_path: Path, browser: Browser, shortcut: str) -> None:  # noqa: F811
+    # (The outside review 6.2 narrow look at the third re-check's fixes, HIGH 4.) On a KVM the page took for one of a single input, the two
+    # buttons asked a plain question and went over the live line, which names no input, once it was answered. They go as the
+    # Actions menu sends them on every machine that takes keys: with the machine, and saying the KVM was one of a single input,
+    # which the wall holds them to; keyboard and mouse are asked for again after.
+    from tests.test_in_a_browser import a_wall
+
+    desk = FakeKvm(FakeState()).start()
+    try:
+        with a_wall(tmp_path, ("Desk", desk)) as (live, _), looking(browser, live) as page:
+            sign_in(page, live)
+            expect(tile(page, "Desk")).to_have_attribute("data-state", "online")
+            enlarged(page, "Desk")
+            pressed_in_the_view(page, shortcut)
+            expect(top(page).locator("p").first).to_have_text(SHORTCUT_ASKED[shortcut].format("Desk"))
+            with page.expect_response(lambda reply: reply.request.method == "POST" and reply.url.endswith("/actions")) as answered:
+                top(page).locator(".actions button").last.click()
+            sent = answered.value.request.post_data_json
+            assert answered.value.status == 200 and sent.get("one_input") is True and "input" not in sent and sent.get("target"), sent
+            assert desk.state.actions == [SHORTCUT_SENT[shortcut]] and kvm_keys(desk) == [], (desk.state.actions, kvm_keys(desk))
+            expect(page.locator("#focus-control")).to_have_attribute("aria-pressed", "true")  # (keyboard and mouse asked for again)
+    finally:
+        desk.stop()
+
+
+@pytest.mark.parametrize("shortcut", [*SHORTCUT_ASKED])
+def test_the_large_views_question_of_ctrl_alt_del_or_alt_f4_goes_once_the_kvm_shows_several_inputs(tmp_path: Path, browser: Browser, monkeypatch: pytest.MonkeyPatch, shortcut: str) -> None:  # noqa: F811
+    # (HIGH 4.) Asked while the KVM's switch did not answer (one input, as far as anybody knew), the question stayed open once it
+    # answered with two, and its yes sent the keys over the live line to whichever computer was on screen. It is the Actions
+    # menu's question now, closed once the KVM is found to have several; asked again, it names the port.
+    from qkvm import kvm
+    from tests.test_in_a_browser import a_wall
+
+    monkeypatch.setattr(kvm, "ABOUT_TTL", 0)
+    monkeypatch.setattr(kvm, "STATUS_TTL", 0)
+    switch = FakeKvm(FakeState(ports=[(30, 15, 25), (10, 30, 15)], switch_fails=10**6)).start()
+    try:
+        with a_wall(tmp_path, ("Rack", switch)) as (live, _), looking(browser, live) as page:
+            sign_in(page, live)
+            expect(tile(page, "Rack")).to_have_attribute("data-state", "online")
+            enlarged(page, "Rack")
+            pressed_in_the_view(page, shortcut)
+            expect(top(page).locator("p").first).to_have_text(SHORTCUT_ASKED[shortcut].format("Rack"))
+            switch.state.switch_fails = 0  # (its switch answers, with two inputs, while the question is open)
+            expect(tile(page, "Rack").locator(".ports button").first).to_have_attribute("aria-pressed", "true")
+            expect(page.locator("dialog[open]")).to_have_count(0)
+            assert switch.state.actions == [] and kvm_keys(switch) == [], (switch.state.actions, kvm_keys(switch))
+            pressed_in_the_view(page, shortcut)
+            expect(top(page).locator("p").first).to_have_text(SHORTCUT_ASKED[shortcut].format("Rack, port 1"))
+            top(page).get_by_role("button", name="Cancel").click()
+            page.wait_for_timeout(300)
+            assert switch.state.actions == [] and kvm_keys(switch) == []
+    finally:
+        switch.stop()
+
+
+def test_keyboard_and_mouse_are_asked_for_again_after_keys_of_the_large_view_that_the_wall_refused(tmp_path: Path, browser: Browser, monkeypatch: pytest.MonkeyPatch) -> None:  # noqa: F811
+    # (The outside review 6.2's narrow look, LOW.) The question of the large view's Ctrl+Alt+Del says keyboard and mouse are let go for it
+    # "then requested again": they were, where the keys went, and not where the wall refused them (another computer on screen
+    # by then): the view was left without them, nothing said why. Refused, nothing sent, they are asked for again all the same.
+    from qkvm import kvm
+    from tests.test_in_a_browser import a_wall
+
+    monkeypatch.setattr(kvm, "STATUS_TTL", 0)
+    switch = FakeKvm(FakeState(ports=[(30, 15, 25), (10, 30, 15)])).start()
+    try:
+        with a_wall(tmp_path, ("Rack", switch)) as (live, _), looking(browser, live) as page:
+            sign_in(page, live)
+            expect(tile(page, "Rack").locator(".ports button").nth(0)).to_have_attribute("aria-pressed", "true")
+            enlarged(page, "Rack")
+            pressed_in_the_view(page, "#focus-cad")
+            expect(top(page).locator("p").first).to_have_text("Ctrl+Alt+Del on Rack, port 1?")
+            switch.state.active_port = 1  # (switched at the KVM itself while the question was open)
+            with page.expect_response(lambda reply: reply.request.method == "POST" and reply.url.endswith("/actions")) as answered:
+                top(page).locator(".actions button").last.click()
+            assert answered.value.status == 409
+            expect(page.locator("#focus-control")).to_have_attribute("aria-pressed", "true")  # (keyboard and mouse asked for again)
+            assert switch.state.actions == [] and kvm_keys(switch) == [], (switch.state.actions, kvm_keys(switch))
+    finally:
+        switch.stop()
+
+
+def test_ctrl_alt_del_and_alt_f4_of_the_large_view_of_a_kvm_with_several_inputs_name_the_port_and_go_only_there(tmp_path: Path, browser: Browser, monkeypatch: pytest.MonkeyPatch) -> None:  # noqa: F811
+    # (The outside review 6.2 third re-check, H4.) Confirmed in the large view, Ctrl+Alt+Del and Alt+F4 asked "Ctrl+Alt+Del on Rack?"
+    # and went over the live line, which names no input: a switch at the KVM's own buttons while the question was open sent
+    # them to the other computer. On a KVM with several inputs they name the port, and go as the Actions menu sends them,
+    # held to that input by the wall right before they go.
+    from qkvm import kvm
+    from tests.test_in_a_browser import a_wall
+
+    monkeypatch.setattr(kvm, "STATUS_TTL", 0)
+    switch = FakeKvm(FakeState(ports=[(30, 15, 25), (10, 30, 15)])).start()
+    try:
+        with a_wall(tmp_path, ("Rack", switch)) as (live, _), looking(browser, live) as page:
+            sign_in(page, live)
+            lit = tile(page, "Rack").locator(".ports button")
+            expect(lit.nth(0)).to_have_attribute("aria-pressed", "true")
+            enlarged(page, "Rack")
+
+            def pressed(button: str) -> None:
+                control = page.locator("#focus-control")
+                expect(control).to_be_visible()
+                if control.get_attribute("aria-pressed") != "true":
+                    control.click()
+                expect(control).to_have_attribute("aria-pressed", "true")
+                if not page.locator(button).is_visible():
+                    page.locator("#focus-keys-more summary").click()
+                page.locator(button).click()
+
+            pressed("#focus-alt-f4")
+            expect(top(page).locator("p").first).to_have_text("Alt+F4 on Rack, port 1? It closes the window that is in front there.")
+            top(page).get_by_role("button", name="Cancel").click()
+            pressed("#focus-cad")
+            expect(top(page).locator("p").first).to_have_text("Ctrl+Alt+Del on Rack, port 1?")
+            switch.state.active_port = 1  # (switched at the KVM itself while the question was open)
+            with page.expect_response(lambda reply: reply.request.method == "POST" and reply.url.endswith("/actions")) as answered:
+                top(page).locator(".actions button").last.click()
+            assert answered.value.status == 409
+            page.wait_for_timeout(300)
+            assert switch.state.actions == [] and kvm_keys(switch) == [], (switch.state.actions, kvm_keys(switch))
+            # Asked again for the computer on screen now: sent for that input, as an action, and not over the live line.
+            expect(lit.nth(1)).to_have_attribute("aria-pressed", "true")
+            pressed("#focus-cad")
+            expect(top(page).locator("p").first).to_have_text("Ctrl+Alt+Del on Rack, port 2?")
+            with page.expect_response(lambda reply: reply.request.method == "POST" and reply.url.endswith("/actions")) as answered:
+                top(page).locator(".actions button").last.click()
+            assert answered.value.status == 200 and answered.value.request.post_data_json.get("input") == 1
+            assert switch.state.actions == ["shortcut ControlLeft,AltLeft,Delete"] and kvm_keys(switch) == [], (switch.state.actions, kvm_keys(switch))
+            expect(page.locator("#focus-control")).to_have_attribute("aria-pressed", "true")  # (keyboard and mouse asked for again)
+    finally:
+        switch.stop()

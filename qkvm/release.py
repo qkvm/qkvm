@@ -38,7 +38,7 @@
         release workflow runs on the lock it made (.github/security/make-libraries.py). Needs packaging.
 
 Attach the wheel, the libraries' lock, the source archive, SHA256SUMS and SHA256SUMS.sig to a GitHub release tagged v1.2.3 (the release
-workflow makes it a draft with these files and the record of the scanned images, and a person publishes it).
+workflow makes it a draft with these files, the SBOM and the record of the scanned images, and a person publishes it).
 
 This file needs the cryptography library, or with --openssl the openssl command instead, and nothing else of what the
 program needs: where the key is used, as little as possible is installed. The library is loaded only where it is used.

@@ -56,14 +56,9 @@ class NotOurs(ValueError):
     """The folder the certificate is kept in is a link, or another account's: nothing is written into it."""
 
 
-def ensure_certificate(directory: Path, addresses: Iterable[str]) -> tuple[Path, Path, str]:
-    """Create the wall's certificate, or renew it when it is expiring or misses an address.
-
-    Returns (certificate file, key file, SHA-256 fingerprint). NotOurs where the folder is a link or another account's:
-    what another account put in the data folder while it was open stays that account's (whoever owns a file may change its
-    permissions), and a junction planted as `tls` took the wall's HTTPS key into a folder of theirs (the round 3 review).
-    A certificate or key in it that is a link or another account's is not used: a pair of the wall's own replaces it.
-    """
+def tls_folder(directory: Path) -> None:
+    """The folder the wall's certificates are kept in, made the account's own where it is not there. NotOurs where it is a
+    link or another account's (see ensure_certificate)."""
     if os.path.lexists(directory):
         if (why := not_ours(directory)) is not None:
             raise NotOurs(
@@ -74,6 +69,27 @@ def ensure_certificate(directory: Path, addresses: Iterable[str]) -> tuple[Path,
         private_folder(directory)  # (its own, from its first instant)
     else:
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+
+
+def keep_private(path: Path, data: bytes) -> None:
+    """Write `data` to `path` in full under another name, the account's alone from its first moment, then put it in place:
+    the file is the old one or the new one, never half of one."""
+    new = path.with_suffix(".new")
+    new.unlink(missing_ok=True)  # (left by a write that was cut off: made anew, its own)
+    with private(new, "xb") as fh:
+        fh.write(data)
+    os.replace(new, path)
+
+
+def ensure_certificate(directory: Path, addresses: Iterable[str]) -> tuple[Path, Path, str]:
+    """Create the wall's certificate, or renew it when it is expiring or misses an address.
+
+    Returns (certificate file, key file, SHA-256 fingerprint). NotOurs where the folder is a link or another account's:
+    what another account put in the data folder while it was open stays that account's (whoever owns a file may change its
+    permissions), and a junction planted as `tls` took the wall's HTTPS key into a folder of theirs (the round 3 review).
+    A certificate or key in it that is a link or another account's is not used: a pair of the wall's own replaces it.
+    """
+    tls_folder(directory)
     cert_path, key_path = directory / "cert.pem", directory / "key.pem"
     dns, ips = _names(addresses)
     now = datetime.datetime.now(datetime.timezone.utc)

@@ -1,6 +1,6 @@
 """Reads of a served image whose files are opened and let go of by the reader threads, under faults made on purpose: an
 opening and a cut-off in each order, a pool replaced, a pool stopped with its queue cancelled, an opening that raises
-what is no OSError. The outside review's third round (Codex) wrote these; two failed until 0.3.1: the cancelled queue's
+what is no OSError. The outside review's third round wrote these; two failed until 0.3.1: the cancelled queue's
 jobs that close the files and give back the places were dropped (eight of each left), and a ValueError while opening
 kept its place.
 """

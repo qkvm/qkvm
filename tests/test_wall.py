@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import datetime
 import ipaddress
-import socket
+import json
 import ssl
+import threading
 import time
+from collections import Counter
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -22,12 +24,13 @@ from fastapi.testclient import TestClient
 from qkvm import kvm, update, vault
 from qkvm.core import Core
 from qkvm.netbind import BindError, normalize, resolve
-from qkvm.security import Limiter, host_allowed
+from qkvm.security import Limiter, Sessions, host_allowed
 from qkvm.server import create_app
-from qkvm.store import InstanceLock, Store, StoreError, device_url
+from qkvm.store import AuditLog, InstanceLock, Store, StoreError, device_url
 from qkvm.tlscert import ensure_certificate
 from tests import fake_kvm
 from tests.fake_kvm import FakeKvm, FakeState
+from tests.own_ports import closed_port, port_to_listen_on  # noqa: F401  (the tests take them from here)
 from tests.settings_file import settings_text, write_settings_text
 
 PASSWORD = "correct horse battery"
@@ -75,12 +78,6 @@ def snap(device_id: str) -> str:
     return f"/api/v1/devices/{device_id}/snapshot"
 
 
-def closed_port() -> int:
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
-
-
 def wait_until(condition: Any, message: str, timeout: float = 5.0) -> None:
     deadline = time.monotonic() + timeout
     while not condition():
@@ -89,6 +86,63 @@ def wait_until(condition: Any, message: str, timeout: float = 5.0) -> None:
 
 
 # --- setup, login, sessions ---------------------------------------------------
+
+
+WRITERS = ("activity-log", "kept-sign-ins")  # the threads that write the activity log and who is kept signed in
+
+
+def writers_alive() -> Counter[str]:
+    return Counter(thread.name for thread in threading.enumerate() if thread.name in WRITERS and thread.is_alive())
+
+
+def test_a_wall_that_ends_leaves_none_of_its_writers_behind(tmp_path: Path) -> None:
+    # In one test process the suite came to some 1,400 threads (15 GB of address space on Linux): an activity-log and a
+    # kept-sign-ins writer for every wall a test made, each waiting for an entry that never came. A wall that ends has
+    # what it gave them written down, and lets them go.
+    before = writers_alive()
+    for each in range(3):
+        data = tmp_path / str(each)
+        with wall(data, sign_in=False) as client:
+            assert client.post("/api/v1/setup", json={"password": PASSWORD}).status_code == 200
+            assert client.post("/api/v1/login", json={"password": PASSWORD, "remember": True}).status_code == 200
+            assert writers_alive() - before == Counter(WRITERS)  # (both at work)
+        assert writers_alive() == before
+        written = [json.loads(line)["event"] for line in (data / "audit.log").read_text(encoding="utf-8").splitlines()]
+        assert {"setup", "login", "unlock_at_start_on"} <= set(written), written  # what they were given is on disk
+        assert len(json.loads((data / "sessions.json").read_text(encoding="ascii"))) == 1
+
+
+def test_a_writer_that_ended_starts_again_and_leaves_nothing_behind(tmp_path: Path) -> None:
+    # What is given while a close waits, or after it, is written all the same, in its turn: a wall that ends is opened
+    # anew where its network settings changed, and writes on.
+    held, going = threading.Event(), threading.Event()
+
+    def forward(line: str) -> None:
+        if '"first"' in line:
+            held.set()
+            going.wait(10)
+
+    before = writers_alive()
+    log = AuditLog(tmp_path / "audit.log", forward=forward)
+    log.write("first", "")
+    assert held.wait(10)  # the writer is busy with it...
+    log.close(within=0.1)  # ...as the close comes, which waits no longer than it is given
+    log.write("second", "")  # given after the close, before its writer came to its end
+    going.set()
+    log.close()
+    assert writers_alive() == before
+    log.write("third", "")  # and after that: a writer again
+    log.close()
+    assert writers_alive() == before
+    assert [entry["event"] for entry in log.entries()] == ["third", "second", "first"]
+
+    sessions = Sessions(tmp_path / "sessions.json")
+    for each in range(2):
+        sessions.create("192.0.2.1", True, f"0000000{each}", mark="m")
+        assert writers_alive() - before == Counter({"kept-sign-ins": 1})
+        assert sessions.close() is None
+        assert writers_alive() == before
+        assert len(json.loads((tmp_path / "sessions.json").read_text(encoding="ascii"))) == each + 1
 
 
 def test_first_run_setup_then_login(tmp_path: Path) -> None:
@@ -471,8 +525,9 @@ def test_status_never_waits_for_a_dead_device(tmp_path: Path, monkeypatch: pytes
         # seconds, so the answer is "connecting"; Linux is refused at once, and may know already.
         # (What it can be asked is the driver's list, there being no look at the device yet that could add to it.)
         can = kvm.can_do(*kvm.KvmDevice.can)
-        nobody_there = {"can": can, "state": "offline", "error": {"code": "unreachable", "message": "Device is unreachable"}, "last_seen_ago": None}
-        assert first in ({"can": can, "state": "connecting", "error": None, "last_seen_ago": None}, nobody_there)
+        target = client.get("/api/v1/wall").json()["devices"][0]["target"]  # (and the machine it is of, as every status says)
+        nobody_there = {"can": can, "target": target, "state": "offline", "error": {"code": "unreachable", "message": "Device is unreachable"}, "last_seen_ago": None}
+        assert first in ({"can": can, "target": target, "state": "connecting", "error": None, "last_seen_ago": None}, nobody_there)
         wait_until(lambda: client.get("/api/v1/status").json()[device]["state"] == "offline", "never reported offline")
 
 
@@ -1037,9 +1092,10 @@ def test_the_activity_log_can_be_searched_and_taken_away(tmp_path: Path, fake: F
         def events(query: str) -> list[str]:
             return [e["event"] for e in client.get(f"/api/v1/audit?{query}").json()["entries"]]
 
-        assert events("limit=50") == ["login_failed", "user_added", "action", "device_added", "setup"]
+        # (Before anything, the log's seals as the wall began to serve: its genesis and its start. See test_activity_chain_written.)
+        assert events("limit=50") == ["login_failed", "user_added", "action", "device_added", "setup", "log_sealed", "log_sealed"]
         assert events("kind=signin") == ["login_failed", "setup"]
-        assert events("kind=action") == ["action"] and events("kind=change") == ["user_added", "device_added"]
+        assert events("kind=action") == ["action"] and events("kind=change") == ["user_added", "device_added", "log_sealed", "log_sealed"]
         assert events("q=OLGA") == ["login_failed", "user_added"]  # in whatever case it is typed
         assert events("q=reboot") == ["action"] and events("q=nothing-like-this") == []
         # What the page shows is called something else in here: it asks under both names, and either finds it.
@@ -1049,7 +1105,7 @@ def test_the_activity_log_can_be_searched_and_taken_away(tmp_path: Path, fake: F
         entries = client.get("/api/v1/audit?limit=2").json()
         assert [e["event"] for e in entries["entries"]] == ["login_failed", "user_added"] and entries["more"] is True
         older = client.get(f"/api/v1/audit?limit=50&before={entries['entries'][-1]['time']}").json()
-        assert [e["event"] for e in older["entries"]] == ["action", "device_added", "setup"] and older["more"] is False
+        assert [e["event"] for e in older["entries"]] == ["action", "device_added", "setup", "log_sealed", "log_sealed"] and older["more"] is False
 
         # As a file: a table for a spreadsheet, or the lines as they are for a program.
         table = client.get("/api/v1/audit/export?format=csv&kind=action")
@@ -1063,7 +1119,7 @@ def test_the_activity_log_can_be_searched_and_taken_away(tmp_path: Path, fake: F
         lines = client.get("/api/v1/audit/export?format=jsonl").text.splitlines()
         # (The download of a moment ago is in the log itself, with what it was of: the activity log taken away is something done.)
         exported, *rest = [json_lines.loads(line) for line in lines]
-        assert [entry["event"] for entry in rest] == ["login_failed", "user_added", "action", "device_added", "setup"]
+        assert [entry["event"] for entry in rest] == ["login_failed", "user_added", "action", "device_added", "setup", "log_sealed", "log_sealed"]
         assert (exported["event"], exported["format"], exported["asked"], exported["user"]) == ("activity_exported", "csv", {"kind": "action"}, "admin")
         assert client.get("/api/v1/audit/export?format=pdf").status_code == 422
 

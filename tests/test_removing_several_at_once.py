@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import json
 import sqlite3
 import threading
 import time
@@ -34,7 +33,7 @@ from tests.test_meanwhile import in_background
 from tests.test_tokens import script
 from tests.test_users import account, browser, visitor
 from tests.test_wall import add, closed_port, wait_until, wall
-from tests.settings_file import settings_text
+from tests.settings_file import settings_while_saved
 
 REMOVE = "/api/v1/devices/remove"
 # (A live line is opened and held by test_live's `Viewer` for as long as a test wants it, not in a `with`: the library would rather it were.)
@@ -71,7 +70,16 @@ def on_the_wall(admin: Any) -> list[str]:
 
 
 def in_the_file(data: Path) -> list[str]:
-    return [device["id"] for device in json.loads(settings_text(data / "qkvm.json", encoding="utf-8"))["devices"]]
+    """The machines in the settings file, read while the wall may be saving it: Windows refuses a reader for the moment the
+    file is replaced (settings_while_saved), and a wall just started saves (GitHub's Windows runner, 3.12, failed so)."""
+    saved: list[Any] = []
+
+    def read() -> bool:
+        saved[:] = [settings_while_saved(data / "qkvm.json")]
+        return saved[0] is not None
+
+    wait_until(read, "the settings file could not be read", timeout=10)
+    return [device["id"] for device in saved[0]["devices"]]
 
 
 def removed_lines(admin: Any) -> list[dict[str, Any]]:

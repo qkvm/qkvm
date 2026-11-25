@@ -16,7 +16,7 @@ import pytest
 from tests.workflow_text import APP, SECURITY, WORKFLOWS, jobs, steps
 
 RELEASE = WORKFLOWS / "release.yml"
-THREE_NAMES = 'test "$listed" = "qkvm-${TAG#v}-image.json qkvm-${TAG#v}-libraries.json qkvm-${TAG#v}-py3-none-any.whl qkvm-${TAG#v}.tar.gz "'
+NAMES = 'test "$listed" = "qkvm-${TAG#v}-image.json qkvm-${TAG#v}-libraries.json qkvm-${TAG#v}-py3-none-any.whl qkvm-${TAG#v}-sbom.cdx.json qkvm-${TAG#v}.tar.gz "'
 
 
 def tag_pattern() -> str:
@@ -49,8 +49,8 @@ def test_the_names_are_checked_before_the_draft_is_made() -> None:
     order = steps(jobs(RELEASE)["draft"])
     before = next(index for index, step in enumerate(order) if 'awk \'{print $2}\' release/SHA256SUMS' in step)
     made = next(index for index, step in enumerate(order) if "gh release create" in step)
-    assert before < made and THREE_NAMES in order[before]
-    assert THREE_NAMES in order[made], "and again on what the draft holds"
+    assert before < made and NAMES in order[before]
+    assert NAMES in order[made], "and again on what the draft holds"
 
 
 def test_the_readme_says_to_publish_only_a_draft_whose_run_is_green() -> None:

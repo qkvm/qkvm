@@ -14,6 +14,7 @@ with; where they are missing the tests are skipped:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -23,6 +24,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlsplit
 
 import httpx
 import pytest
@@ -37,7 +39,7 @@ from tests.fake_jetkvm import FakeJetKvm, JetState
 from tests.fake_kvm import FakeKvm, FakeState
 from tests.fake_redfish import BmcState, FakeBmc
 from tests.scripted_device import Scripted, as_json
-from tests.test_hardening import LiveWall
+from tests.test_hardening import KEPT_AS_THE_PROGRAM, LiveWall
 from tests.test_totp import code_for, switch_on
 from tests.test_users import OTHER
 from tests.test_wall import CSRF, PASSWORD, closed_port
@@ -83,7 +85,7 @@ def fakes() -> Iterator[list[FakeKvm]]:
 @contextmanager
 def a_wall(data: Path, *devices: tuple[str, FakeKvm], **options: Any) -> Iterator[tuple[LiveWall, httpx.Client]]:
     """A wall on a port of its own with its first account made, and that account as a script beside the browser."""
-    with LiveWall(data) as live, httpx.Client(base_url=live.url, headers=CSRF, timeout=30) as admin:
+    with LiveWall(data, **KEPT_AS_THE_PROGRAM) as live, httpx.Client(base_url=live.url, headers=CSRF, timeout=30) as admin:
         assert admin.post("/api/v1/setup", json={"password": PASSWORD}).status_code == 200
         for name, fake in devices:
             reply = admin.post("/api/v1/devices", json={"url": fake.url, "password": DEVICE_PASSWORD, "name": name, **options})
@@ -366,6 +368,416 @@ def test_a_key_is_sent_at_a_click_and_what_can_cost_work_only_after_a_yes(tmp_pa
         asked_first("Hold power button", "atx power_long", "A long press cuts the power. Unsaved work is lost.")
 
 
+def test_a_menu_opened_before_its_tile_was_pointed_elsewhere_sends_nothing_there(tmp_path: Path, browser: Browser, fakes: list[FakeKvm]) -> None:
+    # (The outside review 6.2 re-check, R1.) A menu stays open while the wall is fetched again, and its buttons that act at a click
+    # sent what the tile was at by the time of the click: Lock screen in the menu headed "Build server" went to the machine
+    # an admin's edit had put under the tile meanwhile. The menu sends the machine it was opened for; the wall refuses it.
+    # (The second re-check, H1.) Its question named the tile as it was by the click, the request the machine the menu was
+    # opened for: once the wall is fetched again, a menu and its question whose tile is at another machine are closed.
+    first, second = fakes
+    spare = FakeKvm().start()
+    try:
+        with a_wall(tmp_path, ("Build server", first)) as (live, admin), looking(browser, live) as page:
+            sign_in(page, live)
+            expect(tile(page, "Build server")).to_have_attribute("data-state", "online")
+            page.get_by_role("button", name="Actions for Build server").click()
+            menu = top(page)
+            device = admin.get("/api/v1/wall").json()["devices"][0]["id"]
+            edited = admin.put(f"/api/v1/devices/{device}", json={"name": "Build server", "url": second.url, "username": "admin", "password": DEVICE_PASSWORD})
+            assert edited.status_code == 200, edited.text
+            # Clicked before the wall is fetched again: the machine the menu was opened for goes with it, and is refused.
+            with page.expect_response(lambda reply: reply.url.endswith("/api/v1/wall")):  # (the wall, fetched anew after the refusal)
+                menu.get_by_role("button", name="Lock screen").click()
+                told(page, "Build server: ")
+            page.wait_for_timeout(400)
+            assert first.state.actions == [] and second.state.actions == [], (first.state.actions, second.state.actions)
+            told(page, "Nothing was sent")
+            expect(page.locator("dialog[open]")).to_have_count(0)  # (the menu it was clicked in is out of date)
+            # Opened anew, with a question open from it: an edit puts the first KVM back under the tile, and one more KVM added
+            # elsewhere has the wall fetch every tile again at its next look. Both are closed, and nothing is sent.
+            page.get_by_role("button", name="Actions for Build server").click()
+            top(page).get_by_role("button", name="Ctrl+Alt+Del").click()
+            expect(page.locator("dialog[open]")).to_have_count(2)
+            expect(top(page).locator("p").first).to_have_text("Ctrl+Alt+Del on Build server?")
+            edited = admin.put(f"/api/v1/devices/{device}", json={"name": "Build server", "url": first.url, "username": "admin", "password": DEVICE_PASSWORD})
+            assert edited.status_code == 200, edited.text
+            assert admin.post("/api/v1/devices", json={"url": spare.url, "password": DEVICE_PASSWORD, "name": "Spare"}).status_code == 201
+            expect(tile(page, "Spare")).to_have_count(1)
+            expect(page.locator("dialog[open]")).to_have_count(0)
+            page.wait_for_timeout(400)
+            assert first.state.actions == [] and second.state.actions == [], (first.state.actions, second.state.actions)
+    finally:
+        spare.stop()
+
+
+def test_keys_from_a_menu_opened_while_another_input_was_on_screen_are_not_sent(tmp_path: Path, browser: Browser, monkeypatch: pytest.MonkeyPatch) -> None:
+    # (The outside review 6.2 re-check, R2.) On a KVM with several inputs the menu says keys go to the computer on screen. Switched at
+    # the KVM's own buttons while the menu was open, its Lock screen went to the other computer. It names the input it showed.
+    monkeypatch.setattr(kvm, "STATUS_TTL", 0)
+    several = FakeKvm(FakeState(ports=[(200, 30, 30), (30, 200, 30)], active_port=0)).start()
+    try:
+        with a_wall(tmp_path, ("Rack KVM", several)) as (live, _), looking(browser, live) as page:
+            sign_in(page, live)
+            lit = tile(page, "Rack KVM").locator(".ports button")
+            expect(lit.nth(0)).to_have_attribute("aria-pressed", "true")
+            page.get_by_role("button", name="Actions for Rack KVM").click()
+            menu = top(page)
+            several.state.active_port = 1  # (switched at the KVM itself)
+            expect(lit.nth(1)).to_have_attribute("aria-pressed", "true")
+            menu.get_by_role("button", name="Lock screen").click()
+            told(page, "Rack KVM: ")
+            page.wait_for_timeout(400)
+            assert several.state.actions == []
+            told(page, "Nothing was sent")
+            expect(page.locator("dialog[open]")).to_have_count(0)
+            # Opened again, its buttons go to the computer on screen now.
+            page.get_by_role("button", name="Actions for Rack KVM").click()
+            top(page).get_by_role("button", name="Lock screen").click()
+            told(page, "Rack KVM: Win+L sent")
+            assert several.state.actions == ["shortcut MetaLeft,KeyL"]
+    finally:
+        several.stop()
+
+
+def test_a_kvm_with_several_inputs_is_offered_no_keys_while_it_cannot_be_told_which_is_on_screen(tmp_path: Path, browser: Browser, monkeypatch: pytest.MonkeyPatch) -> None:
+    # (The outside review 6.2 second re-check, H3.) Its switch stopped answering: the port buttons went from its tile, and its menu went
+    # on offering Lock screen, which named no input and went to whichever computer was on screen. None is offered then.
+    monkeypatch.setattr(kvm, "STATUS_TTL", 0)
+    several = FakeKvm(FakeState(ports=[(200, 30, 30), (30, 200, 30)], active_port=0)).start()
+    try:
+        with a_wall(tmp_path, ("Rack KVM", several)) as (live, _), looking(browser, live) as page:
+            sign_in(page, live)
+            lit = tile(page, "Rack KVM").locator(".ports button")
+            expect(lit.nth(0)).to_have_attribute("aria-pressed", "true")
+            several.state.switch_fails = 10**6  # (its switch answers 502 from now on)
+            expect(lit).to_have_count(0)
+            page.get_by_role("button", name="Actions for Rack KVM").click()
+            menu = top(page)
+            expect(menu).to_contain_text("qKVM cannot tell which computer this KVM shows")
+            for name in ("Lock screen", "Ctrl+Alt+Del", "Send keys...", "Type text..."):
+                expect(menu.get_by_role("button", name=name)).to_have_count(0)
+            page.keyboard.press("Escape")
+            expect(page.locator("dialog[open]")).to_have_count(0)
+            # Its switch answers again: the menu offers them, and they name the input lit.
+            several.state.switch_fails = 0
+            expect(lit.nth(0)).to_have_attribute("aria-pressed", "true")
+            sent: list[Any] = []
+            page.on("request", lambda request: sent.append(request.post_data_json) if request.method == "POST" and request.url.endswith("/actions") else None)
+            page.get_by_role("button", name="Actions for Rack KVM").click()
+            top(page).get_by_role("button", name="Lock screen").click()
+            told(page, "Rack KVM: Win+L sent")
+            assert several.state.actions == ["shortcut MetaLeft,KeyL"]
+            assert [body.get("input") for body in sent] == [0], sent
+    finally:
+        several.stop()
+
+
+def test_every_keyboard_action_the_page_sends_names_the_input_or_says_the_kvm_has_one(tmp_path: Path, browser: Browser, monkeypatch: pytest.MonkeyPatch) -> None:
+    # (The outside review 6.2 narrow look at the third re-check's fixes, HIGH 5.) Keys for a KVM the page took for one of a single input
+    # named nothing: the wall could not tell them from a script's, and sent them wherever they landed. They say so now
+    # (`one_input`), which the wall holds them to; keys for a KVM with several name the input lit. Never neither.
+    monkeypatch.setattr(kvm, "STATUS_TTL", 0)
+    several = FakeKvm(FakeState(ports=[(200, 30, 30), (30, 200, 30)], active_port=0)).start()
+    desk = FakeKvm(FakeState()).start()
+    try:
+        with a_wall(tmp_path, ("Rack KVM", several), ("Desk", desk)) as (live, _), looking(browser, live) as page:
+            sign_in(page, live)
+            expect(tile(page, "Rack KVM").locator(".ports button").nth(0)).to_have_attribute("aria-pressed", "true")
+            expect(page.locator('#wall article[data-state="online"]')).to_have_count(2)
+            sent: list[Any] = []
+            page.on("request", lambda request: sent.append(request.post_data_json) if request.method == "POST" and request.url.endswith("/actions") else None)
+            for name in ("Rack KVM", "Desk"):
+                page.get_by_role("button", name=f"Actions for {name}").click()
+                top(page).get_by_role("button", name="Lock screen").click()
+                told(page, f"{name}: Win+L sent")
+                page.keyboard.press("Escape")  # (the menu stays open after a button that acts at a click)
+                expect(page.locator("dialog[open]")).to_have_count(0)
+            assert [(body.get("input"), body.get("one_input")) for body in sent] == [(0, None), (None, True)], sent
+            assert several.state.actions == ["shortcut MetaLeft,KeyL"] and desk.state.actions == ["shortcut MetaLeft,KeyL"]
+    finally:
+        several.stop()
+        desk.stop()
+
+
+# Holds every answer to the page's question of how the machines are (GET /api/v1/status) until the test lets them go.
+HOLD_THE_STATUS = """(() => {
+    const original = window.fetch.bind(window);
+    const gate = new Promise(resolve => { window.letTheStatusGo = resolve; });
+    window.fetch = async (...given) => {
+        const answer = await original(...given);
+        if (new URL(answer.url).pathname === '/api/v1/status') {
+            window.statusHeld = true;
+            await gate;
+        }
+        return answer;
+    };
+})()"""
+
+KEYBOARD_BUTTONS = ("Lock screen", "Ctrl+Alt+Del", "Send keys...", "Type text...")
+
+
+def test_a_menu_opened_before_the_page_has_word_of_a_kvm_with_several_inputs_offers_no_keys_that_name_none(tmp_path: Path, browser: Browser) -> None:
+    # (The outside review 6.2 third re-check, H1.) The wall knew the KVM has several inputs; the page, just opened, had no status of it
+    # yet, and its menu offered Lock screen, which named no input and would have gone to whichever computer was on screen. Its
+    # keys wait for the page's word of the machine; a menu opened before then offers none, and is closed once it comes.
+    several = FakeKvm(FakeState(ports=[(200, 30, 30), (30, 200, 30)], active_port=0)).start()
+    try:
+        with a_wall(tmp_path, ("Rack KVM", several)) as (live, admin), looking(browser, live) as page:
+            until(page, lambda: next(iter(admin.get("/api/v1/status").json().values())).get("several_inputs") is True, "the wall never saw its inputs")
+            page.add_init_script(HOLD_THE_STATUS)
+            sign_in(page, live)
+            page.get_by_role("button", name="Actions for Rack KVM").click()
+            menu = top(page)
+            expect(menu).to_be_visible()
+            page.wait_for_function("window.statusHeld === true")
+            expect(menu).to_contain_text("qKVM has had no word from this machine yet")
+            for name in KEYBOARD_BUTTONS:
+                expect(menu.get_by_role("button", name=name)).to_have_count(0)
+            page.evaluate("window.letTheStatusGo()")
+            expect(tile(page, "Rack KVM").locator(".ports button").nth(0)).to_have_attribute("aria-pressed", "true")
+            expect(page.locator("dialog[open]")).to_have_count(0)  # (taken without an input: closed once the page knows)
+            sent: list[Any] = []
+            page.on("request", lambda request: sent.append(request.post_data_json) if request.method == "POST" and request.url.endswith("/actions") else None)
+            page.get_by_role("button", name="Actions for Rack KVM").click()
+            top(page).get_by_role("button", name="Lock screen").click()
+            told(page, "Rack KVM: Win+L sent")
+            assert several.state.actions == ["shortcut MetaLeft,KeyL"]
+            assert [body.get("input") for body in sent] == [0], sent
+    finally:
+        several.stop()
+
+
+def test_two_clicks_while_the_page_waits_for_its_first_word_of_a_machine_open_one_menu(tmp_path: Path, browser: Browser, fakes: list[FakeKvm]) -> None:
+    # (The outside review 6.2's narrow look, LOW.) Its Actions pressed twice while the page waited for its first word of the machine (up to
+    # two seconds), and two menus came, one over the other. One menu for one selection.
+    with a_wall(tmp_path, ("Build server", fakes[0])) as (live, _), looking(browser, live) as page:
+        page.add_init_script(HOLD_THE_STATUS)
+        sign_in(page, live)
+        until(page, lambda: page.evaluate("window.statusHeld === true"), "the page never asked how the machine is")
+        page.get_by_role("button", name="Actions for Build server").click()
+        page.get_by_role("button", name="Actions for Build server").click()
+        expect(top(page)).to_be_visible()
+        page.wait_for_timeout(500)
+        assert page.locator("dialog[open]").count() == 1
+        page.evaluate("window.letTheStatusGo()")
+        top(page).get_by_role("button", name="Close").click()
+        expect(page.locator("dialog[open]")).to_have_count(0)
+        assert fakes[0].state.actions == []
+
+
+def test_a_menu_opened_while_a_kvm_seemed_to_have_one_input_is_closed_once_it_shows_several(tmp_path: Path, browser: Browser, monkeypatch: pytest.MonkeyPatch) -> None:
+    # (H1, the bugs round of the same re-check.) Its switch did not answer from the start: a KVM of one input as far as anybody
+    # knew, and its menu offered Lock screen with no input to name. Its switch answered with the second input on screen while
+    # the menu was open, and the Lock screen still in it went there. The menu is closed once the KVM is known to have several.
+    monkeypatch.setattr(kvm, "STATUS_TTL", 0)
+    monkeypatch.setattr(kvm, "ABOUT_TTL", 0)
+    several = FakeKvm(FakeState(ports=[(200, 30, 30), (30, 200, 30)], switch_fails=10**6)).start()
+    try:
+        with a_wall(tmp_path, ("Rack KVM", several)) as (live, _), looking(browser, live) as page:
+            sign_in(page, live)
+            rack = tile(page, "Rack KVM")
+            expect(rack).to_have_attribute("data-state", "online")
+            expect(rack.locator(".ports button")).to_have_count(0)
+            page.get_by_role("button", name="Actions for Rack KVM").click()
+            expect(top(page).get_by_role("button", name="Lock screen")).to_be_visible()
+            several.state.active_port = 1
+            several.state.switch_fails = 0
+            expect(rack.locator(".ports button").nth(1)).to_have_attribute("aria-pressed", "true")
+            expect(page.locator("dialog[open]")).to_have_count(0)
+            assert several.state.actions == []
+    finally:
+        several.stop()
+
+
+@pytest.mark.parametrize("several_before", [True, False])
+def test_a_tile_pointed_at_another_machine_shows_and_offers_nothing_of_the_one_before(tmp_path: Path, browser: Browser, several_before: bool) -> None:
+    # (The outside review 6.2 third re-check, H2.) A tile rebuilt for the machine an admin's edit put under it took the status of the one
+    # before: the port buttons of a KVM with several inputs on a KVM of one; and, the other way round, keys offered as for a KVM
+    # of one input, naming none, on one with several. It shows nothing of the one before, and offers keys once it has the new
+    # one's word.
+    two, one = [(200, 30, 30), (30, 200, 30)], []
+    before, after = (FakeKvm(FakeState(ports=two if several_before else one)).start(), FakeKvm(FakeState(ports=one if several_before else two)).start())
+    try:
+        with a_wall(tmp_path, ("Former", before)) as (live, admin), looking(browser, live) as page:
+            sign_in(page, live)
+            expect(tile(page, "Former")).to_have_attribute("data-state", "online")
+            expect(tile(page, "Former").locator(".ports button")).to_have_count(2 if several_before else 0)
+            shown = admin.get("/api/v1/wall").json()["devices"][0]
+            page.route("**/api/v1/status", lambda route: route.fulfill(json={}))  # (no word of the new machine for now)
+            edited = admin.put(f"/api/v1/devices/{shown['id']}", json={"name": "Current", "url": after.url, "username": "admin", "password": DEVICE_PASSWORD})
+            assert edited.status_code == 200 and edited.json()["device"]["target"] != shown["target"], edited.text
+            page.evaluate("reloadWall()")
+            expect(tile(page, "Current")).to_have_count(1)
+            expect(tile(page, "Current").locator(".ports button")).to_have_count(0)
+            page.get_by_role("button", name="Actions for Current").click()
+            menu = top(page)
+            expect(menu).to_contain_text("qKVM has had no word from this machine yet")
+            for name in KEYBOARD_BUTTONS:
+                expect(menu.get_by_role("button", name=name)).to_have_count(0)
+            assert before.state.actions == after.state.actions == []
+    finally:
+        before.stop()
+        after.stop()
+
+
+def test_a_page_with_the_wall_as_it_was_takes_no_status_of_the_machine_an_edit_put_under_a_tile(tmp_path: Path, browser: Browser) -> None:
+    # (The outside review 6.2's narrow look, HIGH 6.) The page had the wall as it was before an admin pointed a tile at another KVM, and took
+    # that one's status under the old one's name: its two port buttons on the tile of a KVM of one input (and, with the edit
+    # taken back, the old `target` good again for what was offered by them). A status says the machine it is of: one of
+    # another than the tile's is not taken, and the wall is fetched again.
+    former, current = FakeKvm(FakeState()).start(), FakeKvm(FakeState(ports=[(200, 30, 30), (30, 200, 30)])).start()
+    try:
+        with a_wall(tmp_path, ("Former", former)) as (live, admin), looking(browser, live) as page:
+            sign_in(page, live)
+            expect(tile(page, "Former")).to_have_attribute("data-state", "online")
+            shown = admin.get("/api/v1/wall").json()["devices"][0]
+            fetched: list[Any] = []
+            page.route("**/api/v1/wall", lambda route: fetched.append(route))  # the wall as it was stays on the page until let through
+            edited = admin.put(f"/api/v1/devices/{shown['id']}", json={"name": "Former", "url": current.url, "username": "admin", "password": DEVICE_PASSWORD})
+            assert edited.status_code == 200 and edited.json()["device"]["target"] != shown["target"], edited.text
+            until(page, lambda: admin.get("/api/v1/status").json()[shown["id"]].get("several_inputs") is True, "the wall never saw the new KVM's inputs")
+            page.evaluate("lookNow()")
+            assert tile(page, "Former").locator(".ports button").count() == 0  # nothing of the other machine on the old one's tile
+            until(page, lambda: bool(fetched), "the page never fetched the wall again")
+            for route in fetched:
+                route.continue_()
+            page.unroute("**/api/v1/wall")
+            # Fetched again, the tile is at the new KVM, and takes its word.
+            expect(tile(page, "Former").locator(".ports button")).to_have_count(2)
+            assert page.evaluate(f"tiles.get('{shown['id']}').device.target") == edited.json()["device"]["target"]
+            assert former.state.actions == current.state.actions == []
+    finally:
+        former.stop()
+        current.stop()
+
+
+def test_refusals_for_a_machine_put_in_a_tiles_place_fetch_the_wall_once_at_a_time(tmp_path: Path, browser: Browser, fakes: list[FakeKvm]) -> None:
+    # (The second fresh review of the HA round, a nit.) Each refusal `machine_changed` fetched the wall again on its own, whatever was
+    # under way already; they share the one fetch that is out, as a status or a picture of another machine does.
+    with a_wall(tmp_path, ("Alpha", fakes[0])) as (live, _), looking(browser, live) as page:
+        sign_in(page, live)
+        expect(page.locator("#wall article")).to_have_count(1)
+        asked: list[str] = []
+        page.on("request", lambda request: asked.append(request.url) if urlsplit(request.url).path == "/api/v1/wall" else None)
+        page.evaluate("for (let n = 0; n < 3; n += 1) lookAgainAfter({ code: 'machine_changed' })")
+        page.wait_for_timeout(1000)
+        assert len(asked) == 1, asked
+
+
+def test_a_menu_with_the_wall_as_it_was_offers_no_computers_to_wake_of_the_machine_an_edit_put_under_its_tile(tmp_path: Path, browser: Browser) -> None:
+    # (The sweep of the second fresh review of the HA round.) The menu's "Wake ..." buttons came from a list asked by the tile's id
+    # alone: on a page with the wall as it was, the computers the other KVM wakes, under the old one's name. The list names the
+    # machine the menu was opened for: refused, no such button, and the wall is fetched again (and the menu closed).
+    first = FakeKvm(FakeState(wol=[{"mac": "02:00:00:00:00:01", "name": "build-01"}])).start()
+    second = FakeKvm(FakeState(wol=[{"mac": "02:00:00:00:00:02", "name": "only-there"}])).start()
+    try:
+        with a_wall(tmp_path, ("Rack", first)) as (live, admin), looking(browser, live) as page:
+            sign_in(page, live)
+            shown = admin.get("/api/v1/wall").json()["devices"][0]
+            expect(tile(page, "Rack")).to_have_attribute("data-state", "online")
+            asked: list[tuple[int, str]] = []
+            page.on("response", lambda reply: asked.append((reply.status, reply.url)) if urlsplit(reply.url).path.endswith("/wol") else None)
+            page.get_by_role("button", name="Actions for Rack").click()
+            expect(top(page).get_by_role("button", name="Wake build-01")).to_be_visible()
+            assert parse_qs(urlsplit(asked[-1][1]).query).get("target") == [shown["target"]], asked
+            page.keyboard.press("Escape")
+            fetched: list[Any] = []
+            page.route("**/api/v1/wall", lambda route: fetched.append(route))  # (the wall as it was stays on the page until let through)
+            page.route("**/api/v1/status", lambda route: route.fulfill(json={}))
+            edited = admin.put(f"/api/v1/devices/{shown['id']}", json={"name": "Rack", "url": second.url, "username": "admin", "password": DEVICE_PASSWORD})
+            assert edited.status_code == 200, edited.text
+            page.get_by_role("button", name="Actions for Rack").click()
+            until(page, lambda: len(asked) >= 2, "the menu never listed the computers to wake")
+            assert asked[-1][0] == 409, asked
+            page.wait_for_timeout(300)
+            expect(page.get_by_role("button", name="Wake only-there")).to_have_count(0)
+            until(page, lambda: bool(fetched), "the page never fetched the wall again")
+            for route in fetched:
+                route.continue_()
+            assert second.state.actions == [] and first.state.actions == []
+    finally:
+        first.stop()
+        second.stop()
+
+
+MIDDLE_PIXEL = """el => { const c = el.getContext('2d'); return [...c.getImageData(Math.floor(el.width / 2), Math.floor(el.height / 2), 1, 1).data].slice(0, 3); }"""
+# How many pixels of a canvas are near each of two colours (the two stand-ins' desks: their moving bar is white in both).
+COLOURS_SEEN = """([el, colours]) => { const d = el.getContext('2d').getImageData(0, 0, el.width, el.height).data;
+  return colours.map(([r, g, b]) => { let n = 0; for (let i = 0; i < d.length; i += 4) if (Math.abs(d[i] - r) + Math.abs(d[i + 1] - g) + Math.abs(d[i + 2] - b) < 40) n += 1; return n; }); }"""
+
+
+def test_a_page_with_the_wall_as_it_was_shows_no_picture_of_the_machine_an_edit_put_under_a_tile(tmp_path: Path, browser: Browser, fakes: list[FakeKvm]) -> None:
+    # (The fresh review of the HA round, L2.) A tile's pictures were asked by its id alone: a page with the wall as it was showed the
+    # screen of the machine an admin had put under the tile, under the old one's name, until it looked at the status again. Each
+    # picture names the machine the tile is at as the page has it (`target`): refused, and the wall is fetched again.
+    with a_wall(tmp_path, ("Former", fakes[0])) as (live, admin), looking(browser, live) as page:
+        sign_in(page, live)
+        former = tile(page, "Former")
+        expect(former).to_have_class(re.compile(r"\bhas-frame\b"))
+        shown = admin.get("/api/v1/wall").json()["devices"][0]
+        canvas = page.locator(f'#wall article[data-id="{shown["id"]}"] canvas')
+        desks = [list(fakes[0].state.colour), list(fakes[1].state.colour)]
+        old_desk, new_desk = canvas.evaluate(f"el => ({COLOURS_SEEN})([el, {desks}])")
+        assert old_desk > 0 and new_desk == 0, (old_desk, new_desk)
+        fetched: list[Any] = []
+        page.route("**/api/v1/wall", lambda route: fetched.append(route))  # (the wall as it was stays on the page until let through)
+        page.route("**/api/v1/status", lambda route: route.fulfill(json={}))  # (and no status says otherwise: this is the pictures')
+        answers: list[tuple[int, str]] = []
+        edited = admin.put(f"/api/v1/devices/{shown['id']}", json={"name": "Former", "url": fakes[1].url, "username": "admin", "password": DEVICE_PASSWORD})
+        assert edited.status_code == 200 and edited.json()["device"]["target"] != shown["target"], edited.text
+        page.on("response", lambda reply: answers.append((reply.status, reply.url)) if "/snapshot" in reply.url else None)
+        # (A picture asked just before the edit may still be answered after it, with the machine it was asked of: so the
+        # refusal is waited for, not taken as the first answer; and every picture asked named the machine as the page had it.)
+        until(page, lambda: any(status == 409 for status, _ in answers), f"no picture was refused after the edit: {answers}")
+        assert all(parse_qs(urlsplit(url).query).get("target") == [shown["target"]] for _, url in answers), answers
+        until(page, lambda: bool(fetched), "the page never fetched the wall again")
+        old_desk, new_desk = canvas.evaluate(f"el => ({COLOURS_SEEN})([el, {desks}])")
+        assert new_desk == 0 and old_desk > 0, (old_desk, new_desk)  # (still the picture of the machine its name is of)
+        for route in fetched:
+            route.continue_()
+        page.unroute("**/api/v1/wall")
+        expect(former.locator("canvas")).to_have_count(1)  # (and, fetched again, the tile is the new machine's: its pictures go)
+        until(page, lambda: any(status == 200 and edited.json()["device"]["target"] in url for status, url in answers), "no picture of the machine the tile is at now")
+
+
+@pytest.mark.parametrize("editor", ["Type text...", "Send keys..."])
+def test_the_key_and_text_editors_name_the_port_their_menu_showed_and_send_for_it(tmp_path: Path, browser: Browser, monkeypatch: pytest.MonkeyPatch, editor: str) -> None:
+    # (The outside review 6.2 second re-check, H2.) The menu showed port 1; while its editor was open the KVM was switched at its own
+    # buttons, the page saw port 2 lit, and the editor's question asked "Type this on Rack KVM?" and sent for port 2. Its
+    # question names the port the menu showed, and its request is for that one: refused, nothing sent, and how the KVM is
+    # fetched again at once (the LOW of the same re-check: not at the wall's next look, seconds later).
+    monkeypatch.setattr(kvm, "STATUS_TTL", 0)
+    several = FakeKvm(FakeState(ports=[(200, 30, 30), (30, 200, 30)], active_port=0)).start()
+    try:
+        with a_wall(tmp_path, ("Rack KVM", several)) as (live, _), looking(browser, live) as page:
+            sign_in(page, live)
+            lit = tile(page, "Rack KVM").locator(".ports button")
+            expect(lit.nth(0)).to_have_attribute("aria-pressed", "true")
+            page.get_by_role("button", name="Actions for Rack KVM").click()
+            top(page).get_by_role("button", name=editor).click()
+            several.state.active_port = 1  # (switched at the KVM itself while the editor was open)
+            expect(lit.nth(1)).to_have_attribute("aria-pressed", "true")
+            if editor.startswith("Type"):
+                top(page).locator("textarea").fill("echo hello")
+            else:
+                top(page).get_by_role("combobox", name="Key").select_option(value="Escape")
+            top(page).get_by_role("button", name="Continue").click()
+            expect(top(page).locator("p").first).to_contain_text("Rack KVM, port 1?")
+            looked: list[float] = []
+            page.on("request", lambda request: looked.append(time.monotonic()) if request.url.endswith("/api/v1/status") else None)
+            with page.expect_response(lambda reply: reply.url.endswith("/actions")) as answered:
+                top(page).locator(".actions button").last.click()
+            assert answered.value.status == 409
+            refused_at = time.monotonic()
+            told(page, "Nothing was sent")
+            page.wait_for_timeout(1500)
+            assert several.state.actions == []
+            # (The wall's own looks come every four seconds, and the last one came as port 2 was seen lit.)
+            assert any(refused_at - 0.5 <= at <= refused_at + 1.5 for at in looked), (refused_at, looked)
+    finally:
+        several.stop()
+
+
 def test_a_tile_is_enlarged_and_left_again_by_the_keyboard(tmp_path: Path, browser: Browser, fakes: list[FakeKvm]) -> None:
     with a_wall(tmp_path, ("Build server", fakes[0]), ("Mail server", fakes[1])) as (live, admin), looking(browser, live) as page:
         sign_in(page, live)
@@ -536,7 +948,8 @@ def test_a_kvm_is_added_from_the_wall(tmp_path: Path, browser: Browser, fakes: l
 
 TABS = {
     "devices": "KVMs", "actions": "Actions", "alerts": "Alerts", "media": "Server images", "files": "Export and import", "users": "Accounts", "tokens": "Tokens",
-    "security": "Security", "network": "Network", "metrics": "Metrics", "activity": "Activity", "updates": "Updates", "about": "About",
+    "security": "Security", "network": "Network", "metrics": "Metrics", "activity": "Activity", "backups": "Backups", "updates": "Updates",
+    "about": "About",
 }
 
 
@@ -1177,6 +1590,44 @@ def test_a_certificate_that_changed_is_shown_and_nothing_is_sent_until_it_is_tru
             other.stop()
 
 
+def test_a_certificate_box_trusts_nothing_once_its_tile_is_at_another_machine(tmp_path: Path, browser: Browser) -> None:
+    # (The second fresh review of the HA round, L2.) "Review certificate" and its Trust went by the tile's id alone: a box opened for one
+    # machine, its tile pointed at another meanwhile, showed and pinned what that one's address answered, under the old name. The
+    # box asks and trusts for the machine it was opened for (`target`): refused, nothing pinned, and the wall is fetched again.
+    known, third = FakeKvm(tls_dir=tmp_path / "known").start(), FakeKvm(tls_dir=tmp_path / "third").start()
+    other: FakeKvm | None = None
+    try:
+        with a_wall(tmp_path / "wall", ("Build server", known)) as (live, admin), looking(browser, live) as page:
+            sign_in(page, live)
+            expect(tile(page, "Build server")).to_have_class(re.compile(r"\bhas-frame\b"))
+            device = admin.get("/api/v1/wall").json()["devices"][0]
+            known.stop()
+            other = FakeKvm(port=known.port, tls_dir=tmp_path / "other").start()  # (another certificate at its address)
+            review = tile(page, "Build server").get_by_role("button", name="Review certificate")
+            expect(review).to_be_visible(timeout=60_000)
+            asked: list[str] = []
+            page.on("request", lambda request: asked.append(request.url) if "/certificate" in request.url else None)
+            review.click()
+            expect(top(page).locator("h2")).to_have_text("Build server certificate")
+            assert parse_qs(urlsplit(asked[-1]).query).get("target") == [device["target"]], asked
+            fetched: list[Any] = []
+            page.route("**/api/v1/wall", lambda route: fetched.append(route))  # (the wall as it was stays on the page until let through)
+            edited = admin.put(f"/api/v1/devices/{device['id']}", json={"name": "Build server", "url": third.url, "username": "admin", "password": DEVICE_PASSWORD})
+            assert edited.status_code == 200, edited.text
+            pinned = admin.get("/api/v1/wall").json()["devices"][0]["fingerprint"]
+            top(page).get_by_role("button", name="Trust this certificate").click()
+            told(page, "Build server is not the machine you saw any more")
+            expect(page.locator("dialog[open]")).to_have_count(0)
+            assert admin.get("/api/v1/wall").json()["devices"][0]["fingerprint"] == pinned
+            until(page, lambda: bool(fetched), "the page never fetched the wall again")
+            for route in fetched:
+                route.continue_()
+    finally:
+        third.stop()
+        if other is not None:
+            other.stop()
+
+
 def test_a_forgotten_password_is_replaced_with_the_recovery_key_on_the_page(tmp_path: Path, browser: Browser, fakes: list[FakeKvm]) -> None:
     with LiveWall(tmp_path) as live, looking(browser, live) as page:
         made = httpx.post(live.url + "/api/v1/setup", headers=CSRF, json={"password": PASSWORD})
@@ -1461,6 +1912,93 @@ def test_several_are_ticked_and_one_action_run_on_all_of_them(tmp_path: Path, br
         page.wait_for_timeout(400)
         for fake in fakes:
             assert fake.state.actions == ["shortcut MetaLeft,KeyL"], fake.state.actions  # each of them, and each once
+
+
+def test_a_question_for_several_names_the_port_of_each_kvm_with_several_inputs(tmp_path: Path, browser: Browser, fakes: list[FakeKvm]) -> None:
+    # (The outside review 6.2 second re-check, H2.) Keys for several machines go to the computer on screen of each: the question names
+    # the port of each KVM with several inputs, as the menu was opened, and each request is for that port.
+    several = FakeKvm(FakeState(ports=[(200, 30, 30), (30, 200, 30)], active_port=1)).start()
+    try:
+        with a_wall(tmp_path, ("Rack KVM", several), ("Build server", fakes[0])) as (live, _), looking(browser, live) as page:
+            sign_in(page, live)
+            expect(tile(page, "Rack KVM").locator(".ports button").nth(1)).to_have_attribute("aria-pressed", "true")
+            expect(page.locator('#wall article[data-state="online"]')).to_have_count(2)
+            page.locator("#select-toggle").click()
+            page.locator("#bulk-all").click()
+            page.locator("#bulk-run").click()
+            top(page).get_by_role("button", name="Lock screen").click()
+            asking = top(page)
+            expect(asking.locator("ul.targets li", has_text="Rack KVM")).to_contain_text("port 2")
+            expect(asking.locator("ul.targets li", has_text="Build server")).not_to_contain_text("port")
+            sent: list[Any] = []
+            page.on("request", lambda request: sent.append(request.post_data_json) if request.method == "POST" and request.url.endswith("/actions") else None)
+            asking.get_by_role("button", name="Run on 2 KVMs").click()
+            expect(top(page).locator("p[role=status]")).to_have_text("Done on all 2 KVMs.")
+            assert sorted(str(body.get("input")) for body in sent) == ["1", "None"], sent
+            assert several.state.actions == ["shortcut MetaLeft,KeyL"] and fakes[0].state.actions == ["shortcut MetaLeft,KeyL"]
+    finally:
+        several.stop()
+
+
+def test_what_was_asked_for_one_machine_is_not_sent_once_an_admin_has_put_another_under_its_tile(tmp_path: Path, browser: Browser, fakes: list[FakeKvm]) -> None:
+    # (The outside review of 0.4.0, H3.) The question named Build server; while it was open an admin elsewhere pointed the tile
+    # at another KVM. The yes sends nothing to either, the page says why and shows the wall anew, and sends nothing again by
+    # itself; asked again, it goes to the machine the tile is at now.
+    spare = FakeKvm(FakeState(colour=(20, 120, 60), hostname="spare")).start()
+    try:
+        with a_wall(tmp_path, ("Build server", fakes[0])) as (live, admin), looking(browser, live) as page:
+            [build] = [shown["id"] for shown in admin.get("/api/v1/wall").json()["devices"]]
+            sign_in(page, live)
+            expect(tile(page, "Build server")).to_have_attribute("data-state", "online")
+            page.get_by_role("button", name="Actions for Build server").click()
+            menu = top(page)
+            menu.get_by_role("button", name="Ctrl+Alt+Del").click()
+            expect(top(page).locator("h2")).to_have_text("Ctrl+Alt+Del")
+            edit = {"name": "Build server", "url": spare.url, "username": "admin", "password": DEVICE_PASSWORD}
+            assert admin.put(f"/api/v1/devices/{build}", json=edit).status_code == 200
+            with page.expect_response(lambda reply: reply.url.endswith("/api/v1/wall")):  # (the wall, fetched anew after the refusal)
+                top(page).locator(".actions button").last.click()
+                told(page, "Build server is not the machine you saw any more")
+            page.wait_for_timeout(600)
+            assert fakes[0].state.actions == [] and spare.state.actions == [], (fakes[0].state.actions, spare.state.actions)
+            # (Asked again from the tile's menu anew: the menu opened before the edit is closed once the wall is shown anew,
+            # as its tile is at another machine now: the re-check of the outside review's fixes, R1.)
+            if not menu.is_visible():
+                page.get_by_role("button", name="Actions for Build server").click()
+                menu = top(page)
+            menu.get_by_role("button", name="Ctrl+Alt+Del").click()
+            top(page).locator(".actions button").last.click()
+            until(page, lambda: spare.state.actions != [], "asked again, it never went to the machine the tile is at now")
+            assert spare.state.actions == ["shortcut ControlLeft,AltLeft,Delete"] and fakes[0].state.actions == []
+    finally:
+        spare.stop()
+
+
+def test_a_bulk_run_sends_nothing_to_a_tile_whose_machine_an_admin_replaced_while_its_question_was_open(tmp_path: Path, browser: Browser, fakes: list[FakeKvm]) -> None:
+    spare = FakeKvm(FakeState(colour=(20, 120, 60), hostname="spare")).start()
+    try:
+        with a_wall(tmp_path, ("Build server", fakes[0]), ("Mail server", fakes[1])) as (live, admin), looking(browser, live) as page:
+            build = next(shown["id"] for shown in admin.get("/api/v1/wall").json()["devices"] if shown["name"] == "Build server")
+            sign_in(page, live)
+            expect(page.locator('#wall article[data-state="online"]')).to_have_count(2)
+            page.locator("#select-toggle").click()
+            page.locator("#bulk-all").click()
+            page.locator("#bulk-run").click()
+            top(page).get_by_role("button", name="Lock screen").click()
+            asking = top(page)
+            expect(asking.locator("ul.targets li")).to_have_count(2)
+            edit = {"name": "Build server", "url": spare.url, "username": "admin", "password": DEVICE_PASSWORD}
+            assert admin.put(f"/api/v1/devices/{build}", json=edit).status_code == 200
+            asking.get_by_role("button", name="Run on 2 KVMs").click()
+            run = top(page)
+            expect(run.locator("p[role=status]")).to_have_text("1 succeeded, 1 failed.")
+            expect(run.locator("ul.progress li.bad")).to_contain_text("Build server is not the machine you saw any more")
+            expect(run.get_by_role("button", name=re.compile("Retry"))).to_be_hidden()  # (asked of afresh, not retried from here)
+            page.wait_for_timeout(400)
+            assert fakes[1].state.actions == ["shortcut MetaLeft,KeyL"]
+            assert fakes[0].state.actions == [] and spare.state.actions == [], (fakes[0].state.actions, spare.state.actions)
+    finally:
+        spare.stop()
 
 
 def test_several_are_ticked_and_removed_at_once_after_a_question_that_names_them(tmp_path: Path, browser: Browser, fakes: list[FakeKvm]) -> None:
@@ -1930,6 +2468,241 @@ def test_an_order_still_being_saved_when_the_session_ended_leaves_the_next_arran
         assert page.evaluate("document.querySelector('.top').inert") is False
 
 
+def test_a_session_that_ended_once_sends_a_new_sign_in_back_to_the_sign_in_page_never(tmp_path: Path, browser: Browser, fakes: list[FakeKvm]) -> None:
+    # The session ended from elsewhere, and two of the page's questions were answered "signed out" a moment apart. Each
+    # went the way back to the sign-in page, which asks the wall first whether there is an identity provider to offer;
+    # the second answer to that came after the person had signed in again, and the sign-in page came back over the new
+    # wall, its tiles gone (seen as 0 tiles in the arranging tests above, 1 run in 5 on a busy machine).
+    with a_wall(tmp_path, ("Alpha", fakes[0]), ("Beta", fakes[1])) as (live, admin), looking(browser, live) as page:
+        sign_in(page, live)
+        expect(page.locator("#wall article")).to_have_count(2)
+        held: list[Any] = []
+        page.route("**/api/v1/oidc/offer", lambda route: held.append(route))  # every question about the provider waits until let through here
+        assert admin.post("/api/v1/logout", json={"scope": "all"}).status_code == 200
+        page.evaluate("Promise.allSettled([api('GET', 'api/v1/status'), api('GET', 'api/v1/wall')])")  # two answers "signed out"
+        until(page, lambda: bool(held), "the page never went back to the sign-in page")
+        held.pop(0).continue_()
+        expect(page.get_by_role("heading", name="Sign in")).to_be_visible()
+        page.locator("#auth-card input[type=password]").fill(PASSWORD)
+        page.get_by_role("button", name="Sign in", exact=True).click()
+        expect(page.locator("#wall article")).to_have_count(2)
+        for late in held:  # any other way back to the sign-in page from that session's end: answered only now
+            late.continue_()
+        page.wait_for_timeout(700)
+        assert page.locator("#auth").is_hidden() and page.locator("#wall article").count() == 2
+        page.locator("#open-settings").click()  # and the new wall is the one in use
+        expect(top(page).locator("h2")).to_have_text("Settings")
+
+
+def test_a_question_of_the_ended_session_answered_signed_out_after_a_new_sign_in_leaves_the_new_wall(tmp_path: Path, browser: Browser, fakes: list[FakeKvm], monkeypatch: pytest.MonkeyPatch) -> None:
+    # (The fresh review of the HA round, M1.) One of the page's questions sent under the session that ended (its own look at its
+    # machines, held at the wall) was answered "signed out" only after the person had signed in again: a request that waits at
+    # the wall asks at its end who is asking, and the old cookie is nobody. It put the sign-in page over the new wall. An answer
+    # to a question of a wall that has gone since says nothing of the one on show.
+    plain = kvm.KvmDevice.status
+    hold, entered, gate = [False], threading.Event(), threading.Event()
+
+    async def held(self: kvm.KvmDevice) -> dict[str, Any]:
+        found = await plain(self)
+        if hold[0]:
+            hold[0] = False
+            entered.set()
+            while not gate.is_set():
+                await asyncio.sleep(0.01)
+        return found
+
+    monkeypatch.setattr(kvm.KvmDevice, "status", held)
+    with a_wall(tmp_path, ("Alpha", fakes[0]), ("Beta", fakes[1])) as (live, admin), looking(browser, live) as page:
+        sign_in(page, live)
+        expect(page.locator("#wall article")).to_have_count(2)
+        hold[0] = True
+        until(page, entered.is_set, "the page never asked how its machines are")  # (its own look, held at the wall)
+        try:
+            assert admin.post("/api/v1/logout", json={"scope": "all"}).status_code == 200
+            page.evaluate("api('GET', 'api/v1/wall').catch(() => {})")  # (the session's end, as the page learns it)
+            expect(page.get_by_role("heading", name="Sign in")).to_be_visible()
+            page.locator("#auth-card input[type=password]").fill(PASSWORD)
+            page.get_by_role("button", name="Sign in", exact=True).click()
+            expect(page.locator("#wall article")).to_have_count(2)
+        finally:
+            gate.set()  # the look asked under the ended session is answered now: "signed out"
+        page.wait_for_timeout(2000)
+        assert page.locator("#auth").is_hidden() and page.locator("#wall article").count() == 2, "the sign-in page came back over the new wall"
+
+
+def test_an_edit_answered_signed_out_after_a_new_sign_in_leaves_the_new_wall(tmp_path: Path, browser: Browser, fakes: list[FakeKvm]) -> None:
+    # (M1, with nothing held but a KVM slow to sign in.) An admin's edit pointed a tile at it, seconds of talking to it before the
+    # turn of changes asks again who is asking; the session ended meanwhile, the person signed in again, and the edit's answer
+    # "signed out" came after that: the sign-in page over the new wall.
+    slow = FakeKvm(FakeState(slow_login=8)).start()
+    try:
+        with a_wall(tmp_path, ("Alpha", fakes[0]), ("Beta", fakes[1])) as (live, admin), looking(browser, live) as page:
+            sign_in(page, live)
+            expect(page.locator("#wall article")).to_have_count(2)
+            beta = next(d for d in admin.get("/api/v1/wall").json()["devices"] if d["name"] == "Beta")["id"]
+            page.evaluate(
+                "([id, url, password]) => { window.editAnswer = undefined; api('PUT', `api/v1/devices/${id}`, { name: 'Beta', url, username: 'admin', password })"
+                ".then(() => { window.editAnswer = 'ok'; }, ex => { window.editAnswer = ex.code; }); }",
+                [beta, slow.url, DEVICE_PASSWORD],
+            )
+            until(page, lambda: slow.state.logins > 0, "the edit never reached the slow KVM")  # (counted as its sign-in begins)
+            assert admin.post("/api/v1/logout", json={"scope": "all"}).status_code == 200
+            page.evaluate("api('GET', 'api/v1/wall').catch(() => {})")
+            expect(page.get_by_role("heading", name="Sign in")).to_be_visible()
+            page.locator("#auth-card input[type=password]").fill(PASSWORD)
+            page.get_by_role("button", name="Sign in", exact=True).click()
+            expect(page.locator("#wall article")).to_have_count(2)
+            assert page.evaluate("window.editAnswer") is None, "the edit was answered before the new sign-in: nothing was tried"
+            until(page, lambda: page.evaluate("window.editAnswer !== undefined"), "the edit was never answered")
+            page.wait_for_timeout(2000)
+            assert page.locator("#auth").is_hidden(), f"the sign-in page came back over the new wall (the edit's answer: {page.evaluate('window.editAnswer')})"
+    finally:
+        slow.stop()
+
+
+# Holds the answer to the page's first question of how the machines are (GET /api/v1/status) until the test lets it go.
+FIRST_STATUS_HELD = """(() => {
+    const original = window.fetch.bind(window);
+    let first = true;
+    const gate = new Promise(resolve => { window.letTheStatusGo = resolve; });
+    window.fetch = async (...given) => {
+        const answer = await original(...given);
+        if (first && new URL(answer.url).pathname === '/api/v1/status') {
+            first = false;
+            window.statusHeld = true;
+            await gate;
+        }
+        return answer;
+    };
+})()"""
+
+
+def test_a_menu_waiting_for_its_first_word_of_a_machine_is_not_opened_over_the_sign_in_page(tmp_path: Path, browser: Browser, fakes: list[FakeKvm]) -> None:
+    # (The fresh review of the HA round, M2.) The Actions menu of a machine the page had no word of yet waits up to two seconds for a
+    # look; the look was answered "signed out", the way back to the sign-in page closed the dialogs open then, and the menu opened
+    # a moment later over the sign-in page, naming the machine (its host, its saved actions) to whoever was at the screen.
+    with a_wall(tmp_path, ("Alpha", fakes[0])) as (live, admin), looking(browser, live) as page:
+        page.add_init_script(FIRST_STATUS_HELD)
+        sign_in(page, live)
+        until(page, lambda: page.evaluate("window.statusHeld === true"), "the page never asked how the machine is")
+        held: list[Any] = []
+        page.route("**/api/v1/oidc/offer", lambda route: held.append(route))
+        assert admin.post("/api/v1/logout", json={"scope": "all"}).status_code == 200
+        page.get_by_role("button", name="Actions for Alpha").click()
+        until(page, lambda: bool(held), "the page never went back to the sign-in page")
+        page.wait_for_timeout(500)
+        for route in held:
+            route.continue_()
+        expect(page.get_by_role("heading", name="Sign in")).to_be_visible()
+        page.wait_for_timeout(2500)  # (past the menu's two seconds)
+        assert page.locator("dialog[open]").count() == 0, f"over the sign-in page: {top(page).inner_text()!r}"
+
+
+def test_a_dialog_opened_while_the_way_back_to_the_sign_in_page_waits_is_not_left_over_it(tmp_path: Path, browser: Browser, fakes: list[FakeKvm]) -> None:
+    # (M2.) The way back to the sign-in page closed the dialogs open at the first answer "signed out", then asked the wall about its
+    # identity provider (up to 30 s). Settings, opened meanwhile, was answered "signed out", which no longer went the way again,
+    # and stayed open over the sign-in page. Every dialog is closed as the sign-in page is shown. (The wall goes at once now, its
+    # Settings button with it: the dialog is opened as a path that comes late would open it.)
+    with a_wall(tmp_path, ("Alpha", fakes[0])) as (live, admin), looking(browser, live) as page:
+        sign_in(page, live)
+        expect(page.locator("#wall article")).to_have_count(1)
+        held: list[Any] = []
+        page.route("**/api/v1/oidc/offer", lambda route: held.append(route))
+        assert admin.post("/api/v1/logout", json={"scope": "all"}).status_code == 200
+        page.evaluate("api('GET', 'api/v1/wall').catch(() => {})")
+        until(page, lambda: bool(held), "the page never went back to the sign-in page")
+        page.evaluate("settingsDialog()")
+        expect(top(page)).to_be_visible()
+        page.wait_for_timeout(1500)  # (its own questions, answered "signed out")
+        for route in held:
+            route.continue_()
+        expect(page.get_by_role("heading", name="Sign in")).to_be_visible()
+        page.wait_for_timeout(500)
+        assert page.locator("dialog[open]").count() == 0, f"over the sign-in page: {top(page).inner_text()[:300]!r}"
+
+
+def test_the_wall_goes_at_once_when_the_session_ends_and_the_sign_in_page_comes_without_the_providers_word(tmp_path: Path, browser: Browser, fakes: list[FakeKvm]) -> None:
+    # (The second fresh review of the HA round, L1.) Between the first answer "signed out" and the sign-in page, the wall (its tiles,
+    # their pictures, the large view's last frame) stayed on show and took clicks while the wall was asked about its identity
+    # provider, up to 30 s on a wall slow to answer. The wall goes at once, and the question has a few seconds: without an
+    # answer, the sign-in page is the plain one.
+    with a_wall(tmp_path, ("Alpha", fakes[0])) as (live, admin), looking(browser, live) as page:
+        sign_in(page, live)
+        expect(page.locator("#wall article")).to_have_count(1)
+        held: list[Any] = []
+        page.route("**/api/v1/oidc/offer", lambda route: held.append(route))  # (never answered)
+        assert admin.post("/api/v1/logout", json={"scope": "all"}).status_code == 200
+        page.evaluate("api('GET', 'api/v1/wall').catch(() => {})")
+        until(page, lambda: bool(held), "the page never went back to the sign-in page")
+        assert page.locator("#shell").is_hidden() and page.locator("#wall article").count() == 0, "the wall stayed on show"
+        began = time.monotonic()
+        expect(page.get_by_role("heading", name="Sign in")).to_be_visible(timeout=20_000)
+        assert time.monotonic() - began < 10, time.monotonic() - began
+        expect(page.locator("#auth-card")).to_contain_text("Your session ended")
+        page.locator("#auth-card input[type=password]").fill(PASSWORD)
+        page.get_by_role("button", name="Sign in", exact=True).click()
+        expect(page.locator("#wall article")).to_have_count(1)
+
+
+def test_the_providers_button_comes_to_a_sign_in_page_whose_wall_takes_six_seconds_to_say_it(tmp_path: Path, browser: Browser, fakes: list[FakeKvm]) -> None:
+    # (The third fresh review of the HA round, L2.) The question whether there is an identity provider's button had 5 s also when the
+    # page was first opened, and nothing asked again: on a wall that took 6 s to answer, the sign-in page had no "Sign in with
+    # ...", and accounts the provider made, which have no password, had only a reload. The first opening waits for it as before;
+    # the way back from a session that ended shows the plain page after 5 s, and the button comes to it when the answer does.
+    late = {"on": True, "name": "Okta"}
+    with a_wall(tmp_path, ("Alpha", fakes[0])) as (live, admin), looking(browser, live) as page:
+        held: list[Any] = []
+        page.route("**/api/v1/oidc/offer", lambda route: held.append(route))
+        page.goto(live.url + "/")
+        until(page, lambda: bool(held), "the page never asked about its provider")
+        page.wait_for_timeout(6000)
+        held.pop(0).fulfill(json=late)
+        expect(page.get_by_role("button", name="Sign in with Okta")).to_have_count(1)
+        page.unroute("**/api/v1/oidc/offer")
+        page.locator("#auth-card input[type=password]").fill(PASSWORD)
+        page.get_by_role("button", name="Sign in", exact=True).click()
+        expect(page.locator("#wall article")).to_have_count(1)
+        # The way back: the plain page first, the button once the answer comes, and what was typed meanwhile stays.
+        page.route("**/api/v1/oidc/offer", lambda route: held.append(route))
+        assert admin.post("/api/v1/logout", json={"scope": "all"}).status_code == 200
+        page.evaluate("api('GET', 'api/v1/wall').catch(() => {})")
+        until(page, lambda: bool(held), "the page never went back to the sign-in page")
+        expect(page.get_by_role("heading", name="Sign in")).to_be_visible(timeout=20_000)
+        expect(page.get_by_role("button", name="Sign in with Okta")).to_have_count(0)
+        page.locator("#auth-card input[type=password]").fill("half typed")
+        held.pop(0).fulfill(json=late)
+        expect(page.get_by_role("button", name="Sign in with Okta")).to_have_count(1)
+        expect(page.locator("#auth-card input[type=password]")).to_have_value("half typed")
+
+
+def test_a_wall_fetched_again_for_a_wall_that_has_gone_since_draws_nothing(tmp_path: Path, browser: Browser, fakes: list[FakeKvm]) -> None:
+    # (The third fresh review of the HA round, a nit.) A fetch of the wall made under one wall run (the session that ended, an account
+    # signed out) and answered after another had started drew its tiles over the new wall: the old account's, where another
+    # signed in meanwhile. An answer for a wall that has gone since draws nothing.
+    with a_wall(tmp_path, ("Alpha", fakes[0])) as (live, admin), looking(browser, live) as page:
+        sign_in(page, live)
+        expect(page.locator("#wall article")).to_have_count(1)
+        held: list[Any] = []
+
+        def first_held(route: Any) -> None:
+            if held:
+                route.continue_()
+            else:
+                held.append((route, route.fetch()))  # (the wall as it is now, its answer kept back)
+
+        page.route("**/api/v1/wall", first_held)
+        page.evaluate("() => { reloadWall(); }")  # (not waited for: its answer is held)
+        until(page, lambda: bool(held), "the wall was never fetched again")
+        reply = admin.post("/api/v1/devices", json={"url": fakes[1].url, "password": DEVICE_PASSWORD, "name": "Beta"})
+        assert reply.status_code == 201, reply.text
+        page.evaluate("startWall()")  # (another wall run: as after a new sign-in)
+        expect(page.locator("#wall article")).to_have_count(2)
+        route, answer = held.pop()
+        route.fulfill(response=answer)  # the answer for the wall before, only now
+        page.wait_for_timeout(700)
+        assert page.locator("#wall article").count() == 2, "the answer for the wall before was drawn over the new one"
+
+
 def test_what_is_taken_in_from_a_file_is_what_its_summary_showed(tmp_path: Path, browser: Browser) -> None:
     # A file chosen and "Read the file" pressed; then, before the wall had answered, another file chosen.
     # The first one's summary came up, with a "Take in" that took the second: a list approved, another one
@@ -2038,8 +2811,10 @@ def test_a_token_for_a_script_does_what_its_role_may_and_nothing_once_taken_back
         assert fakes[0].state.actions == []
 
 
-def test_alerts_are_set_up_tried_paused_and_their_address_forgotten(tmp_path: Path, browser: Browser) -> None:
+def test_alerts_are_set_up_tried_paused_and_their_destination_removed(tmp_path: Path, browser: Browser) -> None:
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    from tests.stand_ins import stand_in
 
     received: list[bytes] = []
 
@@ -2053,6 +2828,8 @@ def test_alerts_are_set_up_tried_paused_and_their_address_forgotten(tmp_path: Pa
             pass
 
     taking = ThreadingHTTPServer(("127.0.0.1", 0), Taking)  # where the alerts of this test go: this computer, and nowhere else
+    # (By a name of its own: the wall sends nothing to this computer, and a test's stand-in is reached by its name. 0.4.0)
+    address = f"http://{stand_in(taking.server_port)}/notice"
     worker = threading.Thread(target=taking.serve_forever, daemon=True)
     worker.start()
     try:
@@ -2060,28 +2837,34 @@ def test_alerts_are_set_up_tried_paused_and_their_address_forgotten(tmp_path: Pa
             sign_in(page, live)
             pane = settings(page, "alerts")
             first_line = pane.locator(".section-head")
-            expect(first_line.get_by_role("button", name="Send a test alert")).to_be_disabled()  # nowhere to send one yet
             pane.get_by_label("Watch the KVMs and send alerts").check()
-            pane.get_by_role("textbox", name=re.compile("^Address")).fill(f"http://127.0.0.1:{taking.server_port}/notice")
-            pane.get_by_role("combobox", name=re.compile("^Service")).select_option("json")
             pane.get_by_label("Link in alerts").fill(live.url)
             first_line.get_by_role("button", name="Save", exact=True).click()
             told(page, "Alerts saved")
-            expect(first_line.get_by_role("button", name="Send a test alert")).to_be_enabled()
-            first_line.get_by_role("button", name="Send a test alert").click()
+            first_line.get_by_role("button", name="Add destination").click()
+            top(page).locator(".setting", has_text="Webhook (JSON)").get_by_role("button", name="Choose").click()
+            box = top(page)
+            box.get_by_role("textbox", name=re.compile("^Address")).fill(address)
+            box.get_by_label("Send without a signature").check()
+            box.get_by_role("button", name="Add", exact=True).click()
+            told(page, "Destination added")
+            row = pane.locator("tr", has_text="Webhook (JSON)")
+            row.get_by_role("button", name="Send test").click()
             until(page, lambda: len(received) == 1, "the test alert never arrived")
-            assert json.loads(received[0])
-            assert f"127.0.0.1:{taking.server_port}" not in page.content()  # the address is kept sealed, and not handed back to the page
+            assert json.loads(received[0])["app"] == "QKVM"
+            assert "/notice" not in page.content()  # the address is kept sealed: the page is shown its host alone
             pane.get_by_role("button", name="For an hour").click()
             told(page, "Alerts paused")
             assert (admin.get("/api/v1/alerts").json()["paused_until"] or 0) > time.time()
             expect(pane).to_contain_text("Paused until")
+            # (The final look at 0.4.0, L2: what was already on its way when a pause begins still goes, within its tries.)
+            expect(pane).to_contain_text("Nothing new is sent meanwhile; what was already on its way still goes.")
             pane.get_by_role("button", name="Send alerts again").click()
             told(page, "Alerts are sent again")
             assert not admin.get("/api/v1/alerts").json()["paused_until"]
-            pane.get_by_label("Forget the saved address").check()
-            first_line.get_by_role("button", name="Save", exact=True).click()
-            until(page, lambda: not admin.get("/api/v1/alerts").json()["has_webhook"], "the address was not forgotten")
+            pane.locator("tr", has_text="Webhook (JSON)").get_by_role("button", name="Remove").click()
+            top(page).get_by_role("button", name="Remove", exact=True).click()
+            until(page, lambda: not admin.get("/api/v1/alerts").json()["has_webhook"], "the destination was not removed")
     finally:
         taking.shutdown()
         taking.server_close()
@@ -2148,9 +2931,10 @@ def test_a_server_is_started_into_its_bios_setup_after_a_question_that_names_it(
     # `watching`; the controller is given the one-time override, then the restart.
     server = FakeBmc().start()
     try:
-        with a_wall(tmp_path, ("A server", server)) as (live, _), looking(browser, live) as page:
+        with a_wall(tmp_path, ("A server", server)) as (live, admin), looking(browser, live) as page:
             sign_in(page, live)
             expect(tile(page, "A server")).to_have_attribute("data-state", "online", timeout=40_000)
+            [seen] = [shown["target"] for shown in admin.get("/api/v1/wall").json()["devices"]]  # (the machine the question names)
             deadline = time.monotonic() + 30
             while True:  # (offered once the page's look at the server says the controller allows it: a menu shows what was known when it opened)
                 page.get_by_role("button", name="Actions for A server").click()
@@ -2170,7 +2954,7 @@ def test_a_server_is_started_into_its_bios_setup_after_a_question_that_names_it(
             top(page).get_by_role("button", name="Start into BIOS setup").click()
             with page.expect_request(lambda request: request.method == "POST" and request.url.endswith("/actions")) as sent:
                 top(page).get_by_role("button", name="Restart into setup").click()
-            assert sent.value.post_data_json == {"action": "bios_setup", "watching": True}
+            assert sent.value.post_data_json == {"action": "bios_setup", "watching": True, "target": seen}
             expect(page.locator("#focus-name")).to_have_text("A server")  # its large view, to watch the setup
             until(page, lambda: server.state.actions == ["system ForceRestart"], "the server was never restarted")
             boots = [change["Boot"] for change in server.state.changes if "Boot" in change]
@@ -2196,7 +2980,7 @@ def test_a_pc_with_intel_amt_says_what_it_is_and_why_its_screen_is_not_shown_and
             expect(switch).to_be_visible()
             switch.click()
             asked = top(page)
-            expect(asked).to_contain_text("This changes a setting of the PC")
+            expect(asked).to_contain_text("This changes a setting of A PC")  # (the PC, by its name)
             assert pc.state.changes == []  # (asked first: nothing is changed before the yes)
             asked.get_by_role("button", name="Switch on", exact=True).click()
             told(page, "Its KVM is on")
@@ -2230,7 +3014,7 @@ def test_a_pcs_kvm_is_switched_on_and_off_in_one_place_under_actions(tmp_path: P
             expect(box.get_by_role("button", name="Switch on its KVM").locator("svg.icon")).to_have_count(1)
             box.get_by_role("button", name="Switch on its KVM").click()
             asked = top(page)
-            expect(asked).to_contain_text("This changes a setting of the PC: its management engine will let whoever has its password see its screen")
+            expect(asked).to_contain_text("This changes a setting of A PC: its management engine will let whoever has its password see its screen")
             assert pc.state.changes == []  # (asked first: nothing is changed before the yes)
             asked.get_by_role("button", name="Switch on", exact=True).click()
             told(page, "Its KVM is on")

@@ -16,7 +16,7 @@ from unittest.mock import AsyncMock
 import httpx
 import pytest
 
-from qkvm import alerts, cli, kvm, server, update, vault
+from qkvm import alerts, cli, egress, kvm, server, update, vault
 from qkvm.core import Core, DeviceManager
 from qkvm.kvm import Device, DeviceSpec, KvmDevice, KvmError, bounded
 from qkvm.store import DeviceRecord, Store
@@ -461,6 +461,9 @@ def test_a_kvm_that_is_slow_with_its_picture_keeps_no_tile_waiting(
             wait_until(pending.done, "released picture did not finish")
             assert client.get(snap(device)).status_code == 200
             assert len(fake.state.snapshot_queries) == 1
+            # (The next look asks the KVM anew. The 0.3 s patience above was for the held picture: on a loaded runner the
+            # fake took longer than that over this one, and the tile was told to ask again. So it gets the usual patience.)
+            monkeypatch.setattr(kvm, "PICTURE_PATIENCE", 20)
             assert client.get(snap(device)).status_code == 200
             assert len(fake.state.snapshot_queries) == 2
         finally:
@@ -670,12 +673,16 @@ def test_an_alert_the_service_refuses_is_not_sent_over_and_over(tmp_path: Path, 
 
 def test_alerts_wait_in_line_and_the_oldest_give_way() -> None:
     async def run() -> None:
-        outbox = alerts.Outbox(lambda: None, lambda problem: None)
+        async def own() -> egress.Own:
+            return egress.Own(frozenset(), frozenset())
+
+        # (0.4.0: a line of its own for each destination, bounded the same way.)
+        courier = alerts.Courier(lambda destination: None, own, lambda destination, delivery: None)
         for number in range(alerts.MAX_WAITING + 5):
-            outbox.put(alerts.Alert("offline", f"KVM {number}", "", "offline", "online", f"KVM {number} is offline", ""))
-        assert outbox._waiting.qsize() == alerts.MAX_WAITING
-        assert outbox._waiting.get_nowait().device == "KVM 5"
-        await outbox.close()
+            courier.put("d1", alerts.Alert("offline", f"KVM {number}", "", "offline", "online", f"KVM {number} is offline", ""))
+        assert courier.waiting("d1") == alerts.MAX_WAITING
+        assert courier._waiting["d1"][0].device == "KVM 5"
+        await courier.close()
 
     asyncio.run(run())
 

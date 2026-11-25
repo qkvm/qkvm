@@ -67,7 +67,10 @@ def test_a_wall_is_taken_to_another_and_its_devices_work_there(tmp_path: Path, f
             {"name": "Rack KVM", "host": fake.url.split("//")[1], "kind": "kvmd", "group": "rack 1", "password": True, "tls": "", "open_url": "", "new": True, "same_as": ""}
         ]
         assert [(a["name"], a["kind"], a["text"], a["enter"], a["new"]) for a in there["actions"]] == [("Lock the screen", "keys", "", False, True), ("Unlock disk", "text", "THE-PASSPHRASE", True, True)]
-        assert there["alerts"] == {"enabled": True, "address": True, "host": "hooks.example", "format": "auto", "kinds": ["offline", "no_signal", "problem"]}
+        assert there["alerts"] == {
+            "enabled": True, "address": True, "host": "hooks.example", "format": "auto", "kinds": ["offline", "no_signal", "problem"],
+            "destinations": [{"kind": "webhook", "name": "", "host": "hooks.example", "private": False}],  # (0.4.0)
+        }  # fmt: skip
         assert there["wall"] == {"interval": 1.0, "update_check": True}
         assert admin.get("/api/v1/wall").json()["devices"] == []  # looking changes nothing
         asked = fake.state.logins

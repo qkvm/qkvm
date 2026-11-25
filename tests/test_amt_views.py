@@ -120,6 +120,36 @@ def test_health_only_opens_no_session_for_anything_and_says_so(pc: FakeAmt) -> N
     asyncio.run(run())
 
 
+def test_a_live_kvm_tiles_session_is_not_let_go_of_while_its_picture_is_being_made(pc: FakeAmt, monkeypatch: pytest.MonkeyPatch) -> None:
+    # A busy computer makes the first picture of a session in seconds: a video worker is started for it. A tile set to live
+    # KVM had its session let go of under it, LET_GO_AFTER after the look that asked for the picture, its encoder closed,
+    # and the next look opened another (the test below, on the coordinator's VM: three sessions where two were due). A
+    # still and the large view were held through it already (`_making`, VncDevice.snapshot); the live KVM tile's look was
+    # the one that went past it. Here each picture takes longer than LET_GO_AFTER to make.
+    monkeypatch.setattr(amt.AmtScreen, "LET_GO_AFTER", 1.0)
+    monkeypatch.setattr(vncdevice, "HEARTBEAT", 0.5)
+    really = vncdevice.rgb_jpeg
+
+    def slowly(*given: Any) -> bytes:
+        time.sleep(1.5)
+        return bytes(really(*given))
+
+    monkeypatch.setattr(vncdevice, "rgb_jpeg", slowly)
+
+    async def run() -> None:
+        device = set_to(pc, "live")
+        try:
+            await device.status()
+            assert (await picture_of(device, within=20.0)).still is False
+            assert (pc.state.kvm_sessions, pc.state.redirection_open) == (1, 1)
+            await shown_for(device, 2.0)  # (and while it is asked for, every picture as slow)
+            assert (pc.state.kvm_sessions, pc.state.redirection_open) == (1, 1)
+        finally:
+            await device.close()
+
+    asyncio.run(run())
+
+
 def test_stills_take_a_short_session_now_and_then_and_live_kvm_holds_one_while_the_tile_is_shown(pc: FakeAmt, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(amt.AmtScreen, "STILL_EVERY", 3600.0)
     monkeypatch.setattr(amt.AmtScreen, "LET_GO_AFTER", 1.0)
@@ -281,6 +311,56 @@ def test_an_operator_changes_the_view_by_its_own_route_and_it_is_written_down_an
             assert views_of(admin, device)[0] == "stills"
     finally:
         kvm_stand_in.stop()
+
+
+def test_a_view_chosen_for_the_pc_seen_is_not_set_on_the_one_put_in_its_place(tmp_path: Path, pc: FakeAmt) -> None:
+    # (The outside review 6.2 second re-check, M1.) The Actions box's view buttons sent the tile's id alone: a box opened for one PC set
+    # the view of the PC an admin's edit had put under the tile meanwhile, and Live KVM opened sessions there. The box sends
+    # the PC it was opened for (`target`), and the view is left as it was where the tile is at another PC by then.
+    other = FakeAmt().start()
+    try:
+        with wall(tmp_path) as admin:
+            device = add(admin, pc.url, name="Desk 7")
+            seen = next(d for d in admin.get("/api/v1/wall").json()["devices"] if d["id"] == device)["target"]
+            route = f"/api/v1/devices/{device}/view"
+            assert admin.put(route, json={"view": "health", "target": seen}).status_code == 200  # (the PC it is at: as before)
+            edited = admin.put(f"/api/v1/devices/{device}", json={"url": other.url, "username": "admin", "password": "secret", "name": "Desk 7"})
+            assert edited.status_code == 200, edited.text
+            refused = admin.put(route, json={"view": "live", "target": seen})
+            assert (refused.status_code, refused.json()["code"]) == (409, "machine_changed"), refused.text
+            assert "Nothing was sent" in refused.json()["message"]
+            assert views_of(admin, device)[0] == "health"
+            now = next(d for d in admin.get("/api/v1/wall").json()["devices"] if d["id"] == device)["target"]
+            assert admin.put(route, json={"view": "live", "target": now}).status_code == 200
+            assert admin.put(route, json={"view": "stills"}).status_code == 200  # (none named, as by a client before 0.4.0: as before)
+            assert views_of(admin, device)[0] == "stills"
+    finally:
+        other.stop()
+
+
+def test_a_view_chosen_for_the_pc_seen_is_refused_as_for_another_machine_where_the_tile_is_at_a_kvm_now(tmp_path: Path, pc: FakeAmt) -> None:
+    # (The outside review 5: a Low of both its reviewers.) The tile was pointed from the PC at a KVM meanwhile: the view chosen for the
+    # PC was refused as for a machine without views (422 `invalid`), before the machine it named was asked of, and the page, which
+    # fetches the wall again at `machine_changed` only, kept showing the PC's view buttons. The machine named is asked of first.
+    desk = FakeKvm(FakeState()).start()
+    try:
+        with wall(tmp_path) as admin:
+            device = add(admin, pc.url, name="Desk 7")
+            seen = next(d for d in admin.get("/api/v1/wall").json()["devices"] if d["id"] == device)["target"]
+            route = f"/api/v1/devices/{device}/view"
+            edited = admin.put(f"/api/v1/devices/{device}", json={"url": desk.url, "username": "admin", "password": "secret", "name": "Desk 7", "kind": "kvmd"})
+            assert edited.status_code == 200 and edited.json()["device"]["kind"] == "kvmd", edited.text
+            refused = admin.put(route, json={"view": "live", "target": seen})
+            assert (refused.status_code, refused.json()["code"]) == (409, "machine_changed"), refused.text
+            # Named for the KVM it is at now, or named for none (a client before 0.4.0): a KVM has no views, as before.
+            now = edited.json()["device"]["target"]
+            for body in ({"view": "live", "target": now}, {"view": "live"}):
+                refused = admin.put(route, json=body)
+                assert (refused.status_code, refused.json()["code"]) == (422, "invalid"), (body, refused.text)
+            assert "amt_view" not in next(d for d in admin.get("/api/v1/wall").json()["devices"] if d["id"] == device)
+            assert not [e for e in admin.get("/api/v1/audit").json()["entries"] if e["event"] == "amt_view_changed"]
+    finally:
+        desk.stop()
 
 
 def test_the_view_goes_along_in_a_file_and_one_from_before_the_views_brings_stills(tmp_path: Path, pc: FakeAmt) -> None:

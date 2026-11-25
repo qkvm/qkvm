@@ -16,7 +16,7 @@ from qkvm.cli import SERVER_OPTIONS
 from qkvm.core import Core
 from qkvm.server import create_app
 from tests.fake_redfish import FakeBmc
-from tests.test_wall import CSRF, PASSWORD, closed_port, wait_until
+from tests.test_wall import CSRF, PASSWORD, port_to_listen_on, wait_until
 
 
 @pytest.fixture(autouse=True)
@@ -44,7 +44,7 @@ def test_a_power_cut_that_went_out_is_in_the_activity_log_though_qkvm_was_stoppe
     bmc.state.power_takes = 20.0  # the controller says "accepted", and the server is off twenty seconds later
     core = Core(tmp_path)
     core.unlock_at_start()
-    port = closed_port()
+    port = port_to_listen_on()
     server = uvicorn.Server(uvicorn.Config(create_app(core), host="127.0.0.1", port=port, **SERVER_OPTIONS))
     serving = threading.Thread(target=server.run, daemon=True)
     serving.start()

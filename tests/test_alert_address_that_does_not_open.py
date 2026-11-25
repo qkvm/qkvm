@@ -51,8 +51,8 @@ def test_an_alert_that_goes_nowhere_because_its_address_does_not_open_is_said(tm
             assert admin.get(snap(device)).status_code == 200
             time.sleep(0.6)  # (the two looks after which the watcher knows what is normal)
 
-            saved = admin.core.store.alerts.webhook  # type: ignore[attr-defined]
-            admin.core.store.alerts.webhook = {"nonce": "!", "data": saved["data"]}  # type: ignore[attr-defined]
+            first = admin.core.store.destinations[0]  # type: ignore[attr-defined]  # (where 0.4.0 keeps the address: the first destination)
+            first.secret = {"nonce": "!", "data": first.secret["data"]}
             heard.lines.clear()
             fake.state.signal = False
             wait_until(lambda: any(entry["event"] == "alert" for entry in admin.get("/api/v1/audit").json()["entries"]), "the watcher never saw the signal go", timeout=20)

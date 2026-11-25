@@ -112,6 +112,33 @@ def test_the_activity_section_narrows_to_a_machine_an_account_and_a_time_and_dow
         second.stop()
 
 
+def test_the_activity_section_says_which_port_keys_were_for_or_that_they_went_as_for_one_input(tmp_path: Path, browser: Browser) -> None:  # noqa: F811
+    # (The supervised key test of 2026-11-23.) A key action said which keys, and not which computer of a KVM with several inputs
+    # it was for; keys refused on what the wall knew of its inputs were not there at all.
+    switch, desk = FakeKvm(FakeState(ports=[(150, 80, 40), (40, 110, 130)])).start(), FakeKvm(FakeState()).start()
+    try:
+        with a_wall(tmp_path, ("Rack", switch), ("Desk", desk)) as (live, admin):
+            ids = {device["name"]: device["id"] for device in admin.get("/api/v1/wall").json()["devices"]}
+            for _ in range(150):
+                if admin.get("/api/v1/status").json()[ids["Rack"]].get("several_inputs") is True:
+                    break
+                time.sleep(0.1)
+            keys = {"action": "keys", "keys": "ShiftLeft"}
+            assert admin.post(f"/api/v1/devices/{ids['Rack']}/actions", json={**keys, "input": 0}).status_code == 200
+            assert admin.post(f"/api/v1/devices/{ids['Rack']}/actions", json={**keys, "one_input": True}).status_code == 409
+            assert admin.post(f"/api/v1/devices/{ids['Desk']}/actions", json={**keys, "one_input": True}).status_code == 200
+            with looking(browser, live) as page:
+                sign_in(page, live)
+                pane = settings(page, "activity")
+                rows = pane.locator("table.rows tbody tr")
+                expect(rows.filter(has_text="Desk").first).to_contain_text("sent as for a KVM of one input")
+                expect(rows.filter(has_text="Rack").filter(has_text="for port 1")).to_have_count(1)
+                expect(rows.filter(has_text="Rack").filter(has_text="has several inputs")).to_contain_text("sent as for a KVM of one input")
+    finally:
+        switch.stop()
+        desk.stop()
+
+
 def test_what_was_done_to_a_machine_counts_its_ages_on_and_shows_a_new_entry_within_seconds(tmp_path: Path, browser: Browser) -> None:  # noqa: F811
     # Register row 8 of 0.2.1 (r2-devices F4): "Done to it" was drawn with the history, once a minute: its "13 s ago" was
     # still said a minute later, and an entry made meanwhile showed up to a minute late. Now its ages count on every

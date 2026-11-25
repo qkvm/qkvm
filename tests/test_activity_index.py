@@ -995,7 +995,7 @@ def test_a_line_naming_half_a_character_is_no_entry_and_breaks_nothing(tmp_path:
         assert answer.status_code == 200 and "half" not in answer.text
         assert any(entry.get("user", "").startswith("a whole ") for entry in answer.json()["entries"])
         lines = admin.get("/api/v1/audit/export", params={"format": "jsonl"}).text.splitlines()
-        assert json.loads(lines[-1])["event"] == "setup"  # (all of it, to its oldest)
+        assert json.loads(lines[-1]).get("why") == "genesis"  # (all of it, to its oldest: since 0.4.0 the seal that begins its chain)
 
 
 def test_a_line_written_by_hand_without_its_end_is_the_same_for_the_index_and_the_files(tmp_path: Path) -> None:
@@ -1229,6 +1229,131 @@ def test_downloads_are_held_to_a_few_at_once_and_one_of_each_account() -> None:
     olga()
     olga()  # (given back once, however often it is called)
     assert downloads.take("rosa") is not None and downloads.take("victor") is None
+
+
+def test_a_place_given_back_by_the_collector_while_one_is_taken_holds_nothing_up() -> None:
+    # (The runner, 2026-11-17, Python 3.12, once in many runs: the event loop waited for itself, and every request of the wall
+    # with it. The collector ran as a download took its place, between two steps of Downloads.take with its lock held, and
+    # found there an earlier download's answer that a cycle had kept: the answer's finalizer gave its place back, and the
+    # give-back waited for the lock its own thread held.) Here the collector runs at that step every time.
+    import gc
+
+    from qkvm import server
+
+    class Collected(set[str]):
+        """The places taken, where the collector runs as each is added (in Downloads.take, as on the runner)."""
+
+        def add(self, asker: str) -> None:
+            gc.collect()
+            super().add(asker)
+
+    async def pieces() -> Any:
+        yield b"x"
+
+    downloads = server.Downloads(3)
+    taken: list[Any] = []
+    collecting = gc.isenabled()
+    gc.disable()  # (the collector runs where this test runs it, and nowhere else)
+    try:
+        give_back = downloads.take("olga")
+        assert give_back is not None
+        cycle: list[Any] = [server.Handed(pieces(), give_back, media_type="text/plain")]
+        cycle.append(cycle)  # (an answer kept by a cycle: only the collector finds it)
+        del cycle
+        downloads._of = Collected(downloads._of)
+        taking = threading.Thread(target=lambda: taken.append(downloads.take("ivan")), daemon=True)
+        taking.start()
+        taking.join(10)
+        assert not taking.is_alive(), "the collector gave a place back within Downloads.take, and that waited for the lock its own thread held"
+    finally:
+        if collecting:
+            gc.enable()
+    assert taken[0] is not None
+    # The place of the answer that was collected comes back all the same.
+    wait_until(lambda: downloads.take("olga") is not None, "the place of the answer that was collected was never given back", 10)
+
+
+def test_an_answer_collected_while_a_thread_pool_takes_work_holds_nothing_up() -> None:
+    # (The same where what an answer is made from goes to a thread pool to be let go of, as a download's file goes to be closed
+    # and a served image's to the readers: a pool takes work under a lock of its own and one that all pools share, and the
+    # collector runs there as well. The answer's finalizer handed its work to a pool there, and waited for those locks.)
+    import gc
+    import queue
+    from concurrent.futures import ThreadPoolExecutor
+
+    from qkvm import server
+
+    class Collected(queue.SimpleQueue):  # type: ignore[type-arg]
+        """A pool's queue of work, where the collector runs as work is put on it (in submit, the pool's locks held)."""
+
+        def put(self, item: Any, block: bool = True, timeout: float | None = None) -> None:
+            gc.collect()
+            super().put(item, block, timeout)
+
+    async def pieces() -> Any:
+        yield b"x"
+
+    pool = ThreadPoolExecutor(1)
+    pool._work_queue = Collected()  # (before the pool has a thread: each is handed the queue as it starts)
+    let_go = threading.Event()
+    collecting = gc.isenabled()
+    gc.disable()  # (the collector runs where this test runs it, and nowhere else)
+    try:
+        cycle: list[Any] = [server.Handed(pieces(), lambda: pool.submit(let_go.set), media_type="text/plain")]
+        cycle.append(cycle)  # (an answer kept by a cycle: only the collector finds it)
+        del cycle
+        submitting = threading.Thread(target=lambda: pool.submit(int), daemon=True)
+        submitting.start()
+        submitting.join(10)
+        assert not submitting.is_alive(), "the collector handed work to a thread pool within its submit, and that waited for the pool's locks its own thread held"
+    finally:
+        if collecting:
+            gc.enable()
+    assert let_go.wait(10), "what the answer that was collected was made from was never let go of"
+    pool.shutdown()
+
+
+def test_a_download_whose_answer_is_never_sent_gives_its_place_back_and_lets_go_of_its_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # (An answer dropped unsent by whatever stood between the route and the connection is let go of once it is collected: by
+    # the thread that lets go of such answers, where no lock of anybody's is held, and not by the collector where it ran.)
+    import gc
+
+    from fastapi.responses import PlainTextResponse
+
+    from qkvm import server
+
+    written(tmp_path, old_entries(1_760_000_000.0, ["rack-1"], 3000), 2)
+    monkeypatch.setattr(server, "SPOOL_IN_MEMORY", 10_000)  # (on the disk at once)
+    spooled = activity.Spool
+    closed: list[str] = []
+
+    def spool(in_memory: int, folder: Path) -> Any:
+        file = spooled(in_memory, folder)
+        close = file.close
+
+        def closing() -> None:
+            closed.append(threading.current_thread().name)
+            close()
+
+        file.close = closing  # type: ignore[method-assign]
+        return file
+
+    async def dropped(self: Any, scope: Any, receive: Any, send: Any) -> None:
+        await PlainTextResponse("dropped", status_code=500)(scope, receive, send)  # (and the answer itself never sent)
+
+    def let_go() -> bool:
+        gc.collect()
+        return bool(closed)
+
+    with wall(tmp_path) as admin:
+        caught_up(admin.core.activity)  # type: ignore[attr-defined]
+        monkeypatch.setattr(server.activity, "Spool", spool)
+        with monkeypatch.context() as unsent:
+            unsent.setattr(server.Handed, "__call__", dropped)
+            assert admin.get("/api/v1/audit/export", params={"format": "csv"}).status_code == 500
+        wait_until(let_go, "the file of a download never sent was never let go of", 10)
+        assert closed == ["qkvm-let-go"], closed
+        assert admin.get("/api/v1/audit/export", params={"format": "csv"}).status_code == 200  # (its place was given back)
 
 
 def test_a_download_takes_none_of_the_room_the_record_needs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1633,14 +1758,22 @@ def test_what_is_done_to_a_machine_is_found_by_its_id_through_a_rename_and_downl
 def test_a_download_of_a_long_log_is_made_a_page_at_a_time_and_sent_whole(tmp_path: Path) -> None:
     written(tmp_path, old_entries(1_760_000_000.0, ["rack-1"], 3 * activity.PAGE + 17), 3)
     with wall(tmp_path) as admin:
+        # (The sign-in's note that opens the saved passwords at the next start is made after it, in the background: a line of
+        # the log written while the download is made is not in it, as the guide says. On a loaded runner it came then.)
+        wait_until(lambda: any(entry["event"] == "unlock_at_start_on" for entry in admin.core.audit.tail(10)), "the note of the sign-in was not written", timeout=30)  # type: ignore[attr-defined]
         caught_up(admin.core.activity)  # type: ignore[attr-defined]
         download = admin.get("/api/v1/audit/export", params={"format": "csv"})
         assert int(download.headers["content-length"]) == len(download.content)  # (made whole, then sent with its length)
         rows = list(csv.reader(io.StringIO(download.text)))
         assert rows[0][0] == "time" and sum(1 for row in rows if row[0] == "time") == 1
-        assert len(rows) == 1 + len(admin.core.audit.tail(10**6)) - 1  # type: ignore[attr-defined]  # (all of it but the download's own entry, written after it was read)
-        times = [row[0] for row in rows[1:]]
-        assert times == sorted(times, reverse=True)
+        # All of it but the download's own entry (written after it was read), each once and in the log's own order, the order of
+        # its files, newest first: no page split, left out, given twice or turned round. (Not in the order of the times the
+        # entries say, which the log does not promise: two threads, a clock set back. Asked so, a seal of 0.4.0 written while
+        # the writer read the log at its first start broke it on a slow runner: see test_activity_chain_written.)
+        newest, *log = admin.core.audit.tail(10**6)  # type: ignore[attr-defined]
+        assert newest["event"] == "activity_exported"
+        said = [(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(entry["time"])), entry["event"]) for entry in log]
+        assert [(row[0], row[1]) for row in rows[1:]] == said and len(said) > 3 * activity.PAGE + 17
 
 
 def test_what_an_admin_wants_after_an_incident_is_written_down(tmp_path: Path, fake: FakeKvm) -> None:
@@ -1659,7 +1792,8 @@ def test_what_an_admin_wants_after_an_incident_is_written_down(tmp_path: Path, f
         assert admin.get("/api/v1/audit/export", params={"format": "jsonl", "kind": "action"}).status_code == 200
         wait_until(lambda: any(entry["event"] == "live_closed" for entry in running.core.audit.tail(20)), "the end of the live view was not written down")
         entries = {entry["event"]: entry for entry in running.core.audit.tail(50)}
-        assert entries["live_opened"] | {"time": 0} == {"time": 0, "event": "live_opened", "ip": "127.0.0.1", "user": "admin", "device": "rack-1", "device_id": one}
+        opened = {name: value for name, value in entries["live_opened"].items() if name != "chain"}  # (its place in the chain: 0.4.0)
+        assert opened | {"time": 0} == {"time": 0, "event": "live_opened", "ip": "127.0.0.1", "user": "admin", "device": "rack-1", "device_id": one}
         closed = entries["live_closed"]
         assert (closed["user"], closed["device_id"], closed["why"]) == ("admin", one, "closed") and 1 <= closed["seconds"] <= 5
         assert (entries["activity_exported"]["format"], entries["activity_exported"]["asked"]) == ("jsonl", {"kind": "action"})
@@ -1823,6 +1957,10 @@ def test_the_settings_file_says_how_large_the_activity_log_grows(tmp_path: Path)
         saved = json.loads(settings_text(tmp_path / "qkvm.json", encoding="utf-8"))
         saved["server"]["activity_mb"] = said
         write_settings_text(tmp_path / "qkvm.json", json.dumps(saved), encoding="utf-8")
+        # (A value the settings do not take, a text, a yes or a fraction, makes the wall start from their second copy, which
+        # said the default here as it was made at the setup. Since 0.4.0 it is renewed at each start and stop, where the place
+        # of the activity log's chain is kept: it is made to say the default again, as it did.)
+        write_settings_text(tmp_path / "qkvm.bak", json.dumps({**saved, "server": {**saved["server"], "activity_mb": 50}}), encoding="utf-8")
         with wall(tmp_path) as admin:
             assert admin.core.audit.max_bytes == each, said  # type: ignore[attr-defined]
     # A wall that says 100 already (a candidate of 0.2.0 wrote what was then its default) keeps it, and writes it back.

@@ -52,10 +52,15 @@ Made = tuple[Device, Callable[[], int], Callable[[str], None]]
 
 
 def that_long_has_passed(device: Device) -> None:
-    """The wait is over: for this connection, and in what is kept beside the connections of what was rejected."""
+    """The wait is over: for this connection, and in what is kept beside the connections of what was rejected (and, for an
+    engine with Intel AMT, of how long a no is still the engine refusing this wall: amt._SIGN_INS)."""
     device._login_retry_at = 0.0  # type: ignore[attr-defined]
     for what, (times, unanswered, _) in list(kvm.REJECTED._known.items()):
         kvm.REJECTED._known[what] = (times, unanswered, 0.0)
+    for what, until in list(amt._SIGN_INS.items()):
+        if until != amt.TAKEN:
+            amt._SIGN_INS[what] = float("-inf")
+
 
 
 def a_kvm(server: Any) -> Made:
@@ -127,6 +132,26 @@ def test_each_rejection_in_a_row_has_the_wall_wait_longer_and_an_accepted_login_
             # and a password rejected after that is the first again, not the seventh.
             set_password("changed again")
             device._token = None  # type: ignore[attr-defined]  # (the device has forgotten the session)
+            if isinstance(device, amt.AmtDevice):
+                # (An engine with Intel AMT: a no to the password it took is the engine refusing this wall for a while, after
+                # one more try with the fresh challenge: no verdict, and nothing offered for that wait. A no after it is tried
+                # once more after amt.LAST_TRY, no verdict yet either; a no then is the verdict, the first of the ladder every
+                # device's rejected password waits.)
+                before = logins()
+                with pytest.raises(amt.Refusing):
+                    await device._login()
+                assert logins() == before + 2
+                wait = device._login_retry_at - time.monotonic()
+                assert amt.REFUSING_WAIT - 5 <= wait <= amt.REFUSING_WAIT + TICK, wait
+                assert kvm.REJECTED.times(kvm.REJECTED.what("login", device.spec)) == 0
+                that_long_has_passed(device)
+                with pytest.raises(amt.Refusing):
+                    await device._login()
+                assert logins() == before + 3
+                wait = device._login_retry_at - time.monotonic()
+                assert amt.LAST_TRY - 5 <= wait <= amt.LAST_TRY + TICK, wait
+                assert kvm.REJECTED.times(kvm.REJECTED.what("login", device.spec)) == 0
+                that_long_has_passed(device)
             await rejected(WAITS[0])
         finally:
             await device.close()

@@ -325,8 +325,90 @@ def test_a_subscription_that_does_not_open_is_said_and_sent_nothing(tmp_path: Pa
         assert service.received == []
 
 
+@pytest.mark.parametrize("how", ["alerts switched off", "a pause"])
+def test_an_alert_waiting_for_a_browser_is_dropped_once_alerts_are_switched_off_and_sent_through_a_pause(
+    tmp_path: Path, service: FakePush, monkeypatch: pytest.MonkeyPatch, how: str
+) -> None:
+    # The fresh review of the fixes, N3: a push waiting to be tried again asked only whether its account might still see the
+    # machine: alerts switched off, it went to the phone all the same. Switched off, it is dropped. A pause stops new pushes
+    # only, as it stops new alerts to the destinations: one already on its way goes (it was held once, and lost by another
+    # path: the last look, M4); what changes within the pause is told when it ends.
+    monkeypatch.setattr(webpush, "RETRY_AFTER", (2.0,))
+    fake = FakeKvm().start()
+    phone = Browser("/send/stopped")
+    try:
+        with wall(tmp_path / "wall") as admin:
+            device = add(admin, fake.url, name="build-01")
+            subscribe(admin, phone)
+            assert admin.put("/api/v1/alerts", json={"enabled": True}).status_code == 200
+            time.sleep(0.6)
+            service.service.status = 503  # (its push service away: the alert waits to be tried again)
+            fake.state.signal = False
+            wait_until(lambda: len(service.received) >= 1, "the first alert was never tried", 15)
+            if how == "alerts switched off":
+                assert admin.put("/api/v1/alerts", json={"enabled": False}).status_code == 200
+            else:
+                assert admin.post("/api/v1/alerts/pause", json={"minutes": 60}).status_code == 200
+            stopped_at = len(service.received)
+            service.service.status = 201
+            if how == "alerts switched off":
+                time.sleep(3.0)  # (its next try falls after the switch)
+                assert service.received[stopped_at:] == [], "a push waiting to be tried again went to the phone after alerts were switched off"
+                assert admin.put("/api/v1/alerts", json={"enabled": True}).status_code == 200
+                time.sleep(1.0)
+                assert service.received[stopped_at:] == []  # (dropped: alerts switched off say nothing of what happened then)
+                return
+            wait_until(lambda: len(service.received) > stopped_at, "the push on its way when the pause began was never sent", 10)
+            told = phone.read(service.received[stopped_at])
+            assert told["title"].startswith("build-01") and told["kind"] == "no_signal", told
+            # A pause stops what is new: the machine back within it is told when it ends.
+            fake.state.signal = True
+            wait_until(lambda: admin.core.watcher.state(device) == "online", "it was never seen back", 10)  # type: ignore[attr-defined]
+            time.sleep(1.0)
+            assert len(service.received) == stopped_at + 1, [phone.read(got)["kind"] for got in service.received]
+            assert admin.post("/api/v1/alerts/pause", json={"minutes": 0}).status_code == 200
+            wait_until(lambda: len(service.received) > stopped_at + 1, "what changed within the pause was never told", 10)
+            assert phone.read(service.received[-1])["kind"] == "recovered"
+    finally:
+        fake.stop()
+
+
+def test_an_alert_waiting_for_a_browser_when_alerts_were_switched_off_goes_no_more_though_they_are_on_again(tmp_path: Path, service: FakePush) -> None:
+    # (The outside review of 0.4.0, bugs round 2, M3, for Web Push.) The switch was asked at each try: switched off and on
+    # again before the next try of what waited, it went. What was put in before alerts were switched off goes no more.
+    import threading
+
+    answering, let_go = threading.Event(), threading.Event()
+
+    def busy(received: Any) -> bytes:
+        if not answering.is_set():
+            answering.set()
+            let_go.wait(20)  # (its push service slow to say it is busy: the next try comes after the switches)
+        return b""
+
+    service.service.then, service.service.echo = [503], busy
+    fake = FakeKvm().start()
+    phone = Browser("/send/off-and-on")
+    try:
+        with wall(tmp_path / "wall") as admin:
+            add(admin, fake.url, name="build-01")
+            subscribe(admin, phone)
+            assert admin.put("/api/v1/alerts", json={"enabled": True}).status_code == 200
+            time.sleep(0.6)
+            fake.state.signal = False
+            assert answering.wait(15), "the alert was never tried"
+            assert admin.put("/api/v1/alerts", json={"enabled": False}).status_code == 200
+            assert admin.put("/api/v1/alerts", json={"enabled": True}).status_code == 200
+            let_go.set()
+            time.sleep(1.0)  # (its next try: a twentieth of a second after the busy answer)
+            assert len(service.received) == 1, [phone.read(got)["kind"] for got in service.received]
+    finally:
+        let_go.set()
+        fake.stop()
+
+
 def test_an_alert_waiting_for_a_browser_is_not_sent_once_its_account_is_suspended(tmp_path: Path, service: FakePush, monkeypatch: pytest.MonkeyPatch) -> None:
-    # (The outside review of 0.3.0, Codex's L1: whether an account may be told an alert was asked when it was put in, and
+    # (The outside review of 0.3.0, L1: whether an account may be told an alert was asked when it was put in, and
     # not again: one waiting to be tried again went out after the account was suspended.)
     monkeypatch.setattr(webpush, "RETRY_AFTER", (3.0,))
     seen: list[tuple[Any, str, bytes]] = []

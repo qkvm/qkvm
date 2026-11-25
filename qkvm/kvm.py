@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import errno
+import functools
 import hashlib
 import json
 import logging
@@ -16,7 +17,7 @@ import time
 import zlib
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
 import httpx
@@ -24,6 +25,9 @@ from websockets.asyncio.client import ClientConnection
 from websockets.asyncio.client import connect as _ws_connect
 from websockets.exceptions import InvalidStatus, WebSocketException
 from websockets.frames import CloseCode, Opcode
+
+if TYPE_CHECKING:
+    from .video import VideoUnavailable
 
 log = logging.getLogger("qkvm")
 
@@ -59,7 +63,7 @@ JIGGLER_OFF_THERE = "The jiggler is switched off in the KVM's own settings: swit
 # says which hold for every device of its kind (`Device.can`), and its look at the device adds what that
 # one has (`can` in its status: a power board, several inputs, a light): what a client may ask of the
 # machine, said by the server, so that no client guesses it from the kind. Each word opens actions of
-# POST /api/v1/devices/{id}/actions, or a request (the README, "The API", says which). The words and the
+# POST /api/v1/devices/{id}/actions, or a request (the guide, "The API", says which). The words and the
 # labels the page shows for them are in static/words.json; one that is not in there is a mistake.
 ABILITIES = (
     "screen", "keys", "text", "jiggler", "power", "reset", "fingerbot", "power_state", "wol", "ports", "reboot", "resume",
@@ -286,6 +290,18 @@ BOARD_ANSWER = 8.0
 # Comet's word followed the computer three or four seconds late, on and off alike.
 SEEN_WITHIN = 20.0
 SEEN_EVERY = 1.0
+# A reset leaves the computer's power on, so the board says nothing of it; and a real Comet's computer (on GL.iNet's newer
+# firmware, 2026-11-16) kept its HDMI signal up through its restart and its firmware's screens, so the signal says nothing
+# either. Its picture does: after the button is let go the screen is looked at, this often, SEEN_WITHIN at the most, and the
+# reset is done once it is seen to change from what it was just before the press: its signal goes or comes, its size changes,
+# or at least RESET_SHARE of its squares (screens.GRID, each further than screens.LEVELS from before) changed, which a pointer
+# that moves or a clock that ticks does not do. Not seen: said so (NotSeen), never "not carried out". Where the screen could
+# not be read before the press in a way a change can be told by, within RESET_BEFORE_WITHIN, nothing is looked for. The
+# pictures are of RESET_TIER, and are compared in the video worker (a process of its own, as every picture that is read).
+RESET_LOOK_EVERY = 1.0
+RESET_SHARE = 0.1
+RESET_BEFORE_WITHIN = 2.0
+RESET_TIER = "480"
 # A KVM's power board says how it is on the KVM's line for events (kvmd's /api/ws), at once and at every change, as the KVM's
 # own page reads it; asked at /api/atx instead, a Comet's board answers one asker at a time and tells whoever asks meanwhile
 # that there is none (the wall's questions, once a look, gave a second wall or a script beside it "no board": one answer in
@@ -319,6 +335,38 @@ PRESS_SENT: contextvars.ContextVar[bool | None] = contextvars.ContextVar("press_
 # connection to the KVM was had in time). Signing in first, the tile retired before the send: it never went out. A power
 # button's click that never went out pressed nothing, and holds nothing (register row 4 of 0.2.1, fx-a N2, w16c).
 REQUEST_OUT: contextvars.ContextVar[bool] = contextvars.ContextVar("request_out", default=False)
+# On a KVM with several inputs, the input keys or text are for (an action's `input`: the one the sender saw on screen), set by
+# the server around the action. The KVM itself is asked which one is on screen right before they go, after any signing in,
+# and they are refused where it shows another or does not say (409 `input_changed`, nothing sent): KvmDevice._input_still.
+# None: not asked (a client before 0.4.0). What a look found, or a switch of qKVM's since, decides nothing of it: a switch at
+# the KVM's own buttons comes between them (the owner's design (b) for 0.4.0; the outside review 6.2 second re-check, H4 and H5).
+# ONE_INPUT: the sender took the KVM for one of a single input (an action's `one_input`): refused where it has shown several, or
+# its switch, asked right before they go, lists several (the outside review 6.2 narrow look at the third re-check's fixes, HIGH 5).
+INPUT_ASKED: contextvars.ContextVar[int | None] = contextvars.ContextVar("input_asked", default=None)
+ONE_INPUT = -1
+# The wait of that question to the KVM, every keyboard action's: its whole answer, headers and body, within this many seconds
+# of having a connection to the KVM, and a connection made within as long. One that does not answer within it refuses the
+# keys, nothing sent (a route that hung held every keyboard action for eight seconds and more: the review of Z2, L1; one that
+# trickled in, ten: the narrow re-review of HB's second round, L2). For a free one of the connections kept to it, as long as
+# any request waits (INPUT_READ_WAITS, below WAITS): qKVM's own requests holding them all for a moment are no word of the KVM's.
+INPUT_READ_WAIT = 2.0
+KEYBOARD_ACTIONS = frozenset({"keys", "text", "ctrl_alt_del"})  # what sends keys, by every spelling (a saved action is one of the first two)
+
+
+def input_refused(name: str, asked: int, on: int | None, why: str = "") -> KvmError:
+    """Keys or text for the computer on input `asked` of a KVM with several inputs, refused: input `on` is on screen, or qKVM
+    could not tell which (None, and `why`)."""
+    if on is not None:
+        said = f"{name} shows another computer than the one you saw (input {asked + 1}): input {on + 1} is on screen now."
+    else:
+        said = f"qKVM could not tell which computer {name} shows now ({why or 'the KVM did not say'}), and keys and text go to the one on screen."
+    return KvmError("input_changed", f"{said} Nothing was sent: look at it again.", 409)
+
+
+def one_input_refused(name: str) -> KvmError:
+    """Keys or text sent for a KVM of one input (ONE_INPUT), refused: it has several, and they go to the computer on screen."""
+    said = f"{name} has several inputs, and keys and text go to the computer on screen: this was sent as for a KVM of one input."
+    return KvmError("input_changed", f"{said} Nothing was sent: look at it again.", 409)
 # GL.iNet's Fingerbot, paired with a Comet over Bluetooth, presses a machine's power button with an arm, for a machine
 # that has no ATX board. The Comet says whether one is paired in a `fingerbot` event on its line for events
 # (`{"exist": true}`, and nothing more: a real one, 2026-10-18), and has no route that says it. A press is
@@ -519,7 +567,20 @@ MAX_PICTURE_SIDE = 16384
 MAX_PICTURE_PIXELS = 40_000_000
 LOGIN_RETRY = 10.0  # after a sign-in that failed for another reason than the password, don't try again for this long (twice as long each time: see Rejected.unanswered)
 WAITS = httpx.Timeout(8.0, connect=4.0)  # seconds a device has to accept a connection, and to send the next piece of an answer
+INPUT_READ_WAITS = httpx.Timeout(INPUT_READ_WAIT, pool=WAITS.pool)  # (a second's wait for a free connection refused keys for the wall's own load: the review of HB, L2)
 TRANSFER_TIME = 20.0  # seconds an answer may take to arrive in full, once the device has begun to send it
+# A request's extension: the seconds its whole answer has once it has a connection (bounded); left out, what its waits add up to.
+ANSWERED_WITHIN = "qkvm.answered_within"
+# ...and by when (time.monotonic()) it is to have a connection and to begin to go out on it; later, it is not sent (_TooLate).
+SENT_BY = "qkvm.sent_by"
+# Keys and text leave within this many seconds of the read of the KVM's switch that judged them: after the read their own
+# request waited for a free connection as long as any (eight seconds), and a switch at the KVM's buttons meanwhile sent them
+# to the other computer (the narrow re-review of HB's third round, M1).
+KEYS_AFTER_READ = 0.5
+
+
+class _TooLate(Exception):
+    """Not sent: it would have gone out later than its SENT_BY."""
 CERT_TIMEOUT = 5.0  # seconds a device has to show its certificate
 CONNECT_MARGIN = 0.5  # the time for a whole exchange is at least this much more than getting a connection can take
 STOP_TRIES, STOP_WAIT = 4, 0.5  # how often a task is told to stop, and how long each time is waited for it to
@@ -671,7 +732,10 @@ class Rejected:
         """The device says when to come back (it has locked this address out for a while): then, and not sooner.
 
         That is no verdict on the password either, and counts as none: taken for one more no each
-        time, a JetKVM that asked for a minute was left alone for a quarter of an hour.
+        time, a JetKVM that asked for a minute was left alone for a quarter of an hour. (An engine with
+        Intel AMT that refuses a password it took before is kept so as well: it refuses this address
+        for a while, and says no more of it than a 401; see amt.REFUSING_WAIT. A no it gives after that
+        wait is a verdict, `said_no`, and waits as every rejected password does.)
         """
         times = self.times(what)
         self._known.pop(what, None)  # (what `sent` noted of this very sign-in is not a wait to be kept)
@@ -760,6 +824,15 @@ class KvmError(Exception):
         return {"code": self.code, "message": self.message}
 
 
+def no_video(unable: VideoUnavailable) -> KvmError:
+    """What a picture that needs a video worker is refused with where none could start on this computer, with why: the
+    wall's trouble, not the device's, and the same for every such tile. Where the start only took too long (not `lasting`:
+    a computer under load), "not yet", and the next look tries again."""
+    if unable.lasting:
+        return KvmError("no_video", f"Video cannot start on this computer: {unable.reason}", 503)
+    return KvmError("no_stream", f"Video is slow to start on this computer: {unable.reason}", 503)
+
+
 @dataclass
 class DeviceSpec:
     id: str
@@ -778,6 +851,9 @@ class DeviceSpec:
     ident: str = ""
     fingerbot_strength: str = "firm"  # how hard a Fingerbot paired with the KVM presses: "firm" | "light" (FINGERBOT_STRENGTHS)
     amt_view: str = "stills"  # a PC with Intel AMT: "health", "stills" or "live" (store.DeviceRecord.amt_view); changed in place
+    # A KVM's: where it has shown several inputs, the mark of the machine it showed them at (several_mark), as its tile's record
+    # keeps it (store.DeviceRecord.several_inputs_at); "" none. Taken as so only while that is the machine the spec is at.
+    several_at: str = ""
 
 
 @dataclass(frozen=True)
@@ -789,6 +865,51 @@ class Snapshot:
     # A still kept between sessions, and handed out as it is until the next (a PC with Intel AMT whose tile is only shown):
     # the snapshot route says how old it is (X-KVM-Age), and the tile says so.
     still: bool = False
+
+
+@dataclass(frozen=True)
+class Screen:
+    """How a KVM's computer's screen was at a moment, for a reset (see RESET_SHARE): its signal and the size of what it shows,
+    as the KVM's streamer says them (None: not said), and a small picture of it (a JPEG) where it had a signal."""
+
+    signal: bool | None
+    size: tuple[int, int] | None
+    picture: bytes | None = None
+
+
+def squares_of(picture: bytes, session: Any) -> bytes | None:
+    """A JPEG of a screen, shrunk to screens.GRID squares (screens.fingerprint), decoded in the video worker of `session`
+    (a video.VideoSession); None where it cannot be read. (In a thread: it waits for the worker.)"""
+    from . import screens
+    from .video import VideoError, decode_jpeg
+
+    size = picture_size(picture)
+    if size is None or not 0 < size[0] * size[1] <= screens.MOST_PIXELS:
+        return None
+    try:
+        rgb = decode_jpeg(picture, size[0], size[1], session)
+    except (VideoError, OSError):
+        return None
+    return screens.fingerprint(rgb, size[0], size[1])
+
+
+def restarted(before: Screen, now: Screen, squares: tuple[bytes, bytes] | None) -> bool:
+    """Whether a screen is seen to have changed as a restart changes it, from `before` (just before the reset) to `now`:
+    its signal went or came, its size changed, or at least RESET_SHARE of `squares` (before's and now's) moved further than
+    screens.LEVELS (a pointer that moves, a clock that ticks, a cursor that blinks move a few)."""
+    from . import screens
+
+    if before.signal is not None and now.signal is not None and before.signal != now.signal:
+        return True
+    if before.size is not None and now.size is not None and before.size != now.size:
+        return True
+    if squares is None:
+        return False
+    was, now_squares = squares
+    if len(was) != len(now_squares):
+        return True
+    moved = sum(1 for a, b in zip(was, now_squares, strict=True) if abs(a - b) > screens.LEVELS)
+    return moved >= RESET_SHARE * len(was)
 
 
 def tier_for(width: int) -> str:
@@ -1087,8 +1208,28 @@ async def bounded(
     request.headers["Accept-Encoding"] = "identity"
     if not isinstance(client.cookies, _NoCookies):
         client._cookies = _NoCookies()  # (the library offers no other way to have a client keep none)
+    answered, sent_by = request.extensions.get(ANSWERED_WITHIN), request.extensions.get(SENT_BY)
+    first = [True]
     try:
-        async with asyncio.timeout(within):
+        async with asyncio.timeout(within) as whole:
+            if isinstance(answered, (int, float)) or isinstance(sent_by, float):
+                # The whole answer within `answered` seconds of having a connection (the request is begun on one): the wait for
+                # a free one, or for one to be made, is as long as ever, which a stop must not cut short (above). And where it
+                # is to go out by `sent_by`: not sent where it has a connection, or begins to go out on it, later (_TooLate).
+                earlier = request.extensions.get("trace")
+
+                async def had_a_connection(event: str, info: Any) -> None:
+                    if isinstance(sent_by, float) and (first[0] or event == "http11.send_request_headers.started"):
+                        first[0] = False
+                        if time.monotonic() > sent_by:
+                            raise _TooLate()
+                    if event == "http11.send_request_headers.started" and isinstance(answered, (int, float)):
+                        soon = asyncio.get_running_loop().time() + answered
+                        whole.reschedule(min(soon, whole.when() or soon))
+                    if earlier is not None:
+                        await earlier(event, info)
+
+                request.extensions["trace"] = had_a_connection
             reply = await client.send(request, stream=True)
             try:
                 declared = reply.headers.get("content-length", "")
@@ -1137,6 +1278,26 @@ async def bounded(
     transfer = ("content-encoding", "content-length", "transfer-encoding")
     headers = [(name, value) for name, value in reply.headers.multi_items() if name.lower() not in transfer]
     return httpx.Response(reply.status_code, headers=headers, content=bytes(body), request=request)
+
+
+class _HowItWent:
+    """How a request went out, as the HTTP library says it as it goes (its `trace`): whether on a connection made for it,
+    and whether an answer had begun to come back on it."""
+
+    def __init__(self, request: httpx.Request) -> None:
+        self.made = self.answered = False
+        request.extensions["trace"] = self._said
+
+    async def _said(self, event: str, info: Any) -> None:
+        if event.startswith("connection.connect_tcp."):
+            self.made = True
+        elif event == "http11.receive_response_headers.complete":
+            self.answered = True
+
+    def on_a_kept_one_closed(self) -> bool:
+        """Whether it went out on a connection kept from before, and nothing came back on it: one the device closed as it sat
+        kept (KvmDevice._request)."""
+        return not self.made and not self.answered
 
 
 def _dig(obj: Any, *keys: str) -> Any:
@@ -1486,10 +1647,13 @@ def _ports_from(switch: Any) -> dict[str, Any] | None:
     links = _dig(switch, "video", "links")
     ports = ports if isinstance(ports, list) else []
     signals = links if isinstance(links, list) else []
-    count = min(max(len(ports), len(signals)), MAX_PORTS)
+    count = _inputs_listed(switch)
     active = _dig(switch, "summary", "active_port")
-    # A device without a switch may still answer with an empty shell of this state.
-    if count < 2 or type(active) is not int or not 0 <= active < count:
+    # A device without a switch may still answer with an empty shell of this state. Where kvmd says its state is not in step
+    # with the switch (`summary.synced`, said and not true), which input is on screen is not known: keys that name one went to
+    # whichever the switch had (the outside review 6.2 third re-check, Low "summary.synced").
+    synced = _dig(switch, "summary", "synced")
+    if count < 2 or type(active) is not int or not 0 <= active < count or (synced is not None and synced is not True):
         return None
     return {
         "active": active,
@@ -1501,6 +1665,152 @@ def _ports_from(switch: Any) -> dict[str, Any] | None:
             for index in range(count)
         ],
     }
+
+
+def _inputs_listed(switch: Any) -> int:
+    """How many inputs kvmd's switch state lists (its ports, or its video links, whichever lists more), whether or not it says
+    which of them is on screen: two or more is a KVM with several inputs (KvmDevice._saw_several)."""
+    ports, links = _dig(switch, "model", "ports"), _dig(switch, "video", "links")
+    return min(max(len(ports) if isinstance(ports, list) else 0, len(links) if isinstance(links, list) else 0), MAX_PORTS)
+
+
+def _no_switch_there(switch: Any) -> bool:
+    """Whether kvmd's switch state is the empty one of a kvmd that has no switch, as stock kvmd answers then (and while its
+    switch starts, and after one was unplugged: kvmd 4.226, switch/state.py and chain.py): no units and no ports (each an
+    empty list, or not said), no video links, and not said out of step. The input it says is on screen counts for nothing
+    there: an unplugged switch's stays as it was (the narrow re-review of HB's second round, L3). Anything else is a switch
+    that is there, or one kvmd has not finished finding (a unit found, its ports not listed yet), and no word that there is
+    none (the review of HB, M2). A model that says neither its units nor its ports is no word (kvmd 4.226 gives both: the
+    narrow re-review of HB's third round, L4)."""
+    model, synced = _dig(switch, "model"), _dig(switch, "summary", "synced")
+    return (
+        isinstance(model, dict) and ("ports" in model or "units" in model) and model.get("ports", []) == [] and model.get("units", []) == []
+        and _inputs_listed(switch) == 0 and (synced is None or synced is True)
+    )  # fmt: skip
+
+
+def _kvmd_error(reply: httpx.Response) -> str | None:
+    """The name of the error kvmd says in this answer, in its own error object (`{"ok": false, "result": {"error": ...}}`);
+    None where the answer is none such (a page of a proxy in front of it, its web server's own 502)."""
+    try:
+        said = read_json(reply)
+    except ValueError:
+        return None
+    name = _dig(said, "result", "error") if isinstance(said, dict) and said.get("ok") is False else None
+    return name if isinstance(name, str) else None
+
+
+def _says_no_switch(reply: httpx.Response) -> bool:
+    """Whether this answer to GET /api/switch is kvmd's own word that the KVM has no switch: its error object saying that its
+    switch is unavailable (503 UnavailableError: a GLKVM of one input), or that it has no such route at all (404, in the words
+    of its own web server or as its error object: a kvmd from before switches). Never an answer that did not come from kvmd
+    (a proxy's page, its web server's 502 while kvmd restarts behind it), nor kvmd's word of another trouble."""
+    if reply.status_code == 404:
+        return reply.content.strip() == b"404: Not Found" or _kvmd_error(reply) is not None
+    return reply.status_code == 503 and _kvmd_error(reply) == "UnavailableError"
+
+
+# The KVMs that have shown several inputs while this program runs, by what they are known by (the address, how the certificate
+# is checked and the certificate, the number its machine gives for itself, its identity: as KvmDevice.takes_over compares them),
+# not by a client: one made anew for such a KVM (the wall locked as the last person signed out, and opened again) says so from
+# its start, while its switch does not answer (it said a KVM of one input, and the page offered keys that named no input: the
+# outside review 6.2 third re-check, H3). Not across a restart of the program.
+SEVERAL_MOST = 4096  # KVMs remembered so, the one seen longest ago let go of first
+# A KVM that has shown several inputs is held to them until kvmd's own word that it has no switch (its empty state, its
+# UnavailableError, a route it has not got) has held at every read of its switch for this many seconds without a break: a
+# switch that starts takes seconds to a minute (and says the same as none meanwhile), and ten minutes without one means it
+# is gone. Two reads further apart than NO_SWITCH_GAP are a break too. Kept with the tile, the mark never let go, and a KVM
+# whose switch was taken off, or a KVM of one input put at its address, offered no keys for good (the narrow re-review of
+# HB's second round, M1).
+NO_SWITCH_LETS_GO = 600.0
+NO_SWITCH_GAP = 60.0
+# For so long after it was let go of, its switch is asked at every look (not once in ten minutes, as of a KVM of one input):
+# a switch plugged in again showed as one input until the first keys sent as for one were refused (the narrow re-review of
+# HB's third round, L5(c)).
+LET_GO_WATCHED = 3600.0
+
+
+class _SeveralSeen:
+    """Those KVMs, each seen again at every look of a client that knows it (the last to be let go of). Once one was let go of,
+    a KVM not among those kept may be one that was: which inputs it has is not known, and not "one", until kvmd itself says
+    (KvmDevice._inputs_unknown). A client made anew for one let go of said one input, and its switch not answering, the page
+    offered keys that named none (the outside review 6.2 narrow look at the re-check of those fixes, HIGH 7)."""
+
+    def __init__(self) -> None:
+        self._marks: dict[str, None] = {}
+        self.forgot = False  # one was let go of
+        # Of each kept, since when its switch has said at every read without a break that there is none, and when it last said
+        # so: by the machine's mark, not the client, so that a lock or an edit that keeps the machine does not start the time
+        # again (a wall used in short sessions never let go: the narrow re-review of HB's third round, L5(b)). Not across a
+        # restart of the program: that starts it again, fail closed.
+        self._runs: dict[str, tuple[float, float]] = {}
+        self._let_go: dict[str, float] = {}  # (when each one let go of was, for LET_GO_WATCHED)
+
+    def __contains__(self, mark: object) -> bool:
+        return mark in self._marks
+
+    def __len__(self) -> int:
+        return len(self._marks)
+
+    def seen(self, mark: str) -> None:
+        self._marks.pop(mark, None)
+        self._marks[mark] = None
+        while len(self._marks) > SEVERAL_MOST:
+            self._runs.pop(next(iter(self._marks)), None)
+            del self._marks[next(iter(self._marks))]
+            self.forgot = True
+
+    def drop(self, mark: str) -> None:
+        """Let go of one on purpose (its tile removed): no other is taken for not known by it (`forgot` stays as it was)."""
+        self._marks.pop(mark, None)
+        self._runs.pop(mark, None)
+
+    def heard(self, mark: str, none: bool) -> float:
+        """A read of the switch of the KVM of `mark` came to kvmd's own word that there is none (`none`), or to anything else (a
+        break): how long that word has held for it now, without a break, none of the reads further apart than NO_SWITCH_GAP
+        (0 where it does not hold, or the KVM is not among those kept)."""
+        if not none or mark not in self._marks:
+            self._runs.pop(mark, None)
+            return 0.0
+        now = time.monotonic()
+        since, at = self._runs.get(mark, (now, now))
+        if now - at > NO_SWITCH_GAP:
+            since = now
+        self._runs[mark] = (since, now)
+        return now - since
+
+    def let_go_of(self, mark: str) -> None:
+        """Let go of as the time ran (NO_SWITCH_LETS_GO): no longer kept, and its switch asked at every look for a while."""
+        self.drop(mark)
+        now = time.monotonic()
+        self._let_go = {kept: at for kept, at in self._let_go.items() if now - at < LET_GO_WATCHED}
+        if len(self._let_go) < SEVERAL_MOST:
+            self._let_go[mark] = now
+
+    def let_go_lately(self, mark: str) -> bool:
+        at = self._let_go.get(mark)
+        return at is not None and time.monotonic() - at < LET_GO_WATCHED
+
+    def clear(self) -> None:
+        self._marks.clear()
+        self._runs.clear()
+        self._let_go.clear()
+        self.forgot = False
+
+
+SEVERAL_SEEN = _SeveralSeen()
+
+
+def several_mark(url: str, kind: str, tls: str, cert_pem: str | None, machine: str, ident: str) -> str:
+    """The machine a tile is at, as a mark to keep that it has shown several inputs by: in SEVERAL_SEEN, and with the tile's
+    record (store.DeviceRecord.several_inputs_at), where it holds only while the tile is at that machine (what its `target` is
+    made of but its id). Nothing in it is secret."""
+    said = "\0".join((url, kind, tls, cert_pem or "", machine, ident))
+    return hashlib.sha256(said.encode("utf-8", "surrogatepass")).hexdigest()
+
+
+def _several_mark(spec: DeviceSpec) -> str:
+    return several_mark(spec.base_url, spec.kind, spec.tls, spec.cert_pem, spec.machine, spec.ident)
 
 
 def _stock_about(info: Any) -> dict[str, Any]:
@@ -1575,6 +1885,9 @@ class Device:
     # What every device of this kind can be asked, of ABILITIES. A look at the device adds what that one has
     # (`can` in the status it reads); a client goes by that list, and by this one until there is a look.
     can: tuple[str, ...] = ()
+    # Whether its driver asks the device which input is on screen right before keys or text go, where they name one
+    # (INPUT_ASKED). Where it does not, keys and text that name an input are refused unsent: this machine has none to choose.
+    reads_input = False
     # Kept open for longer than the longest pause between two looks (a tile that is watched is asked every
     # second, one that is only watched over for alerts every fifteen): otherwise every look begins with a new
     # connection, and over HTTPS with a new handshake, at the device's cost as much as at ours.
@@ -1595,6 +1908,9 @@ class Device:
         # the first one it saw, where none was remembered; or a server's controller's beside its computer's. Called with what
         # was remembered until then and what is from now on; kept with the tile from then on (DeviceManager._known).
         self.on_known: Callable[[str, str], Awaitable[None]] | None = None
+        # Told, with its mark (several_mark), that a KVM has shown several inputs where its tile's record does not say so yet
+        # (True), or that they are let go of (False): kept with the record from then on (DeviceManager._several). Must not wait.
+        self.on_several: Callable[[str, bool], None] | None = None
         # The images the wall serves to servers' controllers for a mount (served.Served), given to every tile by the wall;
         # None for a client that is not on the wall (one tried out before it is added).
         self.served: Any = None
@@ -1993,6 +2309,8 @@ class Device:
         seen = None if self._last_ok is None else max(0, round(time.time() - self._last_ok))
         # (`can`: what the look found; the driver's own list where the look found nothing, or there was none yet.)
         found = {"can": can_do(*self.can), **status, "last_seen_ago": seen}
+        if self.several_inputs():  # (said beside `ports`, which is null while its switch does not answer: since 0.4.0)
+            found["several_inputs"] = True
         if self.on_status is not None and not self._closed:
             self.on_status(found)
         return found
@@ -2007,6 +2325,12 @@ class Device:
         now): asked by the live line's look, and said to the line that holds them at once, not at its next key. None where
         they were not (the default; a driver whose status says it tells it there)."""
         return None
+
+    def several_inputs(self) -> bool:
+        """Whether the device has shown several inputs (a KVM with a switch), whichever is on screen now or whether that is
+        known: its status says so (`several_inputs`), and keys and text then name the one they are for (INPUT_ASKED). A driver
+        whose devices have none says False; one that reads which is on screen before keys go says `reads_input`."""
+        return False
 
     def abilities(self) -> list[str]:
         """What this tile can do, as the last look at the device found it; the driver's own list until there was one."""
@@ -2052,6 +2376,7 @@ class KvmDevice(Device):
     # its own restart unless the KVM said it has not got GL.iNet's routes for them, the power board and the inputs where
     # it has them, and takes keep-awake away where the KVM says it is switched off in its own settings.
     can = ("screen", "keys", "text", "jiggler", "live", "control")
+    reads_input = True  # (its switch, at /api/switch: _input_still)
 
     def __init__(self, spec: DeviceSpec, on_pin: Callable[[str], Awaitable[None]] | None = None) -> None:
         super().__init__(spec, on_pin)
@@ -2075,9 +2400,23 @@ class KvmDevice(Device):
         self._jiggler_blocked = False  # ...said so in the way of GLKVM of late, whose jiggler has settings of its own: see JIGGLER_OFF_THERE
         self._single_port_at: float | None = None  # when the device last said it has no port switch
         self._port_seen: int | None = None  # which computer was on screen at the last look (a multi-port KVM)
+        # Whether the computer on screen had a picture, as the KVM said it at the last look that said it (None: never yet). Stock
+        # kvmd runs its streamer only while somebody watches, and says nothing of the signal while it is stopped: what it said
+        # last stands until then (the fake farm of 2026-11-22, finding 1).
+        self._signal_said: bool | None = None
         # Whether the KVM has shown several inputs, at any look of this client or of the one of the same KVM it took over from
-        # (takes_over): its power board may be another computer's than the one on screen (see the board's `note`).
-        self._shown_several = False
+        # (takes_over), or of any client of it since the program started (SEVERAL_SEEN): its power board may be another
+        # computer's than the one on screen (see the board's `note`).
+        # (And by its tile's record, across a restart of the program, while the tile is at the machine that showed them: a wall
+        # started again while kvmd's switch was not up yet took the KVM for one of a single input. The review of HB, M1.)
+        mark = _several_mark(spec)
+        self._shown_several = mark in SEVERAL_SEEN or spec.several_at == mark
+        # Whether which inputs it has is not known: it is not among the KVMs kept as having shown several, and one was let go of,
+        # which may have been this one. Said as several (no keys as for one input) until kvmd itself says (_switch_said).
+        self._inputs_unknown = not self._shown_several and SEVERAL_SEEN.forgot
+        if self._shown_several:
+            SEVERAL_SEEN.seen(mark)
+        self._forgotten = False  # its tile removed: what it showed of its inputs is not put back (forget_several)
         self._usb_unsure = False  # another one is since, and the device has not found its keyboard there yet
         # Whether the KVM's mouse is absolute, as it said at the last look (/api/hid, `mouse.absolute`; None: not said). kvmd
         # drops a move of the other kind: relative steps while its mouse is absolute (stock kvmd, W7), and places while it is
@@ -2124,6 +2463,90 @@ class KvmDevice(Device):
         # (By what its mouse is at the last look: kvmd drops a move of the other kind. Not known: nothing is said.)
         return None if self._mouse_absolute is None else POINTER_ABSOLUTE if self._mouse_absolute else POINTER_RELATIVE
 
+    def several_inputs(self) -> bool:
+        return self._shown_several or self._inputs_unknown
+
+    def _saw_several(self) -> None:
+        """Its switch listed several inputs, whether or not it said which of them is on screen (one it has not got, or none, is
+        "not known": keys that name an input are refused then, and the page offers none). Said by its status from now on, also
+        by a client made anew for it (SEVERAL_SEEN; the outside review 6.2 third re-check, H3)."""
+        self._shown_several = True
+        self._keep_several()
+
+    def forget_several(self) -> None:
+        """Its tile is removed: what it showed of its inputs goes with it, and a tile added at its address starts afresh (the
+        narrow re-review of HB's second round, M1: one was held to several inputs for good, a KVM of one input put there too).
+        Nor put back by a look of its own still under way while it is closed (the narrow re-review of its third round, L2)."""
+        self._forgotten = True
+        SEVERAL_SEEN.drop(_several_mark(self.spec))
+
+    def _keep_several(self) -> None:
+        """That it has shown several inputs, seen again: kept as the last seen (SEVERAL_SEEN), and with the tile's record where
+        that does not say so of this machine yet (on_several: once, never at every look). Not for a client whose tile was
+        removed (forget_several)."""
+        if self._forgotten:
+            return
+        mark = _several_mark(self.spec)
+        SEVERAL_SEEN.seen(mark)
+        if self.spec.several_at != mark and self.on_several is not None and not self._closed:
+            self.spec.several_at = mark
+            self.on_several(mark, True)
+
+    def _heard_switch(self, none: bool) -> None:
+        """What a read of its switch came to: kvmd's own word that it has none (`none`), or anything else, a break. What it
+        showed of its inputs is let go of once that word has held at every read for NO_SWITCH_LETS_GO, none further apart
+        than NO_SWITCH_GAP; keys as for one input are refused until then, and go only where the read right before them says
+        so too (_input_still)."""
+        mark = _several_mark(self.spec)
+        held = SEVERAL_SEEN.heard(mark, none)  # (counted by the machine's mark, across a lock or an edit that keeps it)
+        if none and self._shown_several and held >= NO_SWITCH_LETS_GO:
+            self._shown_several = False
+            SEVERAL_SEEN.let_go_of(mark)
+            self.spec.several_at = ""
+            log.info("%s: its switch has said for %d minutes that there is none: it is taken for a KVM of one input", self.label, NO_SWITCH_LETS_GO // 60)
+            if self.on_several is not None and not self._closed:
+                self.on_several(mark, False)
+
+    async def _input_still(self, asked: int) -> None:
+        """Right before keys or text for the computer on input `asked` go (INPUT_ASKED), after any signing in: which input is on
+        screen, asked of the KVM itself, never taken from a look. Refused where it is another, or the KVM does not say (its
+        switch does not answer, or says it has none). What it says is what the status says from then on, where that has inputs:
+        where it did not say which, the status says that is not known (until the next look). ONE_INPUT (sent as for a KVM of
+        one input): refused where it has shown several, or its switch lists several now; sent only where kvmd itself says it has
+        no switch (_switch_said), never where the read did not come to kvmd's word (a 502 while kvmd restarts, no answer, a
+        proxy's page: a KVM of two inputs had keys sent as for one input on the computer on screen. The review of Z2, M1).
+        The read has a short wait of its own (INPUT_READ_WAIT): no answer within it is no word."""
+        # Retired while it is read, or as its answer came (the tile edited or removed, the wall locked): nothing went out, and
+        # that is what is said, not "it may have been done" (RETIRED: the outside review 6.2 third re-check, MEDIUM 4).
+        unsent = "it was being changed meanwhile"
+        try:
+            switch = await self._switch_said(urgent=True, timeout=INPUT_READ_WAITS, within=INPUT_READ_WAIT, extensions={ANSWERED_WITHIN: INPUT_READ_WAIT})
+        except KvmError as ex:
+            if ex is RETIRED or self._closed:
+                raise input_refused(self.spec.name, asked, None, unsent) from None
+            if self._status is not None and self._status.get("ports"):
+                self._status = {**self._status, "ports": None}
+            if asked == ONE_INPUT and self._shown_several:
+                raise one_input_refused(self.spec.name) from None
+            raise input_refused(self.spec.name, asked, None, f"its switch did not answer: {ex.message}") from None
+        if self._closed:
+            raise input_refused(self.spec.name, asked, None, unsent)
+        ports = _ports_from(switch)
+        if _inputs_listed(switch) >= 2:
+            self._saw_several()
+        if self._status is not None and self._status.get("ports"):
+            self._status = {**self._status, "ports": ports}
+        if asked == ONE_INPUT:
+            if self._shown_several:
+                raise one_input_refused(self.spec.name)
+            if switch is not None and not _no_switch_there(switch):
+                # (A switch that is there, or not found whole yet: no word that there is none. The review of HB, M2.)
+                raise input_refused(self.spec.name, asked, None, "its switch answered, and not as one that is not there")
+            return
+        if ports is None or ports["active"] != asked:
+            why = "it does not say which of its inputs is on screen" if _inputs_listed(switch) >= 2 else "it says it has no inputs to choose from"
+            raise input_refused(self.spec.name, asked, None if ports is None else ports["active"], why)
+
     def takes_over(self, retired: Device) -> None:
         # Which family the KVM is, as the client before found it (the same device at the same address), where this one
         # has not asked yet: until it has, its session would go into the address of a stock kvmd's event line.
@@ -2133,19 +2556,37 @@ class KvmDevice(Device):
         # button (a tile renamed during a hold had the new client ask the battery while the arm was down).
         if isinstance(retired, KvmDevice):
             self._fingerbot_turn = retired._fingerbot_turn
-        # That it has shown several inputs, where this one talks to the KVM the one before it saw: the same check and certificate
-        # (and what else it is known by). A certificate taken anew may be another KVM's, of one input. Not which input was on
-        # screen (_port_seen): this one has not seen that, and a change of it is what makes a keyboard unsure (_usb_unsure).
-        # Without it an edit of the tile (its group) brought the wires' note back while the switch did not answer (the
-        # reviews of 0.3.2), at the new client's own look before it took over too: that look's note goes as well.
+        # That it has shown several inputs, where this one talks to the KVM the one before it saw: at this address and of this
+        # kind (DeviceManager.adopt), with the same check, machine and identity. Also where a certificate was trusted anew, which
+        # pins it whatever check came before, fail closed: the same KVM reflashed was taken for one of a single input, and had
+        # keys sent as for one to the computer on screen while its switch was not up (the narrow re-reviews of HB's second
+        # round, L1, and third, L3); another KVM there, of one input, lets it go once its switch has said long enough that it
+        # has none (NO_SWITCH_LETS_GO). Another check after a pin, another machine or identity is another KVM as far as anything
+        # tells (the reviews of 0.3.2). Not which input was on screen
+        # (_port_seen): this one has not seen that, and a change of it is what makes a keyboard unsure (_usb_unsure). Without it
+        # an edit of the tile (its group) brought the wires' note back while the switch did not answer (the reviews of 0.3.2),
+        # at the new client's own look before it took over too: that look's note goes as well.
         mark = ("tls", "cert_pem", "machine", "ident")
-        if isinstance(retired, KvmDevice) and retired._shown_several and all(getattr(self.spec, f) == getattr(retired.spec, f) for f in mark):
+        same = isinstance(retired, KvmDevice) and all(getattr(self.spec, f) == getattr(retired.spec, f) for f in mark)
+        anew = isinstance(retired, KvmDevice) and all(getattr(self.spec, f) == getattr(retired.spec, f) for f in ("machine", "ident")) and (
+            self.spec.tls in (retired.spec.tls, "pinned")
+        )
+        if anew and isinstance(retired, KvmDevice) and retired._shown_several:
             self._shown_several = True
+            # (Kept as this one's mark, the certificate's new one: else nothing counted kvmd's word of no switch for it, and the
+            # mark was never let go of in this run. The last look at the hold round, L1.)
+            SEVERAL_SEEN.seen(_several_mark(self.spec))
             atx = (self._status or {}).get("atx")
             if self._status is not None and isinstance(atx, dict) and "note" in atx:
                 self._status = {**self._status, "atx": {key: value for key, value in atx.items() if key != "note"}}
+        if same and isinstance(retired, KvmDevice) and not retired._inputs_unknown:
+            self._inputs_unknown = False  # (which inputs it has was known to the one before, of this very machine: HIGH 7)
         # (Whether a Fingerbot is paired, which the KVM says only when a line is opened, and its battery, which it says only when
         # it is asked, are in PACED, found by every client of the KVM: see `_fingerbot`, `_battery`.)
+
+    def has_shown_several(self) -> bool:
+        """Whether it is held to several inputs (shown, or carried over from the client before it), not merely not known."""
+        return self._shown_several
 
     # Whether a Fingerbot is paired, as the KVM said last, and when: kept beside the connections (PACED), not in this client.
     @property
@@ -2261,7 +2702,7 @@ class KvmDevice(Device):
 
     async def _request(
         self, method: str, path: str, *, urgent: bool = False, vital: bool = True, still: Callable[[], bool] | None = None,
-        within: float | None = None, **kwargs: Any,
+        within: float | None = None, ready: Callable[[], Awaitable[None]] | None = None, **kwargs: Any,
     ) -> httpx.Response:
         """Send an authenticated request.
 
@@ -2276,6 +2717,9 @@ class KvmDevice(Device):
         in again, and a power button is not pressed for an account that was removed half a minute ago.
 
         `within`: the time for the whole exchange (see `bounded`); left out, what the request's own waits add up to.
+
+        `ready`: awaited before each attempt, after its signing in (which may take a while), right before it goes: it raises
+        where the request is not to go after all (keys for a computer no longer on screen: _input_still).
         """
         REQUEST_OUT.set(False)
         if not urgent:
@@ -2284,27 +2728,47 @@ class KvmDevice(Device):
         def failed(error: KvmError) -> KvmError:
             return self._failed(error, in_passing=urgent) if vital else error
 
-        retried = relogged = False
+        retried, relogged = 0, False
         while True:
             REQUEST_OUT.set(False)
             token = self._token or await self._login()
             client = await self._http()
+            if ready is not None:
+                await ready()  # (its own requests may sign in anew: their session is the one this goes on)
+                read_at = time.monotonic()  # (what it said holds for KEYS_AFTER_READ: SENT_BY)
+                REQUEST_OUT.set(False)  # (its own requests went out; this one has not, whatever comes next)
+                token, client = self._token or token, await self._http()
             limit = MAX_PICTURE if path == "/api/streamer/snapshot" else MAX_REPLY
+            went: _HowItWent | None = None
             try:
                 request = client.build_request(method, path, headers={"Cookie": f"auth_token={token}"}, **kwargs)
+                if ready is not None:
+                    request.extensions[SENT_BY] = read_at + KEYS_AFTER_READ
+                went = _HowItWent(request) if method == "GET" else None
                 if still is not None and not still():
                     raise KvmError("stopped", "It was not done: whoever asked for it may no longer do that", 403)
                 if self._closed:
                     raise RETIRED.with_traceback(None)  # (as _send says it: not sent)
                 REQUEST_OUT.set(True)
                 resp = await self._send(client, request, limit, within)
+            except _TooLate:
+                # (Its connection came, or it began to go out, later than KEYS_AFTER_READ after the read that judged it: nothing
+                # was sent, and what the KVM showed then is no witness of the computer the keys would reach now.)
+                REQUEST_OUT.set(False)
+                asked = INPUT_ASKED.get()
+                why = "its keys waited for a connection to it after it was asked"
+                raise input_refused(self.spec.name, ONE_INPUT if asked is None else asked, None, why) from None
             except KvmError as ex:
                 raise failed(ex) from None
             except (httpx.RemoteProtocolError, httpx.ReadError, httpx.WriteError) as ex:
-                # Usually a connection the device closed while it sat idle, or because it rebooted.
-                # Only a GET is safe to send twice.
-                if method == "GET" and not retried:
-                    retried = True
+                # Usually a connection the device closed while it sat idle, or because it rebooted. Only a GET is safe to send
+                # twice: once more, and again while it went out on a connection kept from before and nothing came back on it.
+                # A KVM ends the connections kept to it together: a look tried once more on the next one kept was taken for a
+                # KVM that is down, and its tile flashed offline (the fake farm of 2026-11-22, likely defect 2). No more times
+                # than are kept, and one: then it goes out on one made for it.
+                kept = self.LIMITS.max_keepalive_connections or 0
+                if went is not None and (retried == 0 or (went.on_a_kept_one_closed() and retried <= kept)):
+                    retried += 1
                     continue
                 raise failed(_transport_error(ex, self.spec.tls)) from ex
             except httpx.HTTPError as ex:
@@ -2349,6 +2813,38 @@ class KvmDevice(Device):
             if ex.code != "bad_response":
                 raise
             return None
+
+    async def _switch_said(self, **asked: Any) -> dict[str, Any] | None:
+        """Its switch's state (GET /api/switch) as kvmd itself says it: what the switch lists (which says there is none only as
+        the empty state of a kvmd without one: _no_switch_there), or None where kvmd says it has no switch (_says_no_switch).
+        KvmError where the read did not come to kvmd's word: no answer, or one cut off, its web server's 502 while kvmd
+        restarts, a page of something in front of it, kvmd's word of another trouble, its error object at a 200. (Each of
+        those was taken for "no switch": the review of Z2, M1, and of HB, M2.)"""
+        try:
+            resp = await self._request("GET", "/api/switch", vital=False, **asked)
+        except KvmError as ex:
+            if not (ex is RETIRED or self._closed):  # (cut off by a lock or an edit: no word of the KVM's at all. Last look, L2)
+                self._heard_switch(False)
+            raise
+        if resp.status_code == 200:
+            try:
+                whole = read_json(resp)
+                said = whole["result"] if whole.get("ok") is not False else None  # (its error object at a 200 is no answer)
+            except (ValueError, KeyError, TypeError, AttributeError):
+                said = None
+            if not isinstance(said, dict):
+                self._heard_switch(False)
+                raise KvmError("bad_response", "/api/switch returned unexpected data")
+            if _no_switch_there(said):
+                self._inputs_unknown = False  # (several listed say so by _saw_several; anything else leaves it not known)
+            self._heard_switch(_no_switch_there(said))
+            return said
+        if _says_no_switch(resp):
+            self._inputs_unknown = False
+            self._heard_switch(True)
+            return None
+        self._heard_switch(False)
+        raise KvmError("bad_response", f"/api/switch failed (HTTP {resp.status_code})")
 
     # --- identity -----------------------------------------------------------
 
@@ -2784,14 +3280,21 @@ class KvmDevice(Device):
                 raise KvmError("busy", "The KVM's power board is pressing a button at this moment (from its own page, or another program). Wait for it to finish.", 409)
             if before is False and flag(_dig(self._status, "video", "signal")) is not False:
                 before = None  # a light that says "off" beside a picture is not wired up: it is no witness of what a press does
+        screen = await self._screen_before() if action == "atx_reset" else None  # (what a reset is judged by: RESET_SHARE)
+        asked = INPUT_ASKED.get() if action in KEYBOARD_ACTIONS else None
+        ready = None if asked is None else functools.partial(self._input_still, asked)
         try:
-            resp = await self._request("POST", path, urgent=True, params=params, still=still, **extra)
+            resp = await self._request("POST", path, urgent=True, params=params, still=still, ready=ready, **extra)
         except asyncio.CancelledError:
             if action in HELD and REQUEST_OUT.get():
                 PRESS_SENT.set(True)
                 self._board_may_be_pressing(action)  # (qKVM stopping, or its listeners reopened: cut off while the click was on its way)
             raise
         except KvmError as ex:
+            if asked is not None and ex is RETIRED and not REQUEST_OUT.get():
+                # (Keys whose tile was retired before their request went out, while it signed in again, say: nothing was sent,
+                # as for a power button below. The review of HB, L1.)
+                raise input_refused(self.spec.name, asked, None, "it was being changed meanwhile") from None
             # A KVM that is already going down may never answer its own reboot request.
             if action == "reboot" and ex.code in ("dropped", "timeout"):
                 return
@@ -2821,7 +3324,7 @@ class KvmDevice(Device):
             raise KvmError("action_failed", plain(detail, 200) or f"The device refused (HTTP {resp.status_code})")
         if action in HELD:
             PRESS_ANSWERED.set(True)
-            await self._let_go(action, before, self._board_words)
+            await self._let_go(action, before, self._board_words, screen)
         if action == "port":
             # What was on screen belongs to the other computer now.
             self._frames.clear()
@@ -2880,13 +3383,18 @@ class KvmDevice(Device):
         turn = self._fingerbot_turn
         turn.board_until = max(turn.board_until, time.monotonic() + BOARD_ANSWER + HELD[action])
 
-    async def _let_go(self, action: str, before: bool | None, words: int) -> None:
+    async def _let_go(self, action: str, before: bool | None, words: int, screen: Screen | None = None) -> None:
         """After a power button's click was answered: wait until the board has let go of the button (HELD), and then, for a
         press that must change the computer's power, until the board shows the change, SEEN_WITHIN at the most. Where it
         does not, the press was made all the same, and NotSeen says what was seen instead. `words`: how many words the board
-        had said on its line when the click was answered (see `_board_now`)."""
+        had said on its line when the click was answered (see `_board_now`). A reset: until its screen is seen to change from
+        `screen`, as it was just before the press (see RESET_SHARE)."""
         await asyncio.sleep(HELD[action])
         self._status_at = 0.0  # what the tile says may be out of date now
+        if action == "atx_reset":
+            if screen is not None:
+                await self._restart_seen(screen)
+            return
         changes: dict[tuple[str, bool | None], bool] = {("atx_power", False): True, ("atx_power_long", True): False}
         wanted = changes.get((action, before))
         if wanted is None:
@@ -2931,6 +3439,95 @@ class KvmDevice(Device):
                         await news.wait()
                 except TimeoutError:
                     pass
+
+    # --- a reset, judged by the picture (see RESET_SHARE) --------------------------------------------------------------
+
+    async def _screen_now(self) -> Screen:
+        """How the computer's screen is now: its signal and size as the streamer says them, and a small picture of it where
+        it has a signal. (Not where it has none: a Comet answers a picture of no signal after five or six seconds.)"""
+        streamer = await self._get_result("/api/streamer", urgent=True, vital=False)
+        source = _dig(streamer, "streamer", "source")
+        signal = flag(_dig(streamer, "streamer", "hdmi", "signal"))  # GLKVM only
+        if signal is None:
+            signal = flag(_dig(source, "online"))
+        width, height = number(_dig(source, "resolution", "width"), 1, 100_000), number(_dig(source, "resolution", "height"), 1, 100_000)
+        size = (width, height) if isinstance(width, int) and isinstance(height, int) else None
+        if signal is not True:
+            return Screen(signal, size)
+        frame = await self._fetch_snapshot(RESET_TIER, time.monotonic())
+        if not frame.signal:
+            return Screen(False, size)  # (its own picture of no signal)
+        return Screen(True, size, frame.data if frame.content_type == "image/jpeg" else None)
+
+    async def _screen_before(self) -> Screen | None:
+        """The screen just before a reset is pressed, to judge the reset by: within RESET_BEFORE_WITHIN, or None (and the
+        press is not held up any longer for it). None too where it cannot be told whether it changes: a signal and no
+        picture of it the wall can read (one that is no JPEG). Never raises: the press goes out, as it did before 0.4.0."""
+        look = asyncio.ensure_future(self._screen_now())
+        look.add_done_callback(_looked_at)  # (one still under way when the time is up goes on by itself, unwaited for)
+        await asyncio.wait({look}, timeout=RESET_BEFORE_WITHIN)
+        if not look.done() or look.cancelled() or look.exception() is not None:
+            return None
+        screen = look.result()
+        if screen.signal is None or (screen.signal is True and screen.picture is None):
+            return None
+        return screen
+
+    async def _restart_seen(self, before: Screen) -> None:
+        """After a reset was let go: done once the screen is seen to change from `before` (`restarted`), SEEN_WITHIN at the
+        most, looked at every RESET_LOOK_EVERY. Not seen: NotSeen, which says it was pressed and the restart not seen (a
+        machine may keep its picture a while through a restart), never that it was not done. Where `before`'s picture cannot
+        be read (no video worker here), nothing is looked for."""
+        from .video import VideoSession
+
+        deadline = time.monotonic() + SEEN_WITHIN
+        session: VideoSession | None = None
+        try:
+            reference: bytes | None = None
+            if before.picture is not None:
+                # (Its worker starts with the first picture, which may take seconds where none ran before: within the time
+                # a reset is looked for, or nothing is looked for.)
+                session = VideoSession()
+                reading = asyncio.ensure_future(asyncio.to_thread(squares_of, before.picture, session))
+                reading.add_done_callback(_looked_at)
+                await asyncio.wait({reading}, timeout=max(0.0, deadline - time.monotonic()))
+                reference = reading.result() if reading.done() and not reading.cancelled() and reading.exception() is None else None
+                if reference is None:
+                    return
+            decoder = session
+
+            async def look() -> bool:
+                now = await self._screen_now()
+                squares = None
+                if reference is not None and now.picture is not None:
+                    shrunk = await asyncio.to_thread(squares_of, now.picture, decoder)
+                    squares = (reference, shrunk) if shrunk is not None else None
+                return restarted(before, now, squares)
+
+            while True:
+                looking = asyncio.ensure_future(look())
+                looking.add_done_callback(_looked_at)  # (one under way when the time is up goes on by itself, unwaited for)
+                await asyncio.wait({looking}, timeout=max(0.0, deadline - time.monotonic()))
+                if looking.done() and not looking.cancelled():
+                    failed = looking.exception()
+                    if failed is RETIRED or self._closed:
+                        raise NotSeen("pressed; not seen: its connection ended") from None
+                    if failed is None and looking.result():
+                        self._refresh_soon()
+                        return
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    if before.signal is False:
+                        raise NotSeen("pressed; its screen stayed dark, so a restart was not seen: look at it before pressing again")
+                    raise NotSeen(
+                        f"pressed; its screen was not seen to change within {SEEN_WITHIN:g} seconds, and some machines keep their "
+                        "picture a while through a restart: look at it before pressing again"
+                    )
+                await asyncio.sleep(min(RESET_LOOK_EVERY, left))
+        finally:
+            if session is not None:
+                # (Its worker ended in a thread, not waited for: a look still under way gets no picture read, and says so.)
+                asyncio.get_running_loop().run_in_executor(None, session.close)
 
     # --- a Fingerbot paired with the KVM (see FINGERBOT_PRESSES) -------------------------------------------------
 
@@ -3216,7 +3813,14 @@ class KvmDevice(Device):
         if flag(_dig(state, "enabled")) is not True:
             return KvmError("no_virtual_media", "The KVM's own drive is switched off in its own settings", 404)
         if flag(_dig(state, "online")) is not True:
-            return KvmError("action_failed", "The KVM says its drive is not there just now (offline): look at it on its own page", 409)
+            # (A real Comet on GL.iNet's newer firmware said so, 2026-11-16, while the machine behind it was starting after its
+            # power was cut, its keyboard and mouse not there either: what it means, and what to do, not a bare "offline".)
+            return KvmError(
+                "action_failed",
+                "The KVM's drive is not ready (it says offline, as a Comet did while the machine behind it was starting): "
+                "try again once the machine has started, or look at the drive on the KVM's own page",
+                409,
+            )
         if flag(_dig(state, "busy")) is True:
             return KvmError("busy", "The KVM's drive is busy with something else (an upload, or its own page): try again in a moment", 409)
         if flag(_dig(state, "drive_partition", "connected")) is True:
@@ -3313,6 +3917,9 @@ class KvmDevice(Device):
         try:
             await self.act(action, still=still)
         except AlreadySo as so:
+            if action == "atx_reset":
+                # (Its restart not seen in its picture, `_restart_seen`: said as pressed, not as restarted.)
+                return f"Its reset button was {so}; then pick the KVM's drive in its boot menu where it does not start from it by itself."
             said = f"{said} ({so})"
         return f"{said}: pick the KVM's drive in its boot menu where it does not start from it by itself."
 
@@ -3490,10 +4097,30 @@ class KvmDevice(Device):
 
     async def _read_ports(self) -> dict[str, Any] | None:
         """The inputs of a multi-port KVM and which one is on screen; None for an ordinary one."""
-        if self._single_port_at is not None and time.monotonic() - self._single_port_at < ABOUT_TTL:
-            return None  # it said so recently: don't ask every few seconds
-        ports = _ports_from(await self._optional("/api/switch", vital=False))
-        self._single_port_at = time.monotonic() if ports is None else None
+        if (
+            self._single_port_at is not None and time.monotonic() - self._single_port_at < ABOUT_TTL and not self._shown_several
+            and not SEVERAL_SEEN.let_go_lately(_several_mark(self.spec))  # (let go of within the hour: asked at every look)
+        ):  # fmt: skip
+            # It said so recently: don't ask every few seconds. (Not of one that has shown several: one answer that was no yes,
+            # a 502 while kvmd restarts, left its tile without the input on screen, and so without keys, for ten minutes.)
+            return None
+        if self._shown_several:
+            self._keep_several()  # (seen again, whatever its switch says this look: HIGH 7)
+        try:
+            switch = await self._switch_said()
+        except KvmError as ex:
+            if ex.code != "bad_response":
+                raise
+            # No word of kvmd's, and no word that it has no switch: asked again at the next look. (Taken for one, a KVM of two
+            # inputs was not asked again for ten minutes, and keys sent as for one input went to it: the review of Z2, M1.)
+            return None
+        ports = _ports_from(switch)
+        several = _inputs_listed(switch) >= 2
+        if several:
+            self._saw_several()  # (also where it does not say which is on screen: then that is not known, `ports` null)
+        # Not asked again for a while only on kvmd's word that it has no switch, as keys sent as for one input take it: a
+        # switch that is there and lists none (yet) is asked again at the next look (the review of HB, M2).
+        self._single_port_at = time.monotonic() if switch is None or _no_switch_there(switch) else None
         return ports
 
     async def _refresh_status(self) -> None:
@@ -3571,6 +4198,9 @@ class KvmDevice(Device):
             # Shift): that is not knowing, and is told as not knowing, not as a cable that is out.
             self._usb_unsure = self._port_seen is not None
             self._port_seen = active
+            self._signal_said = None  # (what it said of the signal was of the other computer)
+        if signal is not None:
+            self._signal_said = signal
         if started:
             # So does a Comet after the computer behind it came on: "no keyboard" until the first key (a real one,
             # 2026-10-14, at the computer's sign-in screen; the first Shift found it).
@@ -3596,7 +4226,9 @@ class KvmDevice(Device):
         if fingerbot:
             self._battery_soon()
         return {
-            "state": "no_signal" if signal is False else "online",
+            # (A signal it does not say, its streamer stopped while nobody watches, is as it said last: a machine without one was
+            # taken for one with a picture each time, and "has no video signal" and "has a picture again" were sent in pairs.)
+            "state": "no_signal" if self._signal_said is False else "online",
             "error": None,
             # What this one can be asked, beside what every KVM can: Wake-on-LAN and its own restart unless it said it has not got
             # GL.iNet's routes for them, the power and reset buttons where it has a power board, and another input where it has several.
@@ -3623,9 +4255,8 @@ class KvmDevice(Device):
                 # with several inputs: its board may be wired to another computer than the one on screen, and the wires may be
                 # as they should (the review of 0.3.2). The page says "Power unknown" there all the same, without a why. Nor on one
                 # that has shown several (_shown_several, this look's among them, and an edited tile's before the edit) and whose
-                # switch did not answer this look: one answer of it that was not a yes (a 502 while kvmd restarts) has it taken
-                # for a KVM of one input for ABOUT_TTL (_read_ports).
-                **({"note": dict(POWER_LED_UNWIRED)} if power is False and signal is True and not self._shown_several else {}),
+                # switch did not answer this look (a 502 while kvmd restarts: _read_ports).
+                **({"note": dict(POWER_LED_UNWIRED)} if power is False and signal is True and not self.several_inputs() else {}),
             },
             # A Fingerbot paired with the KVM, which presses the power button (`fingerbot` in `can`): its battery in percent
             # (null until it was asked, or where it was no number), and whether that is low. Null without one. It says

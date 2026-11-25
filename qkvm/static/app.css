@@ -210,6 +210,7 @@ select { height: 32px; padding: 0 8px; cursor: pointer; }
 }
 .note.warn { border-left-color: var(--warn); }
 .note.bad { border-left-color: var(--bad); }
+.note.good { border-left-color: var(--ok); }
 .note code { display: block; white-space: pre-wrap; word-break: break-word; }
 .fingerprint { display: block; margin: 6px 0; word-break: break-all; user-select: all; }
 
@@ -411,6 +412,12 @@ select { height: 32px; padding: 0 8px; cursor: pointer; }
 .card > .theme-toggle { position: absolute; top: 14px; right: 14px; }
 .card > :not(.theme-toggle) { animation: rise .35s var(--ease) both; }
 .card h2 { margin: 6px 44px 8px 0; font-size: 18px; }
+/* Signing in through the team's identity provider: its button first, as wide as the form, and the password's way under it. */
+.provider-sign-in { display: grid; gap: 8px; margin: 6px 0 4px; }
+.provider-sign-in > button { width: 100%; justify-content: center; }
+.provider-sign-in > .error { margin: 0; }
+.provider-sign-in .or { display: flex; align-items: center; gap: 10px; margin: 6px 0 0; font-size: 12px; color: var(--muted); }
+.provider-sign-in .or::before, .provider-sign-in .or::after { content: ""; flex: 1; border-top: 1px solid var(--line); }
 .steps { display: flex; gap: 6px; margin: 0 44px 16px 0; padding: 0; list-style: none; color: var(--muted); }
 .steps li { flex: 1; padding-top: 7px; border-top: 2px solid var(--line-strong); font-size: 12px; transition: border-color var(--med), color var(--med); }
 .steps li[aria-current="step"] { border-top-color: var(--accent-text); color: var(--text); font-weight: 600; }
@@ -1170,6 +1177,26 @@ dialog.media .dialog-body > .media-list { flex: 1 1 0; min-height: 80px; overflo
 /* (Its height is kept before the words that fill it come with the answer: four lines, and what is more scrolls in it.) */
 .media-foot { height: 6em; overflow-y: auto; font-size: 12px; line-height: 1.5; }
 
+/* A destination of the alerts (Settings > Alerts): one box of one size for every kind and every state of it, Cancel and Save
+   where they stand; only what it is set to scrolls. The choice of a kind, the log and a secret shown once take the same box. */
+dialog.dialog.destination { width: min(640px, calc(100vw - 24px)); height: min(760px, calc(100vh - 24px)); }
+dialog.destination .dialog-body { display: flex; flex-direction: column; flex: 1; min-height: 0; overflow: hidden; }
+.destination-form { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+.destination-fields { flex: 1 1 0; min-height: 0; overflow-y: auto; padding-right: 4px; }
+.destination-fields > .field, .destination-fields > .check, .destination-fields > div { margin-bottom: 10px; }
+.destination-form > .error { flex: none; margin: 10px 0 0; }
+.destination-form > .actions { flex: none; margin-top: 14px; }
+dialog.destination .dialog-body > .lines, dialog.destination .destination-log { flex: 1 1 0; min-height: 0; overflow-y: auto; }
+dialog.destination .dialog-body > .footnote { flex: none; }
+/* The identity provider's box (Settings > Accounts) is a box of the same size and manner: its groups, a line each. */
+.group-roles { display: grid; gap: 6px; margin: 6px 0; }
+.group-role { display: grid; grid-template-columns: minmax(0, 1fr) 130px auto; gap: 6px; align-items: center; }
+.with-button { display: flex; gap: 6px; }
+.with-button > input { flex: 1; min-width: 0; }
+.quiet-hours { display: flex; gap: 12px; }
+.quiet-hours > .field { flex: 1; }
+.quiet-days { display: flex; flex-wrap: wrap; gap: 4px 14px; }
+
 /* Settings: its sections down the side, in groups, and the one that is chosen beside them. The dialog keeps
    one size whichever is shown, so that nothing jumps when going from one to the next. */
 dialog.dialog.settings { width: min(1080px, calc(100vw - 24px)); height: min(780px, calc(100vh - 24px)); }
@@ -1354,6 +1381,8 @@ dialog.settings .dialog-body { display: grid; grid-template-columns: 212px minma
 .progress li.bad .muted { color: var(--bad); }
 .progress li.unknown .icon, .progress li.unknown .muted { color: var(--warn); }
 .progress li.skipped { color: var(--muted); }
+.check-found { height: 240px; }  /* (a check's findings: the box keeps its size, the list scrolls) */
+.check-found li { align-items: flex-start; }
 
 .rows { width: 100%; border-collapse: collapse; }
 .rows th { padding: 7px 10px; text-align: left; font-size: 11px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); background: var(--inset); border-bottom: 1px solid var(--line-strong); }
@@ -1579,4 +1608,13 @@ dialog.settings .dialog-body { display: grid; grid-template-columns: 212px minma
   .focus-overflow > summary { width: 30px; padding: 4px; }
   .focus-overflow .more-label { display: none; }
   .focus-control-panel { padding-inline: 8px; gap: 6px; }
+}
+
+/* A backup key's recovery kit (Settings > Backups): its text as it is printed or saved. Printed, it is all that is on the page. */
+pre.kit { white-space: pre-wrap; font-family: "Source Code Pro", "Cascadia Mono", ui-monospace, Consolas, monospace; font-size: 0.85rem; line-height: 1.45; padding: 0.75rem;
+  border: 1px solid var(--line); border-radius: 6px; max-height: 40vh; overflow: auto; user-select: text; }
+@media print {
+  html.printing-kit body * { visibility: hidden !important; }
+  html.printing-kit pre.kit, html.printing-kit pre.kit * { visibility: visible !important; }
+  html.printing-kit pre.kit { position: fixed; inset: 0 auto auto 0; max-height: none; overflow: visible; border: none; color: #000; background: #fff; font-size: 11pt; }
 }

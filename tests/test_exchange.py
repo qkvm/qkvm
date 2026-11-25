@@ -10,7 +10,7 @@ import pytest
 
 from qkvm import exchange, vault
 from qkvm.exchange import Content, ExchangeError, gather, is_sealed, pack, unpack
-from qkvm.store import ActionRecord, DeviceRecord, Store
+from qkvm.store import FROM_0_3_2, ActionRecord, DestinationRecord, DeviceRecord, Store
 from qkvm.vault import Vault, VaultLocked
 from tests.fake_kvm import make_device_certificate
 
@@ -36,7 +36,9 @@ def a_wall(tmp_path: Path) -> tuple[Store, Vault, str]:
         ActionRecord(id="11112222", name="Lock the screen", kind="keys", keys="MetaLeft,KeyL"),
         ActionRecord(id="33334444", name="Unlock disk", kind="text", secret=safe.encrypt("THE-PASSPHRASE", "action:33334444"), enter=True, danger=True),
     ]
-    store.alerts.enabled, store.alerts.webhook, store.alerts.link = True, safe.encrypt("https://hooks.example/T0KEN", "alerts:webhook"), "https://wall.example"
+    store.alerts.enabled, store.alerts.link = True, "https://wall.example"
+    # (The address as a 0.3.2 wall's is carried over: its first destination, sealed as it was then.)
+    store.destinations = [DestinationRecord(FROM_0_3_2, "webhook", secret=safe.encrypt("https://hooks.example/T0KEN", "alerts:webhook"), config={"format": "auto"}, private=True)]
     store.server.interval = 2.0
     return store, safe, pem
 
@@ -65,7 +67,7 @@ def test_a_sealed_file_brings_everything_back_and_shows_nothing(tmp_path: Path) 
         ("Lock the screen", "keys", "MetaLeft,KeyL", "", False, False),
         ("Unlock disk", "text", "", "THE-PASSPHRASE", True, True),
     ]
-    assert back.alerts is not None and back.alerts["webhook"] == "https://hooks.example/T0KEN" and back.alerts["enabled"] is True
+    assert back.alerts is not None and back.alerts["destinations"][0]["secrets"] == {"url": "https://hooks.example/T0KEN"} and back.alerts["enabled"] is True
     assert "link" not in back.alerts  # the link an alert carries is the address of the wall it comes from: not a setting to take along
     # A tile that was told to stay beside its twin ("own:...") goes along as that word, not as the mark of the wall it was made on.
     assert [d.keep_both for d in back.devices] == [False, False, True]
@@ -104,7 +106,7 @@ def test_a_plain_file_holds_no_secret_and_reads_without_a_passphrase(tmp_path: P
     assert not back.sealed and not back.secrets and back.left_out == []
     assert back.devices is not None and [d.password for d in back.devices] == ["", "", ""] and back.devices[0].cert_pem == pem
     assert back.actions is not None and [a.name for a in back.actions] == ["Lock the screen"]
-    assert back.alerts is not None and back.alerts["webhook"] == "" and "wall.example" not in text
+    assert back.alerts is not None and back.alerts["destinations"] is None and "wall.example" not in text
     # Without secrets it can be made while nobody has signed in; with them it cannot.
     locked = Vault()
     assert gather(store, locked, {"devices"}, secrets=False)["devices"][0]["name"] == "Rack KVM"
@@ -195,7 +197,7 @@ def test_what_does_not_pass_is_left_out_and_said_and_the_rest_is_read(tmp_path: 
     assert len(actions.left_out) == 5
 
     settings = read({"alerts": {"enabled": "yes", "format": "carrier-pigeon", "webhook": "file:///etc/passwd", "link": "not an address"}, "wall": {"interval": 0.001, "update_check": "no"}})
-    assert settings.alerts == {"enabled": False, "format": "auto", "offline": True, "no_signal": True, "problem": True, "recovered": True, "webhook": ""}
+    assert settings.alerts == {"enabled": False, "offline": True, "no_signal": True, "problem": True, "recovered": True, "destinations": None}
     assert settings.wall == {} and len(settings.left_out) == 2
     for not_parts in ({"devices": {}}, {"actions": "x"}, {"alerts": []}, {"wall": 7}):
         assert read(not_parts).left_out, not_parts

@@ -75,6 +75,7 @@ ROUTES: dict[tuple[str, str], tuple[str, str]] = {
     ("GET", "/api/v1/devices/{device_id}/media/upload"): ("admin", ""),
     ("POST", "/api/v1/devices/{device_id}/media/delete"): ("admin", ""),
     ("PUT", "/api/v1/devices/{device_id}/view"): ("operator", "C"),  # a PC's view (health only, stills, live KVM), kept with its tile
+    ("PUT", "/api/v1/devices/{device_id}/open-in"): ("admin", "C"),  # where else it is opened (0.4.0), kept with its tile
     ("PUT", "/api/v1/wall/order"): ("admin", "C"),
     ("POST", "/api/v1/devices"): ("admin", "T"),
     ("PUT", "/api/v1/devices/{device_id}"): ("admin", "T"),
@@ -84,6 +85,8 @@ ROUTES: dict[tuple[str, str], tuple[str, str]] = {
     ("GET", "/api/v1/devices/{device_id}/alert-picture/{stamp}"): ("admin", ""),  # the picture of a screen alert, as the activity log names it
     ("POST", "/api/v1/devices/{device_id}/trust"): ("admin", "T"),
     ("POST", "/api/v1/discover"): ("admin", ""),  # looks, and saves nothing
+    ("GET", "/api/v1/netbird"): ("admin", ""),
+    ("PUT", "/api/v1/netbird"): ("admin", "T"),  # asks NetBird's management API first
     ("POST", "/api/v1/proxmox/guests"): ("admin", ""),  # asks a Proxmox which guests a token sees, and saves nothing
     ("POST", "/api/v1/actions"): ("admin", "C"),
     ("PUT", "/api/v1/actions/{action_id}"): ("admin", "C"),
@@ -103,10 +106,35 @@ ROUTES: dict[tuple[str, str], tuple[str, str]] = {
     ("PUT", "/api/v1/settings"): ("admin", "C"),
     ("GET", "/api/v1/settings/media"): ("admin", ""),  # the folder of images for servers, and the address they reach the wall at
     ("PUT", "/api/v1/settings/media"): ("admin", "C"),
+    # Backups of the whole wall to a folder (0.4.0, backup.py): an admin's, as every setting is.
+    ("GET", "/api/v1/backups"): ("admin", ""),
+    ("PUT", "/api/v1/backups"): ("admin", "C"),
+    ("POST", "/api/v1/backups/key"): ("admin", "T"),  # the password checked first, the key kept in the turn
+    ("POST", "/api/v1/backups/run"): ("admin", ""),  # sets a run going, which saves how it went in the turn itself (server.back_up)
+    ("POST", "/api/v1/backups/verify"): ("admin", ""),  # reads the latest backup, and saves nothing
     ("GET", "/api/v1/alerts"): ("admin", ""),
     ("PUT", "/api/v1/alerts"): ("admin", "C"),
     ("POST", "/api/v1/alerts/pause"): ("admin", "C"),
     ("POST", "/api/v1/alerts/test"): ("admin", ""),  # sends one, and saves nothing
+    # (0.4.0) Where the alerts go, each destination by itself.
+    ("GET", "/api/v1/alerts/destinations"): ("admin", ""),
+    ("POST", "/api/v1/alerts/destinations"): ("admin", "C"),
+    ("PUT", "/api/v1/alerts/destinations/{destination_id}"): ("admin", "C"),
+    ("DELETE", "/api/v1/alerts/destinations/{destination_id}"): ("admin", "C"),
+    ("POST", "/api/v1/alerts/destinations/{destination_id}/test"): ("admin", ""),  # sends one, and saves nothing
+    ("GET", "/api/v1/alerts/destinations/{destination_id}/log"): ("admin", ""),
+    ("POST", "/api/v1/alerts/destinations/{destination_id}/secret"): ("admin", "C"),  # a new signing secret
+    # Signing in through an identity provider (0.4.0): its settings are an admin's (saved under one_change, by the
+    # route itself); the button's offer, its press and the way back from the provider are anybody's.
+    ("GET", "/api/v1/oidc"): ("admin", ""),
+    ("PUT", "/api/v1/oidc"): ("admin", "T"),
+    ("POST", "/api/v1/oidc/logout"): ("admin", ""),  # signs out everyone the provider signed in
+    ("GET", "/api/v1/oidc/offer"): ("nobody", ""),
+    ("POST", "/api/v1/oidc/begin"): ("nobody", ""),
+    ("GET", "/api/v1/oidc/callback"): ("nobody", "T"),  # makes or updates the account, under one_change
+    # Checking the activity log's chain (0.4.0): an admin's, changing nothing (POST starts a check, GET reads its outcome).
+    ("POST", "/api/v1/audit/check"): ("admin", ""),
+    ("GET", "/api/v1/audit/check"): ("admin", ""),
     # An account's own browsers told the alerts by Web Push: any account's, for itself; a token has none.
     ("GET", "/api/v1/push"): ("viewer", "O"),
     ("POST", "/api/v1/push/key"): ("viewer", "CO"),  # the wall's key, made once
@@ -169,7 +197,7 @@ def test_every_route_falls_under_the_rule_it_is_meant_to(app: object) -> None:
     assert lines == LINES
     # Everything of the wall's own is under the one version, and nothing without one.
     api = [path for _, path in found if path.startswith("/api/")]
-    assert len(api) == 78 and all(path.startswith("/api/v1/") for path in api) and all(path.startswith("/api/v1/") for path in lines)
+    assert len(api) == 101 and all(path.startswith("/api/v1/") for path in api) and all(path.startswith("/api/v1/") for path in lines)
     # What was public before a sign-in, and no more than that: the paths of PUBLIC, and what is below PUBLIC_UNDER, which is
     # the page's files and a mounted image, nothing else.
     assert {path for (_, path), (role, _) in ROUTES.items() if role == "nobody" and not path.startswith(server.PUBLIC_UNDER)} == server.PUBLIC

@@ -12,9 +12,9 @@ from typing import Any
 import pytest
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-from qkvm import totp, update, vault, vault_migration
+from qkvm import kvm, totp, update, vault, vault_migration
 from qkvm.core import Core
-from qkvm.store import ActionRecord, DeviceRecord, Store, StoreError, UserRecord
+from qkvm.store import FROM_0_3_2, ActionRecord, DestinationRecord, DeviceRecord, Store, StoreError, UserRecord
 from qkvm.vault_storage import MAGIC, RECOVERY_MAGIC, MigrationRequired, StorageCipher, StorageError, create_key, key_path, read_key
 from tests.fake_kvm import FakeKvm
 from tests.test_totp import code_for
@@ -28,6 +28,11 @@ VIEWER = "migration viewer password"
 def fast(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(vault, "SCRYPT_N", 2**12)
     monkeypatch.setattr(update, "DEFAULT_REPO", "")
+    # The first picture of a KVM waits for its first contact as in the other tests: at the usual 0.6 s, a loaded runner
+    # answered "Connecting to the KVM" (503) to the picture asked right after signing in (GitHub, 2026-11-24, twice).
+    monkeypatch.setattr(kvm, "STATUS_FIRST_WAIT", 10)
+    monkeypatch.setattr(kvm, "FIRST_CONTACT_WAIT", 10)
+    monkeypatch.setattr(kvm, "PICTURE_PATIENCE", 10)
 
 
 def legacy(data: Path, url: str = "http://127.0.0.1:9") -> tuple[dict[str, Any], bytes, str, str, list[str]]:
@@ -44,7 +49,7 @@ def legacy(data: Path, url: str = "http://127.0.0.1:9") -> tuple[dict[str, Any],
     store.users = [admin, viewer]
     store.devices = [DeviceRecord("device1", "fixture", url, secret=safe.encrypt("secret", "device1"))]
     store.actions = [ActionRecord("action1", "private text", "text", secret=safe.encrypt("saved text", "action:action1"))]
-    store.alerts.webhook = safe.encrypt("https://example.invalid/private-hook", "alerts:webhook")
+    store.destinations = [DestinationRecord(FROM_0_3_2, "webhook", secret=safe.encrypt("https://example.invalid/private-hook", "alerts:webhook"))]
     recovery = vault.new_recovery_key()
     store.recovery = safe.rewrap(vault.tidy_recovery_key(recovery))
     store.recovery_created = time.time()
@@ -121,7 +126,7 @@ def test_migrated_accounts_mfa_codes_credentials_and_recovery_work_through_real_
             assert client.get("/api/v1/devices/device1/snapshot").status_code == 200
             current = client.core  # type: ignore[attr-defined]
             assert current.vault.decrypt(current.store.actions[0].secret, "action:action1") == "saved text"
-            assert current.vault.decrypt(current.store.alerts.webhook, "alerts:webhook").endswith("private-hook")
+            assert current.vault.decrypt(current.store.destinations[0].secret, "alerts:webhook").endswith("private-hook")
             assert client.post("/api/v1/logout", json={}).status_code == 200
             assert client.post("/api/v1/login", json={"name": "viewer", "password": VIEWER}).status_code == 200
             assert client.get("/api/v1/users").status_code == 403

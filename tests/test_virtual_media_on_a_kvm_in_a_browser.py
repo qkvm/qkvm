@@ -12,6 +12,7 @@ import hashlib
 import re
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -259,7 +260,10 @@ def test_a_box_whose_tile_was_moved_to_another_kvm_meanwhile_changes_nothing_the
             debian = box.get_by_role("radio", name=re.compile(r"^debian-13\.iso"))
             expect(debian).to_be_visible(timeout=20_000)
             debian.check()
-            # Meanwhile, from somewhere else, its tile is edited to the other KVM's address, by its name as it was.
+            # Meanwhile, from somewhere else, its tile is edited to the other KVM's address, by its name as it was; and this page has
+            # not fetched the wall again yet (once it has, the box is closed: test_a_media_box_closes_once_the_wall_fetched_again...).
+            held: list[Any] = []
+            page.route("**/api/v1/wall", lambda route: held.append(route))
             edited = admin.put(f"/api/v1/devices/{device}", json={"name": "comet", "url": other.url, "password": DEVICE_PASSWORD})
             assert edited.status_code == 200, edited.text
 
@@ -277,6 +281,10 @@ def test_a_box_whose_tile_was_moved_to_another_kvm_meanwhile_changes_nothing_the
             expect(page.locator("dialog[open]")).to_have_count(0)
             assert other.state.msd_drive["connected"] is False and other.state.msd_calls == [], other.state.msd_calls
             assert comet.state.msd_calls == []
+            for route in held:
+                route.continue_()
+            page.unroute("**/api/v1/wall")
+            page.evaluate("reloadWall()")
             # Opened again, the box lists the machine the tile is at now, and what is chosen from that is done there.
             box = open_the_box(page)
             expect(box.get_by_role("radio", name=re.compile(r"^only-there\.iso"))).to_be_visible(timeout=20_000)
@@ -309,7 +317,10 @@ def test_an_upload_from_a_box_whose_tile_was_moved_to_another_kvm_meanwhile_send
             page.on("request", lambda request: sent.append(request.url) if "/media/upload" in request.url and request.method == "POST" else None)
             box = open_the_box(page)
             expect(box.get_by_role("radio", name=re.compile(r"^rescue-00\.iso"))).to_be_visible(timeout=20_000)
-            # Meanwhile, from somewhere else, its tile is edited to the other KVM's address, by its name as it was.
+            # Meanwhile, from somewhere else, its tile is edited to the other KVM's address, by its name as it was; and this page has
+            # not fetched the wall again yet (once it has, the box is closed: test_a_media_box_closes_once_the_wall_fetched_again...).
+            held: list[Any] = []
+            page.route("**/api/v1/wall", lambda route: held.append(route))
             edited = admin.put(f"/api/v1/devices/{device}", json={"name": "comet", "url": other.url, "password": DEVICE_PASSWORD})
             assert edited.status_code == 200, edited.text
 
@@ -325,7 +336,7 @@ def test_an_upload_from_a_box_whose_tile_was_moved_to_another_kvm_meanwhile_send
             question = top(page)
             expect(question.locator("h2")).to_have_text("Upload rescue.iso")
             question.get_by_role("button", name="Upload", exact=True).click()
-            told(page, "comet is not the machine its images were listed for any more")
+            told(page, "comet is not the machine you saw any more")  # (its list, asked again for the machine it was opened for, is refused)
             expect(page.locator("dialog[open]")).to_have_count(0)
             assert sent == [], sent
             assert other.state.msd_writes == [] and comet.state.msd_writes == []
@@ -359,3 +370,99 @@ def test_what_is_under_way_in_the_box_spins_and_counts_its_seconds(tmp_path: Pat
         told(page, "comet: Upload slow.iso done")
         expect(box.locator(".media-said.working")).to_have_count(0)
         assert box.locator(".media-said").get_attribute("data-waited") is None
+
+
+def test_a_media_box_opened_for_one_kvm_does_not_come_to_list_or_change_the_one_an_edit_put_under_its_tile(tmp_path: Path, browser: Browser, comet: FakeKvm) -> None:  # noqa: F811
+    # (The second fresh review of the HA round, HIGH; older, from 0.3.2.) The Media box is made for the machine its tile is at when it
+    # opens, and was not watched: an edit that pointed the tile at another KVM left it open, also once the page had fetched the
+    # wall again, and it listed again after its mount by the tile's id alone, taking the other KVM's images and `listed` as its
+    # own: the next mount went to the other KVM, under the box opened for the first. It lists for the machine it was opened for
+    # (`target`), and it closes once the wall shows its tile at another.
+    other = FakeKvm(FakeState(msd=True, msd_images={name: {"complete": True, "removable": True, "size": 700_000_000, "mod_ts": 1.0, "sha256": ""} for name in (DEBIAN, "only-there.iso")})).start()
+    try:
+        with a_wall(tmp_path / "wall") as (live, admin), looking(browser, live) as page:
+            added = admin.post("/api/v1/devices", json={"url": comet.url, "password": DEVICE_PASSWORD, "name": "comet"})
+            assert added.status_code == 201, added.text
+            device, first = added.json()["device"]["id"], added.json()["device"]["target"]
+            sign_in(page, live)
+            expect(tile(page, "comet")).to_have_attribute("data-state", "online", timeout=30_000)
+            box = open_the_box(page)
+            debian = box.get_by_role("radio", name=re.compile(r"^debian-13\.iso"))
+            expect(debian).to_be_visible(timeout=20_000)
+            # A mount on this KVM: done. The box lists again after it; that look is held until an edit has put the other KVM there.
+            held: list[Any] = []
+            page.route(f"**/api/v1/devices/{device}/media?*", lambda route: held.append(route) if route.request.method == "GET" else route.continue_())
+            page.route(f"**/api/v1/devices/{device}/media", lambda route: held.append(route) if route.request.method == "GET" else route.continue_())
+            debian.check()
+            box.get_by_role("button", name="Mount", exact=True).click()
+            top(page).get_by_role("button", name="Mount", exact=True).click()
+            told(page, "comet: Mount debian-13.iso done")
+            until(page, lambda: bool(held), "the box never listed again after its mount")
+            assert comet.state.msd_drive["image"] == DEBIAN
+            edited = admin.put(f"/api/v1/devices/{device}", json={"name": "comet", "url": other.url, "password": DEVICE_PASSWORD})
+            assert edited.status_code == 200 and edited.json()["device"]["target"] != first, edited.text
+            now = edited.json()["device"]["target"]
+            answers: list[tuple[int, str]] = []
+            page.on("response", lambda reply: answers.append((reply.status, reply.url)) if f"/devices/{device}/media" in reply.url and reply.request.method == "GET" else None)
+            for route in held:  # the look asked after the mount, answered only now that the tile is at the other KVM
+                route.continue_()
+            page.unroute(f"**/api/v1/devices/{device}/media?*")
+            page.unroute(f"**/api/v1/devices/{device}/media")
+            until(page, lambda: bool(answers), "the held look was never answered")
+            assert answers[0][0] == 409 and f"target={first}" in answers[0][1], answers  # (its own machine's list, or none)
+            expect(page.locator("dialog[open]")).to_have_count(0)  # (the box made for the first KVM is closed)
+            until(page, lambda: page.evaluate(f"tiles.get('{device}').device.target") == now, "the page never fetched the wall again")
+            page.wait_for_timeout(500)
+            assert other.state.msd_calls == [], other.state.msd_calls
+            # Opened again, it is the other KVM's box, and lists for it.
+            box = open_the_box(page)
+            expect(box.get_by_role("radio", name=re.compile(r"^only-there\.iso"))).to_be_visible(timeout=20_000)
+    finally:
+        other.stop()
+
+
+def test_a_media_box_closes_once_the_wall_fetched_again_shows_its_tile_at_another_machine(tmp_path: Path, browser: Browser, comet: FakeKvm) -> None:  # noqa: F811
+    # (The same review.) Its tile pointed at another KVM while it was open, and the page fetched the wall again: the box made for the
+    # first stayed open with the first one's images, its buttons ready to act on the machine the tile is at now.
+    other = FakeKvm(FakeState(msd=True, msd_images={"only-there.iso": {"complete": True, "removable": True, "size": 700_000_000, "mod_ts": 1.0, "sha256": ""}})).start()
+    try:
+        with a_wall(tmp_path / "wall") as (live, admin), looking(browser, live) as page:
+            added = admin.post("/api/v1/devices", json={"url": comet.url, "password": DEVICE_PASSWORD, "name": "comet"})
+            device = added.json()["device"]["id"]
+            sign_in(page, live)
+            expect(tile(page, "comet")).to_have_attribute("data-state", "online", timeout=30_000)
+            box = open_the_box(page)
+            expect(box.get_by_role("radio", name=re.compile(r"^debian-13\.iso"))).to_be_visible(timeout=20_000)
+            edited = admin.put(f"/api/v1/devices/{device}", json={"name": "comet", "url": other.url, "password": DEVICE_PASSWORD})
+            assert edited.status_code == 200, edited.text
+            page.evaluate("reloadWall()")
+            expect(page.locator("dialog[open]")).to_have_count(0)
+            assert other.state.msd_calls == []
+    finally:
+        other.stop()
+
+
+def test_a_question_of_a_media_box_whose_tile_is_at_another_machine_is_not_left_on_show(tmp_path: Path, browser: Browser, comet: FakeKvm) -> None:  # noqa: F811
+    # (The third fresh review of the HA round, L1.) The Media box closes once the wall shows its tile at another machine; its own
+    # questions ("Mount ...?", "Delete ...?", "Unmount ...?", "Upload ...?") were boxes of their own and stayed, naming the first
+    # machine and taking a yes (refused at the wall, by `listed`). They close with it, as an action's question does.
+    other = FakeKvm(FakeState(msd=True, msd_images={"only-there.iso": {"complete": True, "removable": True, "size": 700_000_000, "mod_ts": 1.0, "sha256": ""}})).start()
+    try:
+        with a_wall(tmp_path / "wall") as (live, admin), looking(browser, live) as page:
+            added = admin.post("/api/v1/devices", json={"url": comet.url, "password": DEVICE_PASSWORD, "name": "comet"})
+            device = added.json()["device"]["id"]
+            sign_in(page, live)
+            expect(tile(page, "comet")).to_have_attribute("data-state", "online", timeout=30_000)
+            box = open_the_box(page)
+            debian = box.get_by_role("radio", name=re.compile(r"^debian-13\.iso"))
+            expect(debian).to_be_visible(timeout=20_000)
+            debian.check()
+            box.get_by_role("button", name="Mount", exact=True).click()
+            expect(top(page).locator("h2")).to_have_text("Mount debian-13.iso")
+            edited = admin.put(f"/api/v1/devices/{device}", json={"name": "comet", "url": other.url, "password": DEVICE_PASSWORD})
+            assert edited.status_code == 200, edited.text
+            page.evaluate("reloadWall()")
+            expect(page.locator("dialog[open]")).to_have_count(0)
+            assert other.state.msd_calls == [] and comet.state.msd_calls == []
+    finally:
+        other.stop()

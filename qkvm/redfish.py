@@ -42,7 +42,7 @@ from websockets.exceptions import ConnectionClosed, InvalidStatus, WebSocketExce
 
 from . import ami
 from .aspeed import Garbled, Screen
-from .video import VideoSession
+from .video import WORKER_REST, VideoSession, VideoUnavailable, in_a_thread
 from .kvm import (
     ABOUT_RETRY,
     ABOUT_TTL,
@@ -71,6 +71,7 @@ from .kvm import (
     as_text,
     bounded,
     can_do,
+    no_video,
     not_signing_in,
     number,
     plain,
@@ -1286,6 +1287,7 @@ class RedfishDevice(Device):
         self._console: _Console | None = None  # the console that is open, while the wall is watched
         self._console_task: asyncio.Task[None] | None = None
         self._console_wanted_at = 0.0  # when a picture was last asked for
+        self._pictured_at = float("-inf")  # ...as a tile's picture, made in the console's own video worker (see `tidy`)
         self._console_retry_at = 0.0
         self._console_refusal: KvmError | None = None  # why the last attempt came to nothing
         self._leaving: set[asyncio.Future[None]] = set()  # sign-outs of its web page that are under way
@@ -1350,6 +1352,11 @@ class RedfishDevice(Device):
     def tidy(self) -> None:
         if self._rfb_screen is not None:
             self._rfb_screen.tidy()
+        console = self._console
+        if console is not None and time.monotonic() - self._pictured_at > WORKER_REST:
+            # A console that is kept open for a live view (which makes its pictures in a worker of its own), or for keys, has
+            # no use for the worker its tile's pictures were made in (some 35 MB) meanwhile: the next one starts another.
+            console.video_encoder.rest_soon()
 
     def takes_over(self, retired: Device) -> None:
         # Somebody at the server's own console was asked for it, and said no or did not answer: they are
@@ -2694,7 +2701,7 @@ class RedfishDevice(Device):
         rfb_screen = await self._openbmc_known()
         if rfb_screen is not None:
             return await rfb_screen.snapshot(width, fresh)
-        arrived = self._console_wanted_at = time.monotonic()
+        arrived = self._console_wanted_at = self._pictured_at = time.monotonic()
         console = self._console_with_a_picture(arrived)
         # Its size and its bytes in one look: the next frame may be of another size, and is read in another thread.
         shown_width, shown_height, shown = console.screen.shown
@@ -2709,7 +2716,9 @@ class RedfishDevice(Device):
             asked, made_of = time.monotonic(), console.frames
             target = None if size == FULL else TIERS[size][0]
             try:
-                data = await asyncio.to_thread(screen_jpeg, shown_width, shown_height, shown, target, QUANTIZER[size], console.video_encoder)
+                data = await in_a_thread(console.video_encoder, screen_jpeg, shown_width, shown_height, shown, target, QUANTIZER[size], console.video_encoder)
+            except VideoUnavailable as unable:  # no video worker can start on this computer: said as that, and why
+                raise no_video(unable) from None
             except Exception:  # whatever the library that makes it says of a screen caught in the middle of a change
                 raise KvmError("no_stream", "The server's screen changed while its picture was being made", 503) from None
             snap = Snapshot(data, "image/jpeg", True, asked)

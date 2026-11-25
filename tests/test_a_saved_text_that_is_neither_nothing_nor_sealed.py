@@ -10,7 +10,7 @@ from typing import Any
 import pytest
 
 from qkvm import kvm, store, update, vault
-from qkvm.store import ActionRecord, AlertSettings, DeviceRecord, UserRecord
+from qkvm.store import ActionRecord, DestinationRecord, DeviceRecord, UserRecord
 from tests.fake_kvm import FakeKvm
 from tests.test_wall import add, wall
 from tests.settings_file import settings_text, write_settings_text
@@ -73,7 +73,7 @@ def test_what_is_saved_sealed_is_nothing_or_something_whatever_the_file_made_of_
     for make, name in (
         (lambda value: DeviceRecord(id="ab12cd34", name="A KVM", url="https://192.168.1.20", secret=value), "secret"),
         (lambda value: ActionRecord(id="ab12cd35", name="Types", kind="text", secret=value), "secret"),
-        (lambda value: AlertSettings(webhook=value), "webhook"),
+        (lambda value: DestinationRecord(id="ab12cd36", kind="slack", secret=value), "secret"),  # (0.4.0: where an alert address is kept)
         (lambda value: UserRecord(id="admin", name="admin", totp=value), "totp"),
     ):
         for value in (False, 0, [], {}, True, 7, "text", ["x"]):

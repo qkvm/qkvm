@@ -8,6 +8,7 @@ in what a JetKVM says (see `test_a_jetkvm_that_closes_what_it_is_asked_over.py`)
 
 from __future__ import annotations
 
+import asyncio
 import json
 import subprocess
 from pathlib import Path
@@ -16,7 +17,7 @@ from typing import Any
 import pytest
 
 from qkvm import __main__ as starter
-from qkvm import cli, discover, forward, kvm, update, vault
+from qkvm import cli, forward, kvm, tailnet, update, vault
 from qkvm.core import Core
 from qkvm.store import AuditLog, StoreError
 from qkvm.update import Updater
@@ -110,9 +111,9 @@ def test_what_the_tailscale_command_prints(monkeypatch: pytest.MonkeyPatch, said
     def ran(*asked: Any, **how: Any) -> subprocess.CompletedProcess[str]:
         return subprocess.CompletedProcess(asked, 0, stdout=said, stderr="")
 
-    monkeypatch.setattr(discover, "tailscale_command", lambda: "tailscale")
-    monkeypatch.setattr(discover.subprocess, "run", ran)
-    assert discover._tailscale_peers() == []
+    monkeypatch.setattr(tailnet, "tailscale_command", lambda: "tailscale")
+    monkeypatch.setattr(tailnet.subprocess, "run", ran)
+    assert asyncio.run(tailnet.tailscale_peers()) == []
 
 
 @pytest.mark.parametrize("depth", [300, 1_500, 12_000, 30_000])
@@ -233,7 +234,7 @@ def test_something_nested_inside_what_the_settings_file_keeps_sealed(tmp_path: P
                 "a saved text": lambda: saved["actions"][0]["secret"],
                 "an account's password": lambda: saved["users"][0]["auth"],
                 "the recovery key": lambda: saved["recovery"],
-                "the alerts' address": lambda: saved["alerts"]["webhook"],
+                "the alerts' address": lambda: saved["destinations"][0]["secret"],  # (0.4.0: the first destination's)
             }[where]()
             sealed["more"] = "(nested)"
             return json.dumps(saved).replace('"(nested)"', records(depth), 1)

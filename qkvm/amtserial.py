@@ -12,7 +12,7 @@ the reader gives the loop its turn after every message: what answers on that por
 
 What a real PC sent over it: nothing, while Windows ran or started; started into its BIOS setup with Serial over LAN asked
 for (the engine's boot options), a graphical BIOS sent the codes that clear a terminal and set it to 80 by 25, and no text.
-So this is built and tried against the stand-in, and nothing on the wall shows it yet (see the README).
+So this is built and tried against the stand-in, and nothing on the wall shows it yet (see the guide, GUIDE.md).
 
 Which PC it reaches is asked of its tile first, as for the screen (`checked`: AmtDevice._before_a_session, which a console is
 not made without): the console goes to the address the engine that said which PC it is answered from, and on that very

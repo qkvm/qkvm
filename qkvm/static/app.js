@@ -70,6 +70,7 @@ const ICONS = {
   activity: [['path', { d: 'M22 12h-4l-3 9L9 3l-3 9H2' }]],
   clock: [['circle', { cx: 12, cy: 12, r: 10 }], ['path', { d: 'M12 6v6l4 2' }]],
   logOut: [['path', { d: 'M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9' }]],
+  logIn: [['path', { d: 'M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4M10 17l5-5-5-5M15 12H3' }]],
   users: [['path', { d: 'M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75' }],
     ['circle', { cx: 9, cy: 7, r: 4 }]],
   globe: [['circle', { cx: 12, cy: 12, r: 10 }],
@@ -95,6 +96,8 @@ const ICONS = {
   disc: [['circle', { cx: 12, cy: 12, r: 10 }], ['circle', { cx: 12, cy: 12, r: 3 }]],
   eject: [['path', { d: 'M5 15h14L12 6z' }], ['path', { d: 'M5 19h14' }]],
   trash: [['path', { d: 'M3 6h18' }], ['path', { d: 'M8 6V4h8v2' }], ['path', { d: 'M6 6l1 14h10l1-14' }]],
+  database: [['ellipse', { cx: 12, cy: 5, rx: 9, ry: 3 }], ['path', { d: 'M21 12c0 1.7-4 3-9 3s-9-1.3-9-3' }], ['path', { d: 'M3 5v14c0 1.7 4 3 9 3s9-1.3 9-3V5' }]],
+  printer: [['path', { d: 'M6 9V2h12v7' }], ['path', { d: 'M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2' }], ['path', { d: 'M6 14h12v8H6z' }]],
 };
 const SVG_NS = 'http://www.w3.org/2000/svg';
 
@@ -184,6 +187,10 @@ async function loadWords() {
 }
 
 async function api(method, path, body, patience = 30000) {
+  // The wall this was asked for: answered "signed out" after a new sign-in started another (a request that waited at the wall,
+  // an edit that talked to a KVM, asked under the session that ended), it says nothing of the one on show now, and does not
+  // end it (the fresh review of the HA round, M1). So for the page's other requests that go the way back to the sign-in page.
+  const run = wallRun;
   let res;
   try {
     res = await fetch(path, {
@@ -205,7 +212,7 @@ async function api(method, path, body, patience = 30000) {
     if (res.ok && res.status !== 204) throw new ApiError('qKVM returned an unreadable response', 'invalid_response', res.status);
   }
   if (!res.ok) {
-    if (res.status === 401 && data?.code === 'unauthorized') sessionExpired();
+    if (res.status === 401 && data?.code === 'unauthorized' && run === wallRun) sessionExpired();
     if (res.status === 403 && data?.code === 'totp_required') mustEnroll();
     throw new ApiError(data?.message || `Request failed (HTTP ${res.status})`, data?.code || 'error', res.status, data);
   }
@@ -266,7 +273,10 @@ function openDialog(title, build, { size = '' } = {}) {
   return dialog;
 }
 
-function confirmBox({ title, message, action, danger = true }) {
+// `picks`: the machine the question is about, as the box or button it came from had it ([{ id, target, keys: false }]): the
+// question closes, answered no, once the wall shows the tile at another machine, as an action's question does (watchPicks; a
+// Media box's own questions stayed over the wall once their box had closed: the third fresh review of the HA round, L1).
+function confirmBox({ title, message, action, danger = true, picks = null }) {
   return new Promise(resolve => {
     let answer = false;
     const dialog = openDialog(title, (body, close) => {
@@ -281,6 +291,7 @@ function confirmBox({ title, message, action, danger = true }) {
           }, action)),
       );
     });
+    if (picks) watchPicks(dialog, picks);
     dialog.addEventListener('close', () => resolve(answer));
   });
 }
@@ -551,6 +562,7 @@ function hero(kind) {
 // kind picks the greeting next to the form: 'welcome' (first run), 'back' (sign-in) or 'plain'.
 function showAuth(kind, ...content) {
   stopWall();
+  toSignIn = false;  // (here: from now on the sign-in page itself says that the way back is taken)
   const auth = $('#auth');
   $('#shell').hidden = true;
   auth.hidden = false;
@@ -569,7 +581,81 @@ function steps(current) {
     h('li', { 'aria-current': i === current ? 'step' : null }, `${i + 1}. ${name}`)));
 }
 
-function showLogin(notice) {
+// Signing in through the team's identity provider (OpenID Connect), where an admin set it up: { on, name }, asked of the
+// wall before the sign-in page is shown. The password's sign-in stays beside it: it is the way in when the provider is down.
+let providerOffer = { on: false, name: '' };
+
+// The way back from a session that ended waits this long for the answer before it shows the sign-in page, the plain one where
+// none came by then; the button is added to that page when the answer comes (lateOffer). The page's first opening waits for
+// it as for any question: on a wall slow to answer, a page without the button that never got it left accounts the provider
+// made, which have no password, nothing but a reload (the third fresh review of the HA round, L2).
+const OFFER_PATIENCE = 5000;
+
+async function askProviderOffer() {
+  try {
+    providerOffer = await api('GET', 'api/v1/oidc/offer');
+  } catch {
+    providerOffer = { on: false, name: '' };  // (said nothing: the page offers the password, which always works)
+  }
+}
+
+// Why a sign-in through the provider was refused, by the word the wall sent the browser back with (in the address's
+// fragment, which goes to no server). What is not here is said as the last line: the activity log has the reason.
+const PROVIDER_REFUSED = {
+  state: 'That sign-in was not begun in this browser, took longer than ten minutes, or was finished already. Try again.',
+  browser: 'That sign-in was begun in another browser. Try again in this one.',
+  changed: 'Signing in through the identity provider was changed while you were signing in. Try again.',
+  provider_error: 'The identity provider did not sign you in.',
+  no_group: 'Your account at the identity provider is in no group that gives a role on this wall. Ask an admin.',
+  email_domain: 'Your account at the identity provider is not of the email domain this wall lets in.',
+  email_unverified: 'The identity provider does not say that your email address is verified.',
+  suspended: 'Your account is suspended on this wall. An admin can lift that.',
+  locked: 'qKVM was restarted and nobody has signed in with a password since. Ask an admin to sign in once.',
+  not_reached: 'The identity provider could not be reached. Try again in a moment, or sign in with your password.',
+};
+const PROVIDER_REFUSED_ELSE = 'The identity provider\'s answer did not pass this wall\'s checks, so nobody was signed in. An admin finds why in the activity log.';
+
+// The word a refused sign-in through the provider came back with, taken out of the address at once. '' for none.
+function takeProviderRefusal() {
+  const given = /^#signin=([a-z_]{1,40})$/.exec(location.hash);
+  if (!given) return '';
+  history.replaceState(null, '', `${location.pathname}${location.search}`);
+  return given[1];
+}
+
+// The sign-in page on show: its form, and where the provider's button goes in it (before the user name).
+let loginShown = null;
+
+// The answer about the provider, come after the sign-in page was shown without it: the button is added to that page, what was
+// typed in it left as it is.
+function lateOffer() {
+  const { form, before } = loginShown || {};
+  if (!providerOffer.on || !form?.isConnected || $('#auth').hidden || form.querySelector('.provider-sign-in')) return;
+  form.insertBefore(providerButton(), before);
+}
+
+function providerButton() {
+  const error = h('p', { class: 'error', hidden: true });
+  const button = h('button', { type: 'button', class: 'primary' }, icon('logIn'), `Sign in with ${providerOffer.name}`);
+  button.addEventListener('click', () => busy(button, async () => {
+    error.hidden = true;
+    let begun;
+    try {
+      begun = await api('POST', 'api/v1/oidc/begin');
+    } catch (ex) {
+      // Begun at another address than the one the provider sends back to: that address, to open qKVM at.
+      error.replaceChildren(ex.message, ...(ex.code === 'elsewhere' && ex.data?.at ? [' ', h('a', { href: ex.data.at }, ex.data.at)] : []));
+      error.hidden = false;
+      return;
+    }
+    location.assign(begun.url);  // (to the provider, which sends the browser back to the wall)
+    await new Promise(() => {});  // (the button stays busy until the page is left)
+  }));
+  return h('div', { class: 'provider-sign-in' }, button, error, h('p', { class: 'or' }, h('span', {}, 'or with a password of this wall')));
+}
+
+// `notice`: a word before the form; `problem`: why the last sign-in did not come about (one through the provider).
+function showLogin(notice, problem) {
   const name = h('input', { type: 'text', autocomplete: 'username', maxLength: 64, spellcheck: false, autocapitalize: 'none' });
   const nameBox = field('User name', name);
   const { el: passwordBox, input: password } = passwordField('Password', { autocomplete: 'current-password', required: true });
@@ -631,6 +717,8 @@ function showLogin(notice) {
   },
     h('h2', {}, 'Sign in'),
     notice && h('p', { class: 'muted' }, notice),
+    problem && h('p', { class: 'error', role: 'alert' }, problem),
+    providerOffer.on && providerButton(),
     nameBox,
     passwordBox,
     codeBox,
@@ -642,6 +730,7 @@ function showLogin(notice) {
   );
   askFor(askName);
   showAuth('back', form);
+  loginShown = { form, before: nameBox };
   (askName ? name : password).focus();
 }
 
@@ -884,7 +973,7 @@ function addDevicesForm(onAdded) {
   const results = h('ul', { class: 'results' });
   const submit = h('button', { type: 'submit', class: 'primary' }, 'Check and add');
 
-  // Looking for KVMs on this computer's own network and among its Tailscale peers.
+  // Looking for KVMs on this computer's own network and among the machines of its tailnet (Tailscale, NetBird).
   const found = h('div', { class: 'found', hidden: true });
   const find = h('button', { type: 'button' }, icon('search'), 'Find KVMs on my network');
   find.addEventListener('click', () => busy(find, async () => {
@@ -924,17 +1013,20 @@ function addDevicesForm(onAdded) {
     });
     const where = result.networks.join(' and ') || 'no network';
     const already = result.found.length - fresh.length - moved.length;
-    found.replaceChildren(
+    // (Through the filter, as showAuth does: the browser's own replaceChildren writes a false or a list out as text.)
+    found.replaceChildren(...[
       h('p', { class: 'muted' }, `Asked ${result.scanned} addresses on ${where}. `,
         fresh.length ? `${fresh.length} KVM${fresh.length === 1 ? '' : 's'} not on the wall yet:` : 'No KVM was found that is not on the wall already.',
         already ? ` (${already} already on the wall.)` : ''),
+      // A tailnet that is there and could not be asked (its local API said no, its management API took no token): why.
+      (result.notes || []).map(note => h('p', { class: 'muted' }, note)),
       fresh.length > 0 && h('div', { class: 'picklist' }, picks.map(pick => pick.row)),
       moved.length > 0 && h('ul', { class: 'results' }, moved),
-      twice && h('p', { class: 'muted' }, 'A KVM that answered at two addresses, on your network and on Tailscale, is listed once. Choose which address the wall uses for it.'),
+      twice && h('p', { class: 'muted' }, 'A KVM that answered at two addresses, on your network and on Tailscale or NetBird, is listed once. Choose which address the wall uses for it.'),
       result.container && h('p', { class: 'muted' },
         'qKVM runs in a container, and what it can look through is the network the container is on, which is usually not yours. ',
         'Type the addresses above instead, or start the container on the network of its host (--network host, on Linux).'),
-      fresh.length > 0 && h('div', { class: 'actions' }, use));
+      fresh.length > 0 && h('div', { class: 'actions' }, use)].flat().filter(Boolean));
     found.hidden = false;
   }));
 
@@ -1381,22 +1473,29 @@ function removeSelected(ids) {
   });
 }
 
+// `device`: the tile's machine as the menu or editor it comes from had it; its certificate and Trust are for that one only (409
+// `machine_changed` where an edit has put another under the tile since: the second fresh review of the HA round, L2).
 async function certificateDialog(device, onDone) {
   let cert;
+  const run = wallRun;
   try {
-    cert = await api('GET', `api/v1/devices/${device.id}/certificate`);
+    cert = await api('GET', `api/v1/devices/${device.id}/certificate?target=${encodeURIComponent(device.target)}`);
   } catch (ex) {
     toast(`${device.name}: ${ex.message}`, 'error');
+    lookAgainAfter(ex);
     return;
   }
+  if (run !== wallRun || toSignIn) return;  // (no box over the sign-in page: as for the Actions menu)
   openDialog(`${device.name} certificate`, (body, close) => {
     const same = cert.saved && cert.saved === cert.presented;
     const trust = h('button', { type: 'button', class: 'danger' }, 'Trust this certificate');
     trust.addEventListener('click', () => busy(trust, async () => {
       try {
-        await api('POST', `api/v1/devices/${device.id}/trust`, { fingerprint: cert.presented });
+        await api('POST', `api/v1/devices/${device.id}/trust`, { fingerprint: cert.presented, target: device.target });
       } catch (ex) {
         toast(ex.message, 'error');
+        lookAgainAfter(ex);
+        if (ex.code === 'machine_changed') close();  // (the box is of a machine the tile is not at any more)
         return;
       }
       close();
@@ -1506,9 +1605,10 @@ function keyPicker(initial = '') {
 // Asks before running `spec` on `targets`. What can lose somebody's work needs a tick as well when it goes
 // to several machines: anything marked danger, a power button (a short press shuts a running system down),
 // and typed text (which does whatever the window it lands in makes of it).
+// `targets`: picks (picksOf), named as they were when the menu or editor was opened, each with its port for keys and text.
 function confirmRun(targets, spec) {
   const many = targets.length > 1;
-  const who = many ? `${targets.length} KVMs` : targets[0].device.name;
+  const who = many ? `${targets.length} KVMs` : pickNamed(targets[0], spec);
   return new Promise(resolve => {
     let answer = false;
     const dialog = openDialog(spec.title, (body, close) => {
@@ -1531,14 +1631,19 @@ function confirmRun(targets, spec) {
         h('p', {}, spec.question ? spec.question(who) : `${spec.title} on ${who}?`),
         spec.detail && h('div', { class: 'note' }, h('code', {}, spec.detail)),
         spec.warning && h('div', { class: 'note warn' }, spec.warning),
-        many && h('ul', { class: 'targets' }, targets.map(tile =>
-          h('li', { dataset: { state: tile.state } },
-            h('span', { class: 'dot' }), tile.device.name, h('span', { class: 'muted' }, tile.device.host),
-            h('span', { class: 'muted' }, stateLabel(tile.state, tile.status) || tile.state)))),
+        many && h('ul', { class: 'targets' }, targets.map(pick => {
+          const tile = tiles.get(pick.id) || pick.tile;  // (how it is now; what it is, as it was picked)
+          return h('li', { dataset: { state: tile.state } },
+            h('span', { class: 'dot' }), pick.name, h('span', { class: 'muted' }, pick.host),
+            sendsKeys(spec) && pick.port && h('span', { class: 'muted' }, pick.port),
+            unnamed(pick, spec) && h('span', { class: 'muted' }, 'computer on screen not known: not sent'),
+            h('span', { class: 'muted' }, stateLabel(tile.state, tile.status) || tile.state));
+        })),
         needsTick && check(agree, `Yes, do this on all ${targets.length} machines`),
         many && h('label', { class: 'field' }, h('span', {}, 'In the order shown'), pace),
         h('div', { class: 'actions' }, h('button', { type: 'button', onclick: close }, 'Cancel'), run)));
     });
+    watchPicks(dialog, targets);
     dialog.addEventListener('close', () => resolve(answer));
   });
 }
@@ -1565,9 +1670,21 @@ const CANNOT_BE_REACHED = ['unreachable', 'timeout', 'dropped'];
 const unanswered = ex => ['timeout', 'network', 'dropped', 'internal'].includes(ex.code) || (ex.status >= 500 && ex.code === 'error');
 const ROW_ICONS = { ok: 'check', bad: 'alert', unknown: 'info', skipped: 'x' };
 
+// Refused because an edit put another machine under the tile since it was looked at (409 `machine_changed`: nothing was
+// sent). The wall is fetched again, so that the tile shows what it is at now and the next question is asked of that one;
+// nothing is sent again from here. Refused because another computer is on screen, or which one is not known (409
+// `input_changed`): how each machine is, fetched again at once, also while the wall's own looks are paused.
+function lookAgainAfter(ex) {
+  if (ex?.code === 'machine_changed') refetchWall();  // (the one fetch at a time that a status or a picture of another machine shares)
+  if (ex?.code === 'input_changed') lookNow().catch(() => {});
+}
+
 // Runs `spec` on every target, a few at a time, and shows how each one went.
 // `gap`: undefined for a few at a time; else one after the other, that many seconds apart (machines that are
 // switched on together draw their starting current together, and a storage server wants to be up first).
+// `targets`: what the question named (picksOf), each sent with its machine and input however long it waits its turn; one an
+// edit has put another machine under since (or another input on screen, or none known) is refused, and is not offered again
+// from here.
 function runBulk(targets, spec, gap) {
   // Ties this run's entries together in the activity log.
   const batch = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
@@ -1575,8 +1692,8 @@ function runBulk(targets, spec, gap) {
   let stop = () => {};
   let shown = null;  // the dialog, once there is one to ask whether it is still open
   const dialog = openDialog(`${spec.title} · ${targets.length} KVMs`, (body, close) => {
-    const rows = new Map(targets.map(tile => [tile,
-      h('li', {}, h('span', { class: 'spinner' }), h('strong', {}, tile.device.name), h('span', { class: 'muted' }, 'Waiting...'))]));
+    const rows = new Map(targets.map(pick => [pick,
+      h('li', {}, h('span', { class: 'spinner' }), h('strong', {}, pickNamed(pick, spec)), h('span', { class: 'muted' }, 'Waiting...'))]));
     const summary = h('p', { role: 'status' }, 'Starting...');
     const retry = h('button', { type: 'button', hidden: true }, 'Retry failed');
     const halt = h('button', { type: 'button', class: 'danger' }, 'Stop');
@@ -1596,6 +1713,8 @@ function runBulk(targets, spec, gap) {
       const queue = [...list];
       const failed = [];
       const skipped = [];
+      const moved = new Set();  // of `failed`: another machine is under the tile now, or another computer on screen, which this question did not name
+      const refusals = new Set();  // ...and which of the two refusals came
       let ok = 0;
       let unknown = 0;
       running = true;
@@ -1618,20 +1737,28 @@ function runBulk(targets, spec, gap) {
       };
       const worker = async () => {
         for (let tile = next(); tile; tile = next()) {
-          if (acting.has(tile.device.id)) {
+          if (acting.has(tile.id)) {
             // Something sent from a tile, or by a run before this one, is still out to this machine. Nothing is
             // sent on top of it, and its mark is its own to take away. Offered again with what failed.
-            mark(tile, 'bad', `"${acting.get(tile.device.id)}" is still under way here`);
+            mark(tile, 'bad', `"${acting.get(tile.id)}" is still under way here`);
             failed.push(tile);
             summary.textContent = `${ok + failed.length + unknown} of ${list.length} done...`;
             continue;
           }
+          if (unnamed(tile, spec)) {  // (keys or text where it could not be told which computer is on screen: never sent)
+            mark(tile, 'bad', UNNAMED);
+            failed.push(tile);
+            moved.add(tile);
+            refusals.add('input_changed');
+            summary.textContent = `${ok + failed.length + unknown} of ${list.length} done...`;
+            continue;
+          }
           mark(tile, '', 'Sending...');
-          acting.set(tile.device.id, spec.title);
+          acting.set(tile.id, spec.title);
           try {
-            const result = await api('POST', `api/v1/devices/${tile.device.id}/actions`, { ...spec.body, batch }, ACTION_PATIENCE);
+            const result = await api('POST', `api/v1/devices/${tile.id}/actions`, { ...spec.body, batch, ...pickSent(tile, spec) }, ACTION_PATIENCE);
             mark(tile, 'ok', result?.note || spec.done);  // "already on": left as it was, and that is not a failure
-            afterAction(tile, spec);
+            if (tiles.has(tile.id)) afterAction(tiles.get(tile.id), spec);
             ok += 1;
           } catch (ex) {
             if (unanswered(ex)) {
@@ -1640,9 +1767,13 @@ function runBulk(targets, spec, gap) {
             } else {
               mark(tile, 'bad', ex.message);
               failed.push(tile);
+              if (ex.code === 'machine_changed' || ex.code === 'input_changed') {
+                moved.add(tile);
+                refusals.add(ex.code);
+              }
             }
           } finally {
-            acting.delete(tile.device.id);
+            acting.delete(tile.id);
           }
           summary.textContent = `${ok + failed.length + unknown} of ${list.length} done...`;
           if (gap > 0 && queue.length) {
@@ -1661,8 +1792,10 @@ function runBulk(targets, spec, gap) {
       halt.hidden = true;
       done.hidden = false;
       // Offered again: what was refused, and what was never sent. Not what got no answer, which may have been
-      // carried out: pressing a power button a second time is not a retry.
-      const again = [...failed, ...skipped];
+      // carried out: pressing a power button a second time is not a retry. Nor what is at another machine now than
+      // this question named: that one is asked of afresh, once the wall shows what it is at.
+      const again = [...failed.filter(tile => !moved.has(tile)), ...skipped];
+      for (const code of refusals) lookAgainAfter({ code });  // (their tiles show what they are at now, and which input is on)
       retry.hidden = again.length === 0;
       retry.textContent = !skipped.length ? 'Retry failed' : failed.length ? 'Retry failed, send the rest' : 'Send the rest';
       retry.onclick = () => run(again);
@@ -1676,13 +1809,20 @@ function runBulk(targets, spec, gap) {
   dialog.addEventListener('close', () => { if (running) stop(); });
 }
 
-// The one way anything is done to a machine: ask if needed, then run it on one KVM or on many.
-async function perform(ids, spec, onStarted) {
-  const targets = ids.map(id => tiles.get(id)).filter(Boolean);
+// The one way anything is done to a machine: ask if needed, then run it on one KVM or on many. `picks`: what the menu or the
+// editor it comes from was opened for (picksOf). Each goes with the machine its pick names (`target`), and keys and text with
+// the input lit then (`input`): where an edit has put another machine under the tile by the time it arrives, or another
+// computer is on screen, the wall sends nothing (409 `machine_changed`, `input_changed`), and nothing is sent again from here.
+async function perform(picks, spec, onStarted) {
+  const targets = picks.filter(pick => tiles.has(pick.id));
   if (!targets.length) return;
   const many = targets.length > 1;
-  if (!many && acting.has(targets[0].device.id)) {  // said before asking "are you sure" about something that will not be sent
-    toast(`${targets[0].device.name}: "${acting.get(targets[0].device.id)}" is still under way. Wait for its answer.`, 'info');
+  if (!many && acting.has(targets[0].id)) {  // said before asking "are you sure" about something that will not be sent
+    toast(`${targets[0].name}: "${acting.get(targets[0].id)}" is still under way. Wait for its answer.`, 'info');
+    return;
+  }
+  if (!many && unnamed(targets[0], spec)) {
+    toast(`${targets[0].name}: ${UNNAMED}`, 'error');
     return;
   }
   const go = spec.confirm || many ? await confirmRun(targets, spec) : {};
@@ -1692,56 +1832,136 @@ async function perform(ids, spec, onStarted) {
     runBulk(targets, spec, go.gap);
     return;
   }
-  const [tile] = targets;
-  if (acting.has(tile.device.id)) {
-    toast(`${tile.device.name}: "${acting.get(tile.device.id)}" is still under way. Wait for its answer.`, 'info');
+  const [pick] = targets;
+  const tile = tiles.get(pick.id);
+  if (!tile) return;  // (taken off the wall while it was asked)
+  if (acting.has(pick.id)) {
+    toast(`${pick.name}: "${acting.get(pick.id)}" is still under way. Wait for its answer.`, 'info');
     return;
   }
-  acting.set(tile.device.id, spec.title);
-  const finished = working(`${tile.device.name}: ${spec.title}...`);
+  acting.set(pick.id, spec.title);
+  const finished = working(`${pick.name}: ${spec.title}...`);
   let result;
   let releasedLine = null;
+  // Keyboard and mouse let go of for it are asked for again, as its question said: once it went, and once it was refused,
+  // nothing sent (they were not, and the view was left without them: the outside review 6.2's narrow look). Not where it got no
+  // answer, whose keys may still be on their way; and only while the line they were let go of on is the view's still.
+  const takeBack = () => { if (releasedLine && focus?.live === releasedLine && releasedLine.open && !releasedLine.ended) askControl(); };
   try {
     // Text actions use the device action channel. Release only this page's ownership
-    // after confirmation, and wait for the server acknowledgement before sending.
-    if (spec.body.action === 'text' && focus?.id === tile.device.id && focus.control?.on) {
+    // after confirmation, and wait for the server acknowledgement before sending. (So do keys: the large view's Ctrl+Alt+Del
+    // and Alt+F4 go this way on every machine that takes keys as an action. The outside review 6.2 third re-check, H4, and the narrow
+    // look at its fixes, HIGH 4.)
+    if (sendsKeys(spec) && focus?.id === tile.device.id && focus.control?.on) {
       releasedLine = focus.live;
       giveBack();
       const deadline = performance.now() + 3000;
       while (releasedLine.open && !releasedLine.ended && releasedLine.owed.length && performance.now() < deadline) await sleep(25);
-      if (performance.now() >= deadline || !releasedLine.open || releasedLine.ended || releasedLine.owed.length || focus?.live !== releasedLine) throw new Error('Control release was not confirmed; no text was sent.');
+      if (performance.now() >= deadline || !releasedLine.open || releasedLine.ended || releasedLine.owed.length || focus?.live !== releasedLine) throw new Error(`Control release was not confirmed; ${spec.body.action === 'text' ? 'no text' : 'nothing'} was sent.`);
     }
+    // (Looked at again after the question and that wait: the KVM may have been found to have several inputs meanwhile.)
+    if (unnamed(pick, spec)) throw new Error(UNNAMED);
     // From this machine's large view: the server is told so (a PC with Intel AMT then opens a session before switching on).
     const body = focus?.id === tile.device.id ? { ...spec.body, watching: true } : spec.body;
-    result = await api('POST', `api/v1/devices/${tile.device.id}/actions`, body, ACTION_PATIENCE);
+    result = await api('POST', `api/v1/devices/${pick.id}/actions`, { ...body, ...pickSent(pick, spec) }, ACTION_PATIENCE);
   } catch (ex) {
     toast(unanswered(ex)
-      ? `${tile.device.name}: no answer to "${spec.title}". It may have been done all the same: look before sending it again.`
-      : `${tile.device.name}: ${ex.message}`, 'error');
-    if (ex.code === 'changed') {
+      ? `${pick.name}: no answer to "${spec.title}". It may have been done all the same: look before sending it again.`
+      : `${pick.name}: ${ex.message}`, 'error');
+    if (['changed', 'machine_changed', 'input_changed'].includes(ex.code)) {
       for (const dialog of document.querySelectorAll('dialog[open]')) dialog.close();  // the list it was clicked in is out of date
       loadSavedActions();
     }
+    lookAgainAfter(ex);
+    if (!unanswered(ex) && ex.code !== 'unauthorized') takeBack();
     return;
   } finally {
-    acting.delete(tile.device.id);
+    acting.delete(pick.id);
     finished();
   }
-  if (releasedLine && focus?.live === releasedLine && releasedLine.open && !releasedLine.ended) askControl();
-  toast(`${tile.device.name}: ${result?.note || spec.done}`, 'ok');
+  takeBack();
+  toast(`${pick.name}: ${result?.note || spec.done}`, 'ok');
   afterAction(tile, spec);
   if (spec.body.action === 'reboot') onStarted?.();
 }
 
-function typeTextDialog(ids) {
-  openDialog('Type text', (body, close) => {
+// A KVM with several inputs (its status's `several_inputs`, or its `ports`): keys and text go to the computer on screen, so
+// every keyboard action names the input lit (`input`), and none is offered or sent while which one is lit is not known (its
+// switch did not answer: `ports` null). The wall asks the KVM itself right before they go, and sends nothing where another
+// is on screen by then, or it cannot tell (409 `input_changed`; the outside review 6.2 re-checks, R2 and H3).
+const KEYBOARD = ['keys', 'text', 'custom', 'ctrl_alt_del'];  // (a saved action presses keys or types)
+const sendsKeys = spec => KEYBOARD.includes(spec.body.action);
+
+// Whether the page has word of the machine a tile is at: a status of that machine (applyStatuses), and one of a look that reached
+// it (not "connecting" to a machine never seen). Until then nothing says whether it has several inputs (the outside review 6.2 third
+// re-check, H1 and H2).
+const heardOf = tile => Boolean(tile.status) && !(tile.status.state === 'connecting' && tile.status.last_seen_ago == null);
+
+function inputLit(tile) {
+  const active = tile.status?.ports?.active;
+  if (Number.isInteger(active)) return active;
+  return !heardOf(tile) || tile.status.several_inputs === true || tile.status.ports ? null : undefined;  // (undefined: a machine of one input)
+}
+
+// What a menu, an editor or a question was opened for, taken once as it opened: each machine as its tile showed it then, its
+// name and the machine it is at (`target`), and on a KVM with several inputs the input lit (null: not known) and that port's
+// name. What its questions name and what its requests carry come from this one selection, however long it stays open, and it
+// is closed when the wall is fetched again and a tile of its is at another machine by then (watchPicks; the outside review 6.2 re-checks,
+// R1, H1 and H2).
+function picksOf(ids) {
+  return ids.map(id => tiles.get(id)).filter(Boolean).map(tile => {
+    const input = inputLit(tile);
+    const port = Number.isInteger(input) ? tile.status.ports.list?.[input] : null;
+    const label = !Number.isInteger(input) ? '' : port?.name ? `${port.name} (port ${input + 1})` : `port ${input + 1}`;
+    return { id: tile.device.id, tile, name: tile.device.name, host: tile.device.host, target: tile.device.target, input, port: label };
+  });
+}
+
+// The machine of a pick as a question names it: with the port its keys and text go to, on a KVM with several inputs.
+const pickNamed = (pick, spec) => (sendsKeys(spec) && pick.port ? `${pick.name}, ${pick.port}` : pick.name);
+
+// What a request carries of its pick: the machine, and for keys and text the input lit then, or that the KVM was one of a single
+// input (`one_input`), which the wall holds them to (the narrow look at the third re-check's fixes, HIGH 5). Never neither: where
+// it could say neither, nothing is sent (unnamed).
+const pickSent = (pick, spec) => ({
+  target: pick.target,
+  ...(!sendsKeys(spec) ? {} : Number.isInteger(pick.input) ? { input: pick.input } : pick.input === undefined ? { one_input: true } : {}),
+});
+
+// A selection taken without an input lit (no word of the machine yet, or of one input) whose tile, still at that machine, has
+// learned since that it has several, or which one is lit: what it sends would name no input, or not the one it showed.
+function learnedSeveral(pick) {
+  const tile = tiles.get(pick.id);
+  // (`keys: false`: a box that sends no keys, as the Media box, which inputs found meanwhile do not close.)
+  if (!tile || pick.keys === false || tile.device.target !== pick.target || Number.isInteger(pick.input)) return false;
+  const now = inputLit(tile);
+  return now !== undefined && now !== pick.input;
+}
+
+// Keys or text for a KVM with several inputs whose input lit was not known: never sent (they would go to whichever is on).
+const unnamed = (pick, spec) => sendsKeys(spec) && (pick.input === null || learnedSeveral(pick));
+const UNNAMED = 'qKVM could not tell which computer it shows when this was chosen (its switch did not answer, or there was no word from it yet). Nothing was sent: look at it again.';
+
+// Open menus, editors and questions -> what each was opened for (picksOf): closed by the wall's next fetch where a tile of
+// theirs is at another machine by then, or gone (buildTiles).
+const watched = new Map();
+function watchPicks(dialog, picks) {
+  watched.set(dialog, picks);
+  dialog.addEventListener('close', () => watched.delete(dialog));
+  return dialog;
+}
+
+// `picks`: what the menu it came from was opened for (picksOf), or the large view's machine as it was when this was opened.
+function typeTextDialog(picks) {
+  const ids = picks.map(pick => pick.id);
+  watchPicks(openDialog('Type text', (body, close) => {
     const text = h('textarea', { rows: 4, required: true, maxLength: 2000, spellcheck: false, placeholder: 'ipconfig /all' });
     const enter = h('input', { type: 'checkbox', checked: true });
     body.append(h('form', {
       onsubmit: event => {
         event.preventDefault();
         close();
-        perform(ids, {
+        perform(picks, {
           title: 'Type text',
           body: { action: 'text', text: text.value, enter: enter.checked },
           done: 'text typed',
@@ -1749,7 +1969,7 @@ function typeTextDialog(ids) {
           tick: true,
           question: who => `Type this on ${who}?`,
           detail: text.value + (enter.checked ? ' ⏎' : ''),
-          warning: ids.length === 1 && focus?.id === ids[0] && focus.control?.on ? 'Control is briefly released to type this text, then requested again. Another session holding control will still block this action.' : '',
+          warning: ids.length === 1 && focus?.id === ids[0] && focus.control?.on ? 'Control is briefly released to type this text, then requested again once qKVM has answered. Another session holding control will still block this action.' : '',
         });
       },
     },
@@ -1760,11 +1980,11 @@ function typeTextDialog(ids) {
         h('button', { type: 'button', onclick: close }, 'Cancel'),
         h('button', { type: 'submit', class: 'primary' }, 'Continue'))));
     text.focus();
-  });
+  }), picks);
 }
 
-function sendKeysDialog(ids) {
-  openDialog('Send keys', (body, close) => {
+function sendKeysDialog(picks) {
+  watchPicks(openDialog('Send keys', (body, close) => {
     const picker = keyPicker();
     const error = h('p', { class: 'error', hidden: true }, 'Choose at least one key.');
     body.append(h('form', {
@@ -1774,7 +1994,7 @@ function sendKeysDialog(ids) {
         error.hidden = Boolean(keys);
         if (!keys) return;
         close();
-        perform(ids, keySpec(`Send ${keysLabel(keys)}`, keys, { confirm: true }));
+        perform(picks, keySpec(`Send ${keysLabel(keys)}`, keys, { confirm: true }));
       },
     },
       h('p', { class: 'muted' }, 'Pressed together on the connected computer, then released.'),
@@ -1783,7 +2003,7 @@ function sendKeysDialog(ids) {
       h('div', { class: 'actions' },
         h('button', { type: 'button', onclick: close }, 'Cancel'),
         h('button', { type: 'submit', class: 'primary' }, 'Continue'))));
-  });
+  }), picks);
 }
 
 // "Open console" on a server whose controller hands out a pass for it: straight into the console, signed
@@ -1811,6 +2031,86 @@ function sharesOurName(device) {
   }
 }
 
+// "Open in" (GUIDE.md "Open in"): where else a machine is opened, as an admin set it and the server checked it (open_in.py),
+// shown to operators and admins. Built here by the same rules of characters again, so that nothing else becomes a link, or
+// a line of an .rdp file. A MeshCentral page on the host name this wall is looked at under is not offered (consoleLink).
+const OPEN_IN = { meshcentral: 'MeshCentral', rustdesk: 'RustDesk', rdp: 'Remote Desktop' };
+const OPEN_IN_SHAPE = {
+  meshcentral: /^https:\/\/[!-~]{1,504}$/,
+  rustdesk: /^[A-Za-z0-9][A-Za-z0-9_-]{5,31}$/,
+  rdp: /^(\[[0-9a-fA-F:.]+\]|[A-Za-z0-9_.-]{1,253})(:[0-9]{1,5})?$/,
+};
+
+function openInLinks(device) {
+  const links = device.open_in || {};
+  const fits = kind => typeof links[kind] === 'string' && OPEN_IN_SHAPE[kind].test(links[kind]);
+  return [
+    fits('meshcentral') && !sharesOurName({ open_url: links.meshcentral }) && h('a', {
+      class: 'btn', href: links.meshcentral, target: '_blank', rel: 'noopener noreferrer', 'data-open-in': 'meshcentral',
+    }, icon('external'), h('span', {}, 'MeshCentral')),
+    fits('rustdesk') && h('a', { class: 'btn', href: `rustdesk://connection/new/${links.rustdesk}`, 'data-open-in': 'rustdesk' },
+      icon('external'), h('span', {}, 'RustDesk'), h('kbd', {}, links.rustdesk)),
+    fits('rdp') && h('button', { type: 'button', onclick: () => saveRdp(device, links.rdp), 'data-open-in': 'rdp' },
+      icon('download'), h('span', {}, 'Remote Desktop'), h('kbd', {}, '.rdp')),
+  ].filter(Boolean);
+}
+
+// A Remote Desktop file holding the host and nothing else: the client asks for the account and password itself.
+function saveRdp(device, host) {
+  const url = URL.createObjectURL(new Blob([`full address:s:${host}\r\n`], { type: 'application/x-rdp' }));
+  const name = (device.name || host).replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^[-.]+|[-.]+$/g, '').slice(0, 60) || 'machine';
+  const link = h('a', { href: url, download: `${name}.rdp` });
+  document.body.append(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+// An admin's: the three links of a machine, set at once (an empty one is none of that kind).
+function openInDialog(device, done) {
+  const links = device.open_in || {};
+  openDialog(`Open in: ${device.name}`, (body, close) => {
+    const inputs = {
+      meshcentral: h('input', { type: 'url', value: links.meshcentral || '', spellcheck: false, autocomplete: 'off', maxLength: 512, placeholder: 'https://mesh.example.org/?gotonode=...' }),
+      rustdesk: h('input', { type: 'text', value: links.rustdesk || '', spellcheck: false, autocomplete: 'off', maxLength: 64, placeholder: '123 456 789' }),
+      rdp: h('input', { type: 'text', value: links.rdp || '', spellcheck: false, autocomplete: 'off', maxLength: 260, placeholder: 'pc-7.example.org' }),
+    };
+    const error = h('p', { class: 'error', role: 'alert', hidden: true });
+    const submit = h('button', { type: 'submit', class: 'primary' }, 'Save');
+    body.append(h('form', {
+      onsubmit: event => {
+        event.preventDefault();
+        error.hidden = true;
+        busy(submit, async () => {
+          try {
+            // (For the machine this box was opened for: refused where an edit has put another under the tile since, L1.)
+            const answer = await api('PUT', `api/v1/devices/${encodeURIComponent(device.id)}/open-in`,
+              { ...Object.fromEntries(Object.entries(inputs).map(([kind, input]) => [kind, input.value])), target: device.target });
+            device.open_in = answer.open_in;
+          } catch (ex) {
+            error.textContent = ex.message;
+            error.hidden = false;
+            lookAgainAfter(ex);
+            return;
+          }
+          close();
+          toast(`${device.name}: Open in links saved`, 'ok');
+          done?.();
+        });
+      },
+    },
+      h('p', { class: 'muted' }, 'Links in this machine\'s menu for its operators, to open it in another tool. No password is kept for them or put in them: each tool asks for its own.'),
+      field('MeshCentral', inputs.meshcentral, 'The https address of the machine\'s page on your MeshCentral, as its browser shows it.'),
+      field('RustDesk', inputs.rustdesk, 'The machine\'s RustDesk ID, as the RustDesk app shows it. The link opens the app at that ID.'),
+      field('Remote Desktop', inputs.rdp, 'Its host name or address, with :port where it is not 3389. The menu gives a small .rdp file holding only that.'),
+      error,
+      h('div', { class: 'actions' },
+        h('button', { type: 'button', onclick: close }, 'Cancel'),
+        submit)));
+    inputs.meshcentral.focus();
+  });
+}
+
 async function openSignedIn(event, tile) {
   // Where no link is offered (consoleLink), no way in either: the pass would take the device's page to the same name.
   if (!tile || !consoleLink(tile.device)) {
@@ -1823,9 +2123,11 @@ async function openSignedIn(event, tile) {
   enteringConsole = true;
   let url;
   try {
-    ({ url } = await api('POST', `api/v1/devices/${tile.device.id}/console`));
+    // (For the server the menu was opened for: no way into the one an edit put under the tile since, L1.)
+    ({ url } = await api('POST', `api/v1/devices/${tile.device.id}/console?target=${encodeURIComponent(tile.device.target)}`));
   } catch (ex) {
     toast(`${tile.device.name}: ${ex.message}`, 'error');
+    lookAgainAfter(ex);
     return;
   } finally {
     enteringConsole = false;
@@ -1849,18 +2151,38 @@ async function openSignedIn(event, tile) {
 }
 
 // The action menu for one KVM (an id) or for several (an array of ids).
-function actionsDialog(target) {
-  const ids = (Array.isArray(target) ? target : [target]).filter(id => tiles.has(id));
+const menusWaiting = new Set();  // the selections whose menu waits for the page's first word of their machines
+async function actionsDialog(target) {
+  let ids = (Array.isArray(target) ? target : [target]).filter(id => tiles.has(id));
   if (!ids.length) return;
-  const picked = ids.map(id => tiles.get(id));
+  if (ids.some(id => !tiles.get(id).status)) {
+    // No word of the machine yet (the page just opened, its tile just pointed at another): asked first, for a moment at most,
+    // so that its keys are offered named for the input lit, or not at all (the outside review 6.2 third re-check, H1). Asked
+    // again meanwhile, for the same machines, it is the one menu on its way (two clicks opened two: the outside review 6.2's narrow look).
+    const selection = ids.join(' ');
+    if (menusWaiting.has(selection)) return;
+    menusWaiting.add(selection);
+    const run = wallRun;
+    try {
+      await Promise.race([lookNow().catch(() => {}), sleep(2000)]);
+    } finally {
+      menusWaiting.delete(selection);
+    }
+    // (The session ended meanwhile, and the page is on its way back to the sign-in page, or there: no menu over it, M2.)
+    if (run !== wallRun || toSignIn) return;
+    ids = ids.filter(id => tiles.has(id));
+    if (!ids.length) return;
+  }
+  const picks = picksOf(ids);  // (what it shows, which its questions name and its buttons send: perform)
+  const picked = picks.map(pick => pick.tile);
   const single = picked.length === 1 ? picked[0] : null;
-  openDialog(single ? single.device.name : `${ids.length} KVMs selected`, (body, close) => {
+  watchPicks(openDialog(single ? single.device.name : `${ids.length} KVMs selected`, (body, close) => {
     // While one of its buttons is being answered the menu holds still: a second click, or a key held down,
     // is not a second request.
     const go = async spec => {
       body.inert = true;
       try {
-        await perform(ids, spec, close);
+        await perform(picks, spec, close);
       } finally {
         body.inert = false;
       }
@@ -1874,7 +2196,8 @@ function actionsDialog(target) {
 
     // What the picked machines can be asked, by the server's word for each (`can`): with one picked, what
     // that one can; with several, what any of them can, and each answers for itself when it is sent.
-    const able = what => picked.some(tile => canDo(tile, what));
+    // Keys and text: only of those that can name the computer on screen (on a KVM with several inputs, the one lit was known).
+    const able = what => picks.some(pick => canDo(pick.tile, what) && !(['keys', 'text'].includes(what) && pick.input === null));
     const saved = h('div', { class: 'action-grid' });
     const fillSaved = () => saved.replaceChildren(...[
       // (A saved action presses keys or types a text: offered where one of the picked can take that.)
@@ -1922,8 +2245,10 @@ function actionsDialog(target) {
             class: 'btn', href: consoleLink(device), target: '_blank', rel: 'noopener noreferrer',
             onclick: event => openSignedIn(event, single),
           }, icon('external'), h('span', {}, 'Open console'), status?.console && can('operator') && h('kbd', {}, 'signed in')),
+          openInLinks(device),
           h('button', { type: 'button', onclick: () => { close(); openFocus(device.id); } }, icon('maximize'), h('span', {}, 'Enlarge')),
           h('button', { type: 'button', class: 'admin-only', onclick: () => { close(); editDeviceDialog(device, reloadWall); } }, icon('edit'), h('span', {}, 'Edit...')),
+          h('button', { type: 'button', class: 'admin-only', onclick: () => { close(); openInDialog(device, reloadWall); } }, icon('external'), h('span', {}, 'Open in...')),
           // Virtual media: an admin's (the server's media right), for a machine whose driver offers it.
           canDo(single, 'media') && h('button', { type: 'button', class: 'admin-only', onclick: () => { close(); mediaDialog(device.id); } }, icon('disc'), h('span', {}, 'Media...')),
           certProblem && h('button', {
@@ -1931,17 +2256,19 @@ function actionsDialog(target) {
           }, icon('shield'), h('span', {}, 'Review certificate')),
           // A PC with Intel AMT: its KVM switched on where it is off, and off where it is on, in this one place (the Health
           // view's button switches it on as well). An admin's, asked first either way.
+          // (Each for the PC this box was opened for: picks[0], its name and `target`.)
           device.kind === 'amt' && amtKvmOff(status?.server?.amt) && h('button', {
-            type: 'button', class: 'admin-only', onclick: async () => { if (await switchKvmOn(device.id)) close(); },
+            type: 'button', class: 'admin-only', onclick: async () => { if (await switchKvmOn(picks[0])) close(); },
           }, icon('power'), h('span', {}, 'Switch on its KVM')),
           device.kind === 'amt' && status?.server?.amt?.kvm === 'enabled' && !amtKvmOff(status.server.amt) && h('button', {
-            type: 'button', class: 'admin-only', onclick: () => switchKvmOff(device, close),
+            type: 'button', class: 'admin-only', onclick: () => switchKvmOff(picks[0], close),
           }, icon('power'), h('span', {}, 'Switch off its KVM'))));
-      if (canDo(single, 'wol')) api('GET', `api/v1/devices/${device.id}/wol`).then(({ targets }) => {
+      // (The computers the machine this menu was opened for wakes: picks[0]'s `target`.)
+      if (canDo(single, 'wol')) api('GET', `api/v1/devices/${device.id}/wol?target=${encodeURIComponent(picks[0].target)}`).then(({ targets }) => {
         wol.replaceChildren(...targets.map(entry => quick('activity', `Wake ${entry.name || entry.mac}`, {
           title: `Wake ${entry.name || entry.mac}`, body: { action: 'wol', mac: entry.mac }, done: 'Wake-on-LAN sent', confirm: true,
         })));
-      }).catch(() => {});
+      }).catch(lookAgainAfter);  // (none offered; and where its tile is at another machine, the wall fetched again closes the menu)
     } else {
       head.push(h('p', { class: 'muted' }, 'The action you choose runs on every selected KVM. You are asked to confirm first.'));
     }
@@ -1953,7 +2280,7 @@ function actionsDialog(target) {
         const now = amtView(single) === which;
         return h('button', {
           type: 'button', disabled: now, 'aria-pressed': String(now),
-          onclick: async () => { if (await setAmtView(single, which)) close(); },
+          onclick: async () => { if (await setAmtView(single, which, picks[0].target)) close(); },
         }, icon(AMT_VIEW_ICONS[which]), h('span', {}, AMT_VIEWS[which]), now && h('kbd', {}, 'now'));
       })),
       h('p', { class: 'muted' }, 'Health only opens no KVM session: Intel\'s border never shows on the PC, and its screen, keys and text are not offered. Stills take a picture every five minutes (the border shows for a few seconds); the large view is live. Live KVM holds a session while the tile is shown: the border stays on the PC\'s monitor.'));
@@ -1977,10 +2304,16 @@ function actionsDialog(target) {
           // The keys are shown next to the name, unless the name already is the keys.
           able('keys') && QUICK_KEYS.map(key => quick(key.icon, key.label, keySpec(key.label, key.keys, { confirm: key.confirm, danger: key.danger }),
             keysLabel(key.keys) === key.label ? null : keysLabel(key.keys))),
-          able('keys') && h('button', { type: 'button', onclick: () => { close(); sendKeysDialog(ids); } }, icon('command'), h('span', {}, 'Send keys...')),
-          able('text') && h('button', { type: 'button', onclick: () => { close(); typeTextDialog(ids); } }, icon('type'), h('span', {}, 'Type text...'))),
+          able('keys') && h('button', { type: 'button', onclick: () => { close(); sendKeysDialog(picks); } }, icon('command'), h('span', {}, 'Send keys...')),
+          able('text') && h('button', { type: 'button', onclick: () => { close(); typeTextDialog(picks); } }, icon('type'), h('span', {}, 'Type text...'))),
         h('h3', {}, 'Your actions'),
         saved,
+      ],
+      single && picks[0].input === null && canDo(single, 'keys') && [
+        h('h3', {}, 'Keyboard'),
+        h('p', { class: 'muted' }, heardOf(single)
+          ? 'qKVM cannot tell which computer this KVM shows at this moment (its switch did not answer), so no keys or text are offered: they go to the computer on screen. Open this menu again in a moment.'
+          : 'qKVM has had no word from this machine yet, so no keys or text are offered: on a KVM with several inputs they go to the computer on screen. Open this menu again in a moment.'),
       ],
       h('h3', {}, 'Power'),
       h('div', { class: 'action-grid' },
@@ -2042,7 +2375,7 @@ function actionsDialog(target) {
             ? 'This restarts the management controller, not the server, which keeps running. The controller is away for a minute or two.'
             : 'This restarts the KVM itself, not the computer. Anyone using its console is disconnected for about a minute.',
         }))));
-  }, { size: 'wide' });
+  }, { size: 'wide' }), picks);
 }
 
 // --- the recovery key, and a forgotten password ------------------------------------------------------
@@ -2476,7 +2809,7 @@ function tokenDialog(kind, devices, onDone) {
 
 // Numbers for a monitoring system (Prometheus and what reads its format), behind a token of their own.
 // The parts of a wall that a file can hold, as the page names them.
-const FILE_PARTS = { devices: 'KVMs and servers', actions: 'Saved actions', alerts: 'Alert settings', wall: 'Wall settings' };
+const FILE_PARTS = { devices: 'KVMs and servers', actions: 'Saved actions', alerts: 'Alert settings', wall: 'Wall settings', signin: 'Identity provider' };
 
 // Hand a file to the browser to save: `text` under `name`.
 function saveAs(text, name) {
@@ -2497,7 +2830,7 @@ function exportDialog() {
     // (Not 'new-password': beside the box for one's own password, a password manager takes the two for a
     // change of the wall's password, and offers to keep the file's passphrase as that.)
     const passphrase = passwordField('Passphrase for the file', { autocomplete: 'off', maxLength: 256 },
-      'With a passphrase the file is encrypted, and holds the passwords of the devices, the saved texts and the address alerts go to. Left empty, it is a plain file with none of those in it.');
+      'With a passphrase the file is encrypted, and holds the passwords of the devices, the saved texts, where alerts go and the client secret of the identity provider. Left empty, it is a plain file with none of those in it.');
     const own = passwordField('Your password', { autocomplete: 'current-password', required: true, maxLength: 256 });
     const error = h('p', { class: 'error', hidden: true });
     const make = h('button', { type: 'submit', class: 'primary' }, icon('download'), 'Download');
@@ -2509,6 +2842,7 @@ function exportDialog() {
       const typed = passphrase.input.value;
       if (typed && typed.length < 10) return fail('The passphrase needs 10 characters or more. Leave it empty for a file without passwords.');
       let reply;
+      const run = wallRun;  // (as in api(): an answer for an earlier wall ends no newer one)
       try {
         reply = await fetch('api/v1/export', {
           method: 'POST', cache: 'no-store', signal: AbortSignal.timeout(60000),
@@ -2521,7 +2855,7 @@ function exportDialog() {
       if (!reply.ok) {
         let said = null;
         try { said = await reply.json(); } catch { /* not JSON */ }
-        if (reply.status === 401 && said?.code === 'unauthorized') sessionExpired();
+        if (reply.status === 401 && said?.code === 'unauthorized' && run === wallRun) sessionExpired();
         return fail(said?.message || `The file could not be made (HTTP ${reply.status})`);
       }
       const named = /filename="([A-Za-z0-9._-]+)"/.exec(reply.headers.get('content-disposition') || '');
@@ -2652,6 +2986,13 @@ function importDialog(onDone) {
         ].filter(Boolean).join(', ')}.`, true));
         boxes[boxes.length - 1].box.checked = false;
       }
+      if (there.signin) {
+        const gives = there.signin.roles.map(each => `${each.group}: ${ROLE_NAMES[each.role] || each.role}`).join(', ') || 'no group';
+        rows.push(row('signin', 'Identity provider', `Replaces what is set here: ${there.signin.issuer || 'no issuer'}, client ${there.signin.client_id || 'none'}`
+          + `${there.signin.password ? ' with its secret' : ''}; groups and roles: ${gives}${there.signin.anyone ? `; anybody else as ${ROLE_NAMES[there.signin.anyone]}` : ''}`
+          + `${there.signin.domain ? `; only email addresses at ${there.signin.domain}` : ''}. Taken in switched off: switch it on under Accounts, where the provider is asked first.`, true));
+        boxes[boxes.length - 1].box.checked = false;
+      }
       // (Only what is there: handed a `false`, the browser writes the word.)
       found.replaceChildren(...[
         h('p', { class: 'muted' }, [
@@ -2681,7 +3022,7 @@ function importDialog(onDone) {
       }
       close();
       toast([`${done.devices} ${done.devices === 1 ? 'device' : 'devices'} added`, done.actions ? `${done.actions} saved actions` : '',
-        done.alerts ? 'alert settings replaced' : '', done.wall ? 'wall settings replaced' : ''].filter(Boolean).join(', '), 'ok');
+        done.alerts ? 'alert settings replaced' : '', done.wall ? 'wall settings replaced' : '', done.signin ? 'identity provider replaced (switched off)' : ''].filter(Boolean).join(', '), 'ok');
       onDone();
     }));
     passphrase.input.addEventListener('input', () => { if (!read.hidden) return; again(); });
@@ -2711,6 +3052,168 @@ async function filesTab(refresh, does) {
     block('Taking a file in',
       setting('Adds what is not here yet', 'Nothing on this wall is changed or removed by it. The alert and wall settings are replaced only where you tick them.')),
     h('p', { class: 'footnote' }, 'Accounts, tokens, two-factor keys and the recovery key are in no such file: each belongs to the qKVM it was made on. To keep a whole qKVM, accounts and all, keep a copy of its data folder.'),
+  ];
+}
+
+// --- backups of the whole wall (backup.py) --------------------------------------------------------------------------
+
+// The recovery kit of a backup key, as the wall shows it the once it is made: its text, to print or to save as a file. The
+// key is in nothing else the page keeps: once this is closed, it is gone from the page.
+function backupKitView(made) {
+  const kit = h('pre', { class: 'kit', 'aria-label': 'Recovery kit' }, made.kit);
+  const print = h('button', { type: 'button' }, icon('printer'), 'Print');
+  print.addEventListener('click', () => {
+    const root = document.documentElement;
+    root.classList.add('printing-kit');  // (only the kit is printed: see app.css)
+    window.addEventListener('afterprint', () => root.classList.remove('printing-kit'), { once: true });
+    window.print();
+  });
+  const save = h('button', { type: 'button' }, icon('download'), 'Save as a file');
+  save.addEventListener('click', () => {
+    const url = URL.createObjectURL(new Blob([made.kit], { type: 'text/plain' }));
+    const link = h('a', { href: url, download: `qkvm-backup-kit-${made.id}.txt` });
+    document.body.append(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  });
+  return h('div', { class: 'recovery' },
+    h('p', {}, 'This is the backup key\'s recovery kit. It is all it takes to restore a backup on a new computer, and it is shown only now.'),
+    kit,
+    h('div', { class: 'actions left' }, print, save),
+    h('p', { class: 'muted' }, 'Whoever has it and a backup has every device password in it: keep it as a password is kept, printed and put away or in a password manager, not on this computer and not in the folder of the backups.'));
+}
+
+function backupKeyDialog(first, onDone) {
+  askPassword(first ? 'Make the backup key' : 'Make a new backup key',
+    first ? 'The key every backup is encrypted with. Its recovery kit is shown once, next: print it or save it.'
+      : 'Backups made from now on open with the new kit only. Those made before open with the kit before: keep it for as long as you keep them.',
+    first ? 'Make the key' : 'Make a new key',
+    async (password, body, close) => {
+      const made = await api('POST', 'api/v1/backups/key', { password });
+      body.replaceChildren(backupKitView(made), h('div', { class: 'actions' },
+        h('button', { type: 'button', class: 'primary', onclick: close }, 'I have kept it')));
+      // Out of the page the moment the box closes, however it is closed (here, its X, Escape): not while it fades.
+      body.closest('dialog').addEventListener('close', () => { body.replaceChildren(); onDone(); }, { once: true });
+    });
+}
+
+async function backupsTab(refresh, does) {
+  const state = await api('GET', 'api/v1/backups');
+  const when = at => new Date(at * 1000).toLocaleString();
+  const on = h('input', { type: 'checkbox', checked: state.enabled, disabled: !state.key });
+  const folder = h('input', {
+    type: 'text', spellcheck: false, autocomplete: 'off', value: state.folder, maxLength: 1000,
+    placeholder: navigator.platform?.startsWith('Win') ? 'D:\\qkvm-backups' : '/srv/qkvm-backups',
+  });
+  const hour = h('select', {}, Array.from({ length: 24 }, (_, at) => h('option', { value: String(at), selected: at === state.hour }, `${String(at).padStart(2, '0')}:00`)));
+  const keep = h('input', { type: 'number', min: 1, max: 365, step: 1, value: String(state.keep), required: true });
+  const history = h('input', { type: 'checkbox', checked: state.history });
+  const form = h('form', {
+    id: 'backups-form',
+    onsubmit: event => {
+      event.preventDefault();
+      busy(save, async () => {
+        try {
+          await api('PUT', 'api/v1/backups', { enabled: on.checked, folder: folder.value, hour: Number(hour.value), keep: Number(keep.value), history: history.checked });
+        } catch (ex) {
+          toast(ex.message, 'error');
+          return;
+        }
+        toast('Backup settings saved', 'ok');
+        refresh();
+      });
+    },
+  },
+    block('Every day',
+      check(on, 'Back up every day', state.key ? 'At the hour below, by the clock of the computer qKVM runs on.' : 'Make the backup key first, below.'),
+      field('Folder', folder, 'A whole path on the computer qKVM runs on: another disk, a mounted share, or a folder another tool copies elsewhere. Not the data folder.'),
+      field('At', hour),
+      field('Keep', keep, 'Backups kept. The oldest go once a new one is written and read back whole.'),
+      check(history, 'With the history', 'What the wall saw of each machine. It can be large, and a wall comes back without it.')));
+  const save = saves(form);
+  // Each waited for as long as the wall gives it, and half a minute more: Back up now a minute before it answers that the run
+  // goes on, Verify ten minutes before it says the folder does not answer. (With the ordinary 30 s, a Verify of 31 s was said
+  // to have taken too long and what it found was lost, and "Still being made" was never reached.) After a wait that ran out
+  // all the same, the section is read again: the run, or the folder, may have answered meanwhile.
+  const waits = state.waits || { run: 60, verify: 600 };
+  const now = h('button', { type: 'button', disabled: !state.key || !state.folder || state.running }, icon('download'), 'Back up now');
+  now.addEventListener('click', () => busy(now, async () => {
+    let done;
+    try {
+      done = await api('POST', 'api/v1/backups/run', undefined, (waits.run + 30) * 1000);
+    } catch (ex) {
+      toast(ex.message, 'error');
+      if (ex.code === 'timeout') refresh();
+      return;
+    }
+    if (done.running) toast('Still being made: the last run below says how it went, in a moment', 'info');
+    else if (done.ok) toast(`Backup made: ${done.name}`, 'ok');
+    else toast(`No backup was made: ${done.error}`, 'error');
+    refresh();
+  }));
+  does.append(now, save);
+
+  const last = state.last;
+  // (Where the backup last made is not in the folder backups go to now, saved since: said where it is.)
+  const elsewhere = last && last.name && !state.latest && last.folder && last.folder !== state.folder ? ` It is in ${last.folder}, not in the folder backups go to now.` : '';
+  const lastSaid = state.running ? 'Being made just now.'
+    : !last ? 'None yet.'
+      : last.ok ? `${when(last.at)}: ${last.name}, ${bytesText(last.size)}.${elsewhere}`
+        : `${when(last.at)}: no backup was made. ${last.error}${last.good ? ` The last one made is from ${when(last.good)}.` : ''}`;
+  const checked = h('div', { class: 'made' });  // what Verify found, for as long as this section stays open
+  const verify = h('button', { type: 'button', disabled: !state.latest || !state.key }, 'Verify');
+  verify.addEventListener('click', () => busy(verify, async () => {
+    let held;
+    try {
+      held = await api('POST', 'api/v1/backups/verify', undefined, (waits.verify + 30) * 1000);
+    } catch (ex) {
+      if (ex.code === 'timeout') {  // (said where it stays, and the section read again)
+        toast(ex.message, 'error');
+        refresh();
+        return;
+      }
+      checked.replaceChildren(h('p', { class: 'error' }, ex.message));
+      return;
+    }
+    const parts = [
+      `${held.devices} ${held.devices === 1 ? 'machine' : 'machines'}`, `${held.accounts} ${held.accounts === 1 ? 'account' : 'accounts'}`,
+      `${held.secrets} saved ${held.secrets === 1 ? 'secret' : 'secrets'}${held.not_opening ? `, ${held.not_opening} of them not opening` : ', each opening'}`,
+      `the activity log (${bytesText(held.activity_bytes)})`, held.history === null ? 'no history' : `the history (${bytesText(held.history)})`,
+    ];
+    checked.replaceChildren(h('div', { class: 'note' }, h('strong', {}, `${held.name} reads back whole.`), ` Made ${when(held.made)} by qKVM ${held.program}: ${parts.join(', ')}.`));
+  }));
+  const keyLine = state.key
+    ? setting('Backup key', `Made ${when(state.key.made)}, known as ${state.key.id}. Its recovery kit was shown when it was made, and is not shown again.`,
+      h('button', { type: 'button', onclick: () => backupKeyDialog(false, refresh) }, 'Make a new key'))
+    // (A button of its line, at its right, as every line's: what the section does as a whole stays in its first line, the same
+    // buttons in the same place whether there is a key or not.)
+    : setting('Backup key', 'None yet. Every backup is encrypted with it, and its recovery kit, shown once, is all it takes to restore one.',
+      h('button', { type: 'button', onclick: () => backupKeyDialog(true, refresh) }, 'Make the backup key'));
+  // Backups of another key in the folder (another wall's, or this wall's before its key was made new), as the last run
+  // found them: never touched here, and said, since nothing else would say why they stay.
+  const others = state.others ? h('div', { class: 'note warn' }, h('strong', {}, `The folder also holds ${state.others} ${state.others === 1 ? 'backup' : 'backups'} of another key.`),
+    ' Another wall\'s, or this wall\'s from before its key was made new: qKVM never touches them. Delete them yourself when they are no longer wanted.') : null;
+  // Runs their hour cut off that still wait for their folders (a share whose server is gone): each holds a thread until its
+  // folder answers, and none is begun into that folder meanwhile. Said, with what frees them.
+  const waiting = (state.waiting || []).length ? h('div', { class: 'note warn' },
+    h('strong', {}, `A backup cut off after its hour is still waiting for ${state.waiting.map(each => each.folder).join(', ')}.`),
+    ` It has waited since ${when(Math.min(...state.waiting.map(each => each.since)))} and holds a thread of qKVM's until that folder answers; `
+    + 'none is begun into it meanwhile, and backups into another folder go on. A restart of qKVM frees it.') : null;
+  return [
+    h('p', { class: 'intro' }, 'An encrypted copy of the whole wall, made every day: its machines and their passwords, accounts, alerts, '
+      + 'the activity log and, where you choose, the history. It opens with the backup key\'s recovery kit and nothing else.'),
+    waiting,
+    others,
+    block('Key', keyLine),
+    form,
+    block('As it is now',
+      setting('Last run', null, h('span', { class: last && !last.ok && !state.running ? 'value error' : 'value' }, lastSaid)),
+      setting('Next', null, h('span', { class: 'value' }, state.next ? when(state.next) : 'Not by the clock: backups are off.')),
+      setting('Latest backup', state.latest ? `${state.latest.name}, ${bytesText(state.latest.size)}` : 'None in the folder.', verify)),
+    checked,
+    h('p', { class: 'footnote' }, 'To restore, on a new computer: python -m qkvm --restore BACKUP_FILE --backup-key KIT_FILE --data-dir NEW_FOLDER. '
+      + 'The guide\'s chapter Backups says how, and what a backup does not protect against.'),
   ];
 }
 
@@ -2950,6 +3453,319 @@ const PUSH_LIMITS = 'Alerts on a phone: the wall has to be reached over HTTPS, w
   + 'it has to be added to the Home Screen and opened from there. They pass, encrypted, through the push service of the browser\'s maker '
   + '(Apple\'s, Google\'s, Mozilla\'s or Microsoft\'s), which cannot read them: a machine\'s name and what happened, nothing more.';
 
+// The places alerts go (0.4.0): each in its own box, of one size whatever its kind, its list of what it is told scrolling.
+// Every address, key, token and password is typed in and never shown again: the box says whether one is saved.
+const DESTINATION_HINTS = {
+  email: 'Mail through your own mail server, or Gmail with an app password: STARTTLS on port 587, or TLS on 465.',
+  resend: 'Mail through Resend, by its API key. The sender has to be of a domain you verified there.',
+  slack: 'A Slack incoming webhook (Apps, Incoming Webhooks), or a service that takes Slack\'s messages.',
+  teams: 'A Teams Workflows webhook (Workflows, "Post to a channel when a webhook request is received"). The retired Office 365 connectors take nothing any more.',
+  telegram: 'A bot (from BotFather) and the chat it writes to: its number, -100... for a group or a channel, or a channel\'s @name.',
+  discord: 'A Discord webhook (Server Settings, Integrations, Webhooks).',
+  pagerduty: 'An integration of the Events API v2 on a PagerDuty service: its routing key. A problem opens an incident, "back to normal" resolves it.',
+  ntfy: 'An ntfy topic: on ntfy.sh, or on a server of your own, with an access token where it asks for one.',
+  webhook: 'Any address that takes a JSON POST. Each alert is signed by the Standard Webhooks scheme, with a secret shown once.',
+};
+const LEVEL_NAMES = { info: 'Everything', warning: 'Warnings and worse', error: 'Errors and worse', critical: 'Critical only' };
+const DAY_NAMES = { mon: 'Mon', tue: 'Tue', wed: 'Wed', thu: 'Thu', fri: 'Fri', sat: 'Sat', sun: 'Sun' };
+const REMIND_NAMES = { 0: 'Never', 30: 'Every 30 minutes', 60: 'Every hour', 120: 'Every 2 hours', 240: 'Every 4 hours', 480: 'Every 8 hours', 1440: 'Once a day' };
+
+const minuteText = minute => (minute < 0 ? '' : `${String(Math.floor(minute / 60) % 24).padStart(2, '0')}:${String(minute % 60).padStart(2, '0')}`);
+const minuteOf = text => {
+  const found = /^(\d{1,2}):(\d{2})$/.exec(text || '');
+  return found ? Number(found[1]) * 60 + Number(found[2]) : -1;
+};
+
+function destinationDialog(kind, place, catalog, devices, onDone) {
+  const editing = Boolean(place);
+  const config = place?.config || {};
+  openDialog(editing ? `Edit ${place.name || catalog.kinds[kind]}` : `Add ${catalog.kinds[kind]}`, (body, close) => {
+    const input = (props = {}) => h('input', { type: 'text', autocomplete: 'off', spellcheck: false, ...props });
+    const secret = (label, saved, props = {}) => passwordField(label, {
+      autocomplete: 'off', maxLength: 500, placeholder: saved ? 'Saved. Enter another to replace it.' : '', ...props,
+    });
+    const name = input({ value: place?.name || '', maxLength: 80, placeholder: catalog.kinds[kind] });
+    const fields = {};
+    const own = [];
+    const savedSecret = editing && !place.last_error?.includes('does not open');
+    // A saved password, token or key goes only where it was saved for: where the destination is to be reached elsewhere
+    // (another address, mail server, port or region), the box asks for it again, as the wall refuses it otherwise.
+    const askAgain = (field, elsewhere, saved) => {
+      const sync = () => {
+        const again = saved && elsewhere();
+        field.input.required = again;
+        field.input.placeholder = again ? 'Type it again: it is reached elsewhere now' : (saved ? 'Saved. Enter another to replace it.' : '');
+      };
+      return sync;
+    };
+    let url = null;
+    let key = null;  // (PagerDuty's: asked for again where its region changes)
+    if (['slack', 'teams', 'discord', 'ntfy', 'webhook'].includes(kind)) {
+      url = secret('Address', savedSecret, { maxLength: 2048, inputMode: 'url' });
+      fields.url = () => url.input.value.trim();
+      own.push(h('div', {}, url.el, h('small', { class: 'muted' }, editing ? `Goes to ${place.host}. Stored encrypted, and never shown again.` : 'Stored encrypted, and never shown again.')));
+    }
+    if (kind === 'ntfy') {
+      const token = secret('Access token', place?.has_token, { maxLength: 200 });
+      const forget = h('input', { type: 'checkbox' });
+      fields.token = () => token.input.value.trim();
+      fields.forget_token = () => forget.checked;
+      const elsewhere = () => {
+        if (forget.checked || !url.input.value.trim()) return false;
+        try { return new URL(url.input.value.trim()).host.toLowerCase() !== (place?.host || '').toLowerCase(); } catch { return false; }
+      };
+      const sync = askAgain(token, elsewhere, Boolean(place?.has_token));
+      url.input.addEventListener('input', sync);
+      forget.addEventListener('change', sync);
+      own.push(token.el, place?.has_token && check(forget, 'Forget the saved token'));
+    }
+    if (kind === 'webhook') {
+      const unsigned = h('input', { type: 'checkbox', checked: editing && !place.signed });
+      fields.forget_signing = () => unsigned.checked;
+      fields.format = () => (config.format === 'auto' ? 'auto' : 'json');
+      own.push(check(unsigned, 'Send without a signature', 'Only for a receiver that cannot check one.'));
+      if (editing) {
+        const again = h('button', { type: 'button' }, 'Make a new one');
+        again.addEventListener('click', () => busy(again, async () => {
+          const sure = await confirmBox({ title: 'Make a new signing secret?', message: 'The one in use stops working at once: the receiver needs the new one.', action: 'Make a new one' });
+          if (!sure) return;
+          let made;
+          try {
+            made = await api('POST', `api/v1/alerts/destinations/${place.id}/secret`);
+          } catch (ex) {
+            toast(ex.message, 'error');
+            return;
+          }
+          signingShown(body, made.signing_secret, () => { close(); onDone(); });
+        }));
+        own.push(setting('Signing secret', place.signed ? 'Each alert is signed with it. It is shown once, when it is made.' : 'None: alerts go unsigned.', again));
+      }
+    }
+    if (kind === 'telegram') {
+      const token = secret('Bot token', savedSecret, { maxLength: 200 });
+      const chat = input({ value: config.chat || '', maxLength: 40, placeholder: '-1001234567890' });
+      fields.token = () => token.input.value.trim();
+      fields.chat = () => chat.value.trim();
+      own.push(token.el, field('Chat', chat));
+    }
+    if (kind === 'pagerduty' || kind === 'resend') {
+      key = secret(kind === 'pagerduty' ? 'Routing key' : 'API key', savedSecret, { maxLength: 200 });
+      fields.key = () => key.input.value.trim();
+      own.push(key.el);
+    }
+    if (kind === 'pagerduty') {
+      const region = h('select', {}, h('option', { value: 'us' }, 'United States (events.pagerduty.com)'), h('option', { value: 'eu' }, 'Europe (events.eu.pagerduty.com)'));
+      region.value = config.region || 'us';
+      fields.region = () => region.value;
+      region.addEventListener('change', askAgain(key, () => region.value !== (config.region || 'us'), savedSecret));
+      own.push(field('Service region', region));
+    }
+    if (kind === 'email') {
+      const host = input({ value: config.host || '', maxLength: 253, placeholder: 'smtp.gmail.com' });
+      const port = h('select', {}, h('option', { value: '587' }, '587 (STARTTLS)'), h('option', { value: '465' }, '465 (TLS)'));
+      port.value = String(config.port || 587);
+      const user = input({ value: config.user || '', maxLength: 200, placeholder: 'you@gmail.com' });
+      const password = secret('Password', savedSecret && Boolean(config.user));
+      fields.host = () => host.value.trim();
+      fields.port = () => Number(port.value);
+      fields.user = () => user.value.trim();
+      fields.password = () => password.input.value;
+      const sync = askAgain(password, () => host.value.trim().toLowerCase() !== String(config.host || '').toLowerCase() || port.value !== String(config.port || 587),
+        savedSecret && Boolean(config.user));
+      host.addEventListener('input', sync);
+      port.addEventListener('change', sync);
+      own.push(field('Mail server', host), field('Port', port), field('User name', user, 'Empty for a server that takes mail without a login.'), password.el,
+        h('small', { class: 'muted' }, 'For Gmail: an app password (Google Account, Security, App passwords), not the password of the account.'));
+    }
+    if (kind === 'email' || kind === 'resend') {
+      const sender = input({ value: config.sender || '', maxLength: 320, placeholder: 'qKVM <alerts@example.com>' });
+      const to = input({ value: (config.to || []).join(', '), maxLength: 1000, placeholder: 'ops@example.com, oncall@example.com' });
+      fields.sender = () => sender.value.trim();
+      fields.to = () => to.value.split(/[,;\s]+/).filter(Boolean);
+      own.push(field('From', sender), field('To', to, 'Up to ten addresses.'));
+    }
+    // What it is told, about which machines, and when it is left in peace.
+    const events = Object.entries(catalog.events).map(([key, label]) => {
+      const box = h('input', { type: 'checkbox', checked: !place || place.events.includes(key) });
+      return { key, box, row: check(box, label, key === 'recovered' ? 'Where the trouble it ends was told here.' : `Severity: ${catalog.severity[key]}.`) };
+    });
+    const least = h('select', {}, catalog.levels.map(level => h('option', { value: level }, LEVEL_NAMES[level] || level)));
+    least.value = place?.least || (kind === 'pagerduty' ? 'error' : 'info');
+    const machines = machinePicker(devices, place ? { devices: place.devices, groups: place.groups } : null);
+    const quietFrom = h('input', { type: 'time', value: minuteText(place?.quiet_from ?? -1) });
+    const quietTo = h('input', { type: 'time', value: minuteText(place?.quiet_to ?? -1) });
+    const days = Object.entries(DAY_NAMES).map(([key, label]) => {
+      const box = h('input', { type: 'checkbox', checked: Boolean(place?.quiet_days?.includes(key)) });
+      return { key, box, row: check(box, label) };
+    });
+    const remind = h('select', {}, catalog.remind.map(minutes => h('option', { value: String(minutes) }, REMIND_NAMES[minutes] || `${minutes} min`)));
+    remind.value = String(place?.remind || 0);
+    const minimal = h('input', { type: 'checkbox', checked: Boolean(place?.minimal) });
+    // The activity log's daily seal (its head, kept where the wall cannot reach: GUIDE.md "Activity log"). Not to PagerDuty,
+    // whose every event opens an incident.
+    const sealed = h('input', { type: 'checkbox', checked: Boolean(place?.log_seal) });
+    const privately = h('input', { type: 'checkbox', checked: Boolean(place?.private) });
+    const enabled = h('input', { type: 'checkbox', checked: place ? place.enabled : true });
+    const error = h('p', { class: 'error', hidden: true });
+    const save = h('button', { type: 'submit', class: 'primary' }, editing ? 'Save' : 'Add');
+    const form = h('form', {
+      class: 'destination-form',
+      onsubmit: event => {
+        event.preventDefault();
+        error.hidden = true;
+        busy(save, async () => {
+          const said = {
+            kind, name: name.value.trim(), enabled: enabled.checked, private: privately.checked, minimal: minimal.checked,
+            events: events.filter(each => each.box.checked).map(each => each.key), least: least.value, ...machines.read(),
+            quiet_from: minuteOf(quietFrom.value), quiet_to: minuteOf(quietTo.value),
+            quiet_days: days.filter(each => each.box.checked).map(each => each.key), remind: Number(remind.value),
+            log_seal: kind !== 'pagerduty' && sealed.checked,
+          };
+          for (const [key, read] of Object.entries(fields)) said[key] = read();
+          let made;
+          try {
+            made = editing ? await api('PUT', `api/v1/alerts/destinations/${place.id}`, said) : await api('POST', 'api/v1/alerts/destinations', said);
+          } catch (ex) {
+            error.textContent = ex.message;
+            error.hidden = false;
+            return;
+          }
+          if (made.signing_secret) {
+            signingShown(body, made.signing_secret, () => { close(); onDone(); });
+            return;
+          }
+          toast(editing ? 'Destination saved' : 'Destination added', 'ok');
+          close();
+          onDone();
+        });
+      },
+    },
+      h('div', { class: 'destination-fields' },
+        h('p', { class: 'muted' }, DESTINATION_HINTS[kind]),
+        field('Name', name, 'What you call it, in the list and in the activity log.'),
+        ...own,
+        h('h3', {}, 'Tell it'),
+        ...events.map(each => each.row),
+        field('From', least, 'How serious an event has to be (the guide says what each is).'),
+        machines.el,
+        h('h3', {}, 'Quiet hours'),
+        h('div', { class: 'quiet-hours' }, field('From', quietFrom), field('To', quietTo)),
+        h('div', { class: 'quiet-days' }, days.map(each => each.row)),
+        h('small', { class: 'muted' }, 'In this wall\'s time. No days ticked is every day. What is still wrong when they end is told then.'),
+        field('Remind while still wrong', remind),
+        kind !== 'pagerduty' && check(sealed, 'Daily seal of the activity log',
+          'Once a day, a quiet message with the head of the activity log. Kept there, it shows a later rewrite of the log. No secret is in it.'),
+        check(minimal, 'Minimal content', 'The machine\'s name, what happened and the link: no address, no detail.'),
+        check(privately, 'May be a private address', 'This computer (localhost), or an address of your own network (10.x, 172.16 to 31.x, 192.168.x, fc00::/7, and 100.64.0.0/10, where Tailscale is). Link-local addresses and qKVM itself never are.'),
+        check(enabled, 'On')),
+      error,
+      h('div', { class: 'actions' }, h('button', { type: 'button', onclick: close }, 'Cancel'), save));
+    body.append(form);
+    name.focus();
+  }, { size: 'destination' });
+}
+
+// A webhook's signing secret, shown once: in place of the box's form, which holds still.
+function signingShown(body, secret, done) {
+  body.replaceChildren(h('div', { class: 'destination-form' },
+    h('div', { class: 'destination-fields' },
+      h('p', {}, h('strong', {}, 'The signing secret of this webhook. '), 'It is not shown again. Whoever receives the alerts checks each with it '
+        + '(Standard Webhooks: the webhook-signature header, v1 and HMAC-SHA256 over the webhook-id, the webhook-timestamp and the body).'),
+      shownOnce(secret, 'Signing secret')),
+    h('div', { class: 'actions' }, h('button', { type: 'button', class: 'primary', onclick: done }, 'I have it'))));
+}
+
+function chooseKindDialog(catalog, devices, onDone) {
+  openDialog('Add destination', (body, close) => {
+    body.append(h('div', { class: 'lines' }, Object.entries(catalog.kinds).map(([kind, label]) => setting(label, DESTINATION_HINTS[kind],
+      h('button', { type: 'button', onclick: () => { close(); destinationDialog(kind, null, catalog, devices, onDone); } }, 'Choose')))));
+  }, { size: 'destination' });
+}
+
+function deliveriesDialog(place, catalog) {
+  openDialog(`Delivered to ${place.name || catalog.kinds[place.kind]}`, async body => {
+    let deliveries;
+    try {
+      ({ deliveries } = await api('GET', `api/v1/alerts/destinations/${place.id}/log`));
+    } catch (ex) {
+      body.append(h('p', { class: 'error' }, ex.message));
+      return;
+    }
+    body.append(h('div', { class: 'destination-log' }, deliveries.length ? h('table', { class: 'rows' },
+      h('thead', {}, h('tr', {}, h('th', {}, 'When'), h('th', {}, 'What'), h('th', {}, 'How it went'))),
+      h('tbody', {}, deliveries.map(each => h('tr', {},
+        h('td', {}, new Date(each.at * 1000).toLocaleString()),
+        h('td', { class: 'wrap' }, each.what, each.test && h('div', { class: 'muted' }, 'A test')),
+        // (Withheld: not sent by the wall's own rules, the destination or alerts switched off while it waited; no failure of
+        // the destination's. A pause or quiet hours stop new alerts only: what was on its way goes.)
+        h('td', { class: 'wrap' }, h('span', { class: each.ok ? 'ok' : each.withheld ? 'muted' : 'bad' },
+          each.ok ? 'Delivered' : each.withheld ? 'Not sent' : 'Not delivered'),
+          h('div', { class: 'muted' }, `${each.said}${each.attempts > 1 ? ` · after ${each.attempts} attempts` : ''}`))))))
+      : h('p', { class: 'nothing' }, 'Nothing was sent here since qKVM started.')),
+    h('p', { class: 'footnote' }, 'The last fifty, since qKVM started. What could not be delivered is in the activity log as well.'));
+  }, { size: 'destination' });
+}
+
+// (Made once what the section shows has all come: what it does is put in its first line together with it.)
+function destinationBlocks(catalog, refresh, devices, does) {
+  const add = h('button', { type: 'button', class: 'primary', disabled: catalog.destinations.length >= catalog.most,
+    onclick: () => chooseKindDialog(catalog, devices, refresh) }, icon('plus'), 'Add destination');
+  does.append(add);
+  const names = new Map(devices.map(device => [device.id, device.name]));
+  const told = place => {
+    const events = place.events.length === Object.keys(catalog.events).length ? 'Every event' : place.events.map(key => catalog.events[key]).join(', ') || 'Nothing';
+    const machines = place.devices === null ? 'all machines'
+      : [...place.groups.map(group => `everything in ${group}`), ...place.devices.filter(id => names.has(id)).map(id => names.get(id))].join(', ') || 'no machines';
+    const quiet = place.quiet_from >= 0 ? ` · quiet ${minuteText(place.quiet_from)} to ${minuteText(place.quiet_to)}` : '';
+    return `${events}${place.least !== 'info' ? ` (${LEVEL_NAMES[place.least].toLowerCase()})` : ''}, ${machines}${quiet}`;
+  };
+  const test = place => async event => {
+    const button = event.currentTarget;
+    await busy(button, async () => {
+      try {
+        const done = await api('POST', `api/v1/alerts/destinations/${place.id}/test`, undefined, 60000);
+        toast(`Test alert delivered (${done.said})`, 'ok');
+      } catch (ex) {
+        toast(ex.message, 'error');
+      }
+      refresh();
+    });
+  };
+  const remove = place => async () => {
+    const sure = await confirmBox({ title: `Remove ${place.name || catalog.kinds[place.kind]}?`, message: 'Alerts are no longer sent there. What waits to be sent there is dropped.', action: 'Remove' });
+    if (!sure) return;
+    try {
+      await api('DELETE', `api/v1/alerts/destinations/${place.id}`);
+    } catch (ex) {
+      toast(ex.message, 'error');
+      return;
+    }
+    toast('Destination removed', 'ok');
+    refresh();
+  };
+  const state = place => {
+    if (!place.known) return h('span', { class: 'bad' }, 'Of a kind this version does not know');
+    if (place.last_error) return h('span', { class: 'bad' }, `Not delivered: ${place.last_error}`);
+    if (!place.enabled) return h('span', { class: 'muted' }, 'Off');
+    return h('span', { class: 'muted' }, place.last_sent ? `Delivered ${ago(Date.now() / 1000 - place.last_sent)}` : 'Nothing sent yet');
+  };
+  return [
+    block('Destinations', catalog.destinations.length ? h('table', { class: 'rows' },
+      h('thead', {}, h('tr', {}, h('th', {}, 'Where'), h('th', {}, 'Told'), h('th', {}, 'Last'), h('th', {}))),
+      h('tbody', {}, catalog.destinations.map(place => h('tr', { 'data-destination': place.id },
+        h('td', { class: 'wrap' }, h('strong', {}, place.name || catalog.kinds[place.kind] || place.kind),
+          h('div', { class: 'muted' }, [catalog.kinds[place.kind] || place.kind, place.host, place.private && 'private address'].filter(Boolean).join(' · '))),
+        h('td', { class: 'wrap' }, told(place)),
+        h('td', { class: 'wrap' }, state(place)),
+        h('td', { class: 'does' },
+          h('button', { type: 'button', disabled: !place.known, onclick: test(place) }, 'Send test'),
+          h('button', { type: 'button', onclick: () => deliveriesDialog(place, catalog) }, 'Log'),
+          h('button', { type: 'button', disabled: !place.known, onclick: () => destinationDialog(place.kind, place, catalog, devices, refresh) }, 'Edit'),
+          h('button', { type: 'button', class: 'danger', onclick: remove(place) }, 'Remove'))))))
+      : h('p', { class: 'nothing' }, 'None yet: alerts go to the activity log, and to the browsers below. Add destination, at the top right, sends them on.')),
+  ];
+}
+
 async function alertsTab(refresh, does) {
   if (!can('admin')) {
     return [
@@ -2958,26 +3774,19 @@ async function alertsTab(refresh, does) {
       h('p', { class: 'footnote' }, PUSH_LIMITS),
     ];
   }
-  const [state, phone] = await Promise.all([api('GET', 'api/v1/alerts'), pushBlocks(refresh)]);
+  const [state, phone, { devices }, catalog] = await Promise.all([
+    api('GET', 'api/v1/alerts'), pushBlocks(refresh), api('GET', 'api/v1/wall'), api('GET', 'api/v1/alerts/destinations'),
+  ]);
   const enabled = h('input', { type: 'checkbox', checked: state.enabled });
-  const url = h('input', {
-    type: 'text', inputMode: 'url', spellcheck: false, autocomplete: 'off',
-    placeholder: state.has_webhook ? 'Saved. Enter another address to replace it.' : 'https://ntfy.sh/your-topic',
-  });
-  const format = h('select', {}, [
-    ['auto', 'Work it out from the address'], ['ntfy', 'ntfy'], ['slack', 'Slack'], ['discord', 'Discord'], ['json', 'JSON, for anything else'],
-  ].map(([value, label]) => h('option', { value }, label)));
-  format.value = state.format;
   const kinds = [
     ['offline', 'A KVM goes offline', 'It stopped answering.'],
     ['no_signal', 'A computer loses its picture', 'Powered off, asleep, or unplugged from the KVM.'],
-    ['problem', 'A KVM has a problem', 'Its login is rejected, or its certificate changed.'],
+    ['problem', 'A KVM has a problem', 'Its login is rejected, its certificate changed, or a server reports a critical fault.'],
     ['recovered', 'It is over', 'The KVM answers again, or the picture is back.'],
   ].map(([key, label, hint]) => {
     const box = h('input', { type: 'checkbox', checked: state[key] });
     return { key, box, row: check(box, label, hint) };
   });
-  const forget = h('input', { type: 'checkbox' });
   // Where an alert leads: this wall, as whoever sets it up reaches it. Offered, not assumed: a phone on the
   // road may need another address than the desk this is typed at.
   const link = h('input', {
@@ -2993,22 +3802,13 @@ async function alertsTab(refresh, does) {
     toast(minutes ? 'Alerts paused' : 'Alerts are sent again', 'ok');
     refresh();
   };
-  const test = h('button', { type: 'button', disabled: !state.has_webhook }, 'Send a test alert');
-  test.addEventListener('click', () => busy(test, async () => {
-    try {
-      await api('POST', 'api/v1/alerts/test');
-    } catch (ex) {
-      toast(ex.message, 'error');
-      return;
-    }
-    toast('Test alert sent', 'ok');
-  }));
   const form = h('form', {
     id: 'alerts-form',
     onsubmit: event => {
       event.preventDefault();
       busy(save, async () => {
-        const body = { enabled: enabled.checked, webhook: url.value, forget_webhook: forget.checked, format: format.value, link: link.value };
+        // (What is said of the destinations is theirs: this saves what is the wall's, and leaves them as they are.)
+        const body = { enabled: enabled.checked, link: link.value };
         for (const kind of kinds) body[kind.key] = kind.box.checked;
         try {
           await api('PUT', 'api/v1/alerts', body);
@@ -3023,34 +3823,30 @@ async function alertsTab(refresh, does) {
   },
     block(null,
       check(enabled, 'Watch the KVMs and send alerts', 'A change counts once it has lasted about half a minute, so one hiccup stays quiet.'),
-      !state.last_error && state.last_sent && setting('Last alert', null,
-        h('span', { class: 'value' }, `Delivered ${ago(Date.now() / 1000 - state.last_sent)}`))),
-    block('Send them to',
-      field('Address', url, 'A webhook address: an ntfy topic, a Slack or Discord incoming webhook, or any address that takes a POST. '
-        + 'It is stored encrypted and never shown again.'),
-      field('Service', format, 'How the alert is written, for whoever receives it.'),
-      state.has_webhook && check(forget, 'Forget the saved address', 'Alerts then go nowhere until another address is given.'),
       field('Link in alerts', link, 'The address of this wall. An alert then leads to the tile it is about. Leave empty for alerts without a link.')),
     block('Tell me when', kinds.map(kind => kind.row)));
   const save = saves(form);
-  does.append(test, save);
+  save.classList.remove('primary');  // (the section's main button is Add destination)
+  does.append(save);
+  const places = destinationBlocks(catalog, refresh, devices, does);
   const until = state.paused_until && new Date(state.paused_until * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   return [
-    state.last_error && h('div', { class: 'note bad' }, `The last alert could not be delivered: ${state.last_error}`),
+    h('p', { class: 'intro' },
+      'Alerts go to the destinations below (mail, a chat, PagerDuty, ntfy, a webhook), each told what it asked for, and to the browsers ',
+      'turned on under This browser. What is ticked under Tell me when is told at all.'),
     form,
+    ...places,
     ...phone,
     block('Maintenance', state.paused_until
-      ? setting(`Paused until ${until}`, 'Nothing is sent meanwhile. What is not as it was by then is told then.',
+      ? setting(`Paused until ${until}`, 'Nothing new is sent meanwhile; what was already on its way still goes. What is not as it was by then is told then.',
         h('button', { type: 'button', onclick: pause(0) }, 'Send alerts again'))
       : setting('Pause alerts', 'While machines are worked on. What is still wrong when the time is over is told then.',
         h('button', { type: 'button', onclick: pause(60) }, 'For an hour'),
         h('button', { type: 'button', onclick: pause(240) }, 'For four hours'))),
     h('p', { class: 'footnote' },
-      'A single machine that is not to be heard about at all: Settings > KVMs > Edit. ',
-      'Without an address, changes are still written to the activity log. While alerts are on, qKVM keeps watching after ',
-      'everyone has signed out, which means the saved KVM passwords stay unlocked in its memory until it is restarted. ',
-      'After a restart, watching begins when someone signs in. A JetKVM that is not on screen is only checked for answering, ',
-      'not for its picture. ', PUSH_LIMITS),
+      'A machine not to be heard about at all: Settings > KVMs > Edit. Every change is in the activity log as well. While alerts ',
+      'are on, the saved KVM passwords stay unlocked in the memory of qKVM after everyone has signed out. The chapter Alerts of the guide ',
+      'says what each destination is sent, and what never leaves the wall.'),
   ];
 }
 
@@ -3158,6 +3954,7 @@ const EVENTS = {
   action_failed: 'Action failed', console_opened: 'Console opened', settings_changed: 'Network settings changed',
   live_control: 'Keyboard and mouse', export_refused: 'Export refused: wrong password',
   kvm_switched: 'Intel AMT KVM switched', kvm_switch_failed: 'Intel AMT KVM not switched', amt_view_changed: 'Intel AMT PC view changed',
+  open_in_changed: 'Open in links changed',
   saved_action_added: 'Action saved', saved_action_changed: 'Saved action changed', saved_action_removed: 'Saved action removed',
   update_installed: 'Update installed', update_failed: 'Update failed',
   user_added: 'Account added', user_changed: 'Account changed', user_removed: 'Account removed',
@@ -3172,14 +3969,21 @@ const EVENTS = {
   login_code_asked: 'Password right, second step asked for',
   log_gap: 'Entries are missing from this log: it could not be written',
   alerts_paused: 'Alerts paused', alerts_resumed: 'Alerts sent again',
+  alert_not_delivered: 'Alerts not delivered to a destination', alert_delivered_again: 'Alerts delivered to a destination again',
+  destination_added: 'Alert destination added', destination_changed: 'Alert destination changed', destination_removed: 'Alert destination removed',
   push_subscribed: 'Browser told the alerts', push_removed: 'Browser told the alerts no more', push_key_made: 'Key for alerts by Web Push made',
   totp_codes_created: 'New one-time codes made', security_changed: 'Two-factor rule changed',
   token_created: 'Token made', token_removed: 'Token taken back', display_opened: 'Wall screen opened with its link',
   wall_arranged: 'Order of the tiles set',
+  oidc_changed: 'Identity provider settings changed', provider_signed_out: 'Everybody of the identity provider signed out',
+  netbird_changed: 'NetBird settings changed',
   user_suspended: 'Account suspended', user_resumed: 'Account no longer suspended', user_signed_out: 'Account signed out everywhere',
   live_opened: 'Live view opened', live_closed: 'Live view closed', console_failed: 'Console not opened',
   activity_left_out: 'Entries not written',
   activity_exported: 'Activity log downloaded', accounts_reset: 'Accounts and saved passwords erased',
+  log_sealed: 'Activity log sealed', log_checked: 'Activity log checked',
+  backup_made: 'Backup made', backup_failed: 'Backup failed', backup_verified: 'Backup verified', backup_key_made: 'Backup key made',
+  backup_settings_changed: 'Backup settings changed', backup_not_started: 'Backup not started', backup_ended_late: 'Backup cut off, ended late', backup_still_waiting: 'Backup still waiting for its folder', backup_times_mended: 'Backup times set right', wall_restored: 'Restored from a backup',
   media_mounted: 'Image mounted', media_mount_failed: 'Image not mounted', media_booted: 'Started from the image',
   media_boot_failed: 'Not started from the image', media_unmounted: 'Image taken out', media_unmount_failed: 'Image not taken out',
   media_restarted: 'Restarted for the image', media_restart_failed: 'Not restarted for the image',
@@ -3196,7 +4000,7 @@ const ACTION_NAMES = {
 
 const TAB_ICONS = {
   devices: 'grid', actions: 'zap', users: 'users', network: 'globe', security: 'shield', updates: 'download', activity: 'list',
-  about: 'info', alerts: 'bell', metrics: 'activity', tokens: 'code', files: 'archive', media: 'disc',
+  about: 'info', alerts: 'bell', metrics: 'activity', tokens: 'code', files: 'archive', media: 'disc', backups: 'database',
 };
 
 // The sections of the settings, in the groups they are listed under: [key, name, what is in it, what draws it].
@@ -3218,6 +4022,7 @@ const SETTINGS = [
     ['network', 'Network', 'Where it listens, and how.', networkTab],
     ['metrics', 'Metrics', 'Numbers for a monitoring system to collect.', metricsTab],
     ['activity', 'Activity', 'Who signed in, changed what, and did what to which machine.', activityTab],
+    ['backups', 'Backups', 'An encrypted copy of the whole wall, every day, to a folder.', backupsTab],
     ['updates', 'Updates', 'The version that is running, and newer ones.', updatesTab],
     ['about', 'About', 'What this is, whose it is, and under which licence.', aboutTab],
   ]],
@@ -3289,7 +4094,9 @@ function settingsDialog(first) {
 
 // Who may sign in, as what, and which KVMs they see.
 async function usersTab(refresh, does) {
-  const [{ users }, { devices }, rule] = await Promise.all([api('GET', 'api/v1/users'), api('GET', 'api/v1/wall'), api('GET', 'api/v1/security')]);
+  const [{ users }, { devices }, rule, provider] = await Promise.all([
+    api('GET', 'api/v1/users'), api('GET', 'api/v1/wall'), api('GET', 'api/v1/security'), api('GET', 'api/v1/oidc'),
+  ]);
   does.append(h('button', { type: 'button', class: 'primary', onclick: () => editUserDialog(null, devices, refresh) }, icon('plus'), 'Add account'));
   const required = h('select', {}, [
     ['', 'Nobody: each account decides for itself'], ['admin', 'Admins'], ['operator', 'Admins and operators'], ['viewer', 'Everybody'],
@@ -3323,6 +4130,7 @@ async function usersTab(refresh, does) {
           user.suspended && h('div', { class: 'muted' }, 'Suspended'),
           user.totp && h('div', { class: 'muted' }, 'Two-factor sign-in on'),
           user.must_enroll && h('div', { class: 'muted' }, 'Has to set up two-factor sign-in'),
+          user.provider && h('div', { class: 'muted' }, 'Signed in by the identity provider'),
           user.sessions > 0 && !user.you && h('div', { class: 'muted' }, 'Signed in now')),
         h('td', {}, ROLE_NAMES[user.role]),
         h('td', { class: 'wrap' }, sees(user)),
@@ -3333,7 +4141,135 @@ async function usersTab(refresh, does) {
       field('Required of', required, rule.without.length
         ? `Still to set it up: ${rule.without.join(', ')}. They can sign in with their password, and do nothing but set it up.`
         : 'An account it is required of signs in with its password once more, to set it up, and to nothing else until that is done.')),
+    providerBlock(provider, refresh),
   ];
+}
+
+// Signing in through the team's identity provider (OpenID Connect): whether it is on, and the box that sets it up.
+function providerBlock(provider, refresh) {
+  const state = provider.offered ? `On: "Sign in with ${provider.name || new URL(provider.issuer).hostname}"` : provider.enabled ? 'On, but not complete' : 'Off';
+  const everyone = h('button', { type: 'button', class: 'danger' }, 'Sign them out');
+  everyone.addEventListener('click', () => busy(everyone, async () => {
+    const sure = await confirmBox({
+      title: 'Sign out everybody of the identity provider?',
+      message: 'Every browser the identity provider signed in is signed out now. They sign in again with its button, with the role their groups give them then.',
+      action: 'Sign them out',
+    });
+    if (!sure) return;
+    try {
+      const { ended } = await api('POST', 'api/v1/oidc/logout');
+      toast(`${ended} browser${ended === 1 ? '' : 's'} signed out`, 'ok');
+    } catch (ex) {
+      toast(ex.message, 'error');
+      return;
+    }
+    refresh();
+  }));
+  return block('Identity provider',
+    setting(state, 'People sign in with your team\'s identity provider (Entra ID, Google, Authentik, Keycloak: anything that speaks OpenID Connect), and its groups give their role here. Passwords of this wall keep working.',
+      h('button', { type: 'button', onclick: () => providerDialog(provider, refresh) }, provider.issuer ? 'Change' : 'Set up')),
+    provider.accounts > 0 && setting('Signed in by the provider now',
+      `${provider.signed_in} ${provider.signed_in === 1 ? 'browser' : 'browsers'}. A sign-in by the provider lasts 8 hours at the most, with the role it was given; this ends them all now.`,
+      everyone),
+    provider.locked_start && provider.enabled && h('p', { class: 'muted' },
+      'qKVM was started with --locked-start: after a restart, the button works once somebody has signed in with a password.'));
+}
+
+const ANYONE_NAMES = { '': 'Nobody else: only those in a group above', viewer: 'Anybody else, as a viewer', operator: 'Anybody else, as an operator', admin: 'Anybody else, as an admin' };
+
+// The box that sets the identity provider up. It holds still: one size, its Cancel and Save where they stand; only what
+// it holds scrolls, the list of groups with it.
+function providerDialog(provider, onDone) {
+  openDialog('Identity provider', (body, close) => {
+    const input = (props = {}) => h('input', { type: 'text', autocomplete: 'off', spellcheck: false, ...props });
+    const enabled = h('input', { type: 'checkbox', checked: provider.enabled || !provider.issuer });
+    const name = input({ value: provider.name, maxLength: 40, placeholder: 'Microsoft, Google, Company login' });
+    const issuer = input({ value: provider.issuer, maxLength: 500, inputMode: 'url', placeholder: 'https://login.example.org/realms/team' });
+    const client = input({ value: provider.client_id, maxLength: 256 });
+    const secret = passwordField('Client secret', {
+      autocomplete: 'off', maxLength: 512, placeholder: provider.has_secret ? 'Saved. Enter another to replace it.' : '',
+    }, 'Stored encrypted, and never shown again. Kept for this issuer and client ID only.');
+    const scopes = input({ value: provider.scopes, maxLength: 500 });
+    const claim = input({ value: provider.groups_claim, maxLength: 100, placeholder: 'groups' });
+    const rows = h('div', { class: 'group-roles' });
+    const addRow = (group = '', role = 'viewer') => {
+      const named = input({ value: group, maxLength: 256, placeholder: 'The group, as the provider writes it', 'aria-label': 'Group' });
+      const gives = h('select', { 'aria-label': 'Role it gives' }, Object.entries(ROLE_NAMES).map(([value, label]) => h('option', { value }, label)));
+      gives.value = role;
+      const row = h('div', { class: 'group-role' }, named, gives,
+        h('button', { type: 'button', class: 'icon-btn ghost', title: 'Remove this group', 'aria-label': 'Remove this group', onclick: () => row.remove() }, icon('x')));
+      row.read = () => ({ group: named.value.trim(), role: gives.value });
+      rows.append(row);
+      return named;
+    };
+    for (const each of provider.roles) addRow(each.group, each.role);
+    const anyone = h('select', {}, Object.entries(ANYONE_NAMES).map(([value, label]) => h('option', { value }, label)));
+    anyone.value = provider.anyone;
+    const domain = input({ value: provider.domain, maxLength: 253, placeholder: 'example.org' });
+    // Anybody else let in, and no email domain: anybody the provider signs in at all (for Google, refused by the wall).
+    const wide = h('div', { class: 'note warn', hidden: true },
+      'Anybody the provider signs in gets this role. Where anybody can have an account there (Google\'s own accounts, a provider that lets people sign up), set the email domain, or give roles by groups only.');
+    const widen = () => { wide.hidden = !anyone.value || Boolean(domain.value.trim()); };
+    anyone.addEventListener('change', widen);
+    domain.addEventListener('input', widen);
+    widen();
+    const privately = h('input', { type: 'checkbox', checked: provider.private });
+    // The address the provider sends people back to: this wall's own, as this page is looked at. Entered at the provider.
+    const back = `${location.origin}${provider.callback}`;
+    const backShown = input({ value: back, readOnly: true, 'aria-label': 'Redirect URI' });
+    const copy = h('button', { type: 'button', title: 'Copy', 'aria-label': 'Copy the redirect URI', onclick: () => navigator.clipboard?.writeText(back)?.then(() => toast('Copied', 'ok'), () => {}) }, icon('copy'));
+    const error = h('p', { class: 'error', hidden: true });
+    const save = h('button', { type: 'submit', class: 'primary' }, 'Save');
+    const form = h('form', {
+      class: 'destination-form',
+      onsubmit: event => {
+        event.preventDefault();
+        error.hidden = true;
+        busy(save, async () => {
+          const said = {
+            enabled: enabled.checked, name: name.value.trim(), issuer: issuer.value.trim(), client_id: client.value.trim(), client_secret: secret.input.value,
+            scopes: scopes.value.trim(), groups_claim: claim.value.trim(), roles: [...rows.children].map(row => row.read()).filter(row => row.group),
+            anyone: anyone.value, domain: domain.value.trim(), private: privately.checked, redirect_uri: back,
+          };
+          try {
+            await api('PUT', 'api/v1/oidc', said, 60000);  // (the provider is asked what it is before anything is saved)
+          } catch (ex) {
+            error.textContent = ex.message;
+            error.hidden = false;
+            return;
+          }
+          toast('Identity provider saved', 'ok');
+          close();
+          onDone();
+        });
+      },
+    },
+      h('div', { class: 'destination-fields' },
+        h('p', { class: 'muted' }, 'At the provider, register qKVM as an application (a client of OpenID Connect, with a secret), with the redirect URI below. The guide has the steps for Entra ID, Google, Authentik and Keycloak.'),
+        h('div', { class: 'field' }, h('span', {}, 'Redirect URI'), h('div', { class: 'with-button' }, backShown, copy),
+          h('small', {}, provider.redirect_uri && provider.redirect_uri !== back
+            ? `Saved as ${provider.redirect_uri}. Saving here changes it to this address: open these settings at the address your team uses.`
+            : 'Enter it at the provider. People sign in at this address.')),
+        check(enabled, 'On', 'The sign-in page offers the provider\'s button.'),
+        field('Name on the button', name, '"Sign in with" and this. Empty: the provider\'s host.'),
+        field('Issuer', issuer, 'The provider\'s address, exactly as it says it of itself (its /.well-known/openid-configuration is read from there).'),
+        field('Client ID', client),
+        secret.el,
+        field('Scopes', scopes, 'openid, and what the provider needs to send the email and the groups.'),
+        field('Groups claim', claim, 'Where the provider puts a person\'s groups: groups, roles, or a path such as realm_access.roles. Empty: none is read.'),
+        h('h3', {}, 'Groups and the role each gives'),
+        h('small', { class: 'muted' }, 'Written exactly as the provider sends them (Entra ID: the group\'s object ID). Somebody in several gets the highest.'),
+        rows,
+        h('button', { type: 'button', class: 'link', onclick: () => addRow().focus() }, 'Add a group'),
+        field('Who else may sign in', anyone),
+        field('Email domain', domain, 'Only people whose email address at this domain the provider says is verified. For Google, which sends no groups.'),
+        wide,
+        check(privately, 'May be a private address', 'The provider is on your own network (10.x, 172.16 to 31.x, 192.168.x, fc00::/7, 100.64.0.0/10). This computer and link-local addresses never are.')),
+      error,
+      h('div', { class: 'actions' }, h('button', { type: 'button', onclick: close }, 'Cancel'), save));
+    body.append(form);
+    issuer.focus();
+  }, { size: 'destination' });
 }
 
 // "Which machines": all of them, or whole groups (with whatever is added to them later) and single machines.
@@ -3372,7 +4308,9 @@ function editUserDialog(user, devices, onDone) {
     });
     const role = h('select', {}, Object.entries(ROLE_NAMES).map(([value, label]) => h('option', { value }, label)));
     role.value = user?.role || 'viewer';
-    role.disabled = Boolean(user?.you);  // nobody changes their own role: that is how the last admin gets lost
+    // Nobody changes their own role: that is how the last admin gets lost. Nor that of somebody the identity provider signs
+    // in, whose groups there give it at each sign-in.
+    role.disabled = Boolean(user?.you || user?.provider);
     const roleHint = h('p', { class: 'muted' });
     const { el: passwordBox, input: password } = passwordField(user ? 'New password' : 'Password', {
       autocomplete: 'new-password', required: !user && !ssoOn, minLength: minPassword, placeholder: user ? 'Unchanged' : '',
@@ -3386,7 +4324,7 @@ function editUserDialog(user, devices, onDone) {
     const access = machines.el;
     const onHold = h('input', { type: 'checkbox', checked: Boolean(user?.suspended) });
     const sync = () => {
-      roleHint.textContent = ROLE_HINTS[role.value] + (user?.you ? ' You cannot change your own role.' : '');
+      roleHint.textContent = ROLE_HINTS[role.value] + (user?.provider ? ' Given by their groups at the identity provider, at each sign-in.' : user?.you ? ' You cannot change your own role.' : '');
       access.hidden = role.value === 'admin';
     };
     role.addEventListener('change', sync);
@@ -3400,7 +4338,7 @@ function editUserDialog(user, devices, onDone) {
         error.hidden = true;
         busy(save, async () => {
           const account = {
-            name: name.value.trim(), role: role.value, password: user?.you ? '' : password.value, totp_off: totpOff.checked,
+            name: name.value.trim(), role: role.value, password: user?.you || user?.provider ? '' : password.value, totp_off: totpOff.checked,
             ...(role.value === 'admin' ? { devices: null, groups: [] } : machines.read()),
             suspended: onHold.checked,
           };
@@ -3421,7 +4359,8 @@ function editUserDialog(user, devices, onDone) {
     },
       h('div', { class: 'row' }, field('User name', name), field('Role', role)),
       roleHint,
-      user?.you ? h('p', { class: 'muted' }, 'Your own password and second step are changed under Security, where your current password is asked for.') : passwordBox,
+      user?.provider ? h('p', { class: 'muted' }, 'Signed in by the identity provider, which does its own second step: no password here, ever. Suspend the account to keep them out.')
+        : user?.you ? h('p', { class: 'muted' }, 'Your own password and second step are changed under Security, where your current password is asked for.') : passwordBox,
       user?.totp && !user.you && check(totpOff, 'Switch off their two-factor sign-in',
         'For a lost phone. Their password alone signs them in until they set it up again.'),
       access,
@@ -3588,7 +4527,7 @@ function editActionDialog(action, onDone) {
 }
 
 async function networkTab(refresh, does) {
-  const settings = await api('GET', 'api/v1/settings');
+  const [settings, netbird] = await Promise.all([api('GET', 'api/v1/settings'), api('GET', 'api/v1/netbird')]);
   const network = networkForm(settings, true);
   const form = h('form', {
     id: 'network-form',
@@ -3608,6 +4547,8 @@ async function networkTab(refresh, does) {
       network.other.length > 0 && setting('Also listening on', 'Written into the settings file by hand, and kept as it is.',
         h('span', { class: 'value' }, network.other.join(', ')))),
     block('Connection', network.secure, network.more));
+  // (Outside the form: NetBird's settings are saved by a box of their own, and asked once before they are.)
+  const tailnets = netbirdBlock(netbird, refresh);
   const save = saves(form);
   does.append(save);
   return [
@@ -3616,12 +4557,86 @@ async function networkTab(refresh, does) {
     settings.overridden && h('div', { class: 'note warn' },
       'qKVM was started with --bind or --port, which take priority over what is saved here.'),
     form,
+    tailnets,
     block('As it runs now',
       setting('Listening on', null, h('span', { class: 'value' }, settings.listening.join('  ') || 'unknown')),
       settings.cert_fingerprint && setting('Certificate', 'Its SHA-256 fingerprint, to compare with what a browser shows.',
         h('code', {}, settings.cert_fingerprint)),
+      settings.tailscale_certificate && setting('Tailscale\'s certificate',
+        settings.tailscale_certificate.name
+          ? `For https://${settings.tailscale_certificate.name}, until ${settings.tailscale_certificate.until.slice(0, 10)}. Every other name and address is served the certificate above.`
+          : `None yet: ${settings.tailscale_certificate.said || 'not asked for yet'}. The certificate above is served meanwhile.`,
+        settings.tailscale_certificate.fingerprint && h('code', {}, settings.tailscale_certificate.fingerprint)),
       setting('Version', null, h('span', { class: 'value' }, `qKVM ${settings.version}, started ${ago(settings.uptime)}`))),
   ];
+}
+
+// "Find KVMs" asks NetBird's own client where it is on this computer; where it is not (qKVM in a container beside NetBird's),
+// NetBird's management API, with a token: set up here.
+function netbirdBlock(netbird, refresh) {
+  if (netbird.client) {
+    return block('NetBird', setting('Its client is on this computer', 'Find KVMs asks it for the machines of your NetBird network. Nothing needs setting up here.'));
+  }
+  const state = netbird.url ? `On: ${new URL(netbird.url).host}` : 'Off';
+  return block('NetBird',
+    setting(state, 'Where qKVM runs in a container beside NetBird\'s, Find KVMs lists the machines of your NetBird network from its management API, with a token.',
+      h('button', { type: 'button', onclick: () => netbirdDialog(netbird, refresh) }, netbird.url ? 'Change' : 'Set up')));
+}
+
+// The box that sets NetBird's management API up. It holds still: one size, its buttons where they stand.
+function netbirdDialog(netbird, onDone) {
+  openDialog('NetBird', (body, close) => {
+    const address = h('input', {
+      type: 'text', autocomplete: 'off', spellcheck: false, inputMode: 'url', maxLength: 500, value: netbird.url, placeholder: 'https://api.netbird.io',
+    });
+    const token = passwordField('Token', {
+      autocomplete: 'off', maxLength: 400, placeholder: netbird.has_token ? 'Saved. Enter another to replace it.' : 'nbp_...',
+    }, 'Of a service user that may see the peers. Stored encrypted, never shown again, and sent only to the address above.');
+    const privately = h('input', { type: 'checkbox', checked: netbird.private });
+    const error = h('p', { class: 'error', hidden: true });
+    const save = h('button', { type: 'submit', class: 'primary' }, 'Save');
+    const send = async said => {
+      error.hidden = true;
+      try {
+        return await api('PUT', 'api/v1/netbird', said, 60000);  // (the management API is asked once before anything is saved)
+      } catch (ex) {
+        error.textContent = ex.message;
+        error.hidden = false;
+        return null;
+      }
+    };
+    const off = netbird.url && h('button', { type: 'button', class: 'danger' }, 'Turn off');
+    if (off) {
+      off.addEventListener('click', () => busy(off, async () => {
+        if (!(await send({ url: '', token: '', private: false }))) return;
+        toast('NetBird turned off', 'ok');
+        close();
+        onDone();
+      }));
+    }
+    const form = h('form', {
+      class: 'destination-form',
+      onsubmit: event => {
+        event.preventDefault();
+        busy(save, async () => {
+          const done = await send({ url: address.value.trim(), token: token.input.value, private: privately.checked });
+          if (!done) return;
+          toast(done.url ? `Saved: NetBird lists ${done.peers} connected machine${done.peers === 1 ? '' : 's'}` : 'NetBird turned off', 'ok');
+          close();
+          onDone();
+        });
+      },
+    },
+      h('div', { class: 'destination-fields' },
+        h('p', { class: 'muted' }, 'In NetBird, make a service user, and a token for it. Find KVMs asks for its peers and suggests the KVMs among them; nothing is added without you.'),
+        field('Management API', address, 'https://api.netbird.io for NetBird\'s own; your management server\'s address where you run it yourself.'),
+        token.el,
+        check(privately, 'May be a private address', 'The management server is on your own network (10.x, 172.16 to 31.x, 192.168.x, fc00::/7, 100.64.0.0/10). This computer and link-local addresses never are.')),
+      error,
+      h('div', { class: 'actions' }, off, h('button', { type: 'button', onclick: close }, 'Cancel'), save));
+    body.append(form);
+    address.focus();
+  }, { size: 'destination' });
 }
 
 // --- updates ------------------------------------------------------------------------------------------
@@ -3824,7 +4839,7 @@ async function updatesTab(refresh, does) {
   if (!status.repo) {
     notice = h('div', { class: 'note warn' },
       'Updates are not set up. This copy does not know which GitHub repository its releases are published in; ',
-      'see "Publishing releases" in the README.');
+      'see "Publishing releases" in the qKVM guide (GUIDE.md).');
   } else if (status.installed && !status.supervised) {
     notice = h('div', { class: 'note' }, `Version ${status.installed} is installed. Restart qKVM to start using it.`);
   } else if (status.installed) {
@@ -3989,6 +5004,8 @@ async function securityTab(refresh) {
 
 function eventLabel(entry) {
   if (entry.event === 'login_failed' && entry.step === 'code') return 'Wrong two-factor code';
+  if (entry.event === 'login_failed' && entry.provider) return 'Not signed in by the identity provider';
+  if (entry.event === 'login' && entry.provider) return 'Signed in by the identity provider';
   if (entry.event === 'settings_changed' && 'alerts' in entry) return entry.alerts ? 'Alerts saved (on)' : 'Alerts saved (off)';
   if (entry.event === 'settings_changed' && 'update_check' in entry) {
     return entry.update_check ? 'Daily update check switched on' : 'Daily update check switched off';
@@ -4052,6 +5069,23 @@ function leftOutDetail(entry) {
   return [`${entry.unsaid} ${entry.unsaid === 1 ? 'entry' : 'entries'} of this account's ${of} not written: more than are kept an hour`];
 }
 
+// The activity log's own lines (its chain: GUIDE.md "Activity log"): a seal and why it was written, and a check and what it found.
+const SEALED_WHY = {
+  start: 'qKVM started', stop: 'qKVM stopped', hourly: 'every hour', daily: 'for the daily seal of the alerts',
+};
+function sealDetail(entry) {
+  if (entry.event === 'log_checked') {
+    const intact = entry.unproved ? `intact where it is chained, ${entry.unproved} ${entry.unproved === 1 ? 'line' : 'lines'} not proved` : 'intact';
+    return [entry.intact ? intact : `broken${entry.broken_at != null ? ` at line ${entry.broken_at}` : ''}`, entry.last != null && `to line ${entry.last}`];
+  }
+  if (entry.event !== 'log_sealed') return [];
+  if (entry.why === 'genesis') return [`the chain begins${entry.before ? `: ${entry.before} earlier ${entry.before === 1 ? 'line' : 'lines'} taken in` : ''}`];
+  if (entry.why === 'unchained') return [`${entry.count} ${entry.count === 1 ? 'line' : 'lines'} written without the chain after the wall stopped taken in, not proved`];
+  if (entry.why === 'broken') return ['the log was not as the wall left it', entry.said];
+  if (entry.why === 'pruned') return [entry.to != null ? `lines up to ${entry.to} let go with the oldest file` : `${entry.let_go} lines from before the chain let go with the oldest file`];
+  return [SEALED_WHY[entry.why] || entry.why];
+}
+
 function consoleDetail(entry) {
   if (entry.event !== 'console_opened' && entry.event !== 'console_failed') return [];
   return [entry.unsaid && `${entry.unsaid} earlier ${entry.unsaid === 1 ? 'entry' : 'entries'} of this account's consoles not written: more than are kept an hour`];
@@ -4087,6 +5121,36 @@ function alertPictureDialog(entry) {
   }, { size: 'wide' });
 }
 
+// What a check of the activity log's chain found (POST /api/v1/audit/check): intact, or where it is broken and how, in a box
+// of one size whose list scrolls.
+function logCheckDialog(state) {
+  const result = state.result;
+  // (Lines taken in without the chain after a stop are not proved: never said as plainly intact.)
+  const title = !result ? 'The activity log could not be checked'
+    : result.intact ? (result.unchained ? 'The activity log is intact where it is chained' : 'The activity log is intact') : 'The activity log is broken';
+  openDialog(title, body => {
+    const how = result ? (result.intact ? (result.unchained ? 'unproved' : 'intact') : 'broken') : 'failed';
+    body.append(h('p', { class: { intact: 'note good', unproved: 'note warn' }[how] || 'note bad', 'data-check': how }, state.said));
+    if (result) {
+      const found = [
+        ...result.problems.map(problem => h('li', { class: 'bad' }, icon('alert'), h('span', {}, problem.line != null ? `Line ${problem.line}: ${problem.said}` : problem.said))),
+        ...(result.more ? [h('li', { class: 'bad' }, icon('alert'), h('span', {}, `and ${result.more} more`))] : []),
+        ...result.notes.map(note => h('li', { class: 'unknown' }, icon('info'), h('span', {}, note))),
+      ];
+      if (found.length) body.append(h('ul', { class: 'progress check-found' }, found));
+      if (result.last != null) {
+        body.append(h('p', { class: 'muted' }, `The head of the log: line ${result.last}`), h('code', { class: 'fingerprint mono' }, result.head));
+      }
+      // (What intact cannot show is said wherever it is: the outside review of 0.4.0, the settings and the log put back together.)
+      body.append(h('p', { class: 'muted', 'data-check-limits': true },
+        'Checked on the wall with its key, against the head it wrote last and the place its settings keep. Intact means the lines '
+        + 'are as the wall wrote them. It cannot show an older copy of the whole data folder put back (the settings and the log '
+        + 'together), nor a log written anew by someone who holds the wall or its vault: both check as intact here. The heads kept '
+        + 'outside it (syslog, the daily seal of an alert destination) show them, checked with python -m qkvm.checklog --heads.'));
+    }
+  }, { size: 'wide' });
+}
+
 async function activityTab(refresh, does) {
   // What can be narrowed to: the machines on the wall, the accounts and the tokens (a token acts under its name and "(token)").
   const [{ devices }, { users }, { tokens }] = await Promise.all([api('GET', 'api/v1/wall'), api('GET', 'api/v1/users'), api('GET', 'api/v1/tokens')]);
@@ -4097,10 +5161,18 @@ async function activityTab(refresh, does) {
     entry.event === 'alert' && alertWords(entry),
     entry.held && 'not sent: alerts were paused', entry.event !== 'live_control' && !entry.watch && entry.minutes && `${entry.minutes} minutes`,
     entry.browser, entry.service && `through ${entry.service}`, entry.event === 'push_removed' && entry.why === 'gone' && 'its push service said it is no longer subscribed',
+    entry.destination, entry.event?.startsWith('destination_') && entry.host, entry.event === 'alert_not_delivered' && entry.said,
+    entry.untold && `not sent: ${entry.untold}`,
     entry.event === 'push_key_made' && entry.replaced && 'in place of one that did not open',
     entry.recovery_code && `with a one-time code (${entry.codes_left} left)`,
     entry.event === 'login_failed' && entry.suspended && 'the account is suspended',
     entry.event === 'login_failed' && entry.no_second_step && 'the key of its second step does not open',
+    entry.event === 'login_failed' && entry.provider && entry.said,
+    entry.event === 'user_added' && entry.provider && 'at its first sign-in by the identity provider',
+    entry.event === 'user_changed' && entry.by === 'provider' && entry.was && `by its groups at the identity provider (was ${ROLE_NAMES[entry.was] || entry.was})`,
+    entry.event === 'oidc_changed' && (entry.enabled ? `on, ${entry.issuer}` : 'off'),
+    entry.event === 'oidc_changed' && entry.secret && 'client secret replaced',
+    entry.event === 'open_in_changed' && (Object.keys(entry.open_in || {}).map(kind => OPEN_IN[kind] || kind).join(', ') || 'none left'),
     entry.no_such_account && 'no account of the name that was typed',
     entry.event?.startsWith('media_') && entry.image, entry.event?.startsWith('media_') && entry.drive && entry.drive !== 'cd' && MEDIA_DRIVES_SAID[entry.drive],
     entry.event?.startsWith('media_') && entry.writable && 'writable', entry.event?.startsWith('media_') && MEDIA_BOOT_SAID[entry.boot],
@@ -4118,9 +5190,10 @@ async function activityTab(refresh, does) {
     entry.require_totp && `required of: ${{ admin: 'admins', operator: 'admins and operators', viewer: 'everybody' }[entry.require_totp] || 'nobody'}`,
     entry.action === 'port' && entry.port && `port ${entry.port}`,
     liveControlDetail(entry),
-    entry.keys && keysLabel(entry.keys), entry.chars && `${entry.chars} characters`, entry.mac,
+    entry.keys && keysLabel(entry.keys), entry.chars && `${entry.chars} characters`,
+    entry.input && `for port ${entry.input}`, entry.one_input && 'sent as for a KVM of one input', entry.mac,
     entry.batch && 'bulk run', entry.version && `version ${entry.version}`, entry.note, entry.error, entry.url,
-    ...liveViewDetail(entry), ...consoleDetail(entry), ...leftOutDetail(entry), exportedOf(entry, names),
+    ...liveViewDetail(entry), ...consoleDetail(entry), ...leftOutDetail(entry), exportedOf(entry, names), ...sealDetail(entry),
   ].filter(Boolean).join(' · ');
   const line = entry => h('tr', {},
     h('td', { class: 'when' }, new Date(entry.time * 1000).toLocaleString()),
@@ -4303,7 +5376,25 @@ async function activityTab(refresh, does) {
   csvButton.addEventListener('click', () => busy(csvButton, take('csv')));
   const linesButton = h('button', { type: 'button' }, icon('download'), 'JSON lines');
   linesButton.addEventListener('click', () => busy(linesButton, take('jsonl')));
-  does.append(csvButton, linesButton);
+  // Whether the log is as the wall wrote it: its chain read through on the wall (GUIDE.md, "Activity log"), the result in a box.
+  const checkButton = h('button', { type: 'button' }, icon('shield'), 'Check the log');
+  checkButton.addEventListener('click', () => busy(checkButton, async () => {
+    const done = working('Checking the activity log: the wall reads it through');
+    try {
+      let state = await api('POST', 'api/v1/audit/check', undefined, 60000);
+      while (state.running) {
+        await sleep(1500);
+        state = await api('GET', 'api/v1/audit/check');
+      }
+      logCheckDialog(state);
+      await load(false);  // (the check is in the log itself now)
+    } catch (ex) {
+      toast(ex.message, 'error');
+    } finally {
+      done();
+    }
+  }));
+  does.append(csvButton, linesButton, checkButton);
   await load(false);
   return [
     hole,
@@ -4516,6 +5607,7 @@ class Feed {
   }
   async tick() {
     let res, blob;
+    const run = wallRun;  // (as in api(): an answer for an earlier wall ends no newer one)
     await this.slots?.take();
     try {
       if (!this.running || !this.isActive()) return;  // no longer wanted by the time its turn came
@@ -4533,7 +5625,11 @@ class Feed {
       let error = {};
       try { error = await res.json(); } catch { /* not JSON */ }
       if (res.status === 401 && error.code === 'unauthorized') {
-        sessionExpired();
+        if (run === wallRun) sessionExpired();
+        return;
+      }
+      if (res.status === 409 && error.code === 'machine_changed') {
+        refetchWall();  // (its tile is at another machine now: no error of this one's, the wall as it is now)
         return;
       }
       this.fail(error.code || 'error', error.message || `HTTP ${res.status}`);
@@ -4569,9 +5665,13 @@ function sharpWidth(box) {
 // `big`: this is the enlarged (large) view, so a PC with Intel AMT holds a session open for it (and opens one before a
 // power-on to show the start), where a tile that is only shown gets a still now and then.
 // `whole`: the picture as large as the machine has it (the enlarged view at a scale of the machine's own pixels).
-function snapshotUrl(id, box, shared = 0, big = false, whole = false) {
+// `target`: the machine the picture is for, as the page has the tile: refused (409 `machine_changed`) where an edit has put
+// another under the tile since, whose screen a page with the wall as it was showed under the old one's name (the fresh review
+// of the HA round, L2); the wall is fetched again then (Feed.tick).
+function snapshotUrl(id, box, shared = 0, big = false, whole = false, target = '') {
   const age = shared ? `&age=${(shared * 0.8 / 1000).toFixed(2)}` : '';
-  return `api/v1/devices/${encodeURIComponent(id)}/snapshot?w=${whole ? WHOLE_WIDTH : sharpWidth(box)}${age}${big ? '&big=1' : ''}`;
+  const seen = target ? `&target=${encodeURIComponent(target)}` : '';
+  return `api/v1/devices/${encodeURIComponent(id)}/snapshot?w=${whole ? WHOLE_WIDTH : sharpWidth(box)}${age}${big ? '&big=1' : ''}${seen}`;
 }
 const WHOLE_WIDTH = 16384;  // the widest picture asked for (the server's own limit): the machine's own, whatever it is
 
@@ -4624,21 +5724,23 @@ function viewNote(tile, view, screen, large = false) {
 }
 
 // The view changed from the Actions box (an operator's or an admin's): said, and shown at once, with the status that says
-// what the tile can do now.
-async function setAmtView(tile, which) {
+// what the tile can do now. `target`: the PC the box was opened for (picksOf), refused where an edit has put another under
+// the tile since (409 `machine_changed`, nothing changed; the outside review 6.2 second re-check, M1).
+async function setAmtView(tile, which, target) {
   try {
-    const answer = await api('PUT', `api/v1/devices/${encodeURIComponent(tile.device.id)}/view`, { view: which });
+    const answer = await api('PUT', `api/v1/devices/${encodeURIComponent(tile.device.id)}/view`, { view: which, target });
     tile.device.amt_view = answer.amt_view;
     toast(`${tile.device.name}: ${AMT_VIEWS[answer.amt_view]}`, 'ok');
     try {
-      applyStatuses(await api('GET', 'api/v1/status'));
+      await lookNow();
     } catch { /* the regular look brings it */ }
     render(tile);
     renderFocus();
     return true;
   } catch (ex) {
     toast(ex.message, 'error');
-    return false;
+    lookAgainAfter(ex);
+    return ex.code === 'machine_changed';  // (the box it was clicked in is out of date: closed)
   }
 }
 
@@ -4682,12 +5784,15 @@ function metaText(status) {
 function machineText(status) {
   if (!status || !status.video) return '';
   if (status.picture === false) {
+    // A PC with Intel AMT reached over its plain port (only where it offers no other): said on its tile, every time.
+    const plain = status.kind === 'amt' && status.server?.amt?.plain ? 'over plain HTTP' : null;
     // A server's panel already says whether it is on and how warm: its footer says which machine it is.
-    if (!status.video.width) return status.about?.model || '';
+    if (!status.video.width) return [status.about?.model, plain].filter(Boolean).join(' · ');
     // With its screen on the tile, the footer says what the panel would have.
     const health = status.server?.health;
-    return [`${status.video.width}×${status.video.height}`, health && health !== 'OK' ? health : null,
-      status.health?.temp != null ? `${Math.round(status.health.temp)}°C` : null].filter(Boolean).join(' · ');
+    const word = powerWord(status, status.atx?.power !== false);
+    return [`${status.video.width}×${status.video.height}`, word !== 'On' && word !== 'Off' ? word : null, health && health !== 'OK' ? health : null,
+      status.health?.temp != null ? `${Math.round(status.health.temp)}°C` : null, plain].filter(Boolean).join(' · ');
   }
   const parts = [];
   const shown = status.ports?.list[status.ports.active];
@@ -4712,9 +5817,16 @@ function machineText(status) {
 
 // Why a KVM's power board is no witness of the computer's power, in the wall's words (`atx.note`: a light that says off beside
 // a picture is probably not wired). Whole in the enlarged view's Details; the title of a tile's footer, whose one line says
-// "Power unknown".
+// "Power unknown". A PC with Intel AMT: a shutdown the wall asked for that has not come about in time (`server.amt.shutdown`).
 function powerNote(status) {
-  return status?.picture !== false ? status?.atx?.note?.message || '' : '';
+  return status?.picture !== false ? status?.atx?.note?.message || '' : status?.server?.amt?.shutdown || '';
+}
+
+// How a machine's power is, in a word: a PC with Intel AMT has words of its own beyond on and off (shutting down, from the
+// moment the wall's shutdown is taken until it is seen off; sleeping; restarting), which its tile says where it is on.
+function powerWord(status, on) {
+  const said = status?.kind === 'amt' ? status.server?.power : null;
+  return on ? (said || 'On') : 'Off';
 }
 
 // --- servers: seen through their management controller, which has no picture to give ---------------
@@ -4724,9 +5836,10 @@ const HEALTH_TONES = { OK: 'ok', Warning: 'warn', Critical: 'bad' };
 // Fills what a server's tile shows where a KVM's shows the screen: power, health, heat, fans, and what
 // the machine is. `full`: with every temperature, for the enlarged view (of the machine `id`). Returns whether there is
 // anything to show.
-function fillPanel(panel, status, full = false, id = null) {
+// `device`: the large view's tile's machine, as the page has it (its id, name and `target`, which its KVM switch names).
+function fillPanel(panel, status, full = false, device = null) {
   const server = status?.server;
-  const key = server ? JSON.stringify([server, status.health?.temp, full, id, me?.role]) : '';
+  const key = server ? JSON.stringify([server, status.health?.temp, full, device?.id, device?.name, device?.target, me?.role]) : '';
   if (panel.dataset.key === key) return Boolean(server);  // unchanged: leave the DOM alone
   panel.dataset.key = key;
   if (!server) {
@@ -4749,7 +5862,7 @@ function fillPanel(panel, status, full = false, id = null) {
   // kind's word, words.json).
   const what = status.kind !== 'redfish' && KINDS[status.kind] ? KINDS[status.kind] : 'Server';
   panel.replaceChildren(...[
-    h('div', { class: 'panel-power' }, h('span', { class: 'led' }), h('strong', {}, on ? 'On' : 'Off'),
+    h('div', { class: 'panel-power' }, h('span', { class: 'led' }), h('strong', {}, powerWord(status, on)),
       // Somebody is looking for this machine: the tile says so as plainly as the light on it does.
       server.locator ? h('span', { class: 'locating' }, h('i', {}), 'Locator light on') : h('span', {}, what)),
     h('div', { class: 'readings' },
@@ -4758,9 +5871,11 @@ function fillPanel(panel, status, full = false, id = null) {
       server.fans.length > 0 && reading(failing ? `Fans · ${failing} not well` : 'Fans', `${running} running`, failing ? 'warn' : null)),
     hardware && h('p', { class: 'panel-hardware' }, hardware),
     full && server.unwell.length > 0 && h('p', { class: 'panel-unwell' }, `Not well: ${server.unwell.join(', ')}`),
+    // A shutdown the wall asked for that has not come about in time (a PC with Intel AMT): what may be the matter.
+    server.amt?.shutdown && h('p', { class: 'panel-why', title: full ? null : server.amt.shutdown }, server.amt.shutdown),
     // Why there is no picture, where there could be one: on the tile as well, in as many lines as it has room for.
     server.no_screen && h('p', { class: 'panel-why', title: full ? null : server.no_screen }, `Its screen is not shown: ${server.no_screen}`),
-    full && kvmSwitch(status, id),
+    full && kvmSwitch(status, device),
     full && server.temperatures.length + server.fans.length > 0 && h('div', { class: 'sensors' },
       server.temperatures.map(sensor => h('div', { dataset: sensor.ok ? {} : { tone: 'warn' } },
         h('span', {}, sensor.name), h('b', {}, `${Math.round(sensor.celsius)} °C`))),
@@ -4772,12 +5887,13 @@ function fillPanel(panel, status, full = false, id = null) {
 
 // A PC with Intel AMT whose KVM is switched off on its engine (as an engine set up by hand comes): an admin may switch it
 // on from here. It is a setting of the PC's, kept by its engine, and it is said so before anything is changed.
-function kvmSwitch(status, id) {
+function kvmSwitch(status, device) {
   const amt = status.server?.amt;
-  if (!id || !can('admin') || !amtKvmOff(amt)) return null;
+  if (!device || !can('admin') || !amtKvmOff(amt)) return null;
+  const pc = { id: device.id, name: device.name, target: device.target };  // (the PC this button was drawn for)
   const button = h('button', {
     type: 'button',
-    onclick: () => switchKvmOn(id, busy => { button.disabled = busy; }),
+    onclick: () => switchKvmOn(pc, busy => { button.disabled = busy; }),
   }, 'Switch on its KVM');
   return h('div', { class: 'panel-actions' }, button);
 }
@@ -4788,26 +5904,31 @@ function amtKvmOff(amt) {
   return Boolean(amt) && (amt.kvm === 'disabled' || (amt.kvm === 'enabled' && amt.listener === false));
 }
 
-// Switching it on, from the Health view or under Actions: asked first, and said how it went. True where it was done.
-// `busy`: told true while it is being done, and false again where it failed.
-async function switchKvmOn(id, busy) {
+// Switching it on, from the Health view or under Actions: asked first, and said how it went. True where it was done, or
+// where the box it was clicked in is out of date. `pc`: the PC the button was drawn for, its `id`, `name` and `target`: the
+// switch is refused, nothing changed, where an edit has put another PC under the tile since (409 `machine_changed`; the fresh
+// review of the HA round, H1), and the wall is fetched again. `busy`: told true while it is being done, and false again where
+// it failed.
+async function switchKvmOn(pc, busy) {
   const yes = await confirmBox({
     title: 'Switch on its KVM',
-    message: 'This changes a setting of the PC: its management engine will let whoever has its password see its screen and use its keyboard and mouse, from the network. Its redirection listener is switched on with it, which the engine\'s serial console and remote storage use as well. The KVM stays on until it is switched off again: under Actions here (the listener is then left on), or in the PC\'s MEBx. Intel AMT draws a red and yellow border on the PC\'s own screen while somebody looks.',
+    message: `This changes a setting of ${pc.name}: its management engine will let whoever has its password see its screen and use its keyboard and mouse, from the network. Its redirection listener is switched on with it, which the engine's serial console and remote storage use as well. The KVM stays on until it is switched off again: under Actions here (the listener is then left on), or in the PC's MEBx. Intel AMT draws a red and yellow border on the PC's own screen while somebody looks.`,
     action: 'Switch on',
     danger: false,
+    picks: [{ id: pc.id, target: pc.target, keys: false }],
   });
   if (!yes) return false;
   busy?.(true);
   try {
-    await api('POST', `api/v1/devices/${encodeURIComponent(id)}/kvm`, { on: true });
+    await api('POST', `api/v1/devices/${encodeURIComponent(pc.id)}/kvm`, { on: true, target: pc.target });
     toast('Its KVM is on. Its screen comes with the next look.', 'ok');
     lookAgainSoon();
     return true;
   } catch (ex) {
     toast(ex.message, 'error');
+    lookAgainAfter(ex);
     busy?.(false);
-    return false;
+    return ex.code === 'machine_changed';
   }
 }
 
@@ -4816,6 +5937,7 @@ async function switchKvmOn(id, busy) {
 // shows from the start. One machine at a time (not offered in a bulk run).
 async function bootIntoSetup(tile) {
   const name = tile.device.name;
+  const target = tile.device.target;  // (the machine the question names: see perform)
   const on = tile.status?.atx?.power !== false;
   const yes = await confirmBox({
     title: 'Start into BIOS setup',
@@ -4823,6 +5945,7 @@ async function bootIntoSetup(tile) {
       + (on ? ' Any unsaved work on it is lost.' : '') + ' Its large view opens so you can watch the setup.',
     action: on ? 'Restart into setup' : 'Switch on into setup',
     danger: on,
+    picks: [{ id: tile.device.id, target, keys: false }],
   });
   if (!yes) return;
   // The large view, so the setup screen shows (and the server opens a session before the press: `watching`). Not opened
@@ -4835,7 +5958,7 @@ async function bootIntoSetup(tile) {
   acting.set(tile.device.id, 'Start into BIOS setup');
   const finished = working(`${name}: starting into BIOS setup...`);
   try {
-    await api('POST', `api/v1/devices/${tile.device.id}/actions`, { action: 'bios_setup', watching: true }, SETUP_PATIENCE);
+    await api('POST', `api/v1/devices/${tile.device.id}/actions`, { action: 'bios_setup', watching: true, target }, SETUP_PATIENCE);
     toast(`${name}: starting into BIOS setup`, 'ok');
     lookAgainSoon();
   } catch (ex) {
@@ -4843,26 +5966,31 @@ async function bootIntoSetup(tile) {
     toast(ex.data?.message || !unanswered(ex)
       ? `${name}: ${ex.message}`
       : `${name}: no answer to "Start into BIOS setup". It may have been done, and its setup boot may be set for the next boot: look at the machine before sending it again (an admin finds how it ended in the activity log).`, 'error');
+    lookAgainAfter(ex);
   } finally {
     acting.delete(tile.device.id);
     finished();
   }
 }
 
-async function switchKvmOff(device, close) {
+// `pc`: as for switchKvmOn.
+async function switchKvmOff(pc, close) {
   const yes = await confirmBox({
     title: 'Switch off its KVM',
-    message: `This changes a setting of the PC: its management engine will no longer show its screen or take keys and the mouse from the network, from qKVM or anybody else, until its KVM is switched on again. ${device.name} stays on the wall with its power buttons and how it is.`,
+    message: `This changes a setting of ${pc.name}: its management engine will no longer show its screen or take keys and the mouse from the network, from qKVM or anybody else, until its KVM is switched on again. ${pc.name} stays on the wall with its power buttons and how it is.`,
     action: 'Switch off',
+    picks: [{ id: pc.id, target: pc.target, keys: false }],
   });
   if (!yes) return;
   try {
-    await api('POST', `api/v1/devices/${encodeURIComponent(device.id)}/kvm`, { on: false });
+    await api('POST', `api/v1/devices/${encodeURIComponent(pc.id)}/kvm`, { on: false, target: pc.target });
     toast('Its KVM is off.', 'ok');
     close();
     lookAgainSoon();
   } catch (ex) {
     toast(ex.message, 'error');
+    lookAgainAfter(ex);
+    if (ex.code === 'machine_changed') close();  // (the box it was clicked in is out of date)
   }
 }
 
@@ -4961,7 +6089,12 @@ function mediaDialog(id) {
   const tile = tiles.get(id);
   if (!tile) return;
   const { device } = tile;
-  openDialog(`Virtual media of ${device.name}`, body => {
+  // Made for the machine its tile is at as it opens (`target`): it lists for that one only, and closes once the wall shows the
+  // tile at another, as on `moved` (it listed again by the tile's id alone, and its next change went to the machine an edit
+  // had put there: the second fresh review of the HA round, HIGH).
+  const seen = `?target=${encodeURIComponent(device.target)}`;
+  const mine = [{ id: device.id, target: device.target, keys: false }];  // (the box, and each of its questions)
+  const box = openDialog(`Virtual media of ${device.name}`, body => {
     const dialog = body.closest('dialog');
     const mount = h('button', { type: 'button', class: 'primary', disabled: true }, icon('disc'), h('span', {}, 'Mount'));
     const upload = h('button', { type: 'button', class: 'media-upload', title: 'Upload an image from this computer', disabled: true }, icon('upload'), h('span', {}, 'Upload...'));
@@ -5014,9 +6147,15 @@ function mediaDialog(id) {
       again = null;
       let answer;
       try {
-        answer = await api('GET', `api/v1/devices/${encodeURIComponent(device.id)}/media`);
+        answer = await api('GET', `api/v1/devices/${encodeURIComponent(device.id)}/media${seen}`);
       } catch (ex) {
         if (mine !== turn) return;
+        if (ex.code === 'machine_changed') {  // (its tile is at another machine now: closed, as on `moved`)
+          toast(ex.message, 'error');
+          dialog.close();
+          lookAgainAfter(ex);
+          return;
+        }
         // No answer this time (a real server's controller missed one look a second after an unmount): what the last look
         // showed stays, but for what is in its drive, which is not known now; it is asked again once, a little later.
         if (shown) {
@@ -5092,8 +6231,9 @@ function mediaDialog(id) {
         tell(answered ? ex.message : `No answer to "${what}": it may have been done. Look at ${device.name} before trying again.`, true);
         // The tile's machine is not the one this box listed any more (its tile was edited meanwhile): nothing was done, and
         // the box, made for that one, closes. Opened again, it lists the machine the tile is at now.
-        if (ex.code === 'moved') {
+        if (ex.code === 'moved' || ex.code === 'machine_changed') {
           toast(ex.message, 'error');
+          lookAgainAfter(ex);
           moved = true;
         }
       } finally {
@@ -5134,7 +6274,8 @@ function mediaDialog(id) {
         // and not the answer: the box said that it may have been done, and stayed open, where nothing was (the independent
         // review of 0.3.2, L4). Where the tile is at another machine by now, that is said and the box closes, as for the
         // other changes, and nothing is sent. (Where that look gets no answer, the upload goes: the wall still refuses it.)
-        const relisted = await api('GET', `api/v1/devices/${encodeURIComponent(device.id)}/media`).catch(() => null);
+        const relisted = await api('GET', `api/v1/devices/${encodeURIComponent(device.id)}/media${seen}`)
+          .catch(ex => { if (ex.code === 'machine_changed') throw ex; return null; });
         if (controller.signal.aborted) throw new ApiError('The upload was stopped: the box was closed', 'disconnected', 0);
         if (relisted?.listed && listed && relisted.listed !== listed) {
           throw new ApiError(`${device.name} is not the machine its images were listed for any more: its address, or what qKVM knows of the machine there, was changed since. Nothing was uploaded: list its images again.`, 'moved', 409);
@@ -5195,6 +6336,7 @@ function mediaDialog(id) {
         message: `${chosen.name} (${bytesText(chosen.size)}) is carried through qKVM to the KVM's own storage of ${device.name} as this browser reads it, and kept nowhere on the way. Keep this box open until it is done: closing it stops the upload, and what came of it is taken off the KVM.`,
         action: 'Upload',
         danger: false,
+        picks: mine,
       });
       if (!yes) return;
       await carry(`Upload ${chosen.name}`, `Uploading ${chosen.name}...`, () => send(chosen, listed));
@@ -5207,6 +6349,7 @@ function mediaDialog(id) {
         title: `Delete ${image.name}`,
         message: `${image.name} is deleted from the KVM's own storage of ${device.name}. It cannot be brought back from here.`,
         action: 'Delete',
+        picks: mine,
       });
       if (!yes) return;
       await carry(`Delete ${image.name}`, 'Deleting...', () => api('POST', `api/v1/devices/${encodeURIComponent(device.id)}/media/delete`, { image: image.id, machine: device.name, listed }, MEDIA_PATIENCE));
@@ -5244,6 +6387,7 @@ function mediaDialog(id) {
         message: `${device.name} gets ${image.name}${image.where ? ` (on ${image.where})` : ''} ${into}, ${then}${drops}${cut}`,
         action: again ? 'Mount and restart' : 'Mount',
         danger: again || writable,
+        picks: mine,
       });
       if (!yes) return;
       await carry(`Mount ${image.name}`, again ? 'Mounting and restarting: as long as it takes to stop and to start...' : 'Mounting...',
@@ -5258,6 +6402,7 @@ function mediaDialog(id) {
         title: `Unmount ${mounted.name}`,
         message: `${mounted.name} is taken out of the drive of ${device.name}${mounted.first ? ', and its boot order put back where it was set from here' : ''}. A system running from it loses it.${drops}`,
         action: 'Unmount',
+        picks: mine,
       });
       if (!yes) return;
       await carry(`Unmount ${mounted.name}`, 'Unmounting...',
@@ -5278,6 +6423,7 @@ function mediaDialog(id) {
     fit();
     load();
   }, { size: 'media' });
+  watchPicks(box, mine);
 }
 
 // --- multi-port KVMs: one KVM, several computers, one of them on screen ----------------------------
@@ -5293,11 +6439,12 @@ async function switchPort(tile, index) {
   render(tile);
   renderFocus();
   try {
-    await api('POST', `api/v1/devices/${tile.device.id}/actions`, { action: 'port', port: index }, ACTION_PATIENCE);
+    await api('POST', `api/v1/devices/${tile.device.id}/actions`, { action: 'port', port: index, target: tile.device.target }, ACTION_PATIENCE);
     if (tile.status?.ports) tile.status.ports.active = index;  // a status poll may have replaced it meanwhile
     toast(`${tile.device.name}: showing ${portName(ports.list[index], index)}`, 'ok');
   } catch (ex) {
     toast(`${tile.device.name}: ${ex.message}`, 'error');
+    lookAgainAfter(ex);
   }
   tile.switching = null;
   render(tile);
@@ -5330,6 +6477,7 @@ function fillPorts(strip, tile) {
 
 // A JetKVM serves one viewer. When its own console was opened the wall stepped aside; this takes the picture back.
 async function showHere(device) {
+  const target = device.target;  // (the machine the question names: see perform)
   const sure = await confirmBox({
     title: `Show ${device.name} here?`,
     message: 'Whoever has its console open is disconnected from it.',
@@ -5338,9 +6486,10 @@ async function showHere(device) {
   });
   if (!sure) return;
   try {
-    await api('POST', `api/v1/devices/${device.id}/actions`, { action: 'resume' }, ACTION_PATIENCE);
+    await api('POST', `api/v1/devices/${device.id}/actions`, { action: 'resume', target }, ACTION_PATIENCE);
   } catch (ex) {
     toast(`${device.name}: ${ex.message}`, 'error');
+    lookAgainAfter(ex);
     return;
   }
   const tile = tiles.get(device.id);
@@ -5519,7 +6668,7 @@ function makeTile(device, index) {
   tile.feed = new Feed(
     canvas,
     screen,
-    () => snapshotUrl(device.id, screen, period),
+    () => snapshotUrl(device.id, screen, period, false, false, device.target),
     () => period,
     () => showsScreen(device, tile.status) && !document.hidden && tile.visible && !focus,
     result => { applyResult(tile.view, result); render(tile); },
@@ -5815,9 +6964,11 @@ function fitted(boxW, boxH, w, h) {
 // first picture, the first after a JPEG, a new `video`) and after a gap in the counter nothing is handed over
 // until a key frame, which is asked for once.
 class LiveLine {
-  constructor(id, told) {
+  // `target`: the machine the tile is at as the view that opens the line shows it (the wall's `target`): the pass is refused
+  // where an edit has put another machine under the tile since (`machine_changed`), and a pass opens no line once it has.
+  constructor(id, told, target = '') {
     Object.assign(this, {
-      id, told, socket: null, open: false, ended: false, control: false, asking: null, owed: [],
+      id, told, target, socket: null, open: false, ended: false, control: false, asking: null, owed: [],
       lastCounter: 0, needsKey: true, askedKey: false, skipped: 0, byeCode: '', byeMessage: '', need: null,
     });
   }
@@ -5826,7 +6977,8 @@ class LiveLine {
     this.need = need;
     let pass;
     try {
-      pass = await api('POST', `api/v1/devices/${encodeURIComponent(this.id)}/live`, {});
+      const seen = this.target ? `?target=${encodeURIComponent(this.target)}` : '';
+      pass = await api('POST', `api/v1/devices/${encodeURIComponent(this.id)}/live${seen}`, {});
     } catch (ex) {
       this.end(ex.code, ex.message);
       return;
@@ -6698,7 +7850,8 @@ function openFocus(id) {
       canvas,
       box,
       // The large view: a PC with Intel AMT holds a session for it, even while off. At a scale, the machine's whole picture.
-      () => snapshotUrl(id, box, 0, true, Boolean(focus?.scale)),
+      // (For the machine of the tile as the page has it now: a tile rebuilt for another keeps its large view.)
+      () => snapshotUrl(id, box, 0, true, Boolean(focus?.scale), tiles.get(id)?.device.target ?? tile.device.target),
       () => (period ? Math.min(period, FOCUS_PERIOD) : 0),
       () => !document.hidden && showsScreen(tile.device, tile.status),
       result => { applyResult(view, result); renderFocus(); },
@@ -6792,7 +7945,7 @@ function renderFocus() {
   $('#focus-screen').classList.toggle('has-frame', Boolean(focus.view.hasFrame));
   // (Boolean: a toggle given undefined flips the class at every render instead of setting it, and the panel blinked.)
   $('#focus').classList.toggle('has-panel', Boolean(tile.device.picture === false && (!screen || focus.health) && state !== 'connecting'
-    && fillPanel($('#focus-panel'), tile.status, true, tile.device.id)));
+    && fillPanel($('#focus-panel'), tile.status, true, tile.device)));
   $('#focus').classList.toggle('pictured', Boolean(screen && !focus.health));
   // With the server's screen up, how the server is (health, every temperature, every fan) is a button away.
   $('#focus-health').hidden = !screen;
@@ -6944,8 +8097,14 @@ function startLive(id) {
     },
     control: (on, code, message, by, from) => { if (mine()) controlAnswered(on, code, message, by, from); },
     owed: () => { if (mine()) renderControl(); },
-    closed: (code, message) => { if (mine()) liveEnded(code, message); },
-  });
+    closed: (code, message) => {
+      if (!mine()) return;
+      liveEnded(code, message);
+      // The tile was changed meanwhile (another machine under it, perhaps): the wall is fetched again, so that what it is at
+      // now is what the view shows, and "Open again" asks for that one. Nothing is opened again by itself.
+      if (code === 'gone' || code === 'machine_changed') reloadWall();
+    },
+  }, tile.device.target);
   picture = new LivePicture(canvas, box, line);
   picture.scale = () => (mine() ? focus.scale : 0);
   picture.onDrawn = () => {
@@ -7113,6 +8272,9 @@ function renderControl() {
   $('#focus-control-state').textContent = control?.on ? 'Controlling' : 'Viewing';
   $('#focus-release-hint').style.visibility = control?.on ? 'visible' : 'hidden';
   for (const item of keys.querySelectorAll('button')) item.disabled = !control?.on;
+  // (Typed text goes the way of an action, named for the input lit, and so do Ctrl+Alt+Del and Alt+F4 (sentAsAnAction): none
+  // while which one is lit is not known.)
+  if (tile && inputLit(tile) === null) for (const which of ['#focus-type', '#focus-cad', '#focus-alt-f4']) $(which).disabled = true;
   if (!control?.on) {
     $('#focus-keys .focus-input-help').open = false;
     $('#focus-keys-more').open = false;
@@ -7154,7 +8316,10 @@ function renderControl() {
   relative.title = relative.disabled
     ? "This KVM's mouse goes to where the pointer is put, and takes no steps."
     : 'The mouse by how far it moves, for games and some BIOS screens. Esc gives the pointer back to this PC.';
-  const steps = control.stepsOnly ? "This KVM's mouse moves by steps only: click the picture to hand it the pointer (Esc gives it back). " : '';
+  // (Set so in the KVM's own settings, as a real Comet on a newer firmware of GL.iNet's was: where to change it is said.)
+  const steps = control.stepsOnly
+    ? "This KVM's mouse moves by steps only: click the picture to hand it the pointer (Esc gives it back), or set its mouse to absolute on the KVM's own page. "
+    : '';
   $('#focus-keys-note').textContent = steps + keysKeptNote();
 }
 
@@ -7166,6 +8331,21 @@ async function withControl(work) {
   control.releaseAll();
   await work(control);
   if (focus?.control === control && control.on) $('#focus-screen').focus({ preventScroll: true });
+}
+
+// Ctrl+Alt+Del and Alt+F4 from the large view of every machine whose driver takes keys as an action: asked as the Actions menu
+// asks them (naming the port on a KVM with several inputs; the question goes once the KVM is found to have several), and sent its
+// way, with the input lit or that the KVM has one (`one_input`), which the wall holds them to right before they go; never over
+// the live line, which names no input, whatever the page believed when the view opened (the outside review 6.2 third re-check, H4, and
+// the narrow look at its fixes, HIGH 4). False for a machine that takes no keys action: sent over the live line, as before.
+async function sentAsAnAction(label, keys, question, danger = false) {
+  const tile = focus && tiles.get(focus.id);
+  if (!tile) return true;  // (taken off the wall: nothing is sent)
+  if (!canDo(tile, 'keys')) return false;
+  await perform(picksOf([tile.device.id]), keySpec(label, keys, {
+    confirm: true, danger, question, warning: 'Control is briefly released to send these keys, then requested again once qKVM has answered.',
+  }));
+  return true;
 }
 
 // Modifiers are armed locally for one chord, never held down between screen-key clicks.
@@ -7829,7 +9009,10 @@ function buildTiles(devices) {
       if (place === old.el) place = place.nextElementSibling;
       dropTile(old);
       tile = makeTile(device, 0);
-      Object.assign(tile, { status: old.status, rebootUntil: old.rebootUntil, wentDown: old.wentDown });
+      // (What the machine said of itself only where it is still at that machine: pointed at another, it waits for that one's
+      // word, and offers no keys until then. The outside review 6.2 third re-check, H2.)
+      const same = old.device.target === device.target;
+      Object.assign(tile, { status: same ? old.status : undefined, rebootUntil: old.rebootUntil, wentDown: old.wentDown });
       if (ticked) selected.add(device.id);  // renamed by somebody else, it is still one of the machines picked here
     } else if (!tile) {
       tile = makeTile(device, fresh++);
@@ -7856,6 +9039,11 @@ function buildTiles(devices) {
   const ordered = devices.map(device => [device.id, tiles.get(device.id)]);
   tiles.clear();
   for (const [id, tile] of ordered) tiles.set(id, tile);
+  // A menu, an editor or a question opened for a machine that its tile is no longer at (an edit put another there, or the
+  // tile went): closed, so that nothing in it names one machine and sends to another (watchPicks; the outside review 6.2, H1).
+  for (const [dialog, picks] of watched) {
+    if (picks.some(pick => tiles.get(pick.id)?.device.target !== pick.target)) dialog.close();
+  }
   renderFilters();
   renderSelection();
   renderGroups();
@@ -7871,8 +9059,10 @@ function buildTiles(devices) {
 
 async function reloadWall() {
   if (arranging) return;  // not under the hands of whoever is setting the order: it is fetched again when they are done
+  const run = wallRun;  // (an answer for a wall that has gone since, a session that ended, draws nothing over the one on show)
   try {
     const info = await api('GET', 'api/v1/wall');
+    if (run !== wallRun || arranging) return;
     wallLive = info.live === LIVE_FORM;
     buildTiles(info.devices);
   } catch (ex) {
@@ -7892,11 +9082,36 @@ function setBanner(text) {
 
 let polls = 0;
 
-function applyStatuses(all) {
+// How each machine is, as the wall said it: `asked`, each tile's machine as the request went out (askedOf). A tile takes only the
+// status of the machine it is still at: one asked before an edit pointed it at another is not that one's (its ports, what it can
+// do, its input lit; the outside review 6.2 third re-check, H2). A menu, an editor or a question taken without an input lit is closed once
+// its machine is found to have several (learnedSeveral: it would send keys that name none; the same re-check, H1).
+// And each status says the machine it was found at (`target`): one of another machine than the tile's, as this page has the wall,
+// is not taken, and the wall is fetched again. (By the tile's id alone, a page with the wall as it was before an edit took the
+// other machine's ports under the old one's name: the outside review 6.2's narrow look, HIGH 6.)
+const askedOf = () => new Map([...tiles].map(([id, tile]) => [id, tile.device.target]));
+let refetching = null;  // the wall being fetched again for a status or a picture of another machine
+function refetchWall() {
+  if (!refetching) refetching = reloadWall().finally(() => { refetching = null; });
+}
+function applyStatuses(all, asked) {
+  let elsewhere = false;
   for (const [id, status] of Object.entries(all)) {
     const tile = tiles.get(id);
-    if (tile) { tile.status = status; render(tile); }
+    if (!tile || asked.get(id) !== tile.device.target) continue;
+    if (status.target !== tile.device.target) { elsewhere = true; continue; }
+    tile.status = status;
+    render(tile);
   }
+  for (const [dialog, picks] of watched) {
+    if (picks.some(learnedSeveral)) dialog.close();
+  }
+  if (elsewhere) refetchWall();
+}
+
+async function lookNow() {
+  const asked = askedOf();
+  applyStatuses(await api('GET', 'api/v1/status'), asked);
 }
 
 // What was just done to a server (its power button, its locator light) shows on the tile once its
@@ -7914,9 +9129,10 @@ async function lookAgainSoon() {
     await sleep(LOOKS_AFTER[LOOKS_AFTER.length - looksLeft]);
     looksLeft -= 1;
     try {
+      const asked = askedOf();
       const all = await api('GET', 'api/v1/status');
       if (run !== wallRun) break;
-      applyStatuses(all);
+      applyStatuses(all, asked);
       renderFocus();
     } catch {
       break;  // the regular look says what is wrong with the wall
@@ -7929,10 +9145,11 @@ async function pollStatus(run) {
   while (run === wallRun) {
     if (!document.hidden) {
       try {
+        const asked = askedOf();
         const all = await api('GET', 'api/v1/status');
         if (run !== wallRun) return;
         wallDown = false;
-        applyStatuses(all);
+        applyStatuses(all, asked);
         // Somebody added or removed a KVM in another browser: this wall follows.
         const ids = Object.keys(all);
         if (ids.length !== tiles.size || ids.some(id => !tiles.has(id))) await reloadWall();
@@ -7981,6 +9198,7 @@ async function startWall() {
     return;
   }
   stopWall();
+  toSignIn = false;
   const run = wallRun;
   $('#auth').hidden = true;
   $('#auth-card').replaceChildren();  // with it go the password and code that were typed there
@@ -8015,9 +9233,14 @@ async function startWall() {
 }
 
 let reopening = false;  // a display link is being handed in again
+// On the way back to the sign-in page, which asks the wall about its identity provider before it is shown: marked at
+// once, so that the other questions answered "signed out" at that moment do not each go the way again. (They did, and
+// the last answer came after the person had signed in anew: the sign-in page over the new wall. Cleared where the
+// sign-in page is shown or the wall starts.)
+let toSignIn = false;
 
 function sessionExpired() {
-  if (!$('#auth').hidden || reopening) return;  // already back at the sign-in page, or on the way back in
+  if (!$('#auth').hidden || reopening || toSignIn) return;  // already back at the sign-in page, or on the way back in
   if (prefs.get('display-key', '')) {
     // A screen on the wall: nobody is standing there with a keyboard. Its link is what it comes back in with.
     reopening = true;
@@ -8052,8 +9275,27 @@ function sessionExpired() {
     reloadIfOutdated();
     return;
   }
+  toSignIn = true;
   for (const dialog of document.querySelectorAll('dialog[open]')) dialog.close();
-  showLogin('Your session ended. Sign in again to continue.');
+  // The wall goes at once: its tiles, their pictures and the large view's last frame stayed on show, and took clicks, while the
+  // question below was out (the second fresh review of the HA round, L1). The run is taken after that, so that the answer to the
+  // question still shows the sign-in page.
+  stopWall();
+  $('#shell').hidden = true;
+  const run = wallRun;
+  // (With the identity provider's button where it is set up: asked now, as a page signed in since it was loaded never asked.
+  // Answered after a newer sign-in started the wall again, or after another page of the sign-in was shown: left at that.
+  // Every dialog is closed again right before the sign-in page comes: one opened while the question was out, whose own
+  // questions were answered "signed out", stayed over it. The fresh review of the HA round, M2.)
+  // (The provider's button as last known is not offered meanwhile: the plain page, until the answer says otherwise.)
+  providerOffer = { on: false, name: '' };
+  const asked = askProviderOffer();
+  Promise.race([asked, sleep(OFFER_PATIENCE)]).then(() => {
+    if (run !== wallRun) return;
+    for (const dialog of document.querySelectorAll('dialog[open]')) dialog.close();
+    showLogin('Your session ended. Sign in again to continue.');
+    asked.then(lateOffer);
+  });
   reloadIfOutdated();  // sessions end when the program restarts, which is also when it may have become a newer one
 }
 
@@ -8369,18 +9611,20 @@ async function boot() {
   $('#focus-details').addEventListener('toggle', () => { if ($('#focus-details').open) redrawHistory(); });
   $('#focus-again').addEventListener('click', () => focus && startLive(focus.id));
   $('#focus-cad').addEventListener('click', () => withControl(async control => {
+    if (await sentAsAnAction('Ctrl+Alt+Del', 'ControlLeft,AltLeft,Delete', who => `Ctrl+Alt+Del on ${who}?`)) return;
     const name = tiles.get(focus.id)?.device.name || 'this machine';
     if (await confirmBox({ title: 'Ctrl+Alt+Del', message: `Ctrl+Alt+Del on ${name}?`, action: 'Ctrl+Alt+Del', danger: false })) control.ctrlAltDel();
   }));
   $('#focus-win').addEventListener('click', () => withControl(control => control.tap([USAGES.MetaLeft])));
   $('#focus-alt-tab').addEventListener('click', () => withControl(control => control.tap([USAGES.AltLeft, USAGES.Tab])));
   $('#focus-alt-f4').addEventListener('click', () => withControl(async control => {
+    if (await sentAsAnAction('Alt+F4', 'AltLeft,F4', who => `Alt+F4 on ${who}? It closes the window that is in front there.`, true)) return;
     const name = tiles.get(focus.id)?.device.name || 'this machine';
     if (await confirmBox({ title: 'Alt+F4', message: `Alt+F4 on ${name}? It closes the window that is in front there.`, action: 'Alt+F4' })) control.tap([USAGES.AltLeft, USAGES.F4]);
   }));
   $('#focus-prtsc').addEventListener('click', () => withControl(control => control.tap([USAGES.PrintScreen])));
   // The text goes the way the wall types text already (the action), never through the clipboard.
-  $('#focus-type').addEventListener('click', () => withControl(() => { typeTextDialog([focus.id]); }));
+  $('#focus-type').addEventListener('click', () => withControl(() => { typeTextDialog(picksOf([focus.id])); }));
   $('#focus-relative').addEventListener('click', () => focus?.control?.setRelative(!focus.control.relative));
   $('#focus-fullscreen').addEventListener('click', toggleFullscreen);
   $('#focus-health').addEventListener('click', () => {
@@ -8430,6 +9674,8 @@ async function boot() {
 
   // Before anything is waited for: a display link's key does not stay in the address for a moment longer than it takes to read it.
   const offered = takeDisplayKey();
+  const providerRefused = takeProviderRefusal();  // (a sign-in through the identity provider that was refused: why, in a word)
+  const refusedSaid = providerRefused && (PROVIDER_REFUSED[providerRefused] || PROVIDER_REFUSED_ELSE);
   let session;
   try {
     // (And the words the wall is drawn with, from the same server, before the first tile.)
@@ -8448,12 +9694,15 @@ async function boot() {
   // is not: when their session ended, the browser would sign itself in again as the screen, for whoever sits down next.
   if (offered && !session.authenticated) prefs.set('display-key', offered);
   if (!session.initialized) showSetup(session);
-  else if (session.authenticated) startWall();
-  else if (await openDisplay()) startWall();
+  else if (session.authenticated) {
+    startWall();
+    if (refusedSaid) toast(refusedSaid, 'error');  // (signed in already, by a password: the provider's try is said all the same)
+  } else if (!refusedSaid && await openDisplay()) startWall();
   else {
     // Signed in where the company signs in, and unknown here: said, so that nobody wonders which password is wanted.
     const stranger = session.sso?.name && !session.sso.known;
-    showLogin(stranger ? `You are signed in as ${session.sso.name}, and there is no qKVM account of that name. An admin can make one.` : undefined);
+    await askProviderOffer();
+    showLogin(stranger ? `You are signed in as ${session.sso.name}, and there is no qKVM account of that name. An admin can make one.` : undefined, refusedSaid);
   }
 }
 

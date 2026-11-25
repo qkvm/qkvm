@@ -23,7 +23,7 @@ from urllib.parse import urlsplit
 
 import pytest
 
-from qkvm import discover, jetkvm, kvm, redfish, update, vault
+from qkvm import jetkvm, kvm, redfish, tailnet, update, vault
 from qkvm.kvm import DeviceSpec, KvmError, as_text
 from tests.fake_jetkvm import FakeJetKvm
 from tests.fake_kvm import FakeKvm
@@ -177,7 +177,7 @@ def test_a_network_address_of_a_jetkvm_that_is_no_text(read_as_nested: None, dep
     good = json.dumps({"type": "new-ice-candidate", "data": {"candidate": "candidate:1 1 udp 1 192.0.2.1 9 typ host"}})
 
     async def check() -> None:
-        answer, candidates = await jetkvm._await_answer(Heard(ANSWER, odd, good))  # type: ignore[arg-type]
+        answer, candidates = await jetkvm._await_answer(Heard(ANSWER, odd, good), jetkvm._Session())  # type: ignore[arg-type]
         assert answer == SDP and candidates == ["candidate:1 1 udp 1 192.0.2.1 9 typ host"]
 
     asyncio.run(check())
@@ -191,7 +191,7 @@ def test_an_answer_of_a_jetkvm_whose_description_is_no_text(sdp: str) -> None:
 
     async def check() -> None:
         with pytest.raises(KvmError) as refused:
-            await jetkvm._await_answer(Heard(said))  # type: ignore[arg-type]
+            await jetkvm._await_answer(Heard(said), jetkvm._Session())  # type: ignore[arg-type]
         assert refused.value.code == "bad_response"
 
     asyncio.run(check())
@@ -333,8 +333,8 @@ def test_what_the_tailscale_command_says_of_the_other_machines(monkeypatch: pyte
     def ran(*asked: Any, **how: Any) -> subprocess.CompletedProcess[str]:
         return subprocess.CompletedProcess(asked, 0, stdout=printed, stderr="")
 
-    monkeypatch.setattr(discover, "tailscale_command", lambda: "tailscale")
-    monkeypatch.setattr(discover.subprocess, "run", ran)
-    said = discover._tailscale_peers()
+    monkeypatch.setattr(tailnet, "tailscale_command", lambda: "tailscale")
+    monkeypatch.setattr(tailnet.subprocess, "run", ran)
+    said = asyncio.run(tailnet.tailscale_peers())
     # (Nested deeper than this Python reads, the whole of what was printed is unreadable, and nobody is found.)
     assert said == found or ("[[[[" in printed and said == [])

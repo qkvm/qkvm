@@ -32,7 +32,7 @@ import pytest
 import qkvm
 from qkvm import kvm, update, vault
 from qkvm.store import Store, StoreError
-from tests.test_wall import PASSWORD, add, closed_port, wall
+from tests.test_wall import add, closed_port, PASSWORD, port_to_listen_on, wall
 from tests.settings_file import settings_text, write_settings_text
 
 EDITS: dict[str, Any] = {
@@ -90,7 +90,7 @@ def test_whoever_edited_the_file_is_told_which_value_was_refused(tmp_path: Path)
     # The real program, started on a file with one refused value and a second copy beside it.
     a_wall(tmp_path)
     edit(tmp_path, lambda saved: saved["alerts"].__setitem__("paused_until", "tomorrow"), both=False)
-    port = closed_port()
+    port = port_to_listen_on()
     env = {**os.environ, "PYTHONPATH": str(Path(qkvm.__file__).resolve().parent.parent), "QKVM_UPDATE_REPO": ""}
     env.pop("QKVM_CHILD", None)
     words = [sys.executable, "-P", "-m", "qkvm", "--data-dir", str(tmp_path), "--bind", "local"]

@@ -1,5 +1,5 @@
 """A server's mount whose controller was known by nothing when it was mounted (no pinned certificate, no numbers), as the
-outside review's fourth round (Codex, R4-M1) found it: a mount under way during an edit to another controller, and a
+outside review's fourth round (R4-M1) found it: a mount under way during an edit to another controller, and a
 look that learned another controller's numbers at the same address, each left the old one reading the image. Known by
 nothing, its first identity ends the mount; a change of the tile's controller ends it, and a mount under way hands out
 nothing. A name or a group changed with nothing else keeps it, where the controller was known.
